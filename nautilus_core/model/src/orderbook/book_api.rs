@@ -17,6 +17,7 @@ use std::{
     ffi::c_char,
     ops::{Deref, DerefMut},
 };
+use rust_decimal::Decimal;
 
 use nautilus_core::{cvec::CVec, string::str_to_cstr};
 
@@ -28,7 +29,6 @@ use crate::{
     },
     enums::BookType,
     identifiers::instrument_id::InstrumentId,
-    types::{price::Price, quantity::Quantity},
 };
 
 /// Provides a C compatible Foreign Function Interface (FFI) for an underlying [`OrderBook`].
@@ -158,25 +158,25 @@ pub extern "C" fn orderbook_has_ask(book: &mut OrderBook_API) -> u8 {
 }
 
 #[no_mangle]
-pub extern "C" fn orderbook_best_bid_price(book: &mut OrderBook_API) -> Price {
+pub extern "C" fn orderbook_best_bid_price(book: &mut OrderBook_API) -> Decimal {
     book.best_bid_price()
         .expect("Error: No bid orders for best bid price")
 }
 
 #[no_mangle]
-pub extern "C" fn orderbook_best_ask_price(book: &mut OrderBook_API) -> Price {
+pub extern "C" fn orderbook_best_ask_price(book: &mut OrderBook_API) -> Decimal {
     book.best_ask_price()
         .expect("Error: No ask orders for best ask price")
 }
 
 #[no_mangle]
-pub extern "C" fn orderbook_best_bid_size(book: &mut OrderBook_API) -> Quantity {
+pub extern "C" fn orderbook_best_bid_size(book: &mut OrderBook_API) -> Decimal {
     book.best_bid_size()
         .expect("Error: No bid orders for best bid size")
 }
 
 #[no_mangle]
-pub extern "C" fn orderbook_best_ask_size(book: &mut OrderBook_API) -> Quantity {
+pub extern "C" fn orderbook_best_ask_size(book: &mut OrderBook_API) -> Decimal {
     book.best_ask_size()
         .expect("Error: No ask orders for best ask size")
 }
@@ -219,8 +219,8 @@ pub extern "C" fn orderbook_check_integrity(book: &OrderBook_API) {
 #[no_mangle]
 pub extern "C" fn vec_fills_drop(v: CVec) {
     let CVec { ptr, len, cap } = v;
-    let data: Vec<(Price, Quantity)> =
-        unsafe { Vec::from_raw_parts(ptr as *mut (Price, Quantity), len, cap) };
+    let data: Vec<(Decimal, Decimal)> =
+        unsafe { Vec::from_raw_parts(ptr as *mut (Decimal, Decimal), len, cap) };
     drop(data); // Memory freed here
 }
 

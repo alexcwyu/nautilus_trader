@@ -16,10 +16,11 @@
 use std::collections::HashMap;
 
 use evalexpr::{ContextWithMutableVariables, HashMapContext, Node, Value};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::{
     identifiers::{instrument_id::InstrumentId, symbol::Symbol, venue::Venue},
-    types::price::Price,
 };
 
 pub const SYNTHETIC_VENUE: &str = "SYNTH";
@@ -81,7 +82,7 @@ impl SyntheticInstrument {
     pub fn calculate_from_map(
         &mut self,
         inputs: &HashMap<String, f64>,
-    ) -> Result<Price, Box<dyn std::error::Error>> {
+    ) -> Result<Decimal, Box<dyn std::error::Error>> {
         let mut input_values = Vec::new();
 
         for variable in &self.variables {
@@ -99,7 +100,7 @@ impl SyntheticInstrument {
 
     /// Calculates the price of the synthetic instrument based on the given component input prices
     /// provided as an array of `f64` values.
-    pub fn calculate(&mut self, inputs: &[f64]) -> Result<Price, Box<dyn std::error::Error>> {
+    pub fn calculate(&mut self, inputs: &[f64]) -> Result<Decimal, Box<dyn std::error::Error>> {
         if inputs.len() != self.variables.len() {
             return Err("Invalid number of input values".into());
         }
@@ -112,7 +113,7 @@ impl SyntheticInstrument {
         let result: Value = self.operator_tree.eval_with_context(&self.context)?;
 
         match result {
-            Value::Float(price) => Ok(Price::new(price, self.precision)),
+            Value::Float(price) => Ok(Decimal::new(price.to_i64().unwrap(), self.precision.to_u32().unwrap())),
             _ => Err("Failed to evaluate formula to a floating point number".into()),
         }
     }
@@ -144,7 +145,7 @@ mod tests {
 
         let price = synth.calculate_from_map(&inputs).unwrap();
 
-        assert_eq!(price.as_f64(), 150.0);
+        assert_eq!(price.to_f64().unwrap(), 150.0);
         assert_eq!(synth.formula, formula);
     }
 
@@ -164,7 +165,7 @@ mod tests {
         let inputs = vec![100.0, 200.0];
         let price = synth.calculate(&inputs).unwrap();
 
-        assert_eq!(price.as_f64(), 150.0);
+        assert_eq!(price.to_f64().unwrap(), 150.0);
         assert_eq!(synth.formula, formula);
     }
 
@@ -190,7 +191,7 @@ mod tests {
 
         let price = synth.calculate_from_map(&inputs).unwrap();
 
-        assert_eq!(price.as_f64(), 75.0);
+        assert_eq!(price.to_f64().unwrap(), 75.0);
         assert_eq!(synth.formula, new_formula);
     }
 }

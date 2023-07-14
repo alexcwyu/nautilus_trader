@@ -16,10 +16,12 @@
 use std::{collections::HashMap, str::FromStr};
 
 use datafusion::arrow::{
-    array::{Array, Int64Array, StringArray, UInt64Array, UInt8Array},
+    array::{Array, Int64Array, StringArray, UInt64Array, UInt8Array, Float64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use nautilus_model::{
     data::tick::TradeTick,
     enums::AggressorSide,
@@ -36,8 +38,8 @@ impl DecodeDataFromRecordBatch for TradeTick {
 
         // Extract field value arrays from record batch
         let cols = record_batch.columns();
-        let price_values = cols[0].as_any().downcast_ref::<Int64Array>().unwrap();
-        let size_values = cols[1].as_any().downcast_ref::<UInt64Array>().unwrap();
+        let price_values = cols[0].as_any().downcast_ref::<Float64Array>().unwrap();
+        let size_values = cols[1].as_any().downcast_ref::<Float64Array>().unwrap();
         let aggressor_side_values = cols[2].as_any().downcast_ref::<UInt8Array>().unwrap();
         let trade_id_values_values = cols[3].as_any().downcast_ref::<StringArray>().unwrap();
         let ts_event_values = cols[4].as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -54,9 +56,10 @@ impl DecodeDataFromRecordBatch for TradeTick {
             .map(
                 |(((((price, size), aggressor_side), trade_id), ts_event), ts_init)| {
                     Self {
+                        //TODO fix it
                         instrument_id: instrument_id.clone(),
-                        price: Price::from_raw(price.unwrap(), price_precision),
-                        size: Quantity::from_raw(size.unwrap(), size_precision),
+                        price: Decimal::from_f64(price.unwrap()).unwrap(),
+                        size: Decimal::from_f64(size.unwrap()).unwrap(),
                         aggressor_side: AggressorSide::from_repr(aggressor_side.unwrap() as usize)
                             .expect("cannot parse enum value"),
                         trade_id: TradeId::new(trade_id.unwrap()),

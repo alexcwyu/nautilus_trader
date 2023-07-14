@@ -16,6 +16,7 @@ nautilus-model = { path = "../model" }
 futures.workspace = true
 pyo3.workspace = true
 pyo3-asyncio.workspace = true
+rust_decimal.workspace = true
 rand.workspace = true
 tokio.workspace = true
 binary-heap-plus = "0.5.0"

@@ -16,14 +16,15 @@
 use std::{collections::HashMap, str::FromStr};
 
 use datafusion::arrow::{
-    array::{Array, Int64Array, UInt64Array},
+    array::{Array, Int64Array, UInt64Array, Float64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use nautilus_model::{
     data::tick::QuoteTick,
     identifiers::instrument_id::InstrumentId,
-    types::{price::Price, quantity::Quantity},
 };
 
 use crate::parquet::{Data, DecodeDataFromRecordBatch};
@@ -35,10 +36,10 @@ impl DecodeDataFromRecordBatch for QuoteTick {
 
         // Extract field value arrays from record batch
         let cols = record_batch.columns();
-        let bid_values = cols[0].as_any().downcast_ref::<Int64Array>().unwrap();
-        let ask_values = cols[1].as_any().downcast_ref::<Int64Array>().unwrap();
-        let ask_size_values = cols[2].as_any().downcast_ref::<UInt64Array>().unwrap();
-        let bid_size_values = cols[3].as_any().downcast_ref::<UInt64Array>().unwrap();
+        let bid_values = cols[0].as_any().downcast_ref::<Float64Array>().unwrap();
+        let ask_values = cols[1].as_any().downcast_ref::<Float64Array>().unwrap();
+        let ask_size_values = cols[2].as_any().downcast_ref::<Float64Array>().unwrap();
+        let bid_size_values = cols[3].as_any().downcast_ref::<Float64Array>().unwrap();
         let ts_event_values = cols[4].as_any().downcast_ref::<UInt64Array>().unwrap();
         let ts_init_values = cols[5].as_any().downcast_ref::<UInt64Array>().unwrap();
 
@@ -54,10 +55,10 @@ impl DecodeDataFromRecordBatch for QuoteTick {
                 |(((((bid, ask), ask_size), bid_size), ts_event), ts_init)| {
                     Self {
                         instrument_id: instrument_id.clone(),
-                        bid: Price::from_raw(bid.unwrap(), price_precision),
-                        ask: Price::from_raw(ask.unwrap(), price_precision),
-                        bid_size: Quantity::from_raw(bid_size.unwrap(), size_precision),
-                        ask_size: Quantity::from_raw(ask_size.unwrap(), size_precision),
+                        bid: Decimal::from_f64(bid.unwrap()).unwrap(),
+                        ask: Decimal::from_f64(ask.unwrap()).unwrap(),
+                        bid_size: Decimal::from_f64(bid_size.unwrap()).unwrap(),
+                        ask_size: Decimal::from_f64(ask_size.unwrap()).unwrap(),
                         ts_event: ts_event.unwrap(),
                         ts_init: ts_init.unwrap(),
                     }

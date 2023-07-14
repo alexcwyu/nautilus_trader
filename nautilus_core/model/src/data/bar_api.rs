@@ -25,8 +25,11 @@ use super::bar::{Bar, BarSpecification, BarType};
 use crate::{
     enums::{AggregationSource, BarAggregation, PriceType},
     identifiers::instrument_id::InstrumentId,
-    types::{price::Price, quantity::Quantity},
 };
+
+use rust_decimal::prelude::*;
+// use fixed::types::I64F64;
+// type Decimal = I64F64;
 
 #[no_mangle]
 pub extern "C" fn bar_specification_new(
@@ -148,11 +151,11 @@ pub extern "C" fn bar_type_to_cstr(bar_type: &BarType) -> *const c_char {
 #[no_mangle]
 pub extern "C" fn bar_new(
     bar_type: BarType,
-    open: Price,
-    high: Price,
-    low: Price,
-    close: Price,
-    volume: Quantity,
+    open: Decimal,
+    high: Decimal,
+    low: Decimal,
+    close: Decimal,
+    volume: Decimal,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> Bar {
@@ -175,19 +178,19 @@ pub extern "C" fn bar_new_from_raw(
     high: i64,
     low: i64,
     close: i64,
-    price_prec: u8,
+    price_prec: u32,
     volume: u64,
-    size_prec: u8,
+    size_prec: u32,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> Bar {
     Bar {
         bar_type,
-        open: Price::from_raw(open, price_prec),
-        high: Price::from_raw(high, price_prec),
-        low: Price::from_raw(low, price_prec),
-        close: Price::from_raw(close, price_prec),
-        volume: Quantity::from_raw(volume, size_prec),
+        open: Decimal::new(open, price_prec),
+        high: Decimal::new(high, price_prec),
+        low: Decimal::new(low, price_prec),
+        close: Decimal::new(close, price_prec),
+        volume: Decimal::new(volume.to_i64().unwrap(), size_prec),
         ts_event,
         ts_init,
     }

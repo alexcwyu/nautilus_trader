@@ -14,6 +14,9 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::ffi::c_char;
+use rust_decimal::prelude::*;
+// use fixed::types::I64F64;
+// type Decimal = I64F64;
 
 use nautilus_core::{string::str_to_cstr, time::UnixNanos};
 
@@ -24,7 +27,6 @@ use super::{
 use crate::{
     enums::AggressorSide,
     identifiers::{instrument_id::InstrumentId, trade_id::TradeId},
-    types::{price::Price, quantity::Quantity},
 };
 
 #[no_mangle]
@@ -43,10 +45,10 @@ pub extern "C" fn quote_tick_new(
 ) -> QuoteTick {
     QuoteTick::new(
         instrument_id,
-        Price::from_raw(bid_price_raw, bid_price_prec),
-        Price::from_raw(ask_price_raw, ask_price_prec),
-        Quantity::from_raw(bid_size_raw, bid_size_prec),
-        Quantity::from_raw(ask_size_raw, ask_size_prec),
+        Decimal::new(bid_price_raw, bid_price_prec.to_u32().unwrap()),
+        Decimal::new(ask_price_raw, ask_price_prec.to_u32().unwrap()),
+        Decimal::new(bid_size_raw.to_i64().unwrap(), bid_size_prec.to_u32().unwrap()),
+        Decimal::new(ask_size_raw.to_i64().unwrap(), ask_size_prec.to_u32().unwrap()),
         ts_event,
         ts_init,
     )
@@ -82,8 +84,8 @@ pub extern "C" fn trade_tick_new(
 ) -> TradeTick {
     TradeTick::new(
         instrument_id,
-        Price::from_raw(price_raw, price_prec),
-        Quantity::from_raw(size_raw, size_prec),
+        Decimal::new(price_raw, price_prec.to_u32().unwrap()),
+        Decimal::new(size_raw.to_i64().unwrap(), size_prec.to_u32().unwrap()),
         aggressor_side,
         trade_id,
         ts_event,

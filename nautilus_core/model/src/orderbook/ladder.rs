@@ -18,24 +18,25 @@ use std::{
     collections::{BTreeMap, HashMap},
     fmt::{Display, Formatter},
 };
+use rust_decimal::Decimal;
+use rust_decimal::prelude::Zero;
 
 use super::book::BookIntegrityError;
 use crate::{
     data::book::BookOrder,
     enums::OrderSide,
     orderbook::level::Level,
-    types::{price::Price, quantity::Quantity},
 };
 
 #[derive(Copy, Clone, Debug, Eq)]
 pub struct BookPrice {
-    pub value: Price,
+    pub value: Decimal,
     pub side: OrderSide,
 }
 
 impl BookPrice {
     #[must_use]
-    pub fn new(value: Price, side: OrderSide) -> Self {
+    pub fn new(value: Decimal, side: OrderSide) -> Self {
         Self { value, side }
     }
 }
@@ -177,11 +178,11 @@ impl Ladder {
         }
     }
 
-    pub fn simulate_fills(&self, order: &BookOrder) -> Vec<(Price, Quantity)> {
+    pub fn simulate_fills(&self, order: &BookOrder) -> Vec<(Decimal, Decimal)> {
         let is_reversed = self.side == OrderSide::Buy;
 
         let mut fills = Vec::new();
-        let mut cumulative_denominator = Quantity::zero(order.size.precision);
+        let mut cumulative_denominator = Decimal::zero();
         let target = order.size;
 
         for level in self.levels.values() {
@@ -215,6 +216,7 @@ impl Ladder {
 ////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
     use crate::{
         data::book::BookOrder,
         enums::OrderSide,
@@ -224,30 +226,31 @@ mod tests {
             quantity::Quantity,
         },
     };
+    use crate::types::price::{PRICE_MAX_LONG, PRICE_MIN_LONG};
 
     #[test]
     fn test_book_price_bid_sorting() {
         let mut bid_prices = vec![
-            BookPrice::new(Price::new(2.0, 0), OrderSide::Buy),
-            BookPrice::new(Price::new(4.0, 0), OrderSide::Buy),
-            BookPrice::new(Price::new(1.0, 0), OrderSide::Buy),
-            BookPrice::new(Price::new(3.0, 0), OrderSide::Buy),
+            BookDecimal::new(Decimal::new(2, 0), OrderSide::Buy),
+            BookDecimal::new(Decimal::new(4, 0), OrderSide::Buy),
+            BookDecimal::new(Decimal::new(1, 0), OrderSide::Buy),
+            BookDecimal::new(Decimal::new(3, 0), OrderSide::Buy),
         ];
         bid_prices.sort();
-        assert_eq!(bid_prices[0].value.as_f64(), 4.0);
+        assert_eq!(bid_prices[0].value.to_f64().unwrap(), 4.0);
     }
 
     #[test]
     fn test_book_price_ask_sorting() {
         let mut ask_prices = vec![
-            BookPrice::new(Price::new(2.0, 0), OrderSide::Sell),
-            BookPrice::new(Price::new(4.0, 0), OrderSide::Sell),
-            BookPrice::new(Price::new(1.0, 0), OrderSide::Sell),
-            BookPrice::new(Price::new(3.0, 0), OrderSide::Sell),
+            BookDecimal::new(Decimal::new(2, 0), OrderSide::Sell),
+            BookDecimal::new(Decimal::new(4, 0), OrderSide::Sell),
+            BookDecimal::new(Decimal::new(1, 0), OrderSide::Sell),
+            BookDecimal::new(Decimal::new(3, 0), OrderSide::Sell),
         ];
 
         ask_prices.sort();
-        assert_eq!(ask_prices[0].value.as_f64(), 1.0);
+        assert_eq!(ask_prices[0].value.to_f64().unwrap(), 1.0);
     }
 
     #[test]
@@ -255,8 +258,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Buy);
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(10.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1000, 2),
+            Decimal::new(20, 0),
             0,
         );
 
@@ -264,7 +267,7 @@ mod tests {
         assert_eq!(ladder.len(), 1);
         assert_eq!(ladder.volumes(), 20.0);
         assert_eq!(ladder.exposures(), 200.0);
-        assert_eq!(ladder.top().unwrap().price.value.as_f64(), 10.0)
+        assert_eq!(ladder.top().unwrap().price.value.to_f64().unwrap(), 10.0)
     }
 
     #[test]
@@ -272,26 +275,26 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Buy);
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(10.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1000, 2),
+            Decimal::new(20, 0),
             0,
         );
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(9.00, 2),
-            Quantity::new(30.0, 0),
+            Decimal::new(900, 2),
+            Decimal::new(30, 0),
             0,
         );
         let order3 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(9.00, 2),
-            Quantity::new(50.0, 0),
+            Decimal::new(900, 2),
+            Decimal::new(50, 0),
             0,
         );
         let order4 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(8.00, 2),
-            Quantity::new(200.0, 0),
+            Decimal::new(800, 2),
+            Decimal::new(200, 0),
             0,
         );
 
@@ -299,7 +302,7 @@ mod tests {
         assert_eq!(ladder.len(), 3);
         assert_eq!(ladder.volumes(), 300.0);
         assert_eq!(ladder.exposures(), 2520.0);
-        assert_eq!(ladder.top().unwrap().price.value.as_f64(), 10.0)
+        assert_eq!(ladder.top().unwrap().price.value.to_f64().unwrap(), 10.0)
     }
 
     #[test]
@@ -307,26 +310,26 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Sell);
         let order1 = BookOrder::new(
             OrderSide::Sell,
-            Price::new(11.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(20, 0),
             0,
         );
         let order2 = BookOrder::new(
             OrderSide::Sell,
-            Price::new(12.00, 2),
-            Quantity::new(30.0, 0),
+            Decimal::new(1200, 2),
+            Decimal::new(30, 0),
             0,
         );
         let order3 = BookOrder::new(
             OrderSide::Sell,
-            Price::new(12.00, 2),
-            Quantity::new(50.0, 0),
+            Decimal::new(1200, 2),
+            Decimal::new(50, 0),
             0,
         );
         let order4 = BookOrder::new(
             OrderSide::Sell,
-            Price::new(13.00, 2),
-            Quantity::new(200.0, 0),
+            Decimal::new(1300, 2),
+            Decimal::new(200, 0),
             0,
         );
 
@@ -334,7 +337,7 @@ mod tests {
         assert_eq!(ladder.len(), 3);
         assert_eq!(ladder.volumes(), 300.0);
         assert_eq!(ladder.exposures(), 3780.0);
-        assert_eq!(ladder.top().unwrap().price.value.as_f64(), 11.0)
+        assert_eq!(ladder.top().unwrap().price.value.to_f64().unwrap(), 11.0)
     }
 
     #[test]
@@ -342,8 +345,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Buy);
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(11.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -351,8 +354,8 @@ mod tests {
 
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(11.10, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1110, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -361,7 +364,7 @@ mod tests {
         assert_eq!(ladder.volumes(), 20.0);
         assert_eq!(ladder.exposures(), 222.000_000_000_000_03);
         assert_eq!(
-            ladder.top().unwrap().price.value.as_f64(),
+            ladder.top().unwrap().price.value.to_f64().unwrap(),
             11.100_000_000_000_001
         )
     }
@@ -371,8 +374,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Sell);
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::new(11.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -380,8 +383,8 @@ mod tests {
 
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::new(11.10, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1110, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -390,7 +393,7 @@ mod tests {
         assert_eq!(ladder.volumes(), 20.0);
         assert_eq!(ladder.exposures(), 222.000_000_000_000_03);
         assert_eq!(
-            ladder.top().unwrap().price.value.as_f64(),
+            ladder.top().unwrap().price.value.to_f64().unwrap(),
             11.100_000_000_000_001
         )
     }
@@ -400,8 +403,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Buy);
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(11.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -409,8 +412,8 @@ mod tests {
 
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(11.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(10, 0),
             1,
         );
 
@@ -418,7 +421,7 @@ mod tests {
         assert_eq!(ladder.len(), 1);
         assert_eq!(ladder.volumes(), 10.0);
         assert_eq!(ladder.exposures(), 110.0);
-        assert_eq!(ladder.top().unwrap().price.value.as_f64(), 11.0)
+        assert_eq!(ladder.top().unwrap().price.value.to_f64().unwrap(), 11.0)
     }
 
     #[test]
@@ -426,8 +429,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Sell);
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::new(11.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -435,8 +438,8 @@ mod tests {
 
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::new(11.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(10, 0),
             1,
         );
 
@@ -444,7 +447,7 @@ mod tests {
         assert_eq!(ladder.len(), 1);
         assert_eq!(ladder.volumes(), 10.0);
         assert_eq!(ladder.exposures(), 110.0);
-        assert_eq!(ladder.top().unwrap().price.value.as_f64(), 11.0)
+        assert_eq!(ladder.top().unwrap().price.value.to_f64().unwrap(), 11.0)
     }
 
     #[test]
@@ -452,8 +455,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Buy);
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(11.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -461,8 +464,8 @@ mod tests {
 
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(11.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(1100, 2),
+            Decimal::new(10, 0),
             1,
         );
 
@@ -478,8 +481,8 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Sell);
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::new(10.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(1000, 2),
+            Decimal::new(10, 0),
             1,
         );
 
@@ -487,8 +490,8 @@ mod tests {
 
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::new(10.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(1000, 2),
+            Decimal::new(10, 0),
             1,
         );
 
@@ -504,15 +507,15 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Sell);
 
         ladder.add(BookOrder {
-            price: Price::new(100.00, 2),
-            size: Quantity::new(100.0, 0),
+            price: Decimal::new(10000, 2),
+            size: Decimal::new(100, 0),
             side: OrderSide::Sell,
             order_id: 1,
         });
 
         let order = BookOrder {
-            price: Price::new(50.00, 2), // <-- Simulate a MARKET order
-            size: Quantity::new(500.0, 0),
+            price: Decimal::new(5000, 2), // <-- Simulate a MARKET order
+            size: Decimal::new(500, 0),
             side: OrderSide::Buy,
             order_id: 2,
         };
@@ -527,15 +530,15 @@ mod tests {
         let mut ladder = Ladder::new(OrderSide::Buy);
 
         ladder.add(BookOrder {
-            price: Price::new(100.00, 2),
-            size: Quantity::new(100.0, 0),
+            price: Decimal::new(10000, 2),
+            size: Decimal::new(100, 0),
             side: OrderSide::Buy,
             order_id: 1,
         });
 
         let order = BookOrder {
-            price: Price::new(150.00, 2), // <-- Simulate a MARKET order
-            size: Quantity::new(500.0, 0),
+            price: Decimal::new(15000, 2), // <-- Simulate a MARKET order
+            size: Decimal::new(500, 0),
             side: OrderSide::Buy,
             order_id: 2,
         };
@@ -551,28 +554,28 @@ mod tests {
 
         ladder.add_bulk(vec![
             BookOrder {
-                price: Price::new(100.00, 2),
-                size: Quantity::new(100.0, 0),
+                price: Decimal::new(10000, 2),
+                size: Decimal::new(100, 0),
                 side: OrderSide::Sell,
                 order_id: 1,
             },
             BookOrder {
-                price: Price::new(101.00, 2),
-                size: Quantity::new(200.0, 0),
+                price: Decimal::new(10100, 2),
+                size: Decimal::new(200, 0),
                 side: OrderSide::Sell,
                 order_id: 2,
             },
             BookOrder {
-                price: Price::new(102.00, 2),
-                size: Quantity::new(400.0, 0),
+                price: Decimal::new(10200, 2),
+                size: Decimal::new(400, 0),
                 side: OrderSide::Sell,
                 order_id: 3,
             },
         ]);
 
         let order = BookOrder {
-            price: Price::new(PRICE_MAX, 2), // <-- Simulate a MARKET order
-            size: Quantity::new(500.0, 0),
+            price: Decimal::new(PRICE_MAX_LONG, 0), // <-- Simulate a MARKET order
+            size: Decimal::new(500, 0),
             side: OrderSide::Buy,
             order_id: 4,
         };
@@ -582,16 +585,16 @@ mod tests {
         assert_eq!(fills.len(), 3);
 
         let (price1, size1) = &fills[0];
-        assert_eq!(price1, &Price::new(100.00, 2));
-        assert_eq!(size1, &Quantity::new(100.0, 0));
+        assert_eq!(price1, &Decimal::new(10000, 2));
+        assert_eq!(size1, &Decimal::new(100, 0));
 
         let (price2, size2) = &fills[1];
-        assert_eq!(price2, &Price::new(101.00, 2));
-        assert_eq!(size2, &Quantity::new(200.0, 0));
+        assert_eq!(price2, &Decimal::new(10100, 2));
+        assert_eq!(size2, &Decimal::new(200, 0));
 
         let (price3, size3) = &fills[2];
-        assert_eq!(price3, &Price::new(102.00, 2));
-        assert_eq!(size3, &Quantity::new(200.0, 0));
+        assert_eq!(price3, &Decimal::new(10200, 2));
+        assert_eq!(size3, &Decimal::new(200, 0));
     }
 
     #[test]
@@ -600,28 +603,28 @@ mod tests {
 
         ladder.add_bulk(vec![
             BookOrder {
-                price: Price::new(102.00, 2),
-                size: Quantity::new(100.0, 0),
+                price: Decimal::new(10200, 2),
+                size: Decimal::new(100, 0),
                 side: OrderSide::Buy,
                 order_id: 1,
             },
             BookOrder {
-                price: Price::new(101.00, 2),
-                size: Quantity::new(200.0, 0),
+                price: Decimal::new(10100, 2),
+                size: Decimal::new(200, 0),
                 side: OrderSide::Buy,
                 order_id: 2,
             },
             BookOrder {
-                price: Price::new(100.00, 2),
-                size: Quantity::new(400.0, 0),
+                price: Decimal::new(10000, 2),
+                size: Decimal::new(400, 0),
                 side: OrderSide::Buy,
                 order_id: 3,
             },
         ]);
 
         let order = BookOrder {
-            price: Price::new(PRICE_MIN, 2), // <-- Simulate a MARKET order
-            size: Quantity::new(500.0, 0),
+            price: Decimal::new(PRICE_MIN_LONG, 0), // <-- Simulate a MARKET order
+            size: Decimal::new(500, 0),
             side: OrderSide::Sell,
             order_id: 4,
         };
@@ -631,16 +634,16 @@ mod tests {
         assert_eq!(fills.len(), 3);
 
         let (price1, size1) = &fills[0];
-        assert_eq!(price1, &Price::new(102.00, 2));
-        assert_eq!(size1, &Quantity::new(100.0, 0));
+        assert_eq!(price1, &Decimal::new(10200, 2));
+        assert_eq!(size1, &Decimal::new(100, 0));
 
         let (price2, size2) = &fills[1];
-        assert_eq!(price2, &Price::new(101.00, 2));
-        assert_eq!(size2, &Quantity::new(200.0, 0));
+        assert_eq!(price2, &Decimal::new(10100, 2));
+        assert_eq!(size2, &Decimal::new(200, 0));
 
         let (price3, size3) = &fills[2];
-        assert_eq!(price3, &Price::new(100.00, 2));
-        assert_eq!(size3, &Quantity::new(200.0, 0));
+        assert_eq!(price3, &Decimal::new(10000, 2));
+        assert_eq!(size3, &Decimal::new(200, 0));
     }
 
     #[test]
@@ -649,28 +652,28 @@ mod tests {
 
         ladder.add_bulk(vec![
             BookOrder {
-                price: Price::new(102.00, 2),
-                size: Quantity::new(100.0, 9),
+                price: Decimal::new(10200, 2),
+                size: Decimal::new(100000000000, 9),
                 side: OrderSide::Buy,
                 order_id: 1,
             },
             BookOrder {
-                price: Price::new(101.00, 2),
-                size: Quantity::new(200.0, 9),
+                price: Decimal::new(10100, 2),
+                size: Decimal::new(200000000000, 9),
                 side: OrderSide::Buy,
                 order_id: 2,
             },
             BookOrder {
-                price: Price::new(100.00, 2),
-                size: Quantity::new(400.0, 9),
+                price: Decimal::new(10000, 2),
+                size: Decimal::new(400000000000, 9),
                 side: OrderSide::Buy,
                 order_id: 3,
             },
         ]);
 
         let order = BookOrder {
-            price: Price::new(PRICE_MIN, 2),       // <-- Simulate a MARKET order
-            size: Quantity::new(699.999999999, 9), // <-- Size slightly less than total size in ladder
+            price: Decimal::new(PRICE_MIN_LONG, 0),       // <-- Simulate a MARKET order
+            size: Decimal::new(699999999999, 9), // <-- Size slightly less than total size in ladder
             side: OrderSide::Sell,
             order_id: 4,
         };
@@ -680,15 +683,15 @@ mod tests {
         assert_eq!(fills.len(), 3);
 
         let (price1, size1) = &fills[0];
-        assert_eq!(price1, &Price::new(102.00, 2));
-        assert_eq!(size1, &Quantity::new(100.0, 9));
+        assert_eq!(price1, &Decimal::new(10200, 2));
+        assert_eq!(size1, &Decimal::new(100000000000, 9));
 
         let (price2, size2) = &fills[1];
-        assert_eq!(price2, &Price::new(101.00, 2));
-        assert_eq!(size2, &Quantity::new(200.0, 9));
+        assert_eq!(price2, &Decimal::new(10100, 2));
+        assert_eq!(size2, &Decimal::new(200000000000, 9));
 
         let (price3, size3) = &fills[2];
-        assert_eq!(price3, &Price::new(100.00, 2));
-        assert_eq!(size3, &Quantity::new(399.999999999, 9));
+        assert_eq!(price3, &Decimal::new(10000, 2));
+        assert_eq!(size3, &Decimal::new(399999999999, 9));
     }
 }

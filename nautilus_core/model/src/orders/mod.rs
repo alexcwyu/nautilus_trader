@@ -17,6 +17,8 @@
 
 pub mod limit;
 
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use nautilus_core::{time::UnixNanos, uuid::UUID4};
 use thiserror::Error;
 
@@ -35,7 +37,6 @@ use crate::{
         order_list_id::OrderListId, position_id::PositionId, strategy_id::StrategyId,
         trade_id::TradeId, trader_id::TraderId, venue_order_id::VenueOrderId,
     },
-    types::{fixed::fixed_i64_to_f64, price::Price, quantity::Quantity},
 };
 
 #[derive(Error, Debug)]
@@ -114,7 +115,7 @@ struct Order {
     venue_order_ids: Vec<VenueOrderId>, // TODO(cs): Should be `Vec<&VenueOrderId>` or similar
     trade_ids: Vec<TradeId>,            // TODO(cs): Should be `Vec<&TradeId>` or similar
     previous_status: Option<OrderStatus>,
-    triggered_price: Option<Price>,
+    triggered_price: Option<Decimal>,
     pub status: OrderStatus,
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
@@ -126,9 +127,9 @@ struct Order {
     pub last_trade_id: Option<TradeId>,
     pub side: OrderSide,
     pub order_type: OrderType,
-    pub quantity: Quantity,
-    pub price: Option<Price>,
-    pub trigger_price: Option<Price>,
+    pub quantity: Decimal,
+    pub price: Option<Decimal>,
+    pub trigger_price: Option<Decimal>,
     pub trigger_type: Option<TriggerType>,
     pub time_in_force: TimeInForce,
     pub expire_time: Option<UnixNanos>,
@@ -136,9 +137,9 @@ struct Order {
     pub is_post_only: bool,
     pub is_reduce_only: bool,
     pub is_quote_quantity: bool,
-    pub display_qty: Option<Quantity>,
-    pub limit_offset: Option<Price>,
-    pub trailing_offset: Option<Price>,
+    pub display_qty: Option<Decimal>,
+    pub limit_offset: Option<Decimal>,
+    pub trailing_offset: Option<Decimal>,
     pub trailing_offset_type: Option<TriggerType>,
     pub emulation_trigger: Option<TriggerType>,
     pub contingency_type: Option<ContingencyType>,
@@ -146,8 +147,8 @@ struct Order {
     pub linked_order_ids: Option<Vec<ClientOrderId>>,
     pub parent_order_id: Option<ClientOrderId>,
     pub tags: Option<String>,
-    pub filled_qty: Quantity,
-    pub leaves_qty: Quantity,
+    pub filled_qty: Decimal,
+    pub leaves_qty: Decimal,
     pub avg_px: Option<f64>,
     pub slippage: Option<f64>,
     pub init_id: UUID4,
@@ -203,7 +204,7 @@ impl From<OrderInitialized> for Order {
             linked_order_ids: value.linked_order_ids,
             parent_order_id: value.parent_order_id,
             tags: value.tags,
-            filled_qty: Quantity::new(0.0, 0),
+            filled_qty: Decimal::from(0),
             leaves_qty: value.quantity,
             avg_px: None,
             slippage: None,
@@ -360,7 +361,7 @@ impl Order {
         }
     }
 
-    pub fn would_reduce_only(&self, side: PositionSide, position_qty: Quantity) -> bool {
+    pub fn would_reduce_only(&self, side: PositionSide, position_qty: Decimal) -> bool {
         if side == PositionSide::Flat {
             return false;
         }
@@ -465,11 +466,8 @@ impl Order {
             }
         }
 
-        self.quantity.raw = event.quantity.raw;
-        self.leaves_qty = Quantity::from_raw(
-            self.quantity.raw - self.filled_qty.raw,
-            self.quantity.precision,
-        );
+        self.quantity = event.quantity;
+        self.leaves_qty = self.quantity - self.filled_qty;
     }
 
     fn filled(&mut self, event: &OrderFilled) {
@@ -485,30 +483,30 @@ impl Order {
         self.set_slippage();
     }
 
-    fn set_avg_px(&mut self, last_qty: &Quantity, last_px: &Price) {
+    fn set_avg_px(&mut self, last_qty: &Decimal, last_px: &Decimal) {
         if self.avg_px.is_none() {
-            self.avg_px = Some(last_px.as_f64());
+            self.avg_px = Some(last_px.to_f64().unwrap());
         }
 
-        let filled_qty = self.filled_qty.as_f64();
-        let total_qty = filled_qty + last_qty.as_f64();
+        let filled_qty = self.filled_qty.to_f64().unwrap();
+        let total_qty = filled_qty + last_qty.to_f64().unwrap();
 
         let avg_px = self
             .avg_px
             .unwrap()
-            .mul_add(filled_qty, last_px.as_f64() * last_qty.as_f64())
+            .mul_add(filled_qty, last_px.to_f64().unwrap() * last_qty.to_f64().unwrap())
             / total_qty;
         self.avg_px = Some(avg_px);
     }
 
     fn set_slippage(&mut self) {
+        let price_f64 = self.price.unwrap().to_f64().unwrap();
         self.slippage = self.avg_px.and_then(|avg_px| {
             self.price
                 .as_ref()
-                .map(|price| fixed_i64_to_f64(price.raw))
                 .and_then(|price| match self.side {
-                    OrderSide::Buy if avg_px > price => Some(avg_px - price),
-                    OrderSide::Sell if avg_px < price => Some(price - avg_px),
+                    OrderSide::Buy if avg_px > price_f64 => Some(avg_px - price_f64),
+                    OrderSide::Sell if avg_px < price_f64=> Some(price_f64 - avg_px),
                     _ => None,
                 })
         })
@@ -582,20 +580,20 @@ mod tests {
     #[rustfmt::skip]
     #[rstest(
         order_side, order_qty, position_side, position_qty, expected,
-        case(OrderSide::Buy, Quantity::from(100), PositionSide::Long, Quantity::from(50), false),
-        case(OrderSide::Buy, Quantity::from(50), PositionSide::Short, Quantity::from(50), true),
-        case(OrderSide::Buy, Quantity::from(50), PositionSide::Short, Quantity::from(100), true),
-        case(OrderSide::Buy, Quantity::from(50), PositionSide::Flat, Quantity::from(0), false),
-        case(OrderSide::Sell, Quantity::from(50), PositionSide::Flat, Quantity::from(0), false),
-        case(OrderSide::Sell, Quantity::from(50), PositionSide::Long, Quantity::from(50), true),
-        case(OrderSide::Sell, Quantity::from(50), PositionSide::Long, Quantity::from(100), true),
-        case(OrderSide::Sell, Quantity::from(100), PositionSide::Short, Quantity::from(50), false),
+        case(OrderSide::Buy, Decimal::from(100), PositionSide::Long, Decimal::from(50), false),
+        case(OrderSide::Buy, Decimal::from(50), PositionSide::Short, Decimal::from(50), true),
+        case(OrderSide::Buy, Decimal::from(50), PositionSide::Short, Decimal::from(100), true),
+        case(OrderSide::Buy, Decimal::from(50), PositionSide::Flat, Decimal::from(0), false),
+        case(OrderSide::Sell, Decimal::from(50), PositionSide::Flat, Decimal::from(0), false),
+        case(OrderSide::Sell, Decimal::from(50), PositionSide::Long, Decimal::from(50), true),
+        case(OrderSide::Sell, Decimal::from(50), PositionSide::Long, Decimal::from(100), true),
+        case(OrderSide::Sell, Decimal::from(100), PositionSide::Short, Decimal::from(50), false),
     )]
     fn test_would_reduce_only(
         order_side: OrderSide,
-        order_qty: Quantity,
+        order_qty: Decimal,
         position_side: PositionSide,
-        position_qty: Quantity,
+        position_qty: Decimal,
         expected: bool,
     ) {
         let order: Order = OrderInitializedBuilder::default()

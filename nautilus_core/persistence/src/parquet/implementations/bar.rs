@@ -16,7 +16,7 @@
 use std::{collections::HashMap, str::FromStr};
 
 use datafusion::arrow::{
-    array::{Array, Int64Array, UInt64Array},
+    array::{Array, Int64Array, UInt64Array, Float64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
@@ -24,7 +24,7 @@ use nautilus_model::{
     data::bar::{Bar, BarType},
     types::{price::Price, quantity::Quantity},
 };
-
+use rust_decimal::prelude::*;
 use crate::parquet::{Data, DecodeDataFromRecordBatch};
 
 impl DecodeDataFromRecordBatch for Bar {
@@ -34,11 +34,11 @@ impl DecodeDataFromRecordBatch for Bar {
 
         // Extract field value arrays from record batch
         let cols = record_batch.columns();
-        let open_values = cols[0].as_any().downcast_ref::<Int64Array>().unwrap();
-        let high_values = cols[1].as_any().downcast_ref::<Int64Array>().unwrap();
-        let low_values = cols[2].as_any().downcast_ref::<Int64Array>().unwrap();
-        let close_values = cols[3].as_any().downcast_ref::<Int64Array>().unwrap();
-        let volume_values = cols[4].as_any().downcast_ref::<UInt64Array>().unwrap();
+        let open_values = cols[0].as_any().downcast_ref::<Float64Array>().unwrap();
+        let high_values = cols[1].as_any().downcast_ref::<Float64Array>().unwrap();
+        let low_values = cols[2].as_any().downcast_ref::<Float64Array>().unwrap();
+        let close_values = cols[3].as_any().downcast_ref::<Float64Array>().unwrap();
+        let volume_values = cols[4].as_any().downcast_ref::<Float64Array>().unwrap();
         let ts_event_values = cols[5].as_any().downcast_ref::<UInt64Array>().unwrap();
         let ts_init_values = cols[6].as_any().downcast_ref::<UInt64Array>().unwrap();
 
@@ -55,11 +55,11 @@ impl DecodeDataFromRecordBatch for Bar {
                 |((((((open, high), low), close), volume), ts_event), ts_init)| {
                     Self {
                         bar_type: bar_type.clone(),
-                        open: Price::from_raw(open.unwrap(), price_precision),
-                        high: Price::from_raw(high.unwrap(), price_precision),
-                        low: Price::from_raw(low.unwrap(), price_precision),
-                        close: Price::from_raw(close.unwrap(), price_precision),
-                        volume: Quantity::from_raw(volume.unwrap(), size_precision),
+                        open: Decimal::from_f64(open.unwrap()).unwrap(),
+                        high: Decimal::from_f64(high.unwrap()).unwrap(),
+                        low: Decimal::from_f64(low.unwrap()).unwrap(),
+                        close: Decimal::from_f64(close.unwrap()).unwrap(),
+                        volume: Decimal::from_f64(volume.unwrap()).unwrap(),
                         ts_event: ts_event.unwrap(),
                         ts_init: ts_init.unwrap(),
                     }

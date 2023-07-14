@@ -18,6 +18,8 @@ use std::{
     ffi::c_char,
     hash::{Hash, Hasher},
 };
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use nautilus_core::{string::str_to_cstr, time::UnixNanos};
 
@@ -25,8 +27,10 @@ use super::book::{BookOrder, OrderBookDelta};
 use crate::{
     enums::{BookAction, OrderSide},
     identifiers::instrument_id::InstrumentId,
-    types::{price::Price, quantity::Quantity},
 };
+
+// use fixed::types::I64F64;
+// type Decimal = I64F64;
 
 #[no_mangle]
 pub extern "C" fn book_order_from_raw(
@@ -39,8 +43,8 @@ pub extern "C" fn book_order_from_raw(
 ) -> BookOrder {
     BookOrder::new(
         order_side,
-        Price::from_raw(price_raw, price_prec),
-        Quantity::from_raw(size_raw, size_prec),
+        Decimal::new(price_raw, price_prec.to_u32().unwrap()),
+        Decimal::new(size_raw.to_i64().unwrap(), size_prec.to_u32().unwrap()),
         order_id,
     )
 }

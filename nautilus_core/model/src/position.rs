@@ -17,6 +17,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
 use nautilus_core::time::UnixNanos;
 
@@ -41,8 +43,8 @@ struct Position {
     client_order_ids: Vec<ClientOrderId>,
     venue_order_ids: Vec<VenueOrderId>,
     trade_ids: Vec<TradeId>,
-    buy_qty: Quantity,
-    sell_qty: Quantity,
+    buy_qty: Decimal,
+    sell_qty: Decimal,
     commissions: HashMap<Currency, Money>,
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
@@ -54,11 +56,11 @@ struct Position {
     pub entry: OrderSide,
     pub side: PositionSide,
     pub signed_qty: f64,
-    pub quantity: Quantity,
-    pub peak_qty: Quantity,
+    pub quantity: Decimal,
+    pub peak_qty: Decimal,
     pub price_precision: u8,
     pub size_precision: u8,
-    pub multiplier: Quantity,
+    pub multiplier: Decimal,
     pub is_inverse: bool,
     pub quote_currency: Currency,
     pub base_currency: Option<Currency>,
@@ -85,8 +87,8 @@ impl Position {
             client_order_ids: Vec::<ClientOrderId>::new(),
             venue_order_ids: Vec::<VenueOrderId>::new(),
             trade_ids: Vec::<TradeId>::new(),
-            buy_qty: Quantity::new(0.0, instrument.size_precision),
-            sell_qty: Quantity::new(0.0, instrument.size_precision),
+            buy_qty: Decimal::ZERO,
+            sell_qty: Decimal::ZERO,
             commissions: HashMap::<Currency, Money>::new(),
             trader_id: fill.trader_id.clone(),
             strategy_id: fill.strategy_id.clone(),
@@ -112,7 +114,7 @@ impl Position {
             ts_last: fill.ts_event,
             ts_closed: None,
             duration_ns: None,
-            avg_px_open: fill.last_px.as_f64(),
+            avg_px_open: fill.last_px.to_f64().unwrap(),
             avg_px_close: None,
             realized_return: None,
             realized_pnl: None,
@@ -129,16 +131,16 @@ impl Position {
             // Reset position
             self.events.clear();
             self.trade_ids.clear();
-            self.buy_qty = Quantity::new(0.0, self.size_precision);
-            self.sell_qty = Quantity::new(0.0, self.size_precision);
+            self.buy_qty = Decimal::ZERO;
+            self.sell_qty = Decimal::ZERO;
             self.commissions.clear();
             self.opening_order_id = fill.client_order_id.clone();
             self.closing_order_id = None;
-            self.peak_qty = Quantity::new(0.0, self.size_precision);
+            self.peak_qty = Decimal::ZERO;
             self.ts_init = fill.ts_init;
             self.ts_opened = fill.ts_event;
             self.duration_ns = None;
-            self.avg_px_open = fill.last_px.as_f64();
+            self.avg_px_open = fill.last_px.to_f64().unwrap();
             self.avg_px_close = None;
             self.realized_return = None;
             self.realized_pnl = None;
@@ -166,9 +168,9 @@ impl Position {
         }
 
         // Set quantities
-        self.quantity = Quantity::new(self.signed_qty.abs(), self.size_precision);
+        self.quantity = Decimal::from_f64(self.signed_qty.abs()).unwrap();
         if self.quantity > self.peak_qty {
-            self.peak_qty.raw = self.quantity.raw;
+            self.peak_qty = self.quantity;
         }
 
         // Set state

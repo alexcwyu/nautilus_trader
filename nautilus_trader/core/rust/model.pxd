@@ -17,6 +17,10 @@ cdef extern from "../includes/model.h":
 
     const double PRICE_MIN # = -9223372036.0
 
+    const int64_t PRICE_MAX_LONG # = 9223372036
+
+    const int64_t PRICE_MIN_LONG # = -9223372036
+
     const double QUANTITY_MAX # = 18446744073.0
 
     const double QUANTITY_MIN # = 0.0
@@ -365,29 +369,21 @@ cdef extern from "../includes/model.h":
         BarSpecification_t spec;
         AggregationSource aggregation_source;
 
-    cdef struct Price_t:
-        int64_t raw;
-        uint8_t precision;
-
-    cdef struct Quantity_t:
-        uint64_t raw;
-        uint8_t precision;
-
     cdef struct Bar_t:
         BarType_t bar_type;
-        Price_t open;
-        Price_t high;
-        Price_t low;
-        Price_t close;
-        Quantity_t volume;
+        Decimal open;
+        Decimal high;
+        Decimal low;
+        Decimal close;
+        Decimal volume;
         uint64_t ts_event;
         uint64_t ts_init;
 
     # Represents an order in a book.
     cdef struct BookOrder_t:
         OrderSide side;
-        Price_t price;
-        Quantity_t size;
+        Decimal price;
+        Decimal size;
         uint64_t order_id;
 
     # Represents a single change/delta in an order book.
@@ -403,10 +399,10 @@ cdef extern from "../includes/model.h":
     # Represents a single quote tick in a financial market.
     cdef struct QuoteTick_t:
         InstrumentId_t instrument_id;
-        Price_t bid;
-        Price_t ask;
-        Quantity_t bid_size;
-        Quantity_t ask_size;
+        Decimal bid;
+        Decimal ask;
+        Decimal bid_size;
+        Decimal ask_size;
         uint64_t ts_event;
         uint64_t ts_init;
 
@@ -416,8 +412,8 @@ cdef extern from "../includes/model.h":
     # Represents a single trade tick in a financial market.
     cdef struct TradeTick_t:
         InstrumentId_t instrument_id;
-        Price_t price;
-        Quantity_t size;
+        Decimal price;
+        Decimal size;
         AggressorSide aggressor_side;
         TradeId_t trade_id;
         uint64_t ts_event;
@@ -510,6 +506,14 @@ cdef extern from "../includes/model.h":
         int64_t raw;
         Currency_t currency;
 
+    cdef struct Price_t:
+        int64_t raw;
+        uint8_t precision;
+
+    cdef struct Quantity_t:
+        uint64_t raw;
+        uint8_t precision;
+
     BarSpecification_t bar_specification_new(uint64_t step,
                                              uint8_t aggregation,
                                              uint8_t price_type);
@@ -553,11 +557,11 @@ cdef extern from "../includes/model.h":
     const char *bar_type_to_cstr(const BarType_t *bar_type);
 
     Bar_t bar_new(BarType_t bar_type,
-                  Price_t open,
-                  Price_t high,
-                  Price_t low,
-                  Price_t close,
-                  Quantity_t volume,
+                  Decimal open,
+                  Decimal high,
+                  Decimal low,
+                  Decimal close,
+                  Decimal volume,
                   uint64_t ts_event,
                   uint64_t ts_init);
 
@@ -566,9 +570,9 @@ cdef extern from "../includes/model.h":
                            int64_t high,
                            int64_t low,
                            int64_t close,
-                           uint8_t price_prec,
+                           uint32_t price_prec,
                            uint64_t volume,
-                           uint8_t size_prec,
+                           uint32_t size_prec,
                            uint64_t ts_event,
                            uint64_t ts_init);
 
@@ -1161,7 +1165,7 @@ cdef extern from "../includes/model.h":
     void synthetic_instrument_change_formula(SyntheticInstrument_API *synth,
                                              const char *formula_ptr);
 
-    Price_t synthetic_instrument_calculate(SyntheticInstrument_API *synth, const CVec *inputs_ptr);
+    Decimal synthetic_instrument_calculate(SyntheticInstrument_API *synth, const CVec *inputs_ptr);
 
     OrderBook_API orderbook_new(InstrumentId_t instrument_id, BookType book_type);
 
@@ -1206,13 +1210,13 @@ cdef extern from "../includes/model.h":
 
     uint8_t orderbook_has_ask(OrderBook_API *book);
 
-    Price_t orderbook_best_bid_price(OrderBook_API *book);
+    Decimal orderbook_best_bid_price(OrderBook_API *book);
 
-    Price_t orderbook_best_ask_price(OrderBook_API *book);
+    Decimal orderbook_best_ask_price(OrderBook_API *book);
 
-    Quantity_t orderbook_best_bid_size(OrderBook_API *book);
+    Decimal orderbook_best_bid_size(OrderBook_API *book);
 
-    Quantity_t orderbook_best_ask_size(OrderBook_API *book);
+    Decimal orderbook_best_ask_size(OrderBook_API *book);
 
     double orderbook_spread(OrderBook_API *book);
 

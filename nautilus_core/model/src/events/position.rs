@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use rust_decimal::Decimal;
 use nautilus_core::time::{TimedeltaNanos, UnixNanos};
 
 use crate::{
@@ -21,7 +22,7 @@ use crate::{
         account_id::AccountId, client_order_id::ClientOrderId, instrument_id::InstrumentId,
         position_id::PositionId, strategy_id::StrategyId, trader_id::TraderId,
     },
-    types::{currency::Currency, money::Money, price::Price, quantity::Quantity},
+    types::{currency::Currency, money::Money},
 };
 
 pub enum PositionEvent {
@@ -42,9 +43,9 @@ pub struct PositionOpened {
     pub entry: OrderSide,
     pub side: PositionSide,
     pub signed_qty: f64,
-    pub quantity: Quantity,
-    pub last_qty: Quantity,
-    pub last_px: Price,
+    pub quantity: Decimal,
+    pub last_qty: Decimal,
+    pub last_px: Decimal,
     pub currency: Currency,
     pub avg_px_open: f64,
     pub ts_event: UnixNanos,
@@ -63,10 +64,10 @@ pub struct PositionChanged {
     pub entry: OrderSide,
     pub side: PositionSide,
     pub signed_qty: f64,
-    pub quantity: Quantity,
-    pub peak_quantity: Quantity,
-    pub last_qty: Quantity,
-    pub last_px: Price,
+    pub quantity: Decimal,
+    pub peak_quantity: Decimal,
+    pub last_qty: Decimal,
+    pub last_px: Decimal,
     pub currency: Currency,
     pub avg_px_open: f64,
     pub avg_px_closed: f64,
@@ -91,10 +92,10 @@ pub struct PositionClosed {
     pub entry: OrderSide,
     pub side: PositionSide,
     pub signed_qty: f64,
-    pub quantity: Quantity,
-    pub peak_quantity: Quantity,
-    pub last_qty: Quantity,
-    pub last_px: Price,
+    pub quantity: Decimal,
+    pub peak_quantity: Decimal,
+    pub last_qty: Decimal,
+    pub last_px: Decimal,
     pub currency: Currency,
     pub avg_px_open: f64,
     pub avg_px_closed: f64,

@@ -31,6 +31,9 @@ use crate::types::fixed::{f64_to_fixed_i64, fixed_i64_to_f64};
 pub const PRICE_MAX: f64 = 9_223_372_036.0;
 pub const PRICE_MIN: f64 = -9_223_372_036.0;
 
+pub const PRICE_MAX_LONG: i64 = 9_223_372_036;
+pub const PRICE_MIN_LONG: i64 = -9_223_372_036;
+
 #[repr(C)]
 #[derive(Copy, Clone, Eq, Default)]
 #[pyclass]

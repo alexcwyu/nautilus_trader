@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use tabled::{settings::Style, Table, Tabled};
 use thiserror::Error;
 
@@ -25,7 +27,6 @@ use crate::{
     enums::{BookAction, BookType, OrderSide},
     identifiers::instrument_id::InstrumentId,
     orderbook::ladder::Ladder,
-    types::{price::Price, quantity::Quantity},
 };
 
 pub struct OrderBook {
@@ -179,22 +180,22 @@ impl OrderBook {
         }
     }
 
-    pub fn best_bid_price(&self) -> Option<Price> {
+    pub fn best_bid_price(&self) -> Option<Decimal> {
         self.bids.top().map(|top| top.price.value)
     }
 
-    pub fn best_ask_price(&self) -> Option<Price> {
+    pub fn best_ask_price(&self) -> Option<Decimal> {
         self.asks.top().map(|top| top.price.value)
     }
 
-    pub fn best_bid_size(&self) -> Option<Quantity> {
+    pub fn best_bid_size(&self) -> Option<Decimal> {
         match self.bids.top() {
             Some(top) => top.orders.first().map(|order| order.size),
             None => None,
         }
     }
 
-    pub fn best_ask_size(&self) -> Option<Quantity> {
+    pub fn best_ask_size(&self) -> Option<Decimal> {
         match self.asks.top() {
             Some(top) => top.orders.first().map(|order| order.size),
             None => None,
@@ -203,14 +204,14 @@ impl OrderBook {
 
     pub fn spread(&self) -> Option<f64> {
         match (self.best_ask_price(), self.best_bid_price()) {
-            (Some(ask), Some(bid)) => Some(ask.as_f64() - bid.as_f64()),
+            (Some(ask), Some(bid)) => Some(ask.to_f64().unwrap() - bid.to_f64().unwrap()),
             _ => None,
         }
     }
 
     pub fn midpoint(&self) -> Option<f64> {
         match (self.best_ask_price(), self.best_bid_price()) {
-            (Some(ask), Some(bid)) => Some((ask.as_f64() + bid.as_f64()) / 2.0),
+            (Some(ask), Some(bid)) => Some((ask.to_f64().unwrap() + bid.to_f64().unwrap()) / 2.0),
             _ => None,
         }
     }
@@ -225,7 +226,7 @@ impl OrderBook {
         self.update_ask(BookOrder::from_trade_tick(tick, OrderSide::Sell));
     }
 
-    pub fn simulate_fills(&self, order: &BookOrder) -> Vec<(Price, Quantity)> {
+    pub fn simulate_fills(&self, order: &BookOrder) -> Vec<(Decimal, Decimal)> {
         match order.side {
             OrderSide::Buy => self.asks.simulate_fills(order),
             OrderSide::Sell => self.bids.simulate_fills(order),
@@ -418,16 +419,18 @@ impl OrderBook {
     }
 
     fn pre_process_order(&self, mut order: BookOrder) -> BookOrder {
-        match self.book_type {
-            // Because a L1_TBBO only has one level per side, we replace the
-            // `order.order_id` with the enum value of the side, which will let us easily process
-            // the order.
-            BookType::L1_TBBO => order.order_id = order.side as u64,
-            // Because a L2_MBP only has one order per level, we replace the
-            // `order.order_id` with a raw price value, which will let us easily process the order.
-            BookType::L2_MBP => order.order_id = order.price.raw as u64,
-            BookType::L3_MBO => panic!("{}", InvalidBookOperation::PreProcessOrder(self.book_type)),
-        }
+
+        // TODO wrong !!! fix it
+        // match self.book_type {
+        //     // Because a L1_TBBO only has one level per side, we replace the
+        //     // `order.order_id` with the enum value of the side, which will let us easily process
+        //     // the order.
+        //     BookType::L1_TBBO => order.order_id = order.side as u64,
+        //     // Because a L2_MBP only has one order per level, we replace the
+        //     // `order.order_id` with a raw price value, which will let us easily process the order.
+        //     BookType::L2_MBP => order.order_id = order.price.raw as u64,
+        //     BookType::L3_MBO => panic!("{}", InvalidBookOperation::PreProcessOrder(self.book_type)),
+        // }
 
         order
     }
@@ -445,7 +448,6 @@ mod tests {
         data::book::BookOrder,
         enums::{AggressorSide, OrderSide},
         identifiers::{instrument_id::InstrumentId, trade_id::TradeId},
-        types::{price::Price, quantity::Quantity},
     };
 
     fn create_stub_book(book_type: BookType) -> OrderBook {
@@ -496,14 +498,14 @@ mod tests {
         let mut book = create_stub_book(BookType::L3_MBO);
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::from("1.000"),
-            Quantity::from("1.0"),
+            Decimal::from_str("1.000").unwrap(),
+            Decimal::from_str("1.0").unwrap(),
             1,
         );
         book.add(order1, 100, 1);
 
-        assert_eq!(book.best_bid_price(), Some(Price::from("1.000")));
-        assert_eq!(book.best_bid_size(), Some(Quantity::from("1.0")));
+        assert_eq!(book.best_bid_price(), Decimal::from_str("1.000").ok());
+        assert_eq!(book.best_bid_size(), Decimal::from_str("1.0").ok());
         assert_eq!(book.has_bid(), true);
     }
 
@@ -512,14 +514,14 @@ mod tests {
         let mut book = create_stub_book(BookType::L3_MBO);
         let order = BookOrder::new(
             OrderSide::Sell,
-            Price::from("2.000"),
-            Quantity::from("2.0"),
+            Decimal::from_str("2.000").unwrap(),
+            Decimal::from_str("2.0").unwrap(),
             2,
         );
         book.add(order, 200, 2);
 
-        assert_eq!(book.best_ask_price(), Some(Price::from("2.000")));
-        assert_eq!(book.best_ask_size(), Some(Quantity::from("2.0")));
+        assert_eq!(book.best_ask_price(), Decimal::from_str("2.000").ok());
+        assert_eq!(book.best_ask_size(), Decimal::from_str("2.0").ok());
         assert_eq!(book.has_ask(), true);
     }
     #[test]
@@ -533,14 +535,14 @@ mod tests {
         let mut book = create_stub_book(BookType::L2_MBP);
         let bid1 = BookOrder::new(
             OrderSide::Buy,
-            Price::from("1.000"),
-            Quantity::from("1.0"),
+            Decimal::from_str("1.000").unwrap(),
+            Decimal::from_str("1.0").unwrap(),
             1,
         );
         let ask1 = BookOrder::new(
             OrderSide::Sell,
-            Price::from("2.000"),
-            Quantity::from("2.0"),
+            Decimal::from_str("2.000").unwrap(),
+            Decimal::from_str("2.0").unwrap(),
             2,
         );
         book.add(bid1.clone(), 100, 1);
@@ -562,14 +564,14 @@ mod tests {
 
         let bid1 = BookOrder::new(
             OrderSide::Buy,
-            Price::from("1.000"),
-            Quantity::from("1.0"),
+            Decimal::from_str("1.000").unwrap(),
+            Decimal::from_str("1.0").unwrap(),
             1,
         );
         let ask1 = BookOrder::new(
             OrderSide::Sell,
-            Price::from("2.000"),
-            Quantity::from("2.0"),
+            Decimal::from_str("2.000").unwrap(),
+            Decimal::from_str("2.0").unwrap(),
             2,
         );
         book.add(bid1.clone(), 100, 1);
@@ -584,10 +586,10 @@ mod tests {
         let mut book = OrderBook::new(instrument_id.clone(), BookType::L1_TBBO);
         let tick = QuoteTick::new(
             InstrumentId::from_str("ETHUSDT-PERP.BINANCE").unwrap(),
-            Price::new(5000.0, 3),
-            Price::new(5100.0, 3),
-            Quantity::new(100.0, 8),
-            Quantity::new(99.0, 8),
+            Decimal::new(5000, 0),
+            Decimal::new(5100, 0),
+            Decimal::new(100, 0),
+            Decimal::new(99, 0),
             0,
             0,
         );
@@ -608,8 +610,8 @@ mod tests {
         let instrument_id = InstrumentId::from_str("ETHUSDT-PERP.BINANCE").unwrap();
         let mut book = OrderBook::new(instrument_id.clone(), BookType::L1_TBBO);
 
-        let price = Price::new(15_000.0, 3);
-        let size = Quantity::new(10.0, 8);
+        let price = Decimal::from(15_000);
+        let size = Decimal::from(10);
         let trade_tick = TradeTick::new(
             instrument_id,
             price,
@@ -633,38 +635,38 @@ mod tests {
         let mut book = create_stub_book(BookType::L3_MBO);
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::from("1.000"),
-            Quantity::from("1.0"),
+            Decimal::from_str("1.000").unwrap(),
+            Decimal::from_str("1.0").unwrap(),
             1,
         );
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::from("1.500"),
-            Quantity::from("2.0"),
+            Decimal::from_str("1.500").unwrap(),
+            Decimal::from_str("2.0").unwrap(),
             2,
         );
         let order3 = BookOrder::new(
             OrderSide::Buy,
-            Price::from("2.000"),
-            Quantity::from("3.0"),
+            Decimal::from_str("2.000").unwrap(),
+            Decimal::from_str("3.0").unwrap(),
             3,
         );
         let order4 = BookOrder::new(
             OrderSide::Sell,
-            Price::from("3.000"),
-            Quantity::from("3.0"),
+            Decimal::from_str("3.000").unwrap(),
+            Decimal::from_str("3.0").unwrap(),
             4,
         );
         let order5 = BookOrder::new(
             OrderSide::Sell,
-            Price::from("4.000"),
-            Quantity::from("4.0"),
+            Decimal::from_str("4.000").unwrap(),
+            Decimal::from_str("4.0").unwrap(),
             5,
         );
         let order6 = BookOrder::new(
             OrderSide::Sell,
-            Price::from("5.000"),
-            Quantity::from("8.0"),
+            Decimal::from_str("5.000").unwrap(),
+            Decimal::from_str("8.0").unwrap(),
             6,
         );
 

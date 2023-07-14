@@ -17,6 +17,10 @@
 
 #define PRICE_MIN -9223372036.0
 
+#define PRICE_MAX_LONG 9223372036
+
+#define PRICE_MIN_LONG -9223372036
+
 #define QUANTITY_MAX 18446744073.0
 
 #define QUANTITY_MIN 0.0
@@ -655,23 +659,13 @@ typedef struct BarType_t {
     enum AggregationSource aggregation_source;
 } BarType_t;
 
-typedef struct Price_t {
-    int64_t raw;
-    uint8_t precision;
-} Price_t;
-
-typedef struct Quantity_t {
-    uint64_t raw;
-    uint8_t precision;
-} Quantity_t;
-
 typedef struct Bar_t {
     struct BarType_t bar_type;
-    struct Price_t open;
-    struct Price_t high;
-    struct Price_t low;
-    struct Price_t close;
-    struct Quantity_t volume;
+    Decimal open;
+    Decimal high;
+    Decimal low;
+    Decimal close;
+    Decimal volume;
     uint64_t ts_event;
     uint64_t ts_init;
 } Bar_t;
@@ -681,8 +675,8 @@ typedef struct Bar_t {
  */
 typedef struct BookOrder_t {
     enum OrderSide side;
-    struct Price_t price;
-    struct Quantity_t size;
+    Decimal price;
+    Decimal size;
     uint64_t order_id;
 } BookOrder_t;
 
@@ -704,10 +698,10 @@ typedef struct OrderBookDelta_t {
  */
 typedef struct QuoteTick_t {
     struct InstrumentId_t instrument_id;
-    struct Price_t bid;
-    struct Price_t ask;
-    struct Quantity_t bid_size;
-    struct Quantity_t ask_size;
+    Decimal bid;
+    Decimal ask;
+    Decimal bid_size;
+    Decimal ask_size;
     uint64_t ts_event;
     uint64_t ts_init;
 } QuoteTick_t;
@@ -721,8 +715,8 @@ typedef struct TradeId_t {
  */
 typedef struct TradeTick_t {
     struct InstrumentId_t instrument_id;
-    struct Price_t price;
-    struct Quantity_t size;
+    Decimal price;
+    Decimal size;
     enum AggressorSide aggressor_side;
     struct TradeId_t trade_id;
     uint64_t ts_event;
@@ -847,6 +841,16 @@ typedef struct Money_t {
     struct Currency_t currency;
 } Money_t;
 
+typedef struct Price_t {
+    int64_t raw;
+    uint8_t precision;
+} Price_t;
+
+typedef struct Quantity_t {
+    uint64_t raw;
+    uint8_t precision;
+} Quantity_t;
+
 struct BarSpecification_t bar_specification_new(uint64_t step,
                                                 uint8_t aggregation,
                                                 uint8_t price_type);
@@ -899,11 +903,11 @@ uint64_t bar_type_hash(const struct BarType_t *bar_type);
 const char *bar_type_to_cstr(const struct BarType_t *bar_type);
 
 struct Bar_t bar_new(struct BarType_t bar_type,
-                     struct Price_t open,
-                     struct Price_t high,
-                     struct Price_t low,
-                     struct Price_t close,
-                     struct Quantity_t volume,
+                     Decimal open,
+                     Decimal high,
+                     Decimal low,
+                     Decimal close,
+                     Decimal volume,
                      uint64_t ts_event,
                      uint64_t ts_init);
 
@@ -912,9 +916,9 @@ struct Bar_t bar_new_from_raw(struct BarType_t bar_type,
                               int64_t high,
                               int64_t low,
                               int64_t close,
-                              uint8_t price_prec,
+                              uint32_t price_prec,
                               uint64_t volume,
-                              uint8_t size_prec,
+                              uint32_t size_prec,
                               uint64_t ts_event,
                               uint64_t ts_init);
 
@@ -1658,8 +1662,8 @@ uint8_t synthetic_instrument_is_valid_formula(const struct SyntheticInstrument_A
 void synthetic_instrument_change_formula(struct SyntheticInstrument_API *synth,
                                          const char *formula_ptr);
 
-struct Price_t synthetic_instrument_calculate(struct SyntheticInstrument_API *synth,
-                                              const CVec *inputs_ptr);
+Decimal synthetic_instrument_calculate(struct SyntheticInstrument_API *synth,
+                                       const CVec *inputs_ptr);
 
 struct OrderBook_API orderbook_new(struct InstrumentId_t instrument_id, enum BookType book_type);
 
@@ -1704,13 +1708,13 @@ uint8_t orderbook_has_bid(struct OrderBook_API *book);
 
 uint8_t orderbook_has_ask(struct OrderBook_API *book);
 
-struct Price_t orderbook_best_bid_price(struct OrderBook_API *book);
+Decimal orderbook_best_bid_price(struct OrderBook_API *book);
 
-struct Price_t orderbook_best_ask_price(struct OrderBook_API *book);
+Decimal orderbook_best_ask_price(struct OrderBook_API *book);
 
-struct Quantity_t orderbook_best_bid_size(struct OrderBook_API *book);
+Decimal orderbook_best_bid_size(struct OrderBook_API *book);
 
-struct Quantity_t orderbook_best_ask_size(struct OrderBook_API *book);
+Decimal orderbook_best_ask_size(struct OrderBook_API *book);
 
 double orderbook_spread(struct OrderBook_API *book);
 

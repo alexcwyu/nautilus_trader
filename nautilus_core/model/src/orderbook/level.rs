@@ -14,6 +14,8 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::cmp::Ordering;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use crate::{
     data::book::BookOrder,
@@ -70,7 +72,7 @@ impl Level {
     pub fn update(&mut self, order: BookOrder) {
         assert_eq!(order.price, self.price.value); // Confirm order for this level
 
-        if order.size.raw == 0 {
+        if order.size == Decimal::ZERO{
             self.delete(&order)
         } else {
             let idx = self
@@ -101,7 +103,7 @@ impl Level {
     pub fn volume(&self) -> f64 {
         let mut sum: f64 = 0.0;
         for o in self.orders.iter() {
-            sum += o.size.as_f64()
+            sum += o.size.to_f64().unwrap()
         }
         sum
     }
@@ -110,7 +112,7 @@ impl Level {
     pub fn exposure(&self) -> f64 {
         let mut sum: f64 = 0.0;
         for o in self.orders.iter() {
-            sum += o.price.as_f64() * o.size.as_f64()
+            sum += o.price.to_f64().unwrap() * o.size.to_f64().unwrap()
         }
         sum
     }
@@ -155,6 +157,7 @@ impl Ord for Level {
 ////////////////////////////////////////////////////////////////////////////////
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
     use crate::{
         data::book::BookOrder,
         enums::OrderSide,
@@ -164,27 +167,27 @@ mod tests {
 
     #[test]
     fn test_comparisons_bid_side() {
-        let level0 = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
-        let level1 = Level::new(BookPrice::new(Price::new(1.01, 2), OrderSide::Buy));
+        let level0 = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Buy));
+        let level1 = Level::new(BookDecimal::new(Decimal::new(101, 2), OrderSide::Buy));
         assert_eq!(level0, level0);
         assert!(level0 > level1);
     }
 
     #[test]
     fn test_comparisons_ask_side() {
-        let level0 = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Sell));
-        let level1 = Level::new(BookPrice::new(Price::new(1.01, 2), OrderSide::Sell));
+        let level0 = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Sell));
+        let level1 = Level::new(BookDecimal::new(Decimal::new(101, 2), OrderSide::Sell));
         assert_eq!(level0, level0);
         assert!(level0 < level1);
     }
 
     #[test]
     fn test_add_one_order() {
-        let mut level = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Buy));
         let order = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(10, 0),
             0,
         );
 
@@ -196,17 +199,17 @@ mod tests {
 
     #[test]
     fn test_add_multiple_orders() {
-        let mut level = Level::new(BookPrice::new(Price::new(2.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(200, 2), OrderSide::Buy));
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(2.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(200, 2),
+            Decimal::new(10, 0),
             0,
         );
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(2.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(200, 2),
+            Decimal::new(20, 0),
             1,
         );
 
@@ -219,17 +222,17 @@ mod tests {
 
     #[test]
     fn test_update_order() {
-        let mut level = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Buy));
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(10, 0),
             0,
         );
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(20, 0),
             0,
         );
 
@@ -242,17 +245,17 @@ mod tests {
 
     #[test]
     fn test_update_order_with_zero_size() {
-        let mut level = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Buy));
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(10, 0),
             0,
         );
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(0.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(0, 0),
             0,
         );
 
@@ -265,19 +268,19 @@ mod tests {
 
     #[test]
     fn test_delete_order() {
-        let mut level = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Buy));
         let order1_id = 0;
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(10, 0),
             order1_id,
         );
         let order2_id = 0;
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(20, 0),
             order2_id,
         );
 
@@ -292,19 +295,19 @@ mod tests {
 
     #[test]
     fn test_remove_order() {
-        let mut level = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(100, 2), OrderSide::Buy));
         let order1_id = 0;
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(10, 0),
             order1_id,
         );
         let order2_id = 1;
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(1.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(100, 2),
+            Decimal::new(20, 0),
             order2_id,
         );
 
@@ -319,19 +322,19 @@ mod tests {
 
     #[test]
     fn test_add_bulk_orders() {
-        let mut level = Level::new(BookPrice::new(Price::new(2.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::new(200, 2), OrderSide::Buy));
         let order1_id = 0;
         let order1 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(2.00, 2),
-            Quantity::new(10.0, 0),
+            Decimal::new(200, 2),
+            Decimal::new(10, 0),
             order1_id,
         );
         let order2_id = 1;
         let order2 = BookOrder::new(
             OrderSide::Buy,
-            Price::new(2.00, 2),
-            Quantity::new(20.0, 0),
+            Decimal::new(200, 2),
+            Decimal::new(20, 0),
             order2_id,
         );
 
@@ -345,7 +348,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Invalid book operation: order ID 1 not found")]
     fn test_remove_nonexistent_order() {
-        let mut level = Level::new(BookPrice::new(Price::new(1.00, 2), OrderSide::Buy));
+        let mut level = Level::new(BookDecimal::new(Decimal::from(1), OrderSide::Buy));
         level.remove(1);
     }
 }

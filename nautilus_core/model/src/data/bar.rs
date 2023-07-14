@@ -24,10 +24,13 @@ use nautilus_core::time::UnixNanos;
 use pyo3::prelude::*;
 use thiserror::Error;
 
+use rust_decimal::prelude::*;
+// use fixed::types::I64F64;
+// type Decimal = I64F64;
+
 use crate::{
     enums::{AggregationSource, BarAggregation, PriceType},
     identifiers::instrument_id::InstrumentId,
-    types::{price::Price, quantity::Quantity},
 };
 
 #[repr(C)]
@@ -192,11 +195,11 @@ impl Display for BarType {
 #[pyclass]
 pub struct Bar {
     pub bar_type: BarType,
-    pub open: Price,
-    pub high: Price,
-    pub low: Price,
-    pub close: Price,
-    pub volume: Quantity,
+    pub open: Decimal,
+    pub high: Decimal,
+    pub low: Decimal,
+    pub close: Decimal,
+    pub volume: Decimal,
     pub ts_event: UnixNanos,
     pub ts_init: UnixNanos,
 }
@@ -457,22 +460,22 @@ mod tests {
         };
         let bar1 = Bar {
             bar_type: bar_type.clone(),
-            open: Price::from("1.00001"),
-            high: Price::from("1.00004"),
-            low: Price::from("1.00002"),
-            close: Price::from("1.00003"),
-            volume: Quantity::from("100000"),
+            open: Decimal::from_str("1.00001").unwrap(),
+            high: Decimal::from_str("1.00004").unwrap(),
+            low: Decimal::from_str("1.00002").unwrap(),
+            close: Decimal::from_str("1.00003").unwrap(),
+            volume: Decimal::from_str("100000").unwrap(),
             ts_event: 0,
             ts_init: 0,
         };
 
         let bar2 = Bar {
             bar_type,
-            open: Price::from("1.00000"),
-            high: Price::from("1.00004"),
-            low: Price::from("1.00002"),
-            close: Price::from("1.00003"),
-            volume: Quantity::from("100000"),
+            open: Decimal::from_str("1.00000").unwrap(),
+            high: Decimal::from_str("1.00004").unwrap(),
+            low: Decimal::from_str("1.00002").unwrap(),
+            close: Decimal::from_str("1.00003").unwrap(),
+            volume: Decimal::from_str("100000").unwrap(),
             ts_event: 0,
             ts_init: 0,
         };

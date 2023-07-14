@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use rust_decimal::Decimal;
 use nautilus_core::{time::UnixNanos, uuid::UUID4};
 
 use super::Order;
@@ -22,7 +23,6 @@ use crate::{
         client_order_id::ClientOrderId, instrument_id::InstrumentId, order_list_id::OrderListId,
         strategy_id::StrategyId, trader_id::TraderId,
     },
-    types::{price::Price, quantity::Quantity},
 };
 
 pub trait LimitOrder {
@@ -34,14 +34,14 @@ pub trait LimitOrder {
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
         order_side: OrderSide,
-        quantity: Quantity,
-        price: Price,
+        quantity: Decimal,
+        price: Decimal,
         time_in_force: TimeInForce,
         expire_time: Option<UnixNanos>,
         post_only: bool,
         reduce_only: bool,
         quote_quantity: bool,
-        display_qty: Option<Quantity>,
+        display_qty: Option<Decimal>,
         emulation_trigger: Option<TriggerType>,
         contingency_type: Option<ContingencyType>,
         order_list_id: Option<OrderListId>,
@@ -52,7 +52,7 @@ pub trait LimitOrder {
         ts_init: UnixNanos,
     ) -> Self;
 
-    fn price(&self) -> &Price;
+    fn price(&self) -> &Decimal;
 }
 
 impl LimitOrder for Order {
@@ -62,14 +62,14 @@ impl LimitOrder for Order {
         instrument_id: InstrumentId,
         client_order_id: ClientOrderId,
         order_side: OrderSide,
-        quantity: Quantity,
-        price: Price,
+        quantity: Decimal,
+        price: Decimal,
         time_in_force: TimeInForce,
         expire_time: Option<UnixNanos>,
         post_only: bool,
         reduce_only: bool,
         quote_quantity: bool,
-        display_qty: Option<Quantity>,
+        display_qty: Option<Decimal>,
         emulation_trigger: Option<TriggerType>,
         contingency_type: Option<ContingencyType>,
         order_list_id: Option<OrderListId>,
@@ -116,7 +116,7 @@ impl LimitOrder for Order {
             linked_order_ids,
             parent_order_id,
             tags,
-            filled_qty: Quantity::new(0.0, 0),
+            filled_qty: Decimal::new(0, 0),
             leaves_qty: quantity,
             avg_px: None,
             slippage: None,
@@ -127,7 +127,7 @@ impl LimitOrder for Order {
         }
     }
 
-    fn price(&self) -> &Price {
+    fn price(&self) -> &Decimal {
         match &self.price {
             Some(price) => price,
             _ => panic!("Invalid `LimitOrder`: did not have a price"),

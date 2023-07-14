@@ -22,6 +22,8 @@ use nautilus_model::{
 };
 use pyo3::prelude::*;
 
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use crate::Indicator;
 
 #[repr(C)]
@@ -51,15 +53,15 @@ impl Indicator for ExponentialMovingAverage {
     }
 
     fn handle_quote_tick(&mut self, tick: &QuoteTick) {
-        self.update_raw(tick.extract_price(self.price_type).into())
+        self.update_raw(tick.extract_price(self.price_type).to_f64().unwrap())
     }
 
     fn handle_trade_tick(&mut self, tick: &TradeTick) {
-        self.update_raw((&tick.price).into())
+        self.update_raw((&tick.price).to_f64().unwrap())
     }
 
     fn handle_bar(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into())
+        self.update_raw((&bar.close).to_f64().unwrap())
     }
 
     fn reset(&mut self) {
@@ -105,17 +107,17 @@ impl ExponentialMovingAverage {
 
     #[pyo3(name = "handle_quote_tick")]
     fn handle_quote_tick_py(&mut self, tick: &QuoteTick) {
-        self.update_raw(tick.extract_price(self.price_type).into())
+        self.update_raw(tick.extract_price(self.price_type).to_f64().unwrap())
     }
 
     #[pyo3(name = "handle_trade_tick")]
     fn handle_trade_tick_py(&mut self, tick: &TradeTick) {
-        self.update_raw((&tick.price).into())
+        self.update_raw((&tick.price).to_f64().unwrap())
     }
 
     #[pyo3(name = "handle_bar")]
     fn handle_bar_py(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into())
+        self.update_raw((&bar.close).to_f64().unwrap())
     }
 
     #[pyo3(name = "reset")]

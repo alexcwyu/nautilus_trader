@@ -1,0 +1,50 @@
+version: "3.7"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    env_file:
+      - ./config/postgresql-database.env
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data/
+      - ./script/postgres-schema.sql:/docker-entrypoint-initdb.d/1-postgres-schema.sql
+    ports:
+      - "5432:5432"
+
+
+
+  clickhouse-server:
+    image: clickhouse/clickhouse-server:22.8.20.11-alpine
+    container_name: clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    expose:
+      - 8123
+      - 9000
+    volumes:
+      - ./config/clickhouse-config.xml:/etc/clickhouse-server/config.xml
+      - ./config/clickhouse-users.xml:/etc/clickhouse-server/users.xml
+      - ./data/clickhouse:/var/lib/clickhouse
+
+#  clickhouse-init:
+#    image: clickhouse/clickhouse-server:22.5.1
+#    container_name: clickhouse-init
+#    depends_on:
+#      - clickhouse-server
+#    volumes:
+#      - ./script/xxx.sql:/xxx.sql
+#    command:
+#      - /bin/bash
+#      - -c
+#      - |
+#        echo sleep &&
+#        sleep 10 &&
+#        echo running xxx.sql &&
+#        clickhouse-client --multiquery -h clickhouse < /xxx.sql &&
+#        echo all done

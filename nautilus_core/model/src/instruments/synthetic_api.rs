@@ -18,6 +18,7 @@ use std::{
     ops::{Deref, DerefMut},
     str::FromStr,
 };
+use rust_decimal::Decimal;
 
 use nautilus_core::{
     cvec::CVec,
@@ -28,7 +29,6 @@ use nautilus_core::{
 use super::synthetic::SyntheticInstrument;
 use crate::{
     identifiers::{instrument_id::InstrumentId, symbol::Symbol},
-    types::price::Price,
 };
 
 /// Provides a C compatible Foreign Function Interface (FFI) for an underlying
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn synthetic_instrument_change_formula(
 pub extern "C" fn synthetic_instrument_calculate(
     synth: &mut SyntheticInstrument_API,
     inputs_ptr: &CVec,
-) -> Price {
+) -> Decimal {
     let CVec { ptr, len, .. } = inputs_ptr;
     let inputs: &[f64] = unsafe { std::slice::from_raw_parts(*ptr as *mut f64, *len) };
 

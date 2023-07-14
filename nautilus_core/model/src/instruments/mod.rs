@@ -21,7 +21,7 @@ use rust_decimal::Decimal;
 use crate::{
     enums::{AssetClass, AssetType},
     identifiers::{instrument_id::InstrumentId, symbol::Symbol},
-    types::{currency::Currency, price::Price, quantity::Quantity},
+    types::{currency::Currency},
 };
 
 pub struct Instrument {
@@ -35,14 +35,14 @@ pub struct Instrument {
     pub is_inverse: bool,
     pub price_precision: u8,
     pub size_precision: u8,
-    pub price_increment: Price,
-    pub size_increment: Quantity,
-    pub multiplier: Quantity,
-    pub lot_size: Option<Quantity>,
-    pub max_quantity: Option<Quantity>,
-    pub min_quantity: Option<Quantity>,
-    pub max_price: Option<Price>,
-    pub min_price: Option<Price>,
+    pub price_increment: Decimal,
+    pub size_increment: Decimal,
+    pub multiplier: Decimal,
+    pub lot_size: Option<Decimal>,
+    pub max_quantity: Option<Decimal>,
+    pub min_quantity: Option<Decimal>,
+    pub max_price: Option<Decimal>,
+    pub min_price: Option<Decimal>,
     pub margin_init: Decimal,
     pub margin_maint: Decimal,
     pub maker_fee: Decimal,

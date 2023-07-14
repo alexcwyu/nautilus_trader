@@ -16,10 +16,12 @@
 use std::{collections::HashMap, str::FromStr};
 
 use datafusion::arrow::{
-    array::{Array, Int64Array, UInt64Array, UInt8Array},
+    array::{Array, Int64Array, UInt64Array, UInt8Array, Float64Array},
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use datafusion::parquet::record::Field::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use nautilus_model::{
     data::book::{BookOrder, OrderBookDelta},
     enums::{BookAction, BookType, FromU8, OrderSide},
@@ -38,8 +40,8 @@ impl DecodeDataFromRecordBatch for OrderBookDelta {
         let cols = record_batch.columns();
         let action_values = cols[0].as_any().downcast_ref::<UInt8Array>().unwrap();
         let side_values = cols[1].as_any().downcast_ref::<UInt8Array>().unwrap();
-        let price_values = cols[2].as_any().downcast_ref::<Int64Array>().unwrap();
-        let size_values = cols[3].as_any().downcast_ref::<UInt64Array>().unwrap();
+        let price_values = cols[2].as_any().downcast_ref::<Float64Array>().unwrap();
+        let size_values = cols[3].as_any().downcast_ref::<Float64Array>().unwrap();
         let order_id_values = cols[4].as_any().downcast_ref::<UInt64Array>().unwrap();
         let flags_values = cols[5].as_any().downcast_ref::<UInt8Array>().unwrap();
         let sequence_values = cols[6].as_any().downcast_ref::<UInt64Array>().unwrap();
@@ -62,13 +64,15 @@ impl DecodeDataFromRecordBatch for OrderBookDelta {
                     (((((((action, side), price), size), order_id), flags), sequence), ts_event),
                     ts_init,
                 )| {
+
+                    //TODO fix it
                     Self {
                         instrument_id: instrument_id.clone(),
                         action: BookAction::from_u8(action.unwrap()).unwrap(),
                         order: BookOrder {
                             side: OrderSide::from_u8(side.unwrap()).unwrap(),
-                            price: Price::from_raw(price.unwrap(), price_precision),
-                            size: Quantity::from_raw(size.unwrap(), size_precision),
+                            price: rust_decimal::Decimal::from_f64(price.unwrap()).unwrap(),
+                            size: rust_decimal::Decimal::from_f64(size.unwrap()).unwrap(),
                             order_id: order_id.unwrap(),
                         },
                         flags: flags.unwrap(),
