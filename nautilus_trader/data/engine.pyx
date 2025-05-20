@@ -324,8 +324,8 @@ cdef class DataEngine(Component):
         Condition.not_in(client.id, self._clients, "client", "_clients")
 
         self._clients[client.id] = client
-
         routing_log = ""
+
         if client.venue is None:
             if self._default_client is None:
                 self._default_client = client
@@ -743,8 +743,10 @@ cdef class DataEngine(Component):
         cdef DataClient client
 
         # In a backtest context, we never want to subscribe to live data
-        if type(self._default_client) is BacktestMarketDataClient:
-            client = self._default_client
+        cdef ClientId backtest_client_id = ClientId("backtest_default_client")
+
+        if backtest_client_id in self._clients:
+            client = self._clients[backtest_client_id]
         else:
             client = self._clients.get(command.client_id)
 
@@ -1670,7 +1672,12 @@ cdef class DataEngine(Component):
         self._cache.add_instrument(instrument)
 
         if update_catalog:
-            self._update_catalog([instrument], is_instrument=True)
+            self._update_catalog(
+                [instrument],
+                Instrument,
+                instrument.id,
+                is_instrument=True
+            )
 
         self._msgbus.publish_c(
             topic=f"data.instrument"
@@ -1886,7 +1893,7 @@ cdef class DataEngine(Component):
 
         cdef bint query_past_data = response.params.get("subscription_name") is None
 
-        if query_past_data:
+        if query_past_data or response_2.data_type.type == Instrument:
             if response_2.data_type.type == Instrument:
                 update_catalog = response_2.params.get("update_catalog", False)
 
@@ -1911,6 +1918,7 @@ cdef class DataEngine(Component):
                     response_2.data = self._handle_aggregated_bars(response_2.data, response_2.params)
                 else:
                     self._handle_bars(response_2.data, response_2.data_type.metadata.get("partial"))
+            # Note: custom data will use the callback submitted by the user in actor.request_data
 
         self._msgbus.response(response_2)
 
@@ -1928,11 +1936,20 @@ cdef class DataEngine(Component):
         correlation_id = response.correlation_id
 
         if correlation_id not in self._query_group_n_responses or self._query_group_n_responses[correlation_id] == 1:
+            self._check_bounds(response)
+            start = response.params.get("request_ts_start")
+            end = response.params.get("request_ts_end")
+            instrument_id = response.params.get("instrument_id")
             update_catalog = response.params.get("update_catalog", False)
 
             if update_catalog:
-                self._check_bounds(response)
-                self._update_catalog(response.data)
+                self._update_catalog(
+                    response.data,
+                    response.data_type.type,
+                    instrument_id,
+                    start,
+                    end
+                )
 
             self._query_group_n_responses.pop(correlation_id, None)
 
@@ -1957,7 +1974,13 @@ cdef class DataEngine(Component):
                 start = response.params.get("request_ts_start")
                 end = response.params.get("request_ts_end")
                 instrument_id = response.params.get("instrument_id")
-                self._update_catalog(response.data, response.data_type.type, instrument_id, start, end)
+                self._update_catalog(
+                    response.data,
+                    response.data_type.type,
+                    instrument_id,
+                    start,
+                    end
+                )
 
             result += response.data
 
@@ -1974,18 +1997,18 @@ cdef class DataEngine(Component):
         if data_len == 0:
             return
 
-        cdef uint64_t start = response.params.get("request_ts_start")
-        cdef uint64_t end = response.params.get("request_ts_end")
+        cdef uint64_t start = response.params.get("request_ts_start", 0)
+        cdef uint64_t end = response.params.get("request_ts_end", 0)
         cdef int first_index = 0
         cdef int last_index = data_len - 1
 
-        if start is not None:
+        if start:
             for i in range(data_len):
                 if response.data[i].ts_init >= start:
                     first_index = i
                     break
 
-        if end is not None:
+        if end:
             for i in range(data_len-1, -1, -1):
                 if response.data[i].ts_init <= end:
                     last_index = i
@@ -1997,8 +2020,8 @@ cdef class DataEngine(Component):
     def _update_catalog(
         self,
         ticks: list,
-        data_cls: type = None,
-        instrument_id: object = None,
+        data_cls: type,
+        instrument_id: object,
         start: int | None = None,
         end: int | None = None,
         is_instrument: bool = False
@@ -2019,6 +2042,7 @@ cdef class DataEngine(Component):
 
         if used_catalog is not None:
             if len(ticks) == 0 and data_cls and start and end:
+                # instrument_id can be None for custom data
                 used_catalog.extend_file_name(data_cls, instrument_id, start, end)
             else:
                 used_catalog.write_data(ticks, start, end)
@@ -2059,8 +2083,8 @@ cdef class DataEngine(Component):
             aggregator = self._bar_aggregators.get(partial.bar_type)
 
             if aggregator is not None:
-                aggregator.set_await_partial(False)
                 self._log.debug(f"Applying partial bar {partial} for {partial.bar_type}")
+                aggregator.set_await_partial(False)
                 aggregator.set_partial(partial)
             else:
                 if self._fsm.state == ComponentState.RUNNING:

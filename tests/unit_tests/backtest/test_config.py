@@ -374,12 +374,7 @@ class TestBacktestConfigParsing:
         node = BacktestNode([run_config])
 
         # Act
-        engine = node._create_engine(
-            run_config_id=run_config.id,
-            config=run_config.engine,
-            venue_configs=run_config.venues or [],
-            data_configs=run_config.data or [],
-        )
+        engine = node._create_engine(run_config.id)
 
         # Assert
         assert engine

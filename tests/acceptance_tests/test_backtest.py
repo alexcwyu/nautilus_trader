@@ -942,9 +942,9 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
             strategy_path=OptionStrategy.fully_qualified_name(),
             config_path=OptionConfig.fully_qualified_name(),
             config={
-                "future_id": InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
-                "option_id": InstrumentId.from_str(f"{option_symbols[0]}.GLBX"),
-                "option_id2": InstrumentId.from_str(f"{option_symbols[1]}.GLBX"),
+                "future_id": InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
+                "option_id": InstrumentId.from_str(f"{option_symbols[0]}.XCME"),
+                "option_id2": InstrumentId.from_str(f"{option_symbols[1]}.XCME"),
                 "load_greeks": load_greeks,
             },
         ),
@@ -987,17 +987,17 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
         BacktestDataConfig(
             data_cls=QuoteTick,
             catalog_path=catalog.path,
-            instrument_id=InstrumentId.from_str(f"{option_symbols[0]}.GLBX"),
+            instrument_id=InstrumentId.from_str(f"{option_symbols[0]}.XCME"),
         ),
         BacktestDataConfig(
             data_cls=QuoteTick,
             catalog_path=catalog.path,
-            instrument_id=InstrumentId.from_str(f"{option_symbols[1]}.GLBX"),
+            instrument_id=InstrumentId.from_str(f"{option_symbols[1]}.XCME"),
         ),
         BacktestDataConfig(
             data_cls=Bar,
             catalog_path=catalog.path,
-            instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
+            instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
             bar_spec="1-MINUTE-LAST",
         ),
     ]
@@ -1015,7 +1015,7 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
 
     venues = [
         BacktestVenueConfig(
-            name="GLBX",
+            name="XCME",
             oms_type="NETTING",
             account_type="MARGIN",
             base_currency="USD",
@@ -1052,7 +1052,7 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
     engine: BacktestEngine = node.get_engine(configs[0].id)
     engine.trader.generate_order_fills_report()
     engine.trader.generate_positions_report()
-    engine.trader.generate_account_report(Venue("GLBX"))
+    engine.trader.generate_account_report(Venue("XCME"))
     node.dispose()
 
 
@@ -1095,7 +1095,7 @@ class OptionStrategy(Strategy):
             params={"append_data": False},
         )
         self.greeks.subscribe_greeks(
-            InstrumentId.from_str("ES*.GLBX"),
+            InstrumentId.from_str("ES*.XCME"),
         )  # adds all ES greeks read from the message bus to the cache
 
     # def on_data(self, greeks):

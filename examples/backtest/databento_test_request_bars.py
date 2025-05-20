@@ -242,7 +242,7 @@ strategies = [
         strategy_path=TestHistoricalAggStrategy.fully_qualified_name(),
         config_path=TestHistoricalAggConfig.fully_qualified_name(),
         config={
-            "symbol_id": InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
+            "symbol_id": InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
             "historical_start_delay": historical_start_delay,
             "historical_end_delay": historical_end_delay,
         },
@@ -287,7 +287,7 @@ data = [
     BacktestDataConfig(
         data_cls=Bar,
         catalog_path=catalog.path,
-        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
+        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
         bar_spec="1-MINUTE-LAST",
         start_time="2024-07-01T23:40",
         end_time="2024-07-02T00:10",
@@ -295,14 +295,14 @@ data = [
     BacktestDataConfig(
         data_cls=QuoteTick,
         catalog_path=catalog.path,
-        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
+        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
         start_time="2024-07-01T23:58",
         end_time="2024-07-02T00:02",
     ),
     BacktestDataConfig(
         data_cls=TradeTick,
         catalog_path=catalog.path,
-        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
+        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
         start_time="2024-07-01T23:58",
         end_time="2024-07-02T00:02",
     ),
@@ -310,7 +310,7 @@ data = [
 
 venues = [
     BacktestVenueConfig(
-        name="GLBX",
+        name="XCME",
         oms_type="NETTING",
         account_type="MARGIN",
         base_currency="USD",

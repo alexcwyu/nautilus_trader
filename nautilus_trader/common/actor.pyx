@@ -1179,6 +1179,7 @@ cdef class Actor(Component):
         DataType data_type,
         ClientId client_id = None,
         InstrumentId instrument_id = None,
+        bint update_catalog = False,
         dict[str, object] params = None,
     ):
         """
@@ -1194,6 +1195,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The data client ID. If supplied then a `Subscribe` command will be
             sent to the corresponding data client.
+        update_catalog : bool, optional
+            Whether to update a catalog with the received data.
+            Only useful when downloading data during a backtest.
         params : dict[str, Any], optional
             Additional parameters potentially used by a specific client.
 
@@ -1214,6 +1218,9 @@ cdef class Actor(Component):
         # TODO during a backtest, use any ClientId for subscribing to custom data from a catalog when not using instrument_id
         if client_id is None and instrument_id is None:
             return
+
+        params = params or {}
+        params["update_catalog"] = update_catalog
 
         cdef SubscribeData command = SubscribeData(
             data_type=data_type,
@@ -1525,6 +1532,7 @@ cdef class Actor(Component):
         self,
         InstrumentId instrument_id,
         ClientId client_id = None,
+        bint update_catalog = False,
         dict[str, object] params = None,
     ):
         """
@@ -1540,6 +1548,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        update_catalog : bool, optional
+            Whether to update a catalog with the received data.
+            Only useful when downloading data during a backtest.
         params : dict[str, Any], optional
             Additional parameters potentially used by a specific client.
 
@@ -1553,6 +1564,9 @@ cdef class Actor(Component):
                   f".{instrument_id.symbol.topic()}",
             handler=self.handle_quote_tick,
         )
+
+        params = params or {}
+        params["update_catalog"] = update_catalog
 
         cdef SubscribeQuoteTicks command = SubscribeQuoteTicks(
             instrument_id=instrument_id,
@@ -1568,6 +1582,7 @@ cdef class Actor(Component):
         self,
         InstrumentId instrument_id,
         ClientId client_id = None,
+        bint update_catalog = False,
         dict[str, object] params = None,
     ):
         """
@@ -1583,6 +1598,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        update_catalog : bool, optional
+            Whether to update a catalog with the received data.
+            Only useful when downloading data during a backtest.
         params : dict[str, Any], optional
             Additional parameters potentially used by a specific client.
 
@@ -1596,6 +1614,9 @@ cdef class Actor(Component):
                   f".{instrument_id.symbol.topic()}",
             handler=self.handle_trade_tick,
         )
+
+        params = params or {}
+        params["update_catalog"] = update_catalog
 
         cdef SubscribeTradeTicks command = SubscribeTradeTicks(
             instrument_id=instrument_id,
@@ -1698,6 +1719,7 @@ cdef class Actor(Component):
         BarType bar_type,
         ClientId client_id = None,
         bint await_partial = False,
+        bint update_catalog = False,
         dict[str, object] params = None,
     ):
         """
@@ -1716,6 +1738,9 @@ cdef class Actor(Component):
         await_partial : bool, default False
             If the bar aggregator should await the arrival of a historical partial bar prior
             to actively aggregating new bars.
+        update_catalog : bool, optional
+            Whether to update a catalog with the received data.
+            Only useful when downloading data during a backtest.
         params : dict[str, Any], optional
             Additional parameters potentially used by a specific client.
 
@@ -1727,6 +1752,9 @@ cdef class Actor(Component):
             topic=f"data.bars.{bar_type.standard()}",
             handler=self.handle_bar,
         )
+
+        params = params or {}
+        params["update_catalog"] = update_catalog
 
         cdef SubscribeBars command = SubscribeBars(
             bar_type=bar_type,
@@ -2467,7 +2495,7 @@ cdef class Actor(Component):
         if start is not None and end is not None:
             Condition.is_true(start <= end, "start was > end")
 
-        params = params if params else {}
+        params = params or {}
         params["update_catalog"] = update_catalog
 
         cdef UUID4 request_id = UUID4()
@@ -2563,7 +2591,7 @@ cdef class Actor(Component):
         if start is not None and end is not None:
             Condition.is_true(start <= end, "start was > end")
 
-        params = params if params else {}
+        params = params or {}
         params["update_catalog"] = update_catalog
 
         cdef UUID4 request_id = UUID4()
@@ -2657,7 +2685,7 @@ cdef class Actor(Component):
         if start is not None and end is not None:
             Condition.is_true(start <= end, "start was > end")
 
-        params = params if params else {}
+        params = params or {}
         params["update_catalog"] = update_catalog
 
         cdef UUID4 request_id = UUID4()
@@ -2817,7 +2845,7 @@ cdef class Actor(Component):
         if start is not None and end is not None:
             Condition.is_true(start <= end, "start was > end")
 
-        params = params if params else {}
+        params = params or {}
         params["update_catalog"] = update_catalog
 
         cdef UUID4 request_id = UUID4()
@@ -2914,7 +2942,7 @@ cdef class Actor(Component):
         if start is not None and end is not None:
             Condition.is_true(start <= end, "start was > end")
 
-        params = params if params else {}
+        params = params or {}
         params["update_catalog"] = update_catalog
 
         cdef UUID4 request_id = UUID4()
@@ -3012,7 +3040,7 @@ cdef class Actor(Component):
             Condition.is_true(start <= end, "start was > end")
 
 
-        params = params if params else {}
+        params = params or {}
         params["update_catalog"] = update_catalog
 
         cdef UUID4 request_id = UUID4()
@@ -3134,7 +3162,7 @@ cdef class Actor(Component):
         cdef UUID4 request_id = UUID4()
         cdef BarType first_bar_type = bar_types[0]
 
-        params = params if params else {}
+        params = params or {}
         params["bar_type"] = first_bar_type.composite()
         params["bar_types"] = tuple(bar_types)
         params["include_external_data"] = include_external_data

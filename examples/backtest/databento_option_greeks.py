@@ -150,7 +150,7 @@ class OptionStrategy(Strategy):
             params={"append_data": False},
         )
         self.greeks.subscribe_greeks(
-            InstrumentId.from_str("ES*.GLBX"),
+            InstrumentId.from_str("ES*.XCME"),
         )  # adds all ES greeks read from the message bus to the cache
 
     def init_portfolio(self):
@@ -244,9 +244,9 @@ strategies = [
         strategy_path=OptionStrategy.fully_qualified_name(),
         config_path=OptionConfig.fully_qualified_name(),
         config={
-            "future_id": InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
-            "option_id": InstrumentId.from_str(f"{option_symbols[0]}.GLBX"),
-            "option_id2": InstrumentId.from_str(f"{option_symbols[1]}.GLBX"),
+            "future_id": InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
+            "option_id": InstrumentId.from_str(f"{option_symbols[0]}.XCME"),
+            "option_id2": InstrumentId.from_str(f"{option_symbols[1]}.XCME"),
             "load_greeks": load_greeks,
         },
     ),
@@ -292,17 +292,17 @@ data = [
     BacktestDataConfig(
         data_cls=Bar,
         catalog_path=catalog.path,
-        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.GLBX"),
-        # instrument_ids=[InstrumentId.from_str(f"{future_symbols[0]}.GLBX")],
+        instrument_id=InstrumentId.from_str(f"{future_symbols[0]}.XCME"),
+        # instrument_ids=[InstrumentId.from_str(f"{future_symbols[0]}.XCME")],
         bar_spec="1-MINUTE-LAST",
-        # bar_types=[f"{future_symbols[0]}.GLBX-1-MINUTE-LAST-EXTERNAL"],
+        # bar_types=[f"{future_symbols[0]}.XCME-1-MINUTE-LAST-EXTERNAL"],
         # start_time=start_time,
         # end_time=end_time,
     ),
     BacktestDataConfig(
         data_cls=QuoteTick,
         catalog_path=catalog.path,
-        # instrument_ids=[InstrumentId.from_str(f"{option_symbols[0]}.GLBX"), InstrumentId.from_str(f"{option_symbols[1]}.GLBX")],
+        # instrument_ids=[InstrumentId.from_str(f"{option_symbols[0]}.XCME"), InstrumentId.from_str(f"{option_symbols[1]}.XCME")],
     ),
 ]
 
@@ -320,7 +320,7 @@ if load_greeks:
 
 venues = [
     BacktestVenueConfig(
-        name="GLBX",
+        name="XCME",
         oms_type="NETTING",
         account_type="MARGIN",
         base_currency="USD",
@@ -363,7 +363,7 @@ engine.trader.generate_order_fills_report()
 engine.trader.generate_positions_report()
 
 # %%
-engine.trader.generate_account_report(Venue("GLBX"))
+engine.trader.generate_account_report(Venue("XCME"))
 
 # %%
 node.dispose()

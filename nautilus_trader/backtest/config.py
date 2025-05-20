@@ -407,7 +407,7 @@ class BacktestRunConfig(NautilusConfig, frozen=True):
     end : datetime or str or int, optional
         The end datetime (UTC) for the backtest run.
         If ``None`` engine runs to the end of the data.
-    data_clients : dict[str, LiveDataClientConfig], optional
+    data_clients : dict[str, type[LiveDataClientConfig]], optional
         The data clients configuration for the backtest run.
 
     Notes
@@ -426,7 +426,7 @@ class BacktestRunConfig(NautilusConfig, frozen=True):
     dispose_on_completion: bool = True
     start: str | int | None = None
     end: str | int | None = None
-    data_clients: dict[str, LiveDataClientConfig] | None = None
+    data_clients: dict[str, type[LiveDataClientConfig]] | None = None
 
 
 class SimulationModuleConfig(ActorConfig, frozen=True):

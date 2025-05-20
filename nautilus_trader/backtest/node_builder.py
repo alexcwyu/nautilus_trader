@@ -73,7 +73,7 @@ class BacktestNodeBuilder:
 
     def build_data_clients(
         self,
-        config: dict[str, LiveDataClientConfig],
+        config: dict[str, type[LiveDataClientConfig]],
     ) -> None:
         """
         Build the data clients with the given configuration.

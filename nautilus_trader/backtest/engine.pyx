@@ -1659,14 +1659,14 @@ cdef class BacktestEngine:
             self._kernel.data_engine.register_client(client)
 
     def set_default_market_data_client(self) -> None:
-        cdef ClientId client_id = ClientId("default")
+        cdef ClientId client_id = ClientId("backtest_default_client")
         client = BacktestMarketDataClient(
             client_id=client_id,
             msgbus=self._kernel.msgbus,
             cache=self._kernel.cache,
             clock=self._kernel.clock,
         )
-        self._kernel.data_engine.register_default_client(client)
+        self._kernel.data_engine.register_client(client)
 
 
 cdef class BacktestDataIterator:

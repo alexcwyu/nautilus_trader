@@ -76,7 +76,7 @@ future_symbols = ["ESM4"]
 
 # Small amount of data for testing
 start_time = "2024-05-09T10:00"
-end_time = "2024-05-09T10:05"
+end_time = "2024-05-09T10:10"
 
 # A valid databento key can be entered here (or as an env variable of the same name)
 # DATABENTO_API_KEY = None
@@ -120,12 +120,12 @@ class FuturesStrategy(Strategy):
 
         # Request instrument
         now = self.clock.utc_now()
-        self.request_instrument(self.bar_type.instrument_id, end=now)
+        self.request_instrument(self.bar_type.instrument_id, end=now, update_catalog=True)
         # instrument = self.cache.instrument(self.bar_type.instrument_id)
         # self.log.warning(f"{instrument=}")
 
         # Subscribe to bar data
-        self.subscribe_bars(self.bar_type)
+        self.subscribe_bars(self.bar_type, update_catalog=True)
 
         self.user_log(f"Strategy started, subscribed to {self.bar_type}")
 
@@ -195,7 +195,7 @@ catalogs = [
 engine_config = BacktestEngineConfig(
     logging=logging,
     strategies=strategies,
-    # catalogs=catalogs,
+    catalogs=catalogs,
 )
 
 # Create BacktestRunConfig
@@ -209,21 +209,23 @@ venues = [
     ),
 ]
 
-databento_config = DatabentoDataClientConfig(
-    api_key=None,  # 'DATABENTO_API_KEY' env var
-    routing=RoutingConfig(
-        default=False,
-        venues=frozenset(["XCME"]),
+data_clients: dict = {
+    "databento-001": DatabentoDataClientConfig(
+        api_key=None,  # 'DATABENTO_API_KEY' env var is used
+        routing=RoutingConfig(
+            default=True,
+            # venues=frozenset(["XCME"]),
+        ),
     ),
-)
+}
 
 config = BacktestRunConfig(
     engine=engine_config,
     venues=venues,
     data=[],  # Empty data list since we're using data clients
     start=start_time,
-    end="2024-05-09T10:10",
-    data_clients={"databento-001": databento_config},
+    end=end_time,
+    data_clients=data_clients,
 )
 
 configs = [config]

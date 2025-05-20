@@ -121,7 +121,7 @@ def databento_data(
     dataset="GLBX.MDP3",
     to_catalog=True,
     base_path=None,
-    use_exchange_as_venue=False,
+    use_exchange_as_venue=True,
     load_databento_files_if_exist=False,
     **kwargs,
 ):
@@ -241,7 +241,7 @@ def save_data_to_catalog(
     definition_file=None,
     data_file=None,
     base_path=None,
-    use_exchange_as_venue=False,
+    use_exchange_as_venue=True,
 ):
     """
     Save Databento data to a catalog.

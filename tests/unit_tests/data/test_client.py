@@ -160,13 +160,15 @@ class TestDataClient:
     def test_handle_data_response_sends_to_data_engine(self):
         # Arrange
         data_type = DataType(NewsEvent, {"Type": "NEWS_WIRE"})
-        data = NewsEvent(
-            impact=NewsImpact.HIGH,
-            name="Unemployment Rate",
-            currency=USD,
-            ts_event=0,
-            ts_init=0,
-        )
+        data = [
+            NewsEvent(
+                impact=NewsImpact.HIGH,
+                name="Unemployment Rate",
+                currency=USD,
+                ts_event=0,
+                ts_init=0,
+            ),
+        ]
 
         # Act
         self.client._handle_data_response_py(data_type, data, UUID4(), None)

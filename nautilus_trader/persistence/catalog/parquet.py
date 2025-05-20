@@ -284,6 +284,8 @@ class ParquetDataCatalog(BaseDataCatalog):
                 data=chunk,
                 data_cls=name_to_cls[cls_name],
                 instrument_id=instrument_id,
+                start=start,
+                end=end,
             )
 
     def _write_chunk(
