@@ -57,6 +57,7 @@ from nautilus_trader.model.data import Bar
 from nautilus_trader.model.data import QuoteTick
 from nautilus_trader.model.data import TradeTick
 from nautilus_trader.model.identifiers import ClientId
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments.currency_pair import CurrencyPair
 
 
@@ -312,6 +313,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             return
 
         ticks = await self._handle_ticks_request(
+            request.instrument_id,
             IBContract(**instrument.info["contract"]),
             "BID_ASK",
             request.limit,
@@ -339,6 +341,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
             return
 
         ticks = await self._handle_ticks_request(
+            request.instrument_id,
             IBContract(**instrument.info["contract"]),
             "TRADES",
             request.limit,
@@ -354,6 +357,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
 
     async def _handle_ticks_request(
         self,
+        instrument_id: InstrumentId,
         contract: IBContract,
         tick_type: str,
         limit: int,
@@ -371,6 +375,7 @@ class InteractiveBrokersDataClient(LiveMarketDataClient):
         while (start and end > start) or (len(ticks) < limit > 0):
             await self._client.wait_until_ready()
             ticks_part = await self._client.get_historical_ticks(
+                instrument_id,
                 contract,
                 tick_type,
                 end_date_time=end,

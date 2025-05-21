@@ -31,7 +31,6 @@ from nautilus_trader.adapters.interactive_brokers.client.common import IBPositio
 from nautilus_trader.adapters.interactive_brokers.common import IB_VENUE
 from nautilus_trader.adapters.interactive_brokers.common import IBOrderTags
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersExecClientConfig
-from nautilus_trader.adapters.interactive_brokers.config import SymbologyMethod
 from nautilus_trader.adapters.interactive_brokers.parsing.execution import MAP_ORDER_ACTION
 from nautilus_trader.adapters.interactive_brokers.parsing.execution import MAP_ORDER_FIELDS
 from nautilus_trader.adapters.interactive_brokers.parsing.execution import MAP_ORDER_STATUS
@@ -257,7 +256,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
     async def _parse_ib_order_to_order_status_report(self, ib_order: IBOrder) -> OrderStatusReport:
         self._log.debug(f"Trying OrderStatusReport for {ib_order.__dict__}")
-        instrument = await self.instrument_provider.find_with_contract_id(
+        instrument = await self.instrument_provider.get_instrument(
             ib_order.contract.conId,
         )
         total_qty = (
@@ -348,7 +347,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             else:
                 continue  # Skip, IB may continue to display closed positions
 
-            instrument = await self.instrument_provider.find_with_contract_id(
+            instrument = await self.instrument_provider.get_instrument(
                 position.contract.conId,
             )
 
@@ -358,8 +357,10 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 )
                 continue
 
+            contract_details = self.instrument_provider.contract_details[instrument.id]
             avg_px = instrument.make_price(
-                position.avg_cost / instrument.multiplier,
+                position.avg_cost
+                / (instrument.multiplier.as_double() * contract_details.priceMagnifier),
             ).as_decimal()
             quantity = Quantity.from_str(str(position.quantity.copy_abs()))
             order_status = OrderStatusReport(
@@ -423,7 +424,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
             else:
                 continue  # Skip, IB may continue to display closed positions
 
-            instrument = await self.instrument_provider.find_with_contract_id(
+            instrument = await self.instrument_provider.get_instrument(
                 position.contract.conId,
             )
 
@@ -433,10 +434,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
                 )
                 continue
 
-            if (
-                self.instrument_provider.config.symbology_method != SymbologyMethod.DATABENTO
-                and not self._cache.instrument(instrument.id)
-            ):
+            if not self._cache.instrument(instrument.id):
                 self._handle_data(instrument)
 
             position_status = PositionStatusReport(
@@ -490,7 +488,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
         ) and order.trigger_price:
             ib_order.auxPrice = order.trigger_price.as_double()
 
-        details = self.instrument_provider.contract_details[order.instrument_id.value]
+        details = self.instrument_provider.contract_details[order.instrument_id]
         ib_order.contract = details.contract
         ib_order.account = self.account_id.get_id()
         ib_order.clearingAccount = self.account_id.get_id()
@@ -519,6 +517,7 @@ class InteractiveBrokersExecutionClient(LiveExecutionClient):
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         PyCondition.type(command, SubmitOrder, "command")
+
         try:
             ib_order: IBOrder = self._transform_order_to_ib_order(command.order)
             ib_order.orderId = self._client.next_order_id()

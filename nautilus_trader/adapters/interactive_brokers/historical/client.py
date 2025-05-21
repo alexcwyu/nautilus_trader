@@ -25,7 +25,6 @@ from ibapi.common import MarketDataTypeEnum
 from nautilus_trader.adapters.interactive_brokers.client import InteractiveBrokersClient
 from nautilus_trader.adapters.interactive_brokers.common import IBContract
 from nautilus_trader.adapters.interactive_brokers.parsing.instruments import ib_contract_to_instrument_id
-from nautilus_trader.adapters.interactive_brokers.parsing.instruments import instrument_id_to_ib_contract
 from nautilus_trader.adapters.interactive_brokers.providers import InteractiveBrokersInstrumentProvider
 from nautilus_trader.adapters.interactive_brokers.providers import InteractiveBrokersInstrumentProviderConfig
 
@@ -122,19 +121,121 @@ class HistoricInteractiveBrokersClient:
             raise ValueError(
                 "Either instrument_provider_config or ib_contracts/instrument_ids should be provided, not both.",
             )
+
         if instrument_provider_config is None:
             instrument_provider_config = InteractiveBrokersInstrumentProviderConfig(
                 load_contracts=frozenset(contracts) if contracts else None,
                 load_ids=frozenset(instrument_ids) if instrument_ids else None,
             )
 
-        provider = InteractiveBrokersInstrumentProvider(
+        instrument_provider = InteractiveBrokersInstrumentProvider(
             self._client,
             instrument_provider_config,
         )
-        await provider.load_all_async()
+        await instrument_provider.load_all_async()
 
-        return list(provider._instruments.values())
+        return list(instrument_provider._instruments.values())
+
+    async def request_bars(
+        self,
+        venue: str,
+        bar_specifications: list[str],
+        end_date_time: datetime.datetime,
+        tz_name: str,
+        start_date_time: datetime.datetime | None = None,
+        duration: str | None = None,
+        contracts: list[IBContract] | None = None,
+        instrument_ids: list[str] | None = None,
+        use_rth: bool = True,
+        timeout: int = 120,
+    ) -> list[Bar]:
+        """
+        Return Bars for one or more bar specifications for a list of IBContracts and/or
+        InstrumentId strings.
+
+        Parameters
+        ----------
+        venue: str
+            The venue to use for returned bars.
+        bar_specifications : list[str]
+            BarSpecifications represented as strings defining which bars to retrieve.
+            (e.g. '1-HOUR-LAST', '5-MINUTE-MID')
+        start_date_time : datetime.datetime
+            The start date time for the bars. If provided, duration is derived.
+        end_date_time : datetime.datetime
+            The end date time for the bars.
+        tz_name : str
+            The timezone to use. (e.g. 'America/New_York', 'UTC')
+        duration : str
+            The amount of time to go back from the end_date_time.
+            Valid values follow the pattern of an integer followed by S|D|W|M|Y
+            for seconds, days, weeks, months, or years respectively.
+        contracts : list[IBContract], default 'None'
+            IBContracts defining which bars to retrieve.
+        instrument_ids : list[str], default 'None'
+            Instrument IDs (e.g. AAPL.NASDAQ) defining which bars to retrieve.
+        use_rth : bool, default 'True'
+            Whether to use regular trading hours.
+        timeout : int, default 120
+            The timeout (seconds) for each request.
+
+        Returns
+        -------
+        list[Bar]
+
+        """
+        contracts, start_date_time, end_date_time = await self._prepare_request_bars_parameters(
+            bar_specifications,
+            end_date_time,
+            tz_name,
+            start_date_time,
+            duration,
+            contracts,
+            instrument_ids,
+            use_rth,
+        )
+
+        # Ensure instruments are fetched and cached
+        await self._fetch_instruments_if_not_cached(contracts, venue)
+        data: list[Bar] = []
+
+        for contract in contracts:
+            for bar_spec in bar_specifications:
+                instrument_id = ib_contract_to_instrument_id(contract, venue)
+                bar_type = BarType(
+                    instrument_id,
+                    BarSpecification.from_str(bar_spec),
+                    AggregationSource.EXTERNAL,
+                )
+
+                for segment_end_date_time, segment_duration in self._calculate_duration_segments(
+                    start_date_time,
+                    end_date_time,
+                    duration,
+                ):
+                    self.log.info(
+                        f"{instrument_id}: Requesting historical bars: {bar_type} ending on '{segment_end_date_time}' "
+                        f"with duration '{segment_duration}'",
+                    )
+                    bars = await self._client.get_historical_bars(
+                        bar_type,
+                        contract,
+                        use_rth,
+                        segment_end_date_time,
+                        segment_duration,
+                        timeout=timeout,
+                    )
+
+                    if bars:
+                        self.log.info(
+                            f"{instrument_id}: Number of bars retrieved in batch: {len(bars)}",
+                        )
+                        data.extend(bars)
+                        self.log.info(f"Total number of bars in data: {len(data)}")
+                    else:
+                        self.log.info(f"{instrument_id}: No bars retrieved for: {bar_type}")
+
+        return sorted(data, key=lambda x: x.ts_init)
 
     async def _prepare_request_bars_parameters(
         self,
@@ -179,9 +280,14 @@ class HistoricInteractiveBrokersClient:
         if not contracts and not instrument_ids:
             raise ValueError("Either contracts or instrument_ids must be provided")
 
+        instrument_provider = InteractiveBrokersInstrumentProvider(
+            self._client,
+            InteractiveBrokersInstrumentProviderConfig(),
+        )
+
         contracts.extend(
             [
-                instrument_id_to_ib_contract(
+                await instrument_provider.instrument_id_to_ib_contract(
                     InstrumentId.from_str(instrument_id),
                 )
                 for instrument_id in instrument_ids
@@ -190,106 +296,9 @@ class HistoricInteractiveBrokersClient:
 
         return contracts, start_date_time, end_date_time
 
-    async def request_bars(
-        self,
-        bar_specifications: list[str],
-        end_date_time: datetime.datetime,
-        tz_name: str,
-        start_date_time: datetime.datetime | None = None,
-        duration: str | None = None,
-        contracts: list[IBContract] | None = None,
-        instrument_ids: list[str] | None = None,
-        use_rth: bool = True,
-        timeout: int = 120,
-    ) -> list[Bar]:
-        """
-        Return Bars for one or more bar specifications for a list of IBContracts and/or
-        InstrumentId strings.
-
-        Parameters
-        ----------
-        bar_specifications : list[str]
-            BarSpecifications represented as strings defining which bars to retrieve.
-            (e.g. '1-HOUR-LAST', '5-MINUTE-MID')
-        start_date_time : datetime.datetime
-            The start date time for the bars. If provided, duration is derived.
-        end_date_time : datetime.datetime
-            The end date time for the bars.
-        tz_name : str
-            The timezone to use. (e.g. 'America/New_York', 'UTC')
-        duration : str
-            The amount of time to go back from the end_date_time.
-            Valid values follow the pattern of an integer followed by S|D|W|M|Y
-            for seconds, days, weeks, months, or years respectively.
-        contracts : list[IBContract], default 'None'
-            IBContracts defining which bars to retrieve.
-        instrument_ids : list[str], default 'None'
-            Instrument IDs (e.g. AAPL.NASDAQ) defining which bars to retrieve.
-        use_rth : bool, default 'True'
-            Whether to use regular trading hours.
-        timeout : int, default 120
-            The timeout (seconds) for each request.
-
-        Returns
-        -------
-        list[Bar]
-
-        """
-        contracts, start_date_time, end_date_time = await self._prepare_request_bars_parameters(
-            bar_specifications,
-            end_date_time,
-            tz_name,
-            start_date_time,
-            duration,
-            contracts,
-            instrument_ids,
-            use_rth,
-        )
-
-        # Ensure instruments are fetched and cached
-        await self._fetch_instruments_if_not_cached(contracts)
-        data: list[Bar] = []
-
-        for contract in contracts:
-            for bar_spec in bar_specifications:
-                instrument_id = ib_contract_to_instrument_id(contract)
-                bar_type = BarType(
-                    instrument_id,
-                    BarSpecification.from_str(bar_spec),
-                    AggregationSource.EXTERNAL,
-                )
-
-                for segment_end_date_time, segment_duration in self._calculate_duration_segments(
-                    start_date_time,
-                    end_date_time,
-                    duration,
-                ):
-                    self.log.info(
-                        f"{instrument_id}: Requesting historical bars: {bar_type} ending on '{segment_end_date_time}' "
-                        f"with duration '{segment_duration}'",
-                    )
-                    bars = await self._client.get_historical_bars(
-                        bar_type,
-                        contract,
-                        use_rth,
-                        segment_end_date_time,
-                        segment_duration,
-                        timeout=timeout,
-                    )
-
-                    if bars:
-                        self.log.info(
-                            f"{instrument_id}: Number of bars retrieved in batch: {len(bars)}",
-                        )
-                        data.extend(bars)
-                        self.log.info(f"Total number of bars in data: {len(data)}")
-                    else:
-                        self.log.info(f"{instrument_id}: No bars retrieved for: {bar_type}")
-
-        return sorted(data, key=lambda x: x.ts_init)
-
     async def request_ticks(
         self,
+        venue: str,
         tick_type: Literal["TRADES", "BID_ASK"],
         start_date_time: datetime.datetime,
         end_date_time: datetime.datetime,
@@ -305,6 +314,8 @@ class HistoricInteractiveBrokersClient:
 
         Parameters
         ----------
+        venue: str
+            The venue to use for returned bars.
         tick_type : Literal["TRADES", "BID_ASK"]
             The type of ticks to retrieve.
         start_date_time : datetime.date
@@ -350,10 +361,15 @@ class HistoricInteractiveBrokersClient:
         if not contracts and not instrument_ids:
             raise ValueError("Either contracts or instrument_ids must be provided")
 
+        instrument_provider = InteractiveBrokersInstrumentProvider(
+            self._client,
+            InteractiveBrokersInstrumentProviderConfig(),
+        )
+
         # Convert instrument_id strings to IBContracts
         contracts.extend(
             [
-                instrument_id_to_ib_contract(
+                await instrument_provider.instrument_id_to_ib_contract(
                     InstrumentId.from_str(instrument_id),
                 )
                 for instrument_id in instrument_ids
@@ -361,11 +377,11 @@ class HistoricInteractiveBrokersClient:
         )
 
         # Ensure instruments are fetched and cached
-        await self._fetch_instruments_if_not_cached(contracts)
+        await self._fetch_instruments_if_not_cached(contracts, venue)
         data: list[TradeTick | QuoteTick] = []
 
         for contract in contracts:
-            instrument_id = ib_contract_to_instrument_id(contract)
+            instrument_id = ib_contract_to_instrument_id(contract, venue)
             current_start_date_time = start_date_time
 
             while True:
@@ -373,6 +389,7 @@ class HistoricInteractiveBrokersClient:
                     f"{instrument_id}: Requesting {tick_type} ticks from {current_start_date_time}",
                 )
                 ticks: list[TradeTick | QuoteTick] = await self._client.get_historical_ticks(
+                    instrument_id=instrument_id,
                     contract=contract,
                     tick_type=tick_type,
                     start_date_time=current_start_date_time,
@@ -446,7 +463,11 @@ class HistoricInteractiveBrokersClient:
 
         return max_timestamp, True
 
-    async def _fetch_instruments_if_not_cached(self, contracts: list[IBContract]) -> None:
+    async def _fetch_instruments_if_not_cached(
+        self,
+        contracts: list[IBContract],
+        venue: str,
+    ) -> None:
         """
         Fetch and cache Instruments for the given IBContracts if they are not already
         cached.
@@ -455,6 +476,8 @@ class HistoricInteractiveBrokersClient:
         ----------
         contracts : list[IBContract]
             A list of IBContracts to fetch Instruments for.
+        venue: str
+            The venue to use for returned bars.
 
         Returns
         -------
@@ -462,7 +485,7 @@ class HistoricInteractiveBrokersClient:
 
         """
         for contract in contracts:
-            instrument_id = ib_contract_to_instrument_id(contract)
+            instrument_id = ib_contract_to_instrument_id(contract, venue)
 
             if not self._client._cache.instrument(instrument_id):
                 self.log.info(f"Fetching Instrument for: {instrument_id}")

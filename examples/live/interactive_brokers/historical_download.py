@@ -54,6 +54,7 @@ async def main(
         primaryExchange="NASDAQ",
     )
     instrument_id = "TSLA.NASDAQ"
+    venue = "NASDAQ"
 
     client = HistoricInteractiveBrokersClient(host=host, port=port, client_id=5)
     await client.connect()
@@ -65,6 +66,7 @@ async def main(
     )
 
     bars = await client.request_bars(
+        venue=venue,
         bar_specifications=["1-HOUR-LAST", "30-MINUTE-MID"],
         start_date_time=datetime.datetime(2023, 11, 6, 9, 30),
         end_date_time=datetime.datetime(2023, 11, 6, 16, 30),
@@ -74,7 +76,8 @@ async def main(
     )
 
     trade_ticks = await client.request_ticks(
-        "TRADES",
+        venue=venue,
+        tick_type="TRADES",
         start_date_time=datetime.datetime(2023, 11, 6, 10, 0),
         end_date_time=datetime.datetime(2023, 11, 6, 10, 1),
         tz_name="America/New_York",
@@ -83,7 +86,8 @@ async def main(
     )
 
     quote_ticks = await client.request_ticks(
-        "BID_ASK",
+        venue=venue,
+        tick_type="BID_ASK",
         start_date_time=datetime.datetime(2023, 11, 6, 10, 0),
         end_date_time=datetime.datetime(2023, 11, 6, 10, 1),
         tz_name="America/New_York",
