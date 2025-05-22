@@ -58,14 +58,14 @@ impl WeightedMovingAverage {
     ///
     /// Panics if:
     /// * `period` is zero or
-    /// * `weights.len()` does **not** equal `period` or
+    /// * `weights.len()` does not equal `period` or
     /// * `weights` sum is effectively zero.
     #[must_use]
     pub fn new(period: usize, weights: Vec<f64>, price_type: Option<PriceType>) -> Self {
         Self::new_checked(period, weights, price_type).expect(FAILED)
     }
 
-    /// Creates a new [`WeightedMovingAverage`] instance with full validation.
+    /// Creates a new [`WeightedMovingAverage`] instance with the given period and weights.
     ///
     /// # Errors
     ///
@@ -80,10 +80,8 @@ impl WeightedMovingAverage {
     ) -> anyhow::Result<Self> {
         const EPS: f64 = f64::EPSILON; // ≈ 2.22 e-16
 
-        // ① period > 0
         check_predicate_true(period > 0, "`period` must be positive")?;
 
-        // ② period == weights.len()
         check_predicate_true(
             period == weights.len(),
             "`period` must equal `weights.len()`",
@@ -105,11 +103,7 @@ impl WeightedMovingAverage {
         })
     }
 
-    /// Calculates the weighted average of the current window.
-    ///
-    /// *Safe* because the validation above guarantees `self.weights.len() == self.period`.
     fn weighted_average(&self) -> f64 {
-        // Iterate in reverse so the newest price gets the last weight.
         let mut sum = 0.0;
         let mut weight_sum = 0.0;
 
@@ -118,7 +112,6 @@ impl WeightedMovingAverage {
             weight_sum += weight;
         }
 
-        // weight_sum is > EPS by construction, so division is safe.
         sum / weight_sum
     }
 }
@@ -165,16 +158,13 @@ impl MovingAverage for WeightedMovingAverage {
     }
 
     fn update_raw(&mut self, value: f64) {
-        // Maintain sliding window ≤ period
         if self.inputs.len() == self.period {
             self.inputs.remove(0);
         }
         self.inputs.push(value);
 
-        // Re-compute weighted average every tick
         self.value = self.weighted_average();
 
-        // Canonical init rule: initialised when window saturated
         self.initialized = self.count() >= self.period;
     }
 }
