@@ -454,4 +454,23 @@ mod tests {
             assert!(res.is_err());
         }
     }
+
+    #[rstest]
+    fn single_period_returns_latest_input() {
+        let mut wma = WeightedMovingAverage::new(1, vec![1.0], None);
+        for i in 0..5 {
+            let v = i as f64;
+            wma.update_raw(v);
+            assert_eq!(wma.value(), v);
+        }
+    }
+
+    #[rstest]
+    fn value_with_sparse_weights() {
+        let mut wma = WeightedMovingAverage::new(3, vec![0.0, 1.0, 0.0], None);
+        wma.update_raw(10.0);
+        wma.update_raw(20.0);
+        wma.update_raw(30.0);
+        assert_eq!(wma.value(), 20.0);
+    }
 }
