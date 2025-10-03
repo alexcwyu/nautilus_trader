@@ -523,6 +523,10 @@ pub fn parse_candlestick(
 }
 
 /// Parses an OKX order history record into a Nautilus [`OrderStatusReport`].
+///
+/// # Errors
+///
+/// Returns an error if the average price cannot be converted to a valid `Decimal`.
 #[allow(clippy::too_many_lines)]
 pub fn parse_order_status_report(
     order: &OKXOrderHistory,
@@ -699,14 +703,17 @@ pub fn parse_order_status_report(
     {
         report = report.with_price(Price::new(p, price_precision));
     }
+
     if !order.avg_px.is_empty()
-        && let Ok(avg) = order.avg_px.parse::<f64>()
+        && let Ok(avg_px) = order.avg_px.parse::<f64>()
     {
-        report = report.with_avg_px(avg);
+        report = report.with_avg_px(avg_px)?;
     }
+
     if order.ord_type == OKXOrderType::PostOnly {
         report = report.with_post_only(true);
     }
+
     if order.reduce_only == "true" {
         report = report.with_reduce_only(true);
     }
@@ -715,7 +722,7 @@ pub fn parse_order_status_report(
         report = report.with_linked_order_ids(linked_ids);
     }
 
-    report
+    Ok(report)
 }
 
 /// Parses an OKX position into a Nautilus [`PositionStatusReport`].
@@ -2778,7 +2785,8 @@ mod tests {
             2,
             8,
             UnixNanos::default(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(order_report.account_id, account_id);
         assert_eq!(order_report.instrument_id, instrument_id);
