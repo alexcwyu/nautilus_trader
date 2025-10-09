@@ -153,7 +153,7 @@ jobs:
             GIT_TAG=test-${{ steps.platform-slug.outputs.slug }}
 
       # -------------------------------------------------------------------------------------------
-      # Build and push jupyterlab by digest to GHCR (uses 'develop' tag for base image)
+      # Build and push jupyterlab by digest to GHCR (uses 'nightly' tag for base image)
       - name: Build and push jupyterlab by digest to GHCR
         id: build-jupyterlab-ghcr
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
@@ -165,7 +165,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=jupyterlab-test-${{ steps.platform-slug.outputs.slug }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/jupyterlab,push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            GIT_TAG=develop
+            GIT_TAG=nightly
 
       - name: Export jupyterlab digest
         run: |
