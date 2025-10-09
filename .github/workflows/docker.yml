@@ -15,7 +15,7 @@ jobs:
     if: github.ref == 'refs/heads/test-docker'
     runs-on: ${{ matrix.os }}
     permissions:
-      packages: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -153,19 +153,19 @@ jobs:
             GIT_TAG=test-${{ steps.platform-slug.outputs.slug }}
 
       # -------------------------------------------------------------------------------------------
-      # Build and push jupyterlab by digest to GHCR (uses 'nightly' tag for base image)
+      # Build and push jupyterlab by digest to GHCR (uses local registry nautilus_trader)
       - name: Build and push jupyterlab by digest to GHCR
         id: build-jupyterlab-ghcr
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
-          file: .docker/jupyterlab.dockerfile
+          file: /tmp/jupyterlab-test.dockerfile
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=jupyterlab-test-${{ steps.platform-slug.outputs.slug }}
           cache-to: type=gha,mode=max,scope=jupyterlab-test-${{ steps.platform-slug.outputs.slug }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/jupyterlab,push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            GIT_TAG=nightly
+            GIT_TAG=test-${{ steps.platform-slug.outputs.slug }}
 
       - name: Export jupyterlab digest
         run: |
