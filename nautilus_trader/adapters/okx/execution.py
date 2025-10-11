@@ -216,7 +216,10 @@ class OKXExecutionClient(LiveExecutionClient):
 
         for instrument_type in self._instrument_provider._instrument_types:
             await self._ws_client.subscribe_orders(instrument_type)
-            await self._ws_business_client.subscribe_orders_algo(instrument_type)
+
+            # OKX doesn't support algo orders channel for OPTIONS
+            if instrument_type != OKXInstrumentType.OPTION:
+                await self._ws_business_client.subscribe_orders_algo(instrument_type)
 
             # Only subscribe to fills channel if VIP5+ (configurable)
             if self._config.use_fills_channel:
@@ -603,7 +606,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
         return reports
 
-    async def generate_position_status_reports(
+    async def generate_position_status_reports(  # noqa: C901 (too complex)
         self,
         command: GeneratePositionStatusReports,
     ) -> list[PositionStatusReport]:
@@ -648,6 +651,10 @@ class OKXExecutionClient(LiveExecutionClient):
                     pyo3_reports.extend(response)
             else:
                 for instrument_type in self._config.instrument_types:
+                    # SPOT trading uses CASH account and doesn't have positions
+                    if instrument_type == OKXInstrumentType.SPOT:
+                        continue
+
                     response = await self._http_client.request_position_status_reports(
                         account_id=self.pyo3_account_id,
                         instrument_type=instrument_type,

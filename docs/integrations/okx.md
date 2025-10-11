@@ -100,9 +100,9 @@ Format: `{BaseCurrency}-{QuoteCurrency}-{YYMMDD}-{Strike}-{Type}`
 
 Examples:
 
-- `BTC-USD-250328-100000-C` - Bitcoin call option, $100,000 strike, expiring March 28, 2025
-- `BTC-USD-250328-100000-P` - Bitcoin put option, $100,000 strike, expiring March 28, 2025
-- `ETH-USD-250328-4000-C` - Ethereum call option, $4,000 strike, expiring March 28, 2025
+- `BTC-USD-251226-100000-C` - Bitcoin call option, $100,000 strike, expiring December 26, 2025
+- `BTC-USD-251226-100000-P` - Bitcoin put option, $100,000 strike, expiring December 26, 2025
+- `ETH-USD-251226-4000-C` - Ethereum call option, $4,000 strike, expiring December 26, 2025
 
 Where:
 

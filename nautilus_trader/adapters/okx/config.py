@@ -43,6 +43,10 @@ class OKXDataClientConfig(LiveDataClientConfig, frozen=True):
     contract_types : tuple[OKXInstrumentType], optional
         The OKX contract types of instruments to load.
         If None, all contract types are loaded (subject to instrument types and their compatibility with contract types).
+    instrument_families : tuple[str, ...], optional
+        The OKX instrument families to load (e.g., "BTC-USD", "ETH-USD").
+        Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
+        If None, all available instrument families will be attempted (may fail for OPTIONS).
     base_url_http : str, optional
         The base url to OKX's http api.
         If ``None`` then will source the `get_http_base_url()`.
@@ -65,6 +69,7 @@ class OKXDataClientConfig(LiveDataClientConfig, frozen=True):
     api_passphrase: str | None = None
     instrument_types: tuple[OKXInstrumentType, ...] = (OKXInstrumentType.SPOT,)
     contract_types: tuple[OKXContractType, ...] | None = None
+    instrument_families: tuple[str, ...] | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
     is_demo: bool = False
@@ -97,6 +102,10 @@ class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
     contract_types : tuple[OKXInstrumentType], optional
         The OKX contract types of instruments to load.
         If None, all contract types are loaded (subject to instrument types and their compatibility with contract types).
+    instrument_families : tuple[str, ...], optional
+        The OKX instrument families to load (e.g., "BTC-USD", "ETH-USD").
+        Required for OPTIONS. Optional for FUTURES/SWAP. Not applicable for SPOT/MARGIN.
+        If None, all available instrument families will be attempted (may fail for OPTIONS).
     base_url_http : str, optional
         The base url to OKX's http api.
         If ``None`` then will source the `get_http_base_url()`.
@@ -128,6 +137,7 @@ class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
     api_passphrase: str | None = None
     instrument_types: tuple[OKXInstrumentType, ...] = (OKXInstrumentType.SPOT,)
     contract_types: tuple[OKXContractType, ...] | None = None
+    instrument_families: tuple[str, ...] | None = None
     base_url_http: str | None = None
     base_url_ws: str | None = None
     is_demo: bool = False
