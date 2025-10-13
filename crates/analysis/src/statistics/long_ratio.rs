@@ -132,6 +132,9 @@ mod tests {
             buy_qty: Quantity::default(),
             sell_qty: Quantity::default(),
             commissions: HashMap::new(),
+            adjustments: Vec::new(),
+            instrument_class: nautilus_model::enums::InstrumentClass::Spot,
+            is_currency_pair: true,
         }
     }
 

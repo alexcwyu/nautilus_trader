@@ -482,6 +482,7 @@ mod tests {
     ) -> Position {
         Position {
             events: Vec::new(),
+            adjustments: Vec::new(),
             trader_id: trader_id(),
             strategy_id: strategy_id_ema_cross(),
             instrument_id: instrument_id_aud_usd_sim(),
@@ -498,6 +499,8 @@ mod tests {
             size_precision: 2,
             multiplier: Quantity::default(),
             is_inverse: false,
+            instrument_class: nautilus_model::enums::InstrumentClass::Spot,
+            is_currency_pair: true,
             base_currency: None,
             quote_currency: Currency::USD(),
             settlement_currency: Currency::USD(),

@@ -19,13 +19,18 @@ from libc.math cimport fabs
 from libc.math cimport fmin
 
 from nautilus_trader.core.correctness cimport Condition
+from nautilus_trader.core.rust.model cimport InstrumentClass
 from nautilus_trader.core.rust.model cimport OrderSide
 from nautilus_trader.core.rust.model cimport PositionSide
+from nautilus_trader.core.uuid cimport UUID4
 from nautilus_trader.model.events.order cimport OrderFilled
+from nautilus_trader.model.events.position cimport AdjustmentType
+from nautilus_trader.model.events.position cimport PositionAdjustment
 from nautilus_trader.model.functions cimport order_side_to_str
 from nautilus_trader.model.functions cimport position_side_to_str
 from nautilus_trader.model.identifiers cimport TradeId
 from nautilus_trader.model.instruments.base cimport Instrument
+from nautilus_trader.model.instruments.currency_pair cimport CurrencyPair
 from nautilus_trader.model.objects cimport Price
 from nautilus_trader.model.objects cimport Quantity
 
@@ -61,6 +66,7 @@ cdef class Position:
         Condition.not_none(fill.position_id, "fill.position_id")
 
         self._events: list[OrderFilled] = []
+        self._adjustments: list = []
         self._trade_ids: list[TradeId] = []
         self._buy_qty = Quantity.zero_c(precision=instrument.size_precision)
         self._sell_qty = Quantity.zero_c(precision=instrument.size_precision)
@@ -92,6 +98,8 @@ cdef class Position:
         self.size_precision = instrument.size_precision
         self.multiplier = instrument.multiplier
         self.is_inverse = instrument.is_inverse
+        self.is_spot_currency = isinstance(instrument, CurrencyPair)
+        self.instrument_class = instrument.instrument_class
         self.quote_currency = instrument.quote_currency
         self.base_currency = instrument.get_base_currency()  # Can be None
         self.settlement_currency = instrument.get_cost_currency()  # TBD handling quanto
@@ -212,6 +220,9 @@ cdef class Position:
     cdef list events_c(self):
         return self._events.copy()
 
+    cdef list adjustments_c(self):
+        return self._adjustments.copy()
+
     cdef OrderFilled last_event_c(self):
         return self._events[-1] if self._events else None
 
@@ -316,6 +327,18 @@ cdef class Position:
 
         """
         return self.events_c()
+
+    @property
+    def adjustments(self):
+        """
+        Return the position adjustment events.
+
+        Returns
+        -------
+        list[PositionAdjustment]
+
+        """
+        return self.adjustments_c()
 
     @property
     def last_event(self):
@@ -559,6 +582,64 @@ cdef class Position:
 
         self.ts_last = fill.ts_event
 
+    cpdef void apply_adjustment(self, PositionAdjustment adjustment):
+        """
+        Applies a position adjustment event.
+
+        This method handles adjustments to position quantity or realized PnL that occur
+        outside of normal order fills, such as:
+        - Commission adjustments in base currency (crypto spot markets)
+        - Funding payments (perpetual futures)
+
+        The adjustment event is stored in the position's adjustment history for full audit trail.
+
+        Parameters
+        ----------
+        adjustment : PositionAdjustment
+            The position adjustment event to apply.
+
+        """
+        cdef double current_pnl
+
+        Condition.not_none(adjustment, "adjustment")
+
+        # Apply quantity change if present
+        if adjustment.quantity_change is not None:
+            self.signed_qty += adjustment.quantity_change
+
+            # Update quantity object (unsigned)
+            self.quantity = Quantity(abs(self.signed_qty), self.size_precision)
+
+            # Track peak quantity if this increases the position
+            if self.quantity._mem.raw > self.peak_qty._mem.raw:
+                self.peak_qty = self.quantity
+
+        # Apply PnL change if present
+        if adjustment.pnl_change is not None:
+            current_pnl = self.realized_pnl.as_f64_c() if self.realized_pnl is not None else 0.0
+            self.realized_pnl = Money(
+                current_pnl + adjustment.pnl_change.as_f64_c(),
+                self.settlement_currency,
+            )
+
+        # Update position state based on new signed quantity
+        if self.signed_qty > 0.0:
+            self.side = PositionSide.LONG
+            if self.entry == OrderSide.NO_ORDER_SIDE:
+                self.entry = OrderSide.BUY
+        elif self.signed_qty < 0.0:
+            self.side = PositionSide.SHORT
+            if self.entry == OrderSide.NO_ORDER_SIDE:
+                self.entry = OrderSide.SELL
+        else:
+            self.side = PositionSide.FLAT
+
+        # Store the adjustment event
+        self._adjustments.append(adjustment)
+
+        # Update last timestamp
+        self.ts_last = adjustment.ts_event
+
     cpdef Money notional_value(self, Price price):
         """
         Return the current notional value of the position, using a reference
@@ -703,18 +784,21 @@ cdef class Position:
                 raise KeyError(f"Duplicate {fill.trade_id!r} in events {fill} {p_fill}")
 
     cdef void _handle_buy_order_fill(self, OrderFilled fill):
-        # Initialize realized PnL for fill
         cdef double realized_pnl
+        cdef double last_px
+        cdef double last_qty
+        cdef Quantity last_qty_obj
+        cdef PositionAdjustment adjustment
+
+        # Initialize realized PnL for fill
         if fill.commission.currency == self.settlement_currency:
             realized_pnl = -fill.commission.as_f64_c()
         else:
             realized_pnl = 0.0
 
-        cdef double last_px = fill.last_px.as_f64_c()
-        cdef double last_qty = fill.last_qty.as_f64_c()
-        cdef Quantity last_qty_obj = fill.last_qty
-        if self.base_currency is not None and fill.commission.currency == self.base_currency:
-            last_qty_obj = Quantity(last_qty, self.size_precision)
+        last_px = fill.last_px.as_f64_c()
+        last_qty = fill.last_qty.as_f64_c()
+        last_qty_obj = fill.last_qty
 
         # LONG POSITION
         if self.signed_qty > 0:
@@ -734,19 +818,44 @@ cdef class Position:
         self.signed_qty += last_qty
         self.signed_qty = round(self.signed_qty, self.size_precision)
 
+        # For CurrencyPair instruments, create adjustment event when commission is in base currency
+        # This reflects actual asset received/delivered in wallet (e.g., crypto spot, FX spot)
+        if (self.is_spot_currency
+                and self.base_currency is not None
+                and fill.commission.currency == self.base_currency):
+            # Create and apply position adjustment for commission
+            adjustment = PositionAdjustment(
+                self.trader_id,
+                self.strategy_id,
+                self.instrument_id,
+                self.id,
+                self.account_id,
+                AdjustmentType.COMMISSION,
+                fill.commission.as_f64_c(),  # Commission is already negative
+                None,
+                fill.client_order_id.to_str(),
+                UUID4(),
+                fill.ts_event,
+                fill.ts_init,
+            )
+            self.apply_adjustment(adjustment)
+
     cdef void _handle_sell_order_fill(self, OrderFilled fill):
-        # Initialize realized PnL for fill
         cdef double realized_pnl
+        cdef double last_px
+        cdef double last_qty
+        cdef Quantity last_qty_obj
+        cdef PositionAdjustment adjustment
+
+        # Initialize realized PnL for fill
         if fill.commission.currency == self.settlement_currency:
             realized_pnl = -fill.commission.as_f64_c()
         else:
             realized_pnl = 0.0
 
-        cdef double last_px = fill.last_px.as_f64_c()
-        cdef double last_qty = fill.last_qty.as_f64_c()
-        cdef Quantity last_qty_obj = fill.last_qty
-        if self.base_currency is not None and fill.commission.currency == self.base_currency:
-            last_qty_obj = Quantity(last_qty, self.size_precision)
+        last_px = fill.last_px.as_f64_c()
+        last_qty = fill.last_qty.as_f64_c()
+        last_qty_obj = fill.last_qty
 
         # SHORT POSITION
         if self.signed_qty < 0:
@@ -765,6 +874,28 @@ cdef class Position:
         self._sell_qty.add_assign(last_qty_obj)
         self.signed_qty -= last_qty
         self.signed_qty = round(self.signed_qty, self.size_precision)
+
+        # For CurrencyPair instruments, create adjustment event when commission is in base currency
+        # This reflects actual asset received/delivered in wallet (e.g., crypto spot, FX spot)
+        if (self.is_spot_currency
+                and self.base_currency is not None
+                and fill.commission.currency == self.base_currency):
+            # Create and apply position adjustment for commission
+            adjustment = PositionAdjustment(
+                self.trader_id,
+                self.strategy_id,
+                self.instrument_id,
+                self.id,
+                self.account_id,
+                AdjustmentType.COMMISSION,
+                fill.commission.as_f64_c(),  # Commission is already negative
+                None,
+                fill.client_order_id.to_str(),
+                UUID4(),
+                fill.ts_event,
+                fill.ts_init,
+            )
+            self.apply_adjustment(adjustment)
 
     cdef double _calculate_avg_px_open_px(self, double last_px, double last_qty):
         return self._calculate_avg_px(self.quantity.as_f64_c(), self.avg_px_open, last_px, last_qty)

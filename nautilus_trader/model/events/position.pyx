@@ -1032,3 +1032,208 @@ cdef class PositionClosed(PositionEvent):
 
         """
         return PositionClosed.to_dict_c(obj)
+
+
+cdef class PositionAdjustment(Event):
+    """
+    Represents an adjustment to a position's quantity or realized PnL.
+
+    This event is used to track changes to positions that occur outside of normal
+    order fills, such as commission adjustments or funding payments.
+
+    Parameters
+    ----------
+    trader_id : TraderId
+        The trader ID.
+    strategy_id : StrategyId
+        The strategy ID.
+    instrument_id : InstrumentId
+        The instrument ID.
+    position_id : PositionId
+        The position ID.
+    account_id : AccountId
+        The account ID.
+    adjustment_type : AdjustmentType
+        The type of adjustment.
+    quantity_change : double | None
+        The quantity change (positive increases quantity, negative decreases).
+    pnl_change : Money | None
+        The PnL change.
+    reason : str | None
+        Optional reason or reference for the adjustment.
+    event_id : UUID4
+        The event ID.
+    ts_event : uint64_t
+        UNIX timestamp (nanoseconds) when the event occurred.
+    ts_init : uint64_t
+        UNIX timestamp (nanoseconds) when the object was initialized.
+    """
+
+    def __init__(
+        self,
+        TraderId trader_id not None,
+        StrategyId strategy_id not None,
+        InstrumentId instrument_id not None,
+        PositionId position_id not None,
+        AccountId account_id not None,
+        AdjustmentType adjustment_type,
+        double quantity_change,
+        Money pnl_change: Money | None,
+        str reason: str | None,
+        UUID4 event_id not None,
+        uint64_t ts_event,
+        uint64_t ts_init,
+    ):
+        self.trader_id = trader_id
+        self.strategy_id = strategy_id
+        self.instrument_id = instrument_id
+        self.position_id = position_id
+        self.account_id = account_id
+        self.adjustment_type = adjustment_type
+        self.quantity_change = quantity_change
+        self.pnl_change = pnl_change
+        self.reason = reason
+
+        self._event_id = event_id
+        self._ts_event = ts_event
+        self._ts_init = ts_init
+
+    def __eq__(self, Event other) -> bool:
+        return self._event_id == other.id
+
+    def __hash__(self) -> int:
+        return hash(self._event_id)
+
+    def __str__(self) -> str:
+        return (
+            f"{type(self).__name__}("
+            f"instrument_id={self.instrument_id.to_str()}, "
+            f"position_id={self.position_id.to_str()}, "
+            f"account_id={self.account_id.to_str()}, "
+            f"adjustment_type={self.adjustment_type}, "
+            f"quantity_change={self.quantity_change}, "
+            f"pnl_change={self.pnl_change}, "
+            f"reason={self.reason})"
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}("
+            f"trader_id={self.trader_id.to_str()}, "
+            f"strategy_id={self.strategy_id.to_str()}, "
+            f"instrument_id={self.instrument_id.to_str()}, "
+            f"position_id={self.position_id.to_str()}, "
+            f"account_id={self.account_id.to_str()}, "
+            f"adjustment_type={self.adjustment_type}, "
+            f"quantity_change={self.quantity_change}, "
+            f"pnl_change={self.pnl_change}, "
+            f"reason={self.reason}, "
+            f"event_id={self._event_id.to_str()})"
+        )
+
+    @property
+    def id(self) -> UUID4:
+        """
+        The event message identifier.
+
+        Returns
+        -------
+        UUID4
+
+        """
+        return self._event_id
+
+    @property
+    def ts_event(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the event occurred.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._ts_event
+
+    @property
+    def ts_init(self) -> int:
+        """
+        UNIX timestamp (nanoseconds) when the object was initialized.
+
+        Returns
+        -------
+        int
+
+        """
+        return self._ts_init
+
+    @staticmethod
+    cdef PositionAdjustment from_dict_c(dict values):
+        Condition.not_none(values, "values")
+        cdef str reason = values.get("reason")
+        cdef Money pnl_change = None
+        if values.get("pnl_change") is not None:
+            pnl_change = Money.from_str_c(values["pnl_change"])
+
+        return PositionAdjustment(
+            trader_id=TraderId(values["trader_id"]),
+            strategy_id=StrategyId(values["strategy_id"]),
+            instrument_id=InstrumentId.from_str_c(values["instrument_id"]),
+            position_id=PositionId(values["position_id"]),
+            account_id=AccountId(values["account_id"]),
+            adjustment_type=<AdjustmentType>values["adjustment_type"],
+            quantity_change=values.get("quantity_change", 0.0),
+            pnl_change=pnl_change,
+            reason=reason,
+            event_id=UUID4.from_str_c(values["event_id"]),
+            ts_event=values["ts_event"],
+            ts_init=values["ts_init"],
+        )
+
+    @staticmethod
+    cdef dict to_dict_c(PositionAdjustment obj):
+        Condition.not_none(obj, "obj")
+        return {
+            "type": type(obj).__name__,
+            "trader_id": obj.trader_id.to_str(),
+            "strategy_id": obj.strategy_id.to_str(),
+            "instrument_id": obj.instrument_id.to_str(),
+            "position_id": obj.position_id.to_str(),
+            "account_id": obj.account_id.to_str(),
+            "adjustment_type": obj.adjustment_type,
+            "quantity_change": obj.quantity_change if obj.quantity_change != 0.0 else None,
+            "pnl_change": str(obj.pnl_change) if obj.pnl_change is not None else None,
+            "reason": obj.reason,
+            "event_id": obj._event_id.to_str(),
+            "ts_event": obj._ts_event,
+            "ts_init": obj._ts_init,
+        }
+
+    @staticmethod
+    def from_dict(dict values) -> PositionAdjustment:
+        """
+        Return a position adjustment event from the given dict values.
+
+        Parameters
+        ----------
+        values : dict[str, object]
+            The values for initialization.
+
+        Returns
+        -------
+        PositionAdjustment
+
+        """
+        return PositionAdjustment.from_dict_c(values)
+
+    @staticmethod
+    def to_dict(PositionAdjustment obj):
+        """
+        Return a dictionary representation of this object.
+
+        Returns
+        -------
+        dict[str, object]
+
+        """
+        return PositionAdjustment.to_dict_c(obj)

@@ -22,11 +22,11 @@ use pyo3::{PyTypeInfo, exceptions::PyValueError, prelude::*, types::PyType};
 
 use crate::{
     enums::{
-        AccountType, AggregationSource, AggressorSide, AssetClass, BarAggregation, BetSide,
-        BookAction, BookType, ContingencyType, CurrencyType, InstrumentClass, InstrumentCloseType,
-        LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind, OrderSide,
-        OrderStatus, OrderType, PositionSide, PriceType, RecordFlag, TimeInForce, TradingState,
-        TrailingOffsetType, TriggerType,
+        AccountType, AdjustmentType, AggregationSource, AggressorSide, AssetClass, BarAggregation,
+        BetSide, BookAction, BookType, ContingencyType, CurrencyType, InstrumentClass,
+        InstrumentCloseType, LiquiditySide, MarketStatus, MarketStatusAction, OmsType, OptionKind,
+        OrderSide, OrderStatus, OrderType, PositionSide, PriceType, RecordFlag, TimeInForce,
+        TradingState, TrailingOffsetType, TriggerType,
     },
     python::common::EnumIterator,
 };
@@ -97,6 +97,69 @@ impl AccountType {
     #[pyo3(name = "BETTING")]
     fn py_betting() -> Self {
         Self::Betting
+    }
+}
+
+#[pymethods]
+impl AdjustmentType {
+    #[new]
+    fn py_new(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let t = Self::type_object(py);
+        Self::py_from_str(&t, value)
+    }
+
+    fn __hash__(&self) -> isize {
+        *self as isize
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<{}.{}: '{}'>",
+            stringify!(AdjustmentType),
+            self.name(),
+            self.value(),
+        )
+    }
+
+    fn __str__(&self) -> String {
+        self.to_string()
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn name(&self) -> String {
+        self.to_string()
+    }
+
+    #[getter]
+    #[must_use]
+    pub fn value(&self) -> u8 {
+        *self as u8
+    }
+
+    #[classmethod]
+    fn variants(_: &Bound<'_, PyType>, py: Python<'_>) -> EnumIterator {
+        EnumIterator::new::<Self>(py)
+    }
+
+    #[classmethod]
+    #[pyo3(name = "from_str")]
+    fn py_from_str(_: &Bound<'_, PyType>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let data_str: &str = data.extract()?;
+        let tokenized = data_str.to_uppercase();
+        Self::from_str(&tokenized).map_err(to_pyvalue_err)
+    }
+
+    #[classattr]
+    #[pyo3(name = "COMMISSION")]
+    fn py_commission() -> Self {
+        Self::Commission
+    }
+
+    #[classattr]
+    #[pyo3(name = "FUNDING")]
+    fn py_funding() -> Self {
+        Self::Funding
     }
 }
 

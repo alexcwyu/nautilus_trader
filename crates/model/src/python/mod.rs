@@ -91,6 +91,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     // Enums
     m.add_class::<crate::enums::AccountType>()?;
+    m.add_class::<crate::enums::AdjustmentType>()?;
     m.add_class::<crate::enums::AggregationSource>()?;
     m.add_class::<crate::enums::AggressorSide>()?;
     m.add_class::<crate::enums::AssetClass>()?;
@@ -193,6 +194,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::events::OrderCanceled>()?;
     m.add_class::<crate::events::OrderExpired>()?;
     m.add_class::<crate::events::OrderSnapshot>()?;
+    m.add_class::<crate::events::PositionAdjustment>()?;
     m.add_class::<crate::events::PositionSnapshot>()?;
     // Accounts
     m.add_class::<crate::accounts::CashAccount>()?;

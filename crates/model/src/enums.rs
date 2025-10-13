@@ -150,6 +150,46 @@ impl FromU8 for AggressorSide {
     }
 }
 
+/// The type of position adjustment.
+#[repr(C)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    AsRefStr,
+    FromRepr,
+    EnumIter,
+    EnumString,
+)]
+#[strum(ascii_case_insensitive)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.model.enums")
+)]
+pub enum AdjustmentType {
+    /// Commission adjustment affecting position quantity.
+    Commission = 1,
+    /// Funding payment affecting position realized PnL.
+    Funding = 2,
+}
+
+impl FromU8 for AdjustmentType {
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Commission),
+            2 => Some(Self::Funding),
+            _ => None,
+        }
+    }
+}
+
 /// A broad financial market asset class.
 #[repr(C)]
 #[derive(
@@ -1428,6 +1468,7 @@ pub enum TriggerType {
 }
 
 enum_strum_serde!(AccountType);
+enum_strum_serde!(AdjustmentType);
 enum_strum_serde!(AggregationSource);
 enum_strum_serde!(AggressorSide);
 enum_strum_serde!(AssetClass);

@@ -33,6 +33,12 @@ from nautilus_trader.model.objects cimport Quantity
 from nautilus_trader.model.position cimport Position
 
 
+# AdjustmentType enum - imported from PyO3
+cpdef enum AdjustmentType:
+    COMMISSION = 1
+    FUNDING = 2
+
+
 cdef class PositionEvent(Event):
     cdef UUID4 _event_id
     cdef uint64_t _ts_event
@@ -135,3 +141,34 @@ cdef class PositionClosed(PositionEvent):
 
     @staticmethod
     cdef dict to_dict_c(PositionClosed obj)
+
+
+cdef class PositionAdjustment(Event):
+    cdef UUID4 _event_id
+    cdef uint64_t _ts_event
+    cdef uint64_t _ts_init
+
+    cdef readonly TraderId trader_id
+    """The trader ID associated with the event.\n\n:returns: `TraderId`"""
+    cdef readonly StrategyId strategy_id
+    """The strategy ID associated with the event.\n\n:returns: `StrategyId`"""
+    cdef readonly InstrumentId instrument_id
+    """The instrument ID associated with the event.\n\n:returns: `InstrumentId`"""
+    cdef readonly PositionId position_id
+    """The position ID associated with the event.\n\n:returns: `PositionId`"""
+    cdef readonly AccountId account_id
+    """The account ID associated with the adjustment.\n\n:returns: `AccountId`"""
+    cdef readonly AdjustmentType adjustment_type
+    """The type of adjustment.\n\n:returns: `AdjustmentType`"""
+    cdef readonly double quantity_change
+    """The quantity change (can be negative).\n\n:returns: `double` or `None`"""
+    cdef readonly Money pnl_change
+    """The PnL change.\n\n:returns: `Money` or `None`"""
+    cdef readonly str reason
+    """Optional reason for the adjustment.\n\n:returns: `str` or `None`"""
+
+    @staticmethod
+    cdef PositionAdjustment from_dict_c(dict values)
+
+    @staticmethod
+    cdef dict to_dict_c(PositionAdjustment obj)

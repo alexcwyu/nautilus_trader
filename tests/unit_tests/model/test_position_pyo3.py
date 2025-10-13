@@ -15,6 +15,7 @@
 
 import pytest
 
+from nautilus_trader.core.nautilus_pyo3 import AdjustmentType
 from nautilus_trader.core.nautilus_pyo3 import ClientOrderId
 from nautilus_trader.core.nautilus_pyo3 import Currency
 from nautilus_trader.core.nautilus_pyo3 import LiquiditySide
@@ -23,6 +24,7 @@ from nautilus_trader.core.nautilus_pyo3 import OrderFilled
 from nautilus_trader.core.nautilus_pyo3 import OrderSide
 from nautilus_trader.core.nautilus_pyo3 import OrderType
 from nautilus_trader.core.nautilus_pyo3 import Position
+from nautilus_trader.core.nautilus_pyo3 import PositionAdjustment
 from nautilus_trader.core.nautilus_pyo3 import PositionId
 from nautilus_trader.core.nautilus_pyo3 import PositionSide
 from nautilus_trader.core.nautilus_pyo3 import PositionSnapshot
@@ -103,6 +105,7 @@ def test_position_to_from_dict():
     assert result_dict == {
         "type": "Position",
         "account_id": "SIM-000",
+        "adjustments": [],
         "avg_px_close": None,
         "avg_px_open": 1.00001,
         "base_currency": "AUD",
@@ -1155,3 +1158,74 @@ def test_signed_qty_decimal_qty_for_equity(
 
     # Assert
     assert position.signed_qty == expected_signed_qty
+
+
+def test_position_adjustment_creation_and_serialization() -> None:
+    # Arrange
+    adjustment = PositionAdjustment(
+        trader_id=TestIdProviderPyo3.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        instrument_id=TestIdProviderPyo3.audusd_id(),
+        position_id=PositionId("P-123456"),
+        account_id=TestIdProviderPyo3.account_id(),
+        adjustment_type=AdjustmentType.COMMISSION,
+        quantity_change=-0.001,
+        pnl_change=None,
+        reason="test_order_id",
+        event_id=TestIdProviderPyo3.uuid(),
+        ts_event=1_000_000_000,
+        ts_init=2_000_000_000,
+    )
+
+    # Act
+    adj_dict = adjustment.to_dict()
+    reconstructed = PositionAdjustment.from_dict(adj_dict)
+
+    # Assert
+    assert adjustment == reconstructed
+    assert adj_dict["type"] == "PositionAdjustment"
+    assert adj_dict["adjustment_type"] == "COMMISSION"
+    assert adj_dict["quantity_change"] == -0.001
+    assert adj_dict["pnl_change"] is None
+    assert adj_dict["reason"] == "test_order_id"
+
+
+def test_position_with_adjustments_tracking() -> None:
+    # Arrange
+    instrument = TestInstrumentProviderPyo3.btcusdt_binance()
+    order = TestOrderProviderPyo3.market_order(
+        instrument_id=instrument.id,
+        order_side=OrderSide.BUY,
+        quantity=Quantity.from_str("1.0"),
+    )
+    fill = TestEventsProviderPyo3.order_filled(
+        instrument=instrument,
+        order=order,
+        position_id=TestIdProviderPyo3.position_id(),
+        last_px=Price.from_int(50000),
+        trade_id=TradeId("1"),
+    )
+    position = Position(instrument=instrument, fill=fill)
+
+    # Act
+    adjustment = PositionAdjustment(
+        trader_id=TestIdProviderPyo3.trader_id(),
+        strategy_id=StrategyId("S-001"),
+        instrument_id=instrument.id,
+        position_id=TestIdProviderPyo3.position_id(),
+        account_id=TestIdProviderPyo3.account_id(),
+        adjustment_type=AdjustmentType.COMMISSION,
+        quantity_change=-0.001,
+        pnl_change=None,
+        reason="commission_adjustment",
+        event_id=TestIdProviderPyo3.uuid(),
+        ts_event=1_000_000_000,
+        ts_init=2_000_000_000,
+    )
+    position.apply_adjustment(adjustment)
+
+    # Assert
+    assert len(position.adjustments) == 1
+    assert position.adjustments[0].adjustment_type == AdjustmentType.COMMISSION
+    assert position.adjustments[0].quantity_change == -0.001
+    assert position.quantity == Quantity.from_str("0.999")

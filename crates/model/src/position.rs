@@ -22,14 +22,15 @@ use std::{
 };
 
 use nautilus_core::{
-    UnixNanos,
+    UUID4, UnixNanos,
     correctness::{FAILED, check_equal, check_predicate_true},
 };
 use serde::{Deserialize, Serialize};
+use ustr::Ustr;
 
 use crate::{
-    enums::{OrderSide, OrderSideSpecified, PositionSide},
-    events::OrderFilled,
+    enums::{AdjustmentType, InstrumentClass, OrderSide, OrderSideSpecified, PositionSide},
+    events::{OrderFilled, PositionAdjustment},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, TraderId,
         Venue, VenueOrderId,
@@ -50,6 +51,7 @@ use crate::{
 )]
 pub struct Position {
     pub events: Vec<OrderFilled>,
+    pub adjustments: Vec<PositionAdjustment>,
     pub trader_id: TraderId,
     pub strategy_id: StrategyId,
     pub instrument_id: InstrumentId,
@@ -66,6 +68,8 @@ pub struct Position {
     pub size_precision: u8,
     pub multiplier: Quantity,
     pub is_inverse: bool,
+    pub is_currency_pair: bool,
+    pub instrument_class: InstrumentClass,
     pub base_currency: Option<Currency>,
     pub quote_currency: Currency,
     pub settlement_currency: Currency,
@@ -107,6 +111,7 @@ impl Position {
 
         let mut item = Self {
             events: Vec::<OrderFilled>::new(),
+            adjustments: Vec::<PositionAdjustment>::new(),
             trade_ids: Vec::<TradeId>::new(),
             buy_qty: Quantity::zero(instrument.size_precision()),
             sell_qty: Quantity::zero(instrument.size_precision()),
@@ -127,6 +132,8 @@ impl Position {
             size_precision: instrument.size_precision(),
             multiplier: instrument.multiplier(),
             is_inverse: instrument.is_inverse(),
+            is_currency_pair: matches!(instrument, InstrumentAny::CurrencyPair(_)),
+            instrument_class: instrument.instrument_class(),
             base_currency: instrument.base_currency(),
             quote_currency: instrument.quote_currency(),
             settlement_currency: instrument.cost_currency(),
@@ -331,6 +338,7 @@ impl Position {
         let last_qty = fill.last_qty.as_f64();
         let last_qty_object = fill.last_qty;
 
+        // Apply the order fill to position
         if self.signed_qty > 0.0 {
             self.avg_px_open = self.calculate_avg_px_open_px(last_px, last_qty);
         } else if self.signed_qty < 0.0 {
@@ -359,6 +367,31 @@ impl Position {
 
         self.signed_qty += last_qty;
         self.buy_qty += last_qty_object;
+
+        // For CurrencyPair instruments, create adjustment event when commission is in base currency
+        // This reflects actual asset received/delivered in wallet (e.g., crypto spot, FX spot)
+        if self.is_currency_pair
+            && let Some(commission) = fill.commission
+            && let Some(base_currency) = self.base_currency
+            && commission.currency == base_currency
+        {
+            // Create and apply position adjustment for commission
+            let adjustment = PositionAdjustment::new(
+                self.trader_id,
+                self.strategy_id,
+                self.instrument_id,
+                self.id,
+                self.account_id,
+                AdjustmentType::Commission,
+                Some(commission.as_f64()), // Commission is already negative
+                None,
+                Some(Ustr::from(fill.client_order_id.as_ref())),
+                UUID4::new(),
+                fill.ts_event,
+                fill.ts_init,
+            );
+            self.apply_adjustment(adjustment);
+        }
     }
 
     fn handle_sell_order_fill(&mut self, fill: &OrderFilled) {
@@ -377,6 +410,7 @@ impl Position {
         let last_qty = fill.last_qty.as_f64();
         let last_qty_object = fill.last_qty;
 
+        // Apply the order fill to position
         if self.signed_qty < 0.0 {
             self.avg_px_open = self.calculate_avg_px_open_px(last_px, last_qty);
         } else if self.signed_qty > 0.0 {
@@ -404,6 +438,88 @@ impl Position {
 
         self.signed_qty -= last_qty;
         self.sell_qty += last_qty_object;
+
+        // For CurrencyPair instruments, create adjustment event when commission is in base currency
+        // This reflects actual asset received/delivered in wallet (e.g., crypto spot, FX spot)
+        if self.is_currency_pair
+            && let Some(commission) = fill.commission
+            && let Some(base_currency) = self.base_currency
+            && commission.currency == base_currency
+        {
+            // For sells, commission reduces the short position (makes it less negative)
+            // so we need to negate the commission to get the correct signed adjustment
+            let quantity_adjustment = -commission.as_f64();
+
+            // Create and apply position adjustment for commission
+            let adjustment = PositionAdjustment::new(
+                self.trader_id,
+                self.strategy_id,
+                self.instrument_id,
+                self.id,
+                self.account_id,
+                AdjustmentType::Commission,
+                Some(quantity_adjustment),
+                None,
+                Some(Ustr::from(fill.client_order_id.as_ref())),
+                UUID4::new(),
+                fill.ts_event,
+                fill.ts_init,
+            );
+            self.apply_adjustment(adjustment);
+        }
+    }
+
+    /// Applies a position adjustment event.
+    ///
+    /// This method handles adjustments to position quantity or realized PnL that occur
+    /// outside of normal order fills, such as:
+    /// - Commission adjustments in base currency (crypto spot markets)
+    /// - Funding payments (perpetual futures)
+    ///
+    /// The adjustment event is stored in the position's adjustment history for full audit trail.
+    pub fn apply_adjustment(&mut self, adjustment: PositionAdjustment) {
+        // Apply quantity change if present
+        if let Some(quantity_change) = adjustment.quantity_change {
+            self.signed_qty += quantity_change;
+
+            // Update quantity object (unsigned)
+            self.quantity = Quantity::new(self.signed_qty.abs(), self.size_precision);
+
+            // Track peak quantity if this increases the position
+            if self.quantity > self.peak_qty {
+                self.peak_qty = self.quantity;
+            }
+        }
+
+        // Apply PnL change if present
+        if let Some(pnl_change) = adjustment.pnl_change {
+            let current_pnl = self.realized_pnl.map_or(0.0, |p| p.as_f64());
+            self.realized_pnl = Some(Money::new(
+                current_pnl + pnl_change.as_f64(),
+                self.settlement_currency,
+            ));
+        }
+
+        // Update position state based on new signed quantity
+        if self.signed_qty > 0.0 {
+            self.side = PositionSide::Long;
+            if self.entry == OrderSide::NoOrderSide {
+                self.entry = OrderSide::Buy;
+            }
+        } else if self.signed_qty < 0.0 {
+            self.side = PositionSide::Short;
+            if self.entry == OrderSide::NoOrderSide {
+                self.entry = OrderSide::Sell;
+            }
+        } else {
+            self.side = PositionSide::Flat;
+        }
+
+        // Store the adjustment event
+        self.adjustments.push(adjustment);
+
+        // Update last timestamp
+        self.ts_last = adjustment.ts_event;
     }
 
     /// Calculates the average price using f64 arithmetic.
@@ -774,7 +890,7 @@ mod tests {
     use rstest::rstest;
 
     use crate::{
-        enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
+        enums::{AdjustmentType, LiquiditySide, OrderSide, OrderType, PositionSide},
         events::OrderFilled,
         identifiers::{
             AccountId, ClientOrderId, PositionId, StrategyId, TradeId, VenueOrderId, stubs::uuid4,
@@ -2568,6 +2684,379 @@ mod tests {
             (realized - (-1.0)).abs() < 1e-10,
             "Realized PnL should be exactly -1.0 USD (commissions), got {}",
             realized
+        );
+    }
+
+    #[rstest]
+    fn test_position_commission_in_base_currency_buy() {
+        // Test that commission in base currency reduces position quantity on buy (SPOT only)
+        let btc_usdt = currency_pair_btcusdt();
+        let btc_usdt = InstrumentAny::CurrencyPair(btc_usdt);
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Buy 1.0 BTC with 0.001 BTC commission (stored as negative)
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &btc_usdt,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("50000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        let position = Position::new(&btc_usdt, fill.into());
+
+        // Position quantity should be 1.0 - 0.001 = 0.999 BTC
+        assert!(
+            (position.quantity.as_f64() - 0.999).abs() < 1e-9,
+            "Position quantity should be 0.999 BTC (1.0 - 0.001 commission), got {}",
+            position.quantity.as_f64()
+        );
+
+        // Signed qty should also be 0.999
+        assert!(
+            (position.signed_qty - 0.999).abs() < 1e-9,
+            "Signed qty should be 0.999, got {}",
+            position.signed_qty
+        );
+
+        // Verify PositionAdjustment event was created
+        assert_eq!(
+            position.adjustments.len(),
+            1,
+            "Should have 1 adjustment event"
+        );
+        let adjustment = &position.adjustments[0];
+        assert_eq!(adjustment.adjustment_type, AdjustmentType::Commission);
+        assert_eq!(adjustment.quantity_change, Some(-0.001));
+        assert_eq!(adjustment.pnl_change, None);
+    }
+
+    #[rstest]
+    fn test_position_commission_in_base_currency_sell() {
+        // Test that commission in base currency reduces position quantity on sell
+        let btc_usdt = currency_pair_btcusdt();
+        let btc_usdt = InstrumentAny::CurrencyPair(btc_usdt);
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Sell 1.0 BTC with 0.001 BTC commission (stored as negative)
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &btc_usdt,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("50000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        let position = Position::new(&btc_usdt, fill.into());
+
+        // Position quantity should be 1.0 - 0.001 = 0.999 BTC
+        assert!(
+            (position.quantity.as_f64() - 0.999).abs() < 1e-9,
+            "Position quantity should be 0.999 BTC (1.0 - 0.001 commission), got {}",
+            position.quantity.as_f64()
+        );
+
+        // Signed qty should be -0.999 (short position)
+        assert!(
+            (position.signed_qty - (-0.999)).abs() < 1e-9,
+            "Signed qty should be -0.999, got {}",
+            position.signed_qty
+        );
+
+        // Verify PositionAdjustment event was created
+        assert_eq!(
+            position.adjustments.len(),
+            1,
+            "Should have 1 adjustment event"
+        );
+        let adjustment = &position.adjustments[0];
+        assert_eq!(adjustment.adjustment_type, AdjustmentType::Commission);
+        // For sell, commission makes position less negative, so adjustment is positive
+        assert_eq!(adjustment.quantity_change, Some(0.001));
+        assert_eq!(adjustment.pnl_change, None);
+    }
+
+    #[rstest]
+    fn test_position_commission_in_quote_currency_no_adjustment() {
+        // Test that commission in quote currency does NOT reduce position quantity
+        let btc_usdt = currency_pair_btcusdt();
+        let btc_usdt = InstrumentAny::CurrencyPair(btc_usdt);
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Buy 1.0 BTC with 50 USDT commission (in quote currency)
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &btc_usdt,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("50000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-50.0, Currency::USD())),
+            None,
+            None,
+        );
+
+        let position = Position::new(&btc_usdt, fill.into());
+
+        // Position quantity should be exactly 1.0 BTC (no adjustment)
+        assert!(
+            (position.quantity.as_f64() - 1.0).abs() < 1e-9,
+            "Position quantity should be 1.0 BTC (no adjustment for quote currency commission), got {}",
+            position.quantity.as_f64()
+        );
+
+        // Verify NO PositionAdjustment event was created (commission in quote currency)
+        assert_eq!(
+            position.adjustments.len(),
+            0,
+            "Should have no adjustment events for quote currency commission"
+        );
+    }
+
+    #[rstest]
+    fn test_position_long_close_with_base_currency_commission() {
+        // Test opening and closing a long position with commission in base currency
+        let btc_usdt = currency_pair_btcusdt();
+        let btc_usdt = InstrumentAny::CurrencyPair(btc_usdt);
+
+        let buy_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        let sell_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Open: Buy 1.0 BTC with 0.001 BTC commission
+        let open_fill = TestOrderEventStubs::filled(
+            &buy_order,
+            &btc_usdt,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("50000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        let mut position = Position::new(&btc_usdt, open_fill.into());
+
+        // After opening, position should be 0.999 BTC
+        assert!(
+            (position.quantity.as_f64() - 0.999).abs() < 1e-9,
+            "Position after open should be 0.999 BTC, got {}",
+            position.quantity.as_f64()
+        );
+
+        // Close: Sell 0.999 BTC with 0.001 BTC commission (will close slightly less due to commission)
+        let close_fill = TestOrderEventStubs::filled(
+            &sell_order,
+            &btc_usdt,
+            Some(TradeId::new("2")),
+            None,
+            Some(Price::from("51000.0")),
+            Some(Quantity::from("0.999")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        position.apply(&close_fill.into());
+
+        // After closing with 0.999 - 0.001 = 0.998, we should have 0.001 BTC remaining
+        assert!(
+            (position.quantity.as_f64() - 0.001).abs() < 1e-9,
+            "Position after close should be ~0.001 BTC remaining, got {}",
+            position.quantity.as_f64()
+        );
+    }
+
+    #[rstest]
+    fn test_position_short_close_with_base_currency_commission() {
+        // Test opening and closing a short position with commission in base currency
+        let btc_usdt = currency_pair_btcusdt();
+        let btc_usdt = InstrumentAny::CurrencyPair(btc_usdt);
+
+        let sell_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        let buy_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Open: Sell 1.0 BTC with 0.001 BTC commission
+        let open_fill = TestOrderEventStubs::filled(
+            &sell_order,
+            &btc_usdt,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("50000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        let mut position = Position::new(&btc_usdt, open_fill.into());
+
+        // After opening, position should be 0.999 BTC (short)
+        assert!(
+            (position.quantity.as_f64() - 0.999).abs() < 1e-9,
+            "Position after open should be 0.999 BTC, got {}",
+            position.quantity.as_f64()
+        );
+        assert_eq!(position.side, PositionSide::Short);
+
+        // Close: Buy 0.999 BTC with 0.001 BTC commission
+        let close_fill = TestOrderEventStubs::filled(
+            &buy_order,
+            &btc_usdt,
+            Some(TradeId::new("2")),
+            None,
+            Some(Price::from("49000.0")),
+            Some(Quantity::from("0.999")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        position.apply(&close_fill.into());
+
+        // After closing with 0.999 - 0.001 = 0.998, we should have 0.001 BTC remaining
+        assert!(
+            (position.quantity.as_f64() - 0.001).abs() < 1e-9,
+            "Position after close should be ~0.001 BTC remaining, got {}",
+            position.quantity.as_f64()
+        );
+    }
+
+    #[rstest]
+    fn test_position_commission_affects_buy_and_sell_qty() {
+        // Test that commission in base currency affects both buy_qty and sell_qty tracking
+        let btc_usdt = currency_pair_btcusdt();
+        let btc_usdt = InstrumentAny::CurrencyPair(btc_usdt);
+
+        let buy_order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(btc_usdt.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Buy 1.0 BTC with 0.001 BTC commission
+        let fill = TestOrderEventStubs::filled(
+            &buy_order,
+            &btc_usdt,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("50000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-0.001, btc_usdt.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        let position = Position::new(&btc_usdt, fill.into());
+
+        // buy_qty tracks order fills (1.0 BTC), adjustments tracked separately
+        assert!(
+            (position.buy_qty.as_f64() - 1.0).abs() < 1e-9,
+            "buy_qty should be 1.0 (order fill amount), got {}",
+            position.buy_qty.as_f64()
+        );
+
+        // Position quantity reflects both order fill and commission adjustment
+        assert!(
+            (position.quantity.as_f64() - 0.999).abs() < 1e-9,
+            "position.quantity should be 0.999 (1.0 - 0.001 commission), got {}",
+            position.quantity.as_f64()
+        );
+
+        // Adjustment event tracks the commission
+        assert_eq!(position.adjustments.len(), 1);
+        assert_eq!(position.adjustments[0].quantity_change, Some(-0.001));
+    }
+
+    #[rstest]
+    fn test_position_perpetual_commission_no_adjustment() {
+        // Test that perpetuals/futures do NOT adjust quantity for base currency commission
+        let eth_perp = crypto_perpetual_ethusdt();
+        let eth_perp = InstrumentAny::CryptoPerpetual(eth_perp);
+
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(eth_perp.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        // Buy 1.0 ETH-PERP contracts with 0.001 ETH commission
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            &eth_perp,
+            Some(TradeId::new("1")),
+            None,
+            Some(Price::from("3000.0")),
+            Some(Quantity::from("1.0")),
+            None,
+            Some(Money::new(-0.001, eth_perp.base_currency().unwrap())),
+            None,
+            None,
+        );
+
+        let position = Position::new(&eth_perp, fill.into());
+
+        // Position quantity should be exactly 1.0 (NO adjustment for derivatives)
+        assert!(
+            (position.quantity.as_f64() - 1.0).abs() < 1e-9,
+            "Perpetual position should be 1.0 contracts (no adjustment), got {}",
+            position.quantity.as_f64()
+        );
+
+        // Signed qty should also be 1.0
+        assert!(
+            (position.signed_qty - 1.0).abs() < 1e-9,
+            "Signed qty should be 1.0, got {}",
+            position.signed_qty
         );
     }
 }
