@@ -206,7 +206,7 @@ class CoinbaseIntxExecutionClient(LiveExecutionClient):
         try:
             pyo3_account_state = await self._http_client.request_account_state(self.pyo3_account_id)
         except ValueError as e:
-            self._log.error(str(e))
+            self._log.warning(f"Could not retrieve account state: {e}")
             return
 
         account_state = AccountState.from_dict(pyo3_account_state.to_dict())
@@ -217,6 +217,12 @@ class CoinbaseIntxExecutionClient(LiveExecutionClient):
             reported=True,
             ts_event=account_state.ts_event,
         )
+
+        self._log.info("Coinbase INTX API key authenticated", LogColor.GREEN)
+        if account_state.balances:
+            self._log.info(
+                f"Generated account state with {len(account_state.balances)} balance(s)",
+            )
 
     # -- EXECUTION REPORTS ------------------------------------------------------------------------
 

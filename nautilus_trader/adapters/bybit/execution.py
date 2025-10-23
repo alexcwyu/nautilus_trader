@@ -784,7 +784,6 @@ class BybitExecutionClient(LiveExecutionClient):
         return active_symbols
 
     async def _update_account_state(self) -> None:
-        # positions = await self._http_account.query_position_info()
         (balances, ts_event) = await self._http_account.query_wallet_balance()
 
         if balances:
@@ -802,7 +801,7 @@ class BybitExecutionClient(LiveExecutionClient):
                     ts_event=millis_to_nanos(ts_event),
                 )
             except Exception as e:
-                self._log.exception("Failed to generate AccountState", e)
+                self._log.exception("Failed to update account state", e)
 
         # Set Leverages
         if self._futures_leverages:
@@ -873,7 +872,6 @@ class BybitExecutionClient(LiveExecutionClient):
     # -- COMMAND HANDLERS -------------------------------------------------------------------------
 
     async def _query_account(self, _command: QueryAccount) -> None:
-        # Specific account ID (sub account) not yet supported
         await self._update_account_state()
 
     async def _cancel_order(self, command: CancelOrder) -> None:
