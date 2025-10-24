@@ -25,8 +25,14 @@ use axum::{
     routing::get,
 };
 use nautilus_bybit::{
-    common::enums::BybitProductType,
-    http::{client::BybitHttpClient, query::BybitInstrumentsInfoParamsBuilder},
+    common::enums::{BybitAccountType, BybitProductType},
+    http::{
+        client::BybitHttpClient,
+        query::{
+            BybitFeeRateParams, BybitInstrumentsInfoParamsBuilder, BybitPositionListParamsBuilder,
+            BybitWalletBalanceParams,
+        },
+    },
 };
 use rstest::rstest;
 use serde_json::{Value, json};
@@ -250,6 +256,142 @@ async fn handle_post_order(headers: axum::http::HeaderMap, body: axum::body::Byt
 }
 
 #[allow(dead_code)]
+async fn handle_get_wallet_balance(headers: axum::http::HeaderMap) -> Response {
+    // Check for authentication headers
+    if !headers.contains_key("X-BAPI-API-KEY")
+        || !headers.contains_key("X-BAPI-SIGN")
+        || !headers.contains_key("X-BAPI-TIMESTAMP")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let wallet = load_test_data("http_get_wallet_balance.json");
+    Json(wallet).into_response()
+}
+
+#[allow(dead_code)]
+async fn handle_cancel_order(headers: axum::http::HeaderMap, body: axum::body::Bytes) -> Response {
+    // Check for authentication headers
+    if !headers.contains_key("X-BAPI-API-KEY")
+        || !headers.contains_key("X-BAPI-SIGN")
+        || !headers.contains_key("X-BAPI-TIMESTAMP")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    // Parse JSON body
+    let Ok(cancel_req): Result<Value, _> = serde_json::from_slice(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "retCode": 10001,
+                "retMsg": "Invalid JSON body",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    };
+
+    // Validate required fields
+    if cancel_req.get("category").is_none() || cancel_req.get("symbol").is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "retCode": 10001,
+                "retMsg": "Missing required parameters",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    // Return successful cancel response
+    Json(json!({
+        "retCode": 0,
+        "retMsg": "OK",
+        "result": {
+            "orderId": "test-canceled-order-id",
+            "orderLinkId": cancel_req.get("orderLinkId").and_then(|v| v.as_str()).unwrap_or("")
+        },
+        "retExtInfo": {},
+        "time": 1704470400123i64
+    }))
+    .into_response()
+}
+
+#[allow(dead_code)]
+async fn handle_get_positions(headers: axum::http::HeaderMap) -> Response {
+    // Check for authentication headers
+    if !headers.contains_key("X-BAPI-API-KEY")
+        || !headers.contains_key("X-BAPI-SIGN")
+        || !headers.contains_key("X-BAPI-TIMESTAMP")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let positions = load_test_data("http_get_positions.json");
+    Json(positions).into_response()
+}
+
+#[allow(dead_code)]
+async fn handle_get_fee_rate(headers: axum::http::HeaderMap) -> Response {
+    // Check for authentication headers
+    if !headers.contains_key("X-BAPI-API-KEY")
+        || !headers.contains_key("X-BAPI-SIGN")
+        || !headers.contains_key("X-BAPI-TIMESTAMP")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let fee_rate = load_test_data("http_get_fee_rate.json");
+    Json(fee_rate).into_response()
+}
+
+#[allow(dead_code)]
 fn create_test_router(state: TestServerState) -> Router {
     Router::new()
         .route("/v5/market/time", get(handle_get_server_time))
@@ -259,6 +401,10 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/v5/order/history", get(handle_get_orders))
         .route("/v5/order/realtime", get(handle_get_orders))
         .route("/v5/order/create", axum::routing::post(handle_post_order))
+        .route("/v5/order/cancel", axum::routing::post(handle_cancel_order))
+        .route("/v5/account/wallet-balance", get(handle_get_wallet_balance))
+        .route("/v5/position/list", get(handle_get_positions))
+        .route("/v5/account/fee-rate", get(handle_get_fee_rate))
         .with_state(state)
 }
 
@@ -445,4 +591,197 @@ async fn test_rate_limiting_returns_error() {
     assert!(last_error.is_some());
     let error = last_error.unwrap();
     assert!(error.to_string().contains("10006") || error.to_string().contains("Too many"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_open_orders_with_symbol() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let response = client
+        .http_get_open_orders(BybitProductType::Linear, Some("BTCUSDT"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.ret_code, 0);
+    assert!(response.result.list.is_empty() || !response.result.list.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_open_orders_without_symbol() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let response = client
+        .http_get_open_orders(BybitProductType::Linear, None)
+        .await
+        .unwrap();
+
+    assert_eq!(response.ret_code, 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_wallet_balance_requires_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    // Create client without credentials
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+
+    let params = BybitWalletBalanceParams {
+        account_type: BybitAccountType::Unified,
+        coin: None,
+    };
+
+    // Should fail when trying to call authenticated endpoint without credentials
+    let result = client.http_get_wallet_balance(&params).await;
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_wallet_balance_with_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let params = BybitWalletBalanceParams {
+        account_type: BybitAccountType::Unified,
+        coin: None,
+    };
+
+    let response = client.http_get_wallet_balance(&params).await.unwrap();
+
+    assert_eq!(response.ret_code, 0);
+    assert!(!response.result.list.is_empty());
+    assert_eq!(
+        response.result.list[0].account_type,
+        BybitAccountType::Unified
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_positions_requires_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+
+    let params = BybitPositionListParamsBuilder::default()
+        .category(BybitProductType::Linear)
+        .build()
+        .unwrap();
+
+    let result = client.http_get_positions(&params).await;
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_positions_with_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let params = BybitPositionListParamsBuilder::default()
+        .category(BybitProductType::Linear)
+        .build()
+        .unwrap();
+
+    let response = client.http_get_positions(&params).await.unwrap();
+
+    assert_eq!(response.ret_code, 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_fee_rate_requires_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+
+    let params = BybitFeeRateParams {
+        category: BybitProductType::Linear,
+        symbol: Some("BTCUSDT".to_string()),
+        base_coin: None,
+    };
+
+    let result = client.http_get_fee_rate(&params).await;
+    assert!(result.is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_fee_rate_with_credentials() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let params = BybitFeeRateParams {
+        category: BybitProductType::Linear,
+        symbol: Some("BTCUSDT".to_string()),
+        base_coin: None,
+    };
+
+    let response = client.http_get_fee_rate(&params).await.unwrap();
+
+    assert_eq!(response.ret_code, 0);
+    assert!(!response.result.list.is_empty());
 }

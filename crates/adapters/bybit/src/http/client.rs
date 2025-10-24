@@ -2508,6 +2508,62 @@ impl BybitHttpClient {
         self.inner.http_place_order(request).await
     }
 
+    /// Fetches wallet balance (requires authentication).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The response cannot be parsed.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/account/wallet-balance>
+    pub async fn http_get_wallet_balance(
+        &self,
+        params: &BybitWalletBalanceParams,
+    ) -> Result<BybitWalletBalanceResponse, BybitHttpError> {
+        self.inner.http_get_wallet_balance(params).await
+    }
+
+    /// Fetches position information (requires authentication).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API returns an error.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/position/position-info>
+    pub async fn http_get_positions(
+        &self,
+        params: &BybitPositionListParams,
+    ) -> Result<BybitPositionListResponse, BybitHttpError> {
+        self.inner.http_get_positions(params).await
+    }
+
+    /// Fetches fee rate (requires authentication).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - The API returns an error.
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/account/fee-rate>
+    pub async fn http_get_fee_rate(
+        &self,
+        params: &BybitFeeRateParams,
+    ) -> Result<BybitFeeRateResponse, BybitHttpError> {
+        self.inner.http_get_fee_rate(params).await
+    }
+
     // =========================================================================
     // High-level methods using Nautilus domain objects
     // =========================================================================
