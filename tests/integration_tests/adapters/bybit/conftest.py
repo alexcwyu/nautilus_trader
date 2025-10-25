@@ -122,7 +122,14 @@ def mock_http_client():
             "account_type": "CASH",
             "base_currency": "USDT",
             "reported": True,
-            "balances": [],
+            "balances": [
+                {
+                    "currency": "USDT",
+                    "total": "100000.00000000",
+                    "locked": "0.00000000",
+                    "free": "100000.00000000",
+                },
+            ],
             "margins": [],
             "info": {},
             "event_id": str(TestIdStubs.uuid()),
@@ -185,8 +192,8 @@ def mock_instrument_provider(instrument):
     provider.get_all = MagicMock(return_value={instrument.id: instrument})
     provider.currencies = MagicMock(return_value={})
     provider.find = MagicMock(return_value=instrument)
-    provider.product_types = (nautilus_pyo3.BybitProductType.Linear,)
-    provider._product_types = (nautilus_pyo3.BybitProductType.Linear,)
+    provider.product_types = (nautilus_pyo3.BybitProductType.SPOT,)
+    provider._product_types = (nautilus_pyo3.BybitProductType.SPOT,)
     return provider
 
 

@@ -13,8 +13,6 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-# mypy: ignore-errors
-
 import asyncio
 from functools import lru_cache
 
@@ -66,12 +64,11 @@ def get_cached_bybit_http_client(
     BybitHttpClient
 
     """
-    # Determine base URL if not provided
     if base_url is None:
         environment = (
-            nautilus_pyo3.BybitEnvironment.Testnet
+            nautilus_pyo3.BybitEnvironment.TESTNET
             if testnet
-            else nautilus_pyo3.BybitEnvironment.Mainnet
+            else nautilus_pyo3.BybitEnvironment.MAINNET
         )
         base_url = nautilus_pyo3.get_bybit_http_base_url(environment)
 
@@ -236,56 +233,3 @@ class BybitLiveExecClientFactory(LiveExecClientFactory):
             config=config,
             name=name,
         )
-
-
-# Backward compatibility wrappers
-def get_bybit_http_client(
-    clock: LiveClock,
-    key: str | None = None,
-    secret: str | None = None,
-    base_url: str | None = None,
-    is_demo: bool = False,
-    is_testnet: bool = False,
-    recv_window_ms: int = 5_000,
-) -> nautilus_pyo3.BybitHttpClient:
-    """
-    Backward compatibility wrapper for get_cached_bybit_http_client.
-
-    Note: clock and recv_window_ms parameters are ignored in the new Rust client.
-
-    """
-    return get_cached_bybit_http_client(
-        api_key=key,
-        api_secret=secret,
-        base_url=base_url,
-        testnet=is_testnet,
-    )
-
-
-def get_bybit_instrument_provider(
-    client: nautilus_pyo3.BybitHttpClient,
-    clock: LiveClock,
-    product_types: (
-        tuple[BybitProductType, ...] | list[BybitProductType] | frozenset[BybitProductType]
-    ),
-    config: InstrumentProviderConfig,
-) -> BybitInstrumentProvider:
-    """
-    Backward compatibility wrapper for get_cached_bybit_instrument_provider.
-
-    Note: clock parameter is ignored in the new provider.
-
-    """
-    product_types_tuple: tuple[BybitProductType, ...]
-    if isinstance(product_types, tuple):
-        product_types_tuple = product_types
-    elif isinstance(product_types, list):
-        product_types_tuple = tuple(product_types)
-    else:  # frozenset
-        product_types_tuple = tuple(product_types)
-
-    return get_cached_bybit_instrument_provider(
-        client=client,
-        product_types=product_types_tuple,
-        config=config,
-    )

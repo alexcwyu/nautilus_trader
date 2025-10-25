@@ -36,7 +36,7 @@ async def test_load_all_async_populates_provider(monkeypatch, instrument):
 
     provider = BybitInstrumentProvider(
         client=mock_http_client,
-        product_types=(nautilus_pyo3.BybitProductType.Linear,),
+        product_types=(nautilus_pyo3.BybitProductType.LINEAR,),
     )
 
     monkeypatch.setattr(
@@ -49,7 +49,7 @@ async def test_load_all_async_populates_provider(monkeypatch, instrument):
 
     # Assert
     mock_http_client.request_instruments.assert_awaited_once_with(
-        nautilus_pyo3.BybitProductType.Linear,
+        nautilus_pyo3.BybitProductType.LINEAR,
         None,
     )
     assert provider.instruments_pyo3() == pyo3_instruments
@@ -65,7 +65,7 @@ async def test_load_ids_async_filters_results(monkeypatch, instrument):
 
     provider = BybitInstrumentProvider(
         client=mock_http_client,
-        product_types=(nautilus_pyo3.BybitProductType.Linear,),
+        product_types=(nautilus_pyo3.BybitProductType.LINEAR,),
     )
 
     btc = instrument.base_currency
@@ -93,7 +93,7 @@ async def test_load_ids_async_filters_results(monkeypatch, instrument):
 
     # Assert
     mock_http_client.request_instruments.assert_awaited_once_with(
-        nautilus_pyo3.BybitProductType.Linear,
+        nautilus_pyo3.BybitProductType.LINEAR,
         None,
     )
     assert provider.get_all().get(instrument.id) is instrument

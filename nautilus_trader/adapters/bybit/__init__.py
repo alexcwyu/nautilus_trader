@@ -31,8 +31,8 @@ from nautilus_trader.adapters.bybit.constants import BYBIT_CLIENT_ID
 from nautilus_trader.adapters.bybit.constants import BYBIT_VENUE
 from nautilus_trader.adapters.bybit.factories import BybitLiveDataClientFactory
 from nautilus_trader.adapters.bybit.factories import BybitLiveExecClientFactory
-from nautilus_trader.adapters.bybit.factories import get_bybit_http_client
-from nautilus_trader.adapters.bybit.factories import get_bybit_instrument_provider
+from nautilus_trader.adapters.bybit.factories import get_cached_bybit_http_client
+from nautilus_trader.adapters.bybit.factories import get_cached_bybit_instrument_provider
 from nautilus_trader.adapters.bybit.loaders import BybitOrderBookDeltaDataLoader
 from nautilus_trader.adapters.bybit.providers import BybitInstrumentProvider
 from nautilus_trader.core.nautilus_pyo3 import BybitProductType
@@ -51,6 +51,6 @@ __all__ = [
     "BybitOrderBookDeltaDataLoader",
     "BybitProductType",
     "BybitTickerData",
-    "get_bybit_http_client",
-    "get_bybit_instrument_provider",
+    "get_cached_bybit_http_client",
+    "get_cached_bybit_instrument_provider",
 ]

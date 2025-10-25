@@ -58,7 +58,7 @@ def data_client_builder(
         config = BybitDataClientConfig(
             api_key="test_api_key",
             api_secret="test_api_secret",
-            product_types=(nautilus_pyo3.BybitProductType.LINEAR,),
+            product_types=(nautilus_pyo3.BybitProductType.SPOT,),
             **(config_kwargs or {}),
         )
 
@@ -117,14 +117,14 @@ async def test_subscribe_order_book_deltas(data_client_builder, monkeypatch):
         command = SimpleNamespace(
             book_type=BookType.L2_MBP,
             depth=50,
-            instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+            instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         )
 
         # Act
         await client._subscribe_order_book_deltas(command)
 
         # Assert
-        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT.BYBIT")
+        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")
         ws_client.subscribe_orderbook.assert_awaited_once_with(expected_id, 50)
     finally:
         await client._disconnect()
@@ -142,14 +142,14 @@ async def test_subscribe_quote_ticks(data_client_builder, monkeypatch):
         ws_client.subscribe_ticker.reset_mock()
 
         command = SimpleNamespace(
-            instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+            instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         )
 
         # Act
         await client._subscribe_quote_ticks(command)
 
         # Assert
-        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT.BYBIT")
+        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")
         ws_client.subscribe_ticker.assert_awaited_once_with(expected_id)
     finally:
         await client._disconnect()
@@ -167,14 +167,14 @@ async def test_subscribe_trade_ticks(data_client_builder, monkeypatch):
         ws_client.subscribe_trades.reset_mock()
 
         command = SimpleNamespace(
-            instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+            instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         )
 
         # Act
         await client._subscribe_trade_ticks(command)
 
         # Assert
-        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT.BYBIT")
+        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")
         ws_client.subscribe_trades.assert_awaited_once_with(expected_id)
     finally:
         await client._disconnect()
@@ -193,7 +193,7 @@ async def test_subscribe_bars(data_client_builder, monkeypatch):
 
         # Mock bar type with 1-minute interval
         bar_type = MagicMock()
-        bar_type.instrument_id = InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE)
+        bar_type.instrument_id = InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE)
         bar_type.spec.aggregation = BarAggregation.MINUTE
         bar_type.spec.step = 1
 
@@ -203,7 +203,7 @@ async def test_subscribe_bars(data_client_builder, monkeypatch):
         await client._subscribe_bars(command)
 
         # Assert
-        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT.BYBIT")
+        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")
         ws_client.subscribe_klines.assert_awaited_once_with(expected_id, "1")
     finally:
         await client._disconnect()
@@ -221,14 +221,14 @@ async def test_subscribe_funding_rates(data_client_builder, monkeypatch):
         ws_client.subscribe_ticker.reset_mock()
 
         command = SimpleNamespace(
-            instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+            instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         )
 
         # Act
         await client._subscribe_funding_rates(command)
 
         # Assert
-        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT.BYBIT")
+        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")
         ws_client.subscribe_ticker.assert_awaited_once_with(expected_id)
     finally:
         await client._disconnect()
@@ -247,7 +247,7 @@ async def test_unsubscribe_order_book_deltas(data_client_builder, monkeypatch):
         subscribe_command = SimpleNamespace(
             book_type=BookType.L2_MBP,
             depth=50,
-            instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+            instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         )
         await client._subscribe_order_book_deltas(subscribe_command)
 
@@ -255,14 +255,14 @@ async def test_unsubscribe_order_book_deltas(data_client_builder, monkeypatch):
 
         # Now unsubscribe
         unsubscribe_command = SimpleNamespace(
-            instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+            instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         )
 
         # Act
         await client._unsubscribe_order_book_deltas(unsubscribe_command)
 
         # Assert
-        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT.BYBIT")
+        expected_id = nautilus_pyo3.InstrumentId.from_str("BTCUSDT-SPOT.BYBIT")
         ws_client.unsubscribe_orderbook.assert_awaited_once_with(expected_id, 50)
     finally:
         await client._disconnect()

@@ -102,7 +102,6 @@ class BybitDataClient(LiveMarketDataClient):
 
         # Configuration
         self._config = config
-        # None = all product types
         self._product_types = (
             list(config.product_types)
             if config.product_types
@@ -187,6 +186,7 @@ class BybitDataClient(LiveMarketDataClient):
         # Ensures instrument definitions are available for correct
         # price and size precisions when parsing responses
         instruments_pyo3 = self.instrument_provider.instruments_pyo3()
+
         for inst in instruments_pyo3:
             self._http_client.add_instrument(inst)
             # Also add instruments to all websocket clients
@@ -206,15 +206,7 @@ class BybitDataClient(LiveMarketDataClient):
         self,
         instrument_id: nautilus_pyo3.InstrumentId,
     ) -> nautilus_pyo3.BybitWebSocketClient:
-        try:
-            product_type = nautilus_pyo3.bybit_product_type_from_symbol(instrument_id.symbol.value)
-        except ValueError:
-            # Fallback to first available client if symbol doesn't have valid suffix
-            self._log.warning(
-                f"Could not determine product type for {instrument_id.symbol.value}, "
-                f"using first available client",
-            )
-            return next(iter(self._ws_clients.values()))
+        product_type = nautilus_pyo3.bybit_product_type_from_symbol(instrument_id.symbol.value)
 
         ws_client = self._ws_clients.get(product_type)
         if ws_client is None:
@@ -374,36 +366,33 @@ class BybitDataClient(LiveMarketDataClient):
             pyo3_instrument_id.symbol.value,
         )
 
-        try:
-            pyo3_trades = await self._http_client.request_trades(
-                product_type=product_type,
-                instrument_id=pyo3_instrument_id,
-                limit=limit,
+        pyo3_trades = await self._http_client.request_trades(
+            product_type=product_type,
+            instrument_id=pyo3_instrument_id,
+            limit=limit,
+        )
+        trades = TradeTick.from_pyo3_list(pyo3_trades)
+
+        # Filter trades to only include those within the requested time window
+        # Bybit API returns recent trades regardless of time params, so we filter client-side
+        start_ns = request.start.value
+        end_ns = request.end.value
+        filtered_trades = [trade for trade in trades if start_ns <= trade.ts_event <= end_ns]
+
+        if len(filtered_trades) < len(trades):
+            self._log.debug(
+                f"Filtered {len(trades) - len(filtered_trades)} trades outside "
+                f"requested window [{request.start}, {request.end}]",
             )
-            trades = TradeTick.from_pyo3_list(pyo3_trades)
 
-            # Filter trades to only include those within the requested time window
-            # Bybit API returns recent trades regardless of time params, so we filter client-side
-            start_ns = request.start.value
-            end_ns = request.end.value
-            filtered_trades = [trade for trade in trades if start_ns <= trade.ts_event <= end_ns]
-
-            if len(filtered_trades) < len(trades):
-                self._log.debug(
-                    f"Filtered {len(trades) - len(filtered_trades)} trades outside "
-                    f"requested window [{request.start}, {request.end}]",
-                )
-
-            self._handle_trade_ticks(
-                request.instrument_id,
-                filtered_trades,
-                request.id,
-                request.start,
-                request.end,
-                request.params,
-            )
-        except Exception as e:
-            self._log.error(f"Failed to request trade ticks: {e}")
+        self._handle_trade_ticks(
+            request.instrument_id,
+            filtered_trades,
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )
 
     async def _request_bars(self, request: RequestBars) -> None:
         if request.bar_type.is_internally_aggregated():
@@ -438,24 +427,21 @@ class BybitDataClient(LiveMarketDataClient):
             f"Requesting klines start={request.start}, end={request.end}, {request.limit=}",
         )
 
-        try:
-            pyo3_bars = await self._http_client.request_bars(
-                product_type=product_type,
-                bar_type=pyo3_bar_type,
-                start=ensure_pydatetime_utc(request.start),
-                end=ensure_pydatetime_utc(request.end),
-                limit=request.limit or 200,
-                timestamp_on_close=self._bars_timestamp_on_close,
-            )
-            bars = Bar.from_pyo3_list(pyo3_bars)
+        pyo3_bars = await self._http_client.request_bars(
+            product_type=product_type,
+            bar_type=pyo3_bar_type,
+            start=ensure_pydatetime_utc(request.start),
+            end=ensure_pydatetime_utc(request.end),
+            limit=request.limit or 200,
+            timestamp_on_close=self._bars_timestamp_on_close,
+        )
+        bars = Bar.from_pyo3_list(pyo3_bars)
 
-            self._handle_bars(
-                request.bar_type,
-                bars,
-                request.id,
-                request.start,
-                request.end,
-                request.params,
-            )
-        except Exception as e:
-            self._log.error(f"Failed to request bars: {e}")
+        self._handle_bars(
+            request.bar_type,
+            bars,
+            request.id,
+            request.start,
+            request.end,
+            request.params,
+        )

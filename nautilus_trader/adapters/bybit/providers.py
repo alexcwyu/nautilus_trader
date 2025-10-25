@@ -81,6 +81,7 @@ class BybitInstrumentProvider(InstrumentProvider):
         self._log.info(f"Loading all instruments{filters_str}")
 
         all_pyo3_instruments = []
+
         for product_type in self._product_types:
             pyo3_instruments = await self._client.request_instruments(product_type, None)
             all_pyo3_instruments.extend(pyo3_instruments)
@@ -106,6 +107,7 @@ class BybitInstrumentProvider(InstrumentProvider):
             PyCondition.equal(instrument_id.venue, BYBIT_VENUE, "instrument_id.venue", "BYBIT")
 
         all_pyo3_instruments = []
+
         for product_type in self._product_types:
             pyo3_instruments = await self._client.request_instruments(product_type, None)
             all_pyo3_instruments.extend(pyo3_instruments)

@@ -222,15 +222,10 @@ class BybitExecutionClient(LiveExecutionClient):
         await self._ws_private_client.wait_until_active(timeout_secs=10.0)
         self._log.info("Connected to private WebSocket", LogColor.BLUE)
 
-        # Subscribe to private channels
-        try:
-            await self._ws_private_client.subscribe_orders()
-            await self._ws_private_client.subscribe_executions()
-            await self._ws_private_client.subscribe_positions()
-            await self._ws_private_client.subscribe_wallet()
-        except Exception as e:
-            self._log.error(f"Failed to subscribe to private channels: {e}")
-            raise
+        await self._ws_private_client.subscribe_orders()
+        await self._ws_private_client.subscribe_executions()
+        await self._ws_private_client.subscribe_positions()
+        await self._ws_private_client.subscribe_wallet()
 
         # Connect to trade WebSocket
         await self._ws_trade_client.connect(callback=self._handle_msg)
@@ -270,40 +265,34 @@ class BybitExecutionClient(LiveExecutionClient):
         # Ensures instrument definitions are available for correct
         # price and size precisions when parsing responses
         instruments_pyo3 = self.bybit_instrument_provider.instruments_pyo3()
-        self._log.info(f"Caching {len(instruments_pyo3)} instruments")
+
         for inst in instruments_pyo3:
             self._http_client.add_instrument(inst)
             self._ws_private_client.add_instrument(inst)
             self._ws_trade_client.add_instrument(inst)
-        self._log.info("Instrument cache populated")
 
         self._log.debug("Cached instruments", LogColor.MAGENTA)
 
     async def _update_account_state(self) -> None:
-        try:
-            # Determine account type
-            if self._account_type == AccountType.CASH:
-                account_type = BybitAccountType.UNIFIED  # Spot uses unified account
-            else:
-                account_type = BybitAccountType.UNIFIED
+        if self._account_type == AccountType.CASH:
+            account_type = BybitAccountType.UNIFIED  # Spot uses unified account
+        else:
+            account_type = BybitAccountType.UNIFIED
 
-            pyo3_account_state = await self._http_client.request_account_state(
-                account_type=account_type,
-                account_id=self.pyo3_account_id,
-            )
-            account_state = AccountState.from_dict(pyo3_account_state.to_dict())
+        pyo3_account_state = await self._http_client.request_account_state(
+            account_type=account_type,
+            account_id=self.pyo3_account_id,
+        )
+        account_state = AccountState.from_dict(pyo3_account_state.to_dict())
 
-            self.generate_account_state(
-                balances=account_state.balances,
-                margins=account_state.margins,
-                reported=True,
-                ts_event=self._clock.timestamp_ns(),
-            )
+        self.generate_account_state(
+            balances=account_state.balances,
+            margins=account_state.margins,
+            reported=True,
+            ts_event=self._clock.timestamp_ns(),
+        )
 
-            await self._apply_account_configuration()
-
-        except Exception as e:
-            self._log.error(f"Failed to update account state: {e}")
+        await self._apply_account_configuration()
 
     async def _apply_account_configuration(self) -> None:
         if self._futures_leverages:
@@ -320,6 +309,7 @@ class BybitExecutionClient(LiveExecutionClient):
             return
 
         tasks = []
+
         for symbol_str, leverage in self._futures_leverages.items():
             try:
                 product_type = nautilus_pyo3.bybit_product_type_from_symbol(symbol_str)
@@ -335,6 +325,7 @@ class BybitExecutionClient(LiveExecutionClient):
             return
 
         tasks = []
+
         for symbol_str, mode in self._position_mode.items():
             try:
                 product_type = nautilus_pyo3.bybit_product_type_from_symbol(symbol_str)
@@ -560,7 +551,6 @@ class BybitExecutionClient(LiveExecutionClient):
         reports: list[PositionStatusReport] = []
 
         try:
-            # Extract instrument_id if provided
             pyo3_instrument_id = None
             if command.instrument_id:
                 pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(
@@ -679,7 +669,6 @@ class BybitExecutionClient(LiveExecutionClient):
             ts_event=self._clock.timestamp_ns(),
         )
 
-        # Convert to PyO3 types
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(order.instrument_id.value)
         pyo3_client_order_id = nautilus_pyo3.ClientOrderId(order.client_order_id.value)
         pyo3_order_side = order_side_to_pyo3(order.side)
@@ -796,7 +785,6 @@ class BybitExecutionClient(LiveExecutionClient):
             )
             return
 
-        # Convert to PyO3 types
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         pyo3_client_order_id = (
             nautilus_pyo3.ClientOrderId(command.client_order_id.value)
@@ -851,7 +839,6 @@ class BybitExecutionClient(LiveExecutionClient):
             )
             return
 
-        # Convert to PyO3 types
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         pyo3_client_order_id = (
             nautilus_pyo3.ClientOrderId(command.client_order_id.value)
@@ -888,7 +875,6 @@ class BybitExecutionClient(LiveExecutionClient):
             )
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
-        # Convert to PyO3 types
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
 
         product_type = nautilus_pyo3.bybit_product_type_from_symbol(
@@ -909,15 +895,6 @@ class BybitExecutionClient(LiveExecutionClient):
             self._log.error(f"Failed to cancel all orders for {command.instrument_id}: {e}")
 
     async def _batch_cancel_orders(self, command: BatchCancelOrders) -> None:
-        """
-        Batch cancel multiple orders.
-
-        Parameters
-        ----------
-        command : BatchCancelOrders
-            The batch cancel orders command.
-
-        """
         if not command.cancels:
             return
 
@@ -963,9 +940,6 @@ class BybitExecutionClient(LiveExecutionClient):
     # -- MESSAGE HANDLERS -------------------------------------------------------------------------
 
     def _handle_msg(self, msg: Any) -> None:
-        """
-        Handle messages from WebSocket.
-        """
         if isinstance(msg, nautilus_pyo3.BybitWebSocketError):
             self._log.error(f"WebSocket error: {msg}")
         elif isinstance(msg, nautilus_pyo3.AccountState):
@@ -983,10 +957,9 @@ class BybitExecutionClient(LiveExecutionClient):
         elif isinstance(msg, nautilus_pyo3.PositionStatusReport):
             self._handle_position_status_report_pyo3(msg)
         elif isinstance(msg, str):
-            # Raw JSON message - log for debugging
-            self._log.debug(f"Received raw message: {msg[:200]}")
+            self._log.debug(f"Received raw message: {msg}", LogColor.MAGENTA)
         else:
-            self._log.debug(f"Received unhandled message type: {type(msg)}")
+            self._log.warning(f"Received unhandled message type: {type(msg)}")
 
     def _handle_account_state(self, msg: nautilus_pyo3.AccountState) -> None:
         account_state = AccountState.from_dict(msg.to_dict())
