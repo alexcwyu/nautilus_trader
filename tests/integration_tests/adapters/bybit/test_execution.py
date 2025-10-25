@@ -145,7 +145,7 @@ async def test_generate_order_status_reports_converts_results(exec_client_builde
     http_client.request_order_status_reports.return_value = [pyo3_report]
 
     command = GenerateOrderStatusReports(
-        instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+        instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         start=None,
         end=None,
         open_only=True,
@@ -168,7 +168,7 @@ async def test_generate_order_status_reports_handles_failure(exec_client_builder
     http_client.request_order_status_reports.side_effect = Exception("boom")
 
     command = GenerateOrderStatusReports(
-        instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+        instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         start=None,
         end=None,
         open_only=False,
@@ -197,7 +197,7 @@ async def test_generate_fill_reports_converts_results(exec_client_builder, monke
     http_client.request_fill_reports.return_value = [MagicMock()]
 
     command = GenerateFillReports(
-        instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+        instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         venue_order_id=None,
         start=None,
         end=None,

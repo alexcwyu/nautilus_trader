@@ -67,7 +67,7 @@ def account_id(venue) -> AccountId:
 @pytest.fixture()
 def instrument() -> CurrencyPair:
     return CurrencyPair(
-        instrument_id=InstrumentId(Symbol("BTCUSDT"), BYBIT_VENUE),
+        instrument_id=InstrumentId(Symbol("BTCUSDT-SPOT"), BYBIT_VENUE),
         raw_symbol=Symbol("BTCUSDT"),
         base_currency=BTC,
         quote_currency=USDT,
