@@ -108,7 +108,13 @@ class BybitExecutionClient(LiveExecutionClient):
         config: BybitExecClientConfig,
         name: str | None,
     ) -> None:
-        product_types = config.product_types or (BybitProductType.SPOT,)
+        # None = all product types
+        product_types = config.product_types or (
+            BybitProductType.SPOT,
+            BybitProductType.LINEAR,
+            BybitProductType.INVERSE,
+            BybitProductType.OPTION,
+        )
 
         if set(product_types) == {BybitProductType.SPOT}:
             self._account_type = AccountType.CASH
@@ -424,12 +430,10 @@ class BybitExecutionClient(LiveExecutionClient):
         )
 
         try:
-            # FIXME: Determine product type (simplified - use first)
-            product_type = (
-                self._product_types[0] if self._product_types else BybitProductType.LINEAR
-            )
-
             pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
+            product_type = nautilus_pyo3.bybit_product_type_from_symbol(
+                command.instrument_id.symbol.value,
+            )
             pyo3_client_order_id = (
                 nautilus_pyo3.ClientOrderId(command.client_order_id.value)
                 if command.client_order_id
@@ -691,8 +695,9 @@ class BybitExecutionClient(LiveExecutionClient):
         if hasattr(order, "trigger_price") and order.trigger_price is not None:
             pyo3_trigger_price = nautilus_pyo3.Price.from_str(str(order.trigger_price))
 
-        # FIXME: Determine product type (simplified - use first)
-        product_type = self._product_types[0] if self._product_types else BybitProductType.LINEAR
+        product_type = nautilus_pyo3.bybit_product_type_from_symbol(
+            order.instrument_id.symbol.value,
+        )
 
         try:
             # Submit via WebSocket
@@ -808,8 +813,9 @@ class BybitExecutionClient(LiveExecutionClient):
         )
         pyo3_price = nautilus_pyo3.Price.from_str(str(command.price)) if command.price else None
 
-        # FIXME: Determine product type
-        product_type = self._product_types[0] if self._product_types else BybitProductType.LINEAR
+        product_type = nautilus_pyo3.bybit_product_type_from_symbol(
+            command.instrument_id.symbol.value,
+        )
 
         try:
             # Modify via WebSocket
@@ -858,8 +864,9 @@ class BybitExecutionClient(LiveExecutionClient):
             else None
         )
 
-        # FIXME: Determine product type
-        product_type = self._product_types[0] if self._product_types else BybitProductType.LINEAR
+        product_type = nautilus_pyo3.bybit_product_type_from_symbol(
+            command.instrument_id.symbol.value,
+        )
 
         try:
             # Cancel via WebSocket
@@ -884,8 +891,9 @@ class BybitExecutionClient(LiveExecutionClient):
         # Convert to PyO3 types
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
 
-        # FIXME: Determine product type
-        product_type = self._product_types[0] if self._product_types else BybitProductType.LINEAR
+        product_type = nautilus_pyo3.bybit_product_type_from_symbol(
+            command.instrument_id.symbol.value,
+        )
 
         try:
             reports = await self._http_client.cancel_all_orders(
@@ -936,8 +944,10 @@ class BybitExecutionClient(LiveExecutionClient):
             )
             venue_order_ids.append(pyo3_venue_order_id)
 
-        # FIXME: Determine product type
-        product_type = self._product_types[0] if self._product_types else BybitProductType.LINEAR
+        # Derive product type from first cancel (all must be same product type for batch operation)
+        product_type = nautilus_pyo3.bybit_product_type_from_symbol(
+            command.cancels[0].instrument_id.symbol.value,
+        )
 
         try:
             # Batch cancel via WebSocket

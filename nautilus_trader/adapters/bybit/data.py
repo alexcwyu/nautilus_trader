@@ -25,7 +25,6 @@ from nautilus_trader.common.component import LiveClock
 from nautilus_trader.common.component import MessageBus
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.core import nautilus_pyo3
-from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import ensure_pydatetime_utc
 from nautilus_trader.data.messages import RequestBars
 from nautilus_trader.data.messages import RequestQuoteTicks
@@ -89,8 +88,6 @@ class BybitDataClient(LiveMarketDataClient):
         config: BybitDataClientConfig,
         name: str | None,
     ) -> None:
-        PyCondition.not_empty(config.product_types, "config.product_types")
-        assert config.product_types is not None  # Type narrowing for mypy
         super().__init__(
             loop=loop,
             client_id=ClientId(name or BYBIT_VENUE.value),
@@ -105,7 +102,17 @@ class BybitDataClient(LiveMarketDataClient):
 
         # Configuration
         self._config = config
-        self._product_types = list(config.product_types)
+        # None = all product types
+        self._product_types = (
+            list(config.product_types)
+            if config.product_types
+            else [
+                nautilus_pyo3.BybitProductType.SPOT,
+                nautilus_pyo3.BybitProductType.LINEAR,
+                nautilus_pyo3.BybitProductType.INVERSE,
+                nautilus_pyo3.BybitProductType.OPTION,
+            ]
+        )
         self._bars_timestamp_on_close = config.bars_timestamp_on_close
 
         self._log.info(f"Product types: {[str(p) for p in self._product_types]}", LogColor.BLUE)
@@ -128,7 +135,7 @@ class BybitDataClient(LiveMarketDataClient):
             else nautilus_pyo3.BybitEnvironment.MAINNET
         )
 
-        for product_type in config.product_types:
+        for product_type in self._product_types:
             ws_client = nautilus_pyo3.BybitWebSocketClient.new_public(
                 product_type=product_type,
                 environment=environment,
