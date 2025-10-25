@@ -81,7 +81,7 @@ config_node = TradingNodeConfig(
     trader_id=TraderId("TESTER-001"),
     logging=LoggingConfig(
         log_level="INFO",
-        log_level_file="DEBUG",
+        # log_level_file="DEBUG",
         # log_file_max_size=1_000_000_000,
         use_pyo3=True,
     ),

@@ -34,6 +34,7 @@ use nautilus_bybit::{
         },
     },
 };
+use nautilus_model::identifiers::AccountId;
 use rstest::rstest;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -391,6 +392,128 @@ async fn handle_get_fee_rate(headers: axum::http::HeaderMap) -> Response {
 
     let fee_rate = load_test_data("http_get_fee_rate.json");
     Json(fee_rate).into_response()
+}
+
+#[allow(dead_code)]
+async fn handle_get_orders_realtime(
+    query: Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Check for authentication headers
+    if !headers.contains_key("X-BAPI-API-KEY")
+        || !headers.contains_key("X-BAPI-SIGN")
+        || !headers.contains_key("X-BAPI-TIMESTAMP")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    // Check required parameters
+    if !query.contains_key("category") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "retCode": 10001,
+                "retMsg": "Missing required parameter: category",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    // Check for settleCoin when no symbol is provided (for LINEAR products)
+    let category = query.get("category").map(String::as_str);
+    let has_symbol = query.contains_key("symbol");
+    let has_settle_coin = query.contains_key("settleCoin");
+
+    if category == Some("linear") && !has_symbol && !has_settle_coin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "retCode": 10001,
+                "retMsg": "Missing some parameters that must be filled in, symbol or settleCoin or baseCoin",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let orders = load_test_data("http_get_orders_realtime.json");
+    Json(orders).into_response()
+}
+
+#[allow(dead_code)]
+async fn handle_get_orders_history_reconciliation(
+    query: Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // Check for authentication headers
+    if !headers.contains_key("X-BAPI-API-KEY")
+        || !headers.contains_key("X-BAPI-SIGN")
+        || !headers.contains_key("X-BAPI-TIMESTAMP")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "retCode": 10003,
+                "retMsg": "Invalid API key",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    // Check required parameters
+    if !query.contains_key("category") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "retCode": 10001,
+                "retMsg": "Missing required parameter: category",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    // Check for settleCoin when no symbol is provided (for LINEAR products)
+    let category = query.get("category").map(String::as_str);
+    let has_symbol = query.contains_key("symbol");
+    let has_settle_coin = query.contains_key("settleCoin");
+
+    if category == Some("linear") && !has_symbol && !has_settle_coin {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "retCode": 10001,
+                "retMsg": "Missing some parameters that must be filled in, symbol or settleCoin or baseCoin",
+                "result": {},
+                "retExtInfo": {},
+                "time": 1704470400123i64
+            })),
+        )
+            .into_response();
+    }
+
+    let orders = load_test_data("http_get_orders_history_with_duplicate.json");
+    Json(orders).into_response()
 }
 
 #[allow(dead_code)]
@@ -837,4 +960,185 @@ async fn test_get_fee_rate_with_credentials() {
 
     assert_eq!(response.ret_code, 0);
     assert!(!response.result.list.is_empty());
+}
+// Create router with separate handlers for reconciliation testing
+#[allow(dead_code)]
+fn create_reconciliation_test_router(state: TestServerState) -> Router {
+    Router::new()
+        .route("/v5/market/time", get(handle_get_server_time))
+        .route("/v5/market/instruments-info", get(handle_get_instruments))
+        .route("/v5/account/fee-rate", get(handle_get_fee_rate))
+        .route("/v5/order/realtime", get(handle_get_orders_realtime))
+        .route(
+            "/v5/order/history",
+            get(handle_get_orders_history_reconciliation),
+        )
+        .with_state(state)
+}
+
+#[allow(dead_code)]
+async fn start_reconciliation_test_server()
+-> Result<(SocketAddr, TestServerState), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = TestServerState::default();
+    let router = create_reconciliation_test_router(state.clone());
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    Ok((addr, state))
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_reports_calls_both_endpoints() {
+    let (addr, _state) = start_reconciliation_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Required for parsing order reports
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None)
+        .await
+        .unwrap();
+
+    for instrument in instruments {
+        client.add_instrument(instrument);
+    }
+
+    let account_id = AccountId::from("BYBIT-UNIFIED");
+
+    // Should call BOTH /v5/order/realtime and /v5/order/history
+    let reports = client
+        .request_order_status_reports(
+            account_id,
+            BybitProductType::Linear,
+            None,  // No specific instrument - will need settleCoin
+            false, // open_only=false triggers dual endpoint call
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Should get 3 unique orders:
+    // - 2 from realtime (open-order-1, open-order-2)
+    // - 1 from history (closed-order-1)
+    // - open-order-1 appears in both but should be deduplicated
+    let order_ids: Vec<String> = reports
+        .iter()
+        .map(|r| r.venue_order_id.to_string())
+        .collect();
+
+    assert_eq!(
+        reports.len(),
+        3,
+        "Should have 3 unique orders after deduplication"
+    );
+    assert!(order_ids.contains(&"open-order-1".to_string()));
+    assert!(order_ids.contains(&"open-order-2".to_string()));
+    assert!(order_ids.contains(&"closed-order-1".to_string()));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_request_order_status_reports_requires_settle_coin_for_linear() {
+    let (addr, _state) = start_reconciliation_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None)
+        .await
+        .unwrap();
+    for instrument in instruments {
+        client.add_instrument(instrument);
+    }
+
+    let account_id = AccountId::from("BYBIT-UNIFIED");
+
+    // Should succeed because implementation adds settleCoin=USDT automatically
+    let result = client
+        .request_order_status_reports(
+            account_id,
+            BybitProductType::Linear,
+            None, // No symbol - requires settleCoin
+            true, // open_only=true
+            None,
+        )
+        .await;
+
+    assert!(result.is_ok(), "Should succeed with automatic settleCoin");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_order_deduplication_by_order_id() {
+    let (addr, _state) = start_reconciliation_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::with_credentials(
+        "test_api_key".to_string(),
+        "test_api_secret".to_string(),
+        Some(base_url),
+        Some(60),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let instruments = client
+        .request_instruments(BybitProductType::Linear, None)
+        .await
+        .unwrap();
+    for instrument in instruments {
+        client.add_instrument(instrument);
+    }
+
+    let account_id = AccountId::from("BYBIT-UNIFIED");
+
+    let reports = client
+        .request_order_status_reports(
+            account_id,
+            BybitProductType::Linear,
+            None,
+            false, // This will query both endpoints
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Count occurrences of open-order-1 (should appear once despite being in both responses)
+    let open_order_1_count = reports
+        .iter()
+        .filter(|r| r.venue_order_id.to_string() == "open-order-1")
+        .count();
+
+    assert_eq!(
+        open_order_1_count, 1,
+        "open-order-1 should appear exactly once (deduplicated)"
+    );
 }

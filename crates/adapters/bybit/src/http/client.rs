@@ -1963,11 +1963,24 @@ impl BybitHttpInnerClient {
             None
         };
 
+        // Determine settle_coin based on product type
+        // For INVERSE products, don't use settle_coin
+        // For LINEAR/SPOT/OPTION, use USDT as default when no symbol is specified
+        let settle_coin = match product_type {
+            BybitProductType::Inverse => None,
+            _ if symbol_param.is_none() => Some("USDT".to_string()),
+            _ => None,
+        };
+
         let params = if open_only {
+            // When open_only=true, only query realtime endpoint
             let mut p = BybitOpenOrdersParamsBuilder::default();
             p.category(product_type);
             if let Some(symbol) = symbol_param.clone() {
                 p.symbol(symbol);
+            }
+            if let Some(coin) = settle_coin.clone() {
+                p.settle_coin(coin);
             }
             let params = p.build().map_err(|e| anyhow::anyhow!(e))?;
             let path = Self::build_path("/v5/order/realtime", &params)?;
@@ -1975,19 +1988,59 @@ impl BybitHttpInnerClient {
                 self.send_request(Method::GET, &path, None, true).await?;
             response.result.list
         } else {
-            let mut p = BybitOrderHistoryParamsBuilder::default();
-            p.category(product_type);
+            // When open_only=false, query BOTH endpoints to ensure we don't miss any orders
+            // The realtime endpoint has the most up-to-date open orders
+            // The history endpoint has recently closed orders
+            let mut all_orders = Vec::new();
+
+            // First get open orders from realtime endpoint
+            let mut open_params = BybitOpenOrdersParamsBuilder::default();
+            open_params.category(product_type);
+            if let Some(symbol) = symbol_param.clone() {
+                open_params.symbol(symbol);
+            }
+            if let Some(coin) = settle_coin.clone() {
+                open_params.settle_coin(coin);
+            }
+            let open_params = open_params.build().map_err(|e| anyhow::anyhow!(e))?;
+            let open_path = Self::build_path("/v5/order/realtime", &open_params)?;
+            let open_response: BybitOpenOrdersResponse = self
+                .send_request(Method::GET, &open_path, None, true)
+                .await?;
+            let open_orders = open_response.result.list;
+
+            // Collect order IDs from open orders for deduplication
+            let seen_order_ids: std::collections::HashSet<Ustr> =
+                open_orders.iter().map(|o| o.order_id).collect();
+
+            all_orders.extend(open_orders);
+
+            // Then get order history (which may lag for very recent orders)
+            let mut history_params = BybitOrderHistoryParamsBuilder::default();
+            history_params.category(product_type);
             if let Some(symbol) = symbol_param {
-                p.symbol(symbol);
+                history_params.symbol(symbol);
+            }
+            if let Some(coin) = settle_coin {
+                history_params.settle_coin(coin);
             }
             if let Some(limit) = limit {
-                p.limit(limit);
+                history_params.limit(limit);
             }
-            let params = p.build().map_err(|e| anyhow::anyhow!(e))?;
-            let path = Self::build_path("/v5/order/history", &params)?;
-            let response: BybitOrderHistoryResponse =
-                self.send_request(Method::GET, &path, None, true).await?;
-            response.result.list
+            let history_params = history_params.build().map_err(|e| anyhow::anyhow!(e))?;
+            let history_path = Self::build_path("/v5/order/history", &history_params)?;
+            let history_response: BybitOrderHistoryResponse = self
+                .send_request(Method::GET, &history_path, None, true)
+                .await?;
+
+            // De-duplicate by order_id (open orders might appear in both)
+            for order in history_response.result.list {
+                if !seen_order_ids.contains(&order.order_id) {
+                    all_orders.push(order);
+                }
+            }
+
+            all_orders
         };
 
         let ts_init = self.generate_ts_init();
@@ -2002,8 +2055,8 @@ impl BybitHttpInnerClient {
                     reports.push(report);
                 }
             } else {
-                // Try to get instrument from symbol
                 // Bybit returns raw symbol (e.g. "ETHUSDT"), need to add product suffix for cache lookup
+                // Note: instruments are stored in cache by symbol only (without venue)
                 if !order.symbol.is_empty() {
                     let symbol_with_product = Symbol::new(format!(
                         "{}{}",
