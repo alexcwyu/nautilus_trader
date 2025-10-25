@@ -82,6 +82,8 @@ async fn handle_get_instruments(query: Query<HashMap<String, String>>) -> impl I
     let filename = match category {
         Some("linear") => "http_get_instruments_linear.json",
         Some("spot") => "http_get_instruments_spot.json",
+        Some("inverse") => "http_get_instruments_inverse.json",
+        Some("option") => "http_get_instruments_option.json",
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -504,6 +506,57 @@ async fn test_get_instruments_linear() {
         .unwrap();
 
     let response = client.http_get_instruments_linear(&params).await.unwrap();
+    assert!(!response.result.list.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_instruments_spot() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+
+    let params = BybitInstrumentsInfoParamsBuilder::default()
+        .category(BybitProductType::Spot)
+        .build()
+        .unwrap();
+
+    let response = client.http_get_instruments_spot(&params).await.unwrap();
+    assert!(!response.result.list.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_instruments_inverse() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+
+    let params = BybitInstrumentsInfoParamsBuilder::default()
+        .category(BybitProductType::Inverse)
+        .build()
+        .unwrap();
+
+    let response = client.http_get_instruments_inverse(&params).await.unwrap();
+    assert!(!response.result.list.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_get_instruments_option() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let base_url = format!("http://{}", addr);
+
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+
+    let params = BybitInstrumentsInfoParamsBuilder::default()
+        .category(BybitProductType::Option)
+        .build()
+        .unwrap();
+
+    let response = client.http_get_instruments_option(&params).await.unwrap();
     assert!(!response.result.list.is_empty());
 }
 

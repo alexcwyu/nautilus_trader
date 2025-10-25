@@ -136,6 +136,11 @@ def mock_http_client():
     mock.request_fill_reports = AsyncMock(return_value=[])
     mock.request_position_status_reports = AsyncMock(return_value=[])
 
+    mock.submit_order = AsyncMock()
+    mock.modify_order = AsyncMock()
+    mock.cancel_order = AsyncMock()
+    mock.cancel_all_orders = AsyncMock(return_value=[])
+
     return mock
 
 
@@ -160,6 +165,10 @@ def _create_ws_mock() -> MagicMock:
     mock.subscribe_executions = AsyncMock()
     mock.subscribe_positions = AsyncMock()
     mock.subscribe_wallet = AsyncMock()
+    mock.unsubscribe_orders = AsyncMock()
+    mock.unsubscribe_executions = AsyncMock()
+    mock.unsubscribe_positions = AsyncMock()
+    mock.unsubscribe_wallet = AsyncMock()
     return mock
 
 
