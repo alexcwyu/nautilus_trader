@@ -24,10 +24,6 @@ from nautilus_trader.core.nautilus_pyo3 import BybitPositionMode
 from nautilus_trader.core.nautilus_pyo3 import BybitProductType
 
 
-# Placeholder type for config type hints - BybitSymbol not yet exposed from Rust
-BybitSymbol = str
-
-
 class BybitDataClientConfig(LiveDataClientConfig, frozen=True):
     """
     Configuration for ``BybitDataClient`` instances.
@@ -125,9 +121,9 @@ class BybitExecClientConfig(LiveExecClientConfig, frozen=True):
         The timeout for trade websocket messages.
     ws_auth_timeout_secs : PositiveFloat, default 5.0
         The timeout for auth websocket messages.
-    futures_leverages : dict[BybitSymbol, PositiveInt], optional
+    futures_leverages : dict[str, PositiveInt], optional
         The leverages for futures.
-    position_mode : dict[BybitSymbol, BybitPositionMode], optional
+    position_mode : dict[str, BybitPositionMode], optional
         The position mode for `USDT perpetual` and `Inverse futures`.
     margin_mode : BybitMarginMode, optional
         Set Margin Mode.
@@ -156,7 +152,7 @@ class BybitExecClientConfig(LiveExecClientConfig, frozen=True):
     recv_window_ms: PositiveInt = 5_000
     ws_trade_timeout_secs: PositiveFloat | None = 5.0
     ws_auth_timeout_secs: PositiveFloat | None = 5.0
-    futures_leverages: dict[BybitSymbol, PositiveInt] | None = None
-    position_mode: dict[BybitSymbol, BybitPositionMode] | None = None
+    futures_leverages: dict[str, PositiveInt] | None = None
+    position_mode: dict[str, BybitPositionMode] | None = None
     margin_mode: BybitMarginMode | None = None
     use_spot_position_reports: bool = False
