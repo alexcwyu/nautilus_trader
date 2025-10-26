@@ -47,6 +47,12 @@ class BybitDataClientConfig(LiveDataClientConfig, frozen=True):
         If the client is connecting to the Bybit testnet API.
     update_instruments_interval_mins: PositiveInt or None, default 60
         The interval (minutes) between reloading instruments from the venue.
+    max_retries : PositiveInt, optional
+        The maximum number of times an HTTP request will be retried.
+    retry_delay_initial_ms : PositiveInt, optional
+        The initial delay (milliseconds) between retries.
+    retry_delay_max_ms : PositiveInt, optional
+        The maximum delay (milliseconds) between retries.
     recv_window_ms : PositiveInt, default 5000
         The receive window (milliseconds) for Bybit HTTP requests.
     bars_timestamp_on_close : bool, default True
@@ -62,6 +68,9 @@ class BybitDataClientConfig(LiveDataClientConfig, frozen=True):
     demo: bool = False
     testnet: bool = False
     update_instruments_interval_mins: PositiveInt | None = 60
+    max_retries: PositiveInt | None = None
+    retry_delay_initial_ms: PositiveInt | None = None
+    retry_delay_max_ms: PositiveInt | None = None
     recv_window_ms: PositiveInt = 5_000
     bars_timestamp_on_close: bool = True
 

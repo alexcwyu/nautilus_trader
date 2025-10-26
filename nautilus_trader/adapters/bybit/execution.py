@@ -700,16 +700,19 @@ class BybitExecutionClient(LiveExecutionClient):
                 time_in_force=pyo3_time_in_force,
                 price=pyo3_price,
                 trigger_price=pyo3_trigger_price,
+                post_only=order.is_post_only,
                 reduce_only=order.is_reduce_only,
             )
         except Exception as e:
             self._log.error(f"Failed to submit order {order.client_order_id}: {e}")
+            error_msg = str(e)
             self.generate_order_rejected(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
                 client_order_id=order.client_order_id,
-                reason=str(e),
+                reason=error_msg,
                 ts_event=self._clock.timestamp_ns(),
+                due_post_only="EC_PostOnlyWillTakeLiquidity" in error_msg,
             )
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
@@ -1003,7 +1006,13 @@ class BybitExecutionClient(LiveExecutionClient):
             report.linked_order_ids = list(order.linked_order_ids)
 
         if report.order_status == OrderStatus.REJECTED:
-            pass  # Handled by submit_order
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=report.instrument_id,
+                client_order_id=report.client_order_id,
+                reason=report.cancel_reason or "Order rejected by exchange",
+                ts_event=report.ts_last,
+            )
         elif report.order_status == OrderStatus.ACCEPTED:
             if is_order_updated(order, report):
                 self.generate_order_updated(
@@ -1036,11 +1045,11 @@ class BybitExecutionClient(LiveExecutionClient):
                     f"order status {order.status_string()}",
                 )
         elif report.order_status == OrderStatus.CANCELED:
-            # Check if this is a post-only order that was canceled (BitMEX specific behavior)
-            # BitMEX cancels post-only orders instead of rejecting them when they would cross the spread
-            # The specific message is "Order had execInst of ParticipateDoNotInitiate"
+            # Check if this is a post-only order rejected by the exchange
+            # Bybit accepts post-only orders initially then immediately cancels them with
+            # rejectReason="EC_PostOnlyWillTakeLiquidity" if they would cross the spread
             is_post_only_rejection = (
-                report.cancel_reason and "ParticipateDoNotInitiate" in report.cancel_reason
+                report.cancel_reason and "EC_PostOnlyWillTakeLiquidity" in report.cancel_reason
             )
 
             if is_post_only_rejection:
@@ -1096,6 +1105,12 @@ class BybitExecutionClient(LiveExecutionClient):
 
         instrument = self._cache.instrument(order.instrument_id)
         if instrument is None:
+            if self._ignore_uncached_instrument_executions:
+                self._log.warning(
+                    f"Ignoring fill report for uncached instrument {order.instrument_id}",
+                    LogColor.YELLOW,
+                )
+                return
             self._log.error(
                 f"Cannot process fill report - instrument {order.instrument_id} not found",
             )
@@ -1119,8 +1134,10 @@ class BybitExecutionClient(LiveExecutionClient):
         )
 
     def _handle_position_status_report_pyo3(self, msg: nautilus_pyo3.PositionStatusReport) -> None:
-        _report = PositionStatusReport.from_pyo3(msg)
-        self._log.debug(f"Received {_report}", LogColor.MAGENTA)
+        report = PositionStatusReport.from_pyo3(msg)
+        self._log.debug(f"Received {report}", LogColor.MAGENTA)
+        # Do not send position reports from WebSocket stream - we use HTTP endpoint for reconciliation
+        # to avoid noise from position updates every time a fill occurs
 
     def _is_external_order(self, client_order_id: ClientOrderId) -> bool:
         return not client_order_id or not self._cache.strategy_id_for_order(client_order_id)

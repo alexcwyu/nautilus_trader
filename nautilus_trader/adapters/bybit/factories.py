@@ -38,6 +38,11 @@ def get_cached_bybit_http_client(
     api_secret: str | None = None,
     base_url: str | None = None,
     testnet: bool = False,
+    timeout_secs: int | None = None,
+    max_retries: int | None = None,
+    retry_delay_ms: int | None = None,
+    retry_delay_max_ms: int | None = None,
+    recv_window_ms: int | None = None,
 ) -> nautilus_pyo3.BybitHttpClient:
     """
     Cache and return a Bybit HTTP client with the given key and secret.
@@ -58,6 +63,16 @@ def get_cached_bybit_http_client(
         The base URL for the API endpoints.
     testnet : bool, default False
         If the client is connecting to the testnet API.
+    timeout_secs : int, optional
+        The timeout for HTTP requests in seconds.
+    max_retries : int, optional
+        The maximum number of retry attempts for failed requests.
+    retry_delay_ms : int, optional
+        The initial delay (milliseconds) between retries.
+    retry_delay_max_ms : int, optional
+        The maximum delay (milliseconds) between retries.
+    recv_window_ms : int, optional
+        The receive window (milliseconds) for Bybit HTTP requests.
 
     Returns
     -------
@@ -77,6 +92,11 @@ def get_cached_bybit_http_client(
         api_secret=api_secret,
         base_url=base_url,
         testnet=testnet,
+        timeout_secs=timeout_secs,
+        max_retries=max_retries,
+        retry_delay_ms=retry_delay_ms,
+        retry_delay_max_ms=retry_delay_max_ms,
+        recv_window_ms=recv_window_ms,
     )
 
 
@@ -155,6 +175,11 @@ class BybitLiveDataClientFactory(LiveDataClientFactory):
             api_secret=config.api_secret,
             base_url=config.base_url_http,
             testnet=config.testnet,
+            timeout_secs=None,  # Use Rust default (60s)
+            max_retries=config.max_retries,
+            retry_delay_ms=config.retry_delay_initial_ms,
+            retry_delay_max_ms=config.retry_delay_max_ms,
+            recv_window_ms=config.recv_window_ms,
         )
         provider = get_cached_bybit_instrument_provider(
             client=client,
@@ -217,6 +242,11 @@ class BybitLiveExecClientFactory(LiveExecClientFactory):
             api_secret=config.api_secret,
             base_url=config.base_url_http,
             testnet=config.testnet,
+            timeout_secs=None,  # Use Rust default (60s)
+            max_retries=config.max_retries,
+            retry_delay_ms=config.retry_delay_initial_ms,
+            retry_delay_max_ms=config.retry_delay_max_ms,
+            recv_window_ms=config.recv_window_ms,
         )
         provider = get_cached_bybit_instrument_provider(
             client=client,

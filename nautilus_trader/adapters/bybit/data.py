@@ -144,6 +144,9 @@ class BybitDataClient(LiveMarketDataClient):
             self._ws_clients[product_type] = ws_client
 
         self._depths: dict[nautilus_pyo3.InstrumentId, int] = {}
+        self._ticker_subscriptions: dict[nautilus_pyo3.InstrumentId, set[str]] = (
+            {}
+        )  # Reference counting for ticker channel
         self._ws_client_futures: set[asyncio.Future] = set()
 
     @property
@@ -245,7 +248,12 @@ class BybitDataClient(LiveMarketDataClient):
     async def _subscribe_quote_ticks(self, command: SubscribeQuoteTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         ws_client = self._get_ws_client_for_instrument(pyo3_instrument_id)
-        await ws_client.subscribe_ticker(pyo3_instrument_id)
+
+        # Reference counting: only subscribe if first user of ticker channel
+        if pyo3_instrument_id not in self._ticker_subscriptions:
+            self._ticker_subscriptions[pyo3_instrument_id] = set()
+            await ws_client.subscribe_ticker(pyo3_instrument_id)
+        self._ticker_subscriptions[pyo3_instrument_id].add("quotes")
 
     async def _subscribe_trade_ticks(self, command: SubscribeTradeTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
@@ -265,7 +273,12 @@ class BybitDataClient(LiveMarketDataClient):
         # Funding rate data comes through ticker subscriptions for perpetual instruments
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         ws_client = self._get_ws_client_for_instrument(pyo3_instrument_id)
-        await ws_client.subscribe_ticker(pyo3_instrument_id)
+
+        # Reference counting: only subscribe if first user of ticker channel
+        if pyo3_instrument_id not in self._ticker_subscriptions:
+            self._ticker_subscriptions[pyo3_instrument_id] = set()
+            await ws_client.subscribe_ticker(pyo3_instrument_id)
+        self._ticker_subscriptions[pyo3_instrument_id].add("funding")
 
     async def _unsubscribe_order_book_deltas(self, command: UnsubscribeOrderBook) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
@@ -285,7 +298,13 @@ class BybitDataClient(LiveMarketDataClient):
     async def _unsubscribe_quote_ticks(self, command: UnsubscribeQuoteTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         ws_client = self._get_ws_client_for_instrument(pyo3_instrument_id)
-        await ws_client.unsubscribe_ticker(pyo3_instrument_id)
+
+        # Reference counting: only unsubscribe if last user of ticker channel
+        if pyo3_instrument_id in self._ticker_subscriptions:
+            self._ticker_subscriptions[pyo3_instrument_id].discard("quotes")
+            if not self._ticker_subscriptions[pyo3_instrument_id]:
+                await ws_client.unsubscribe_ticker(pyo3_instrument_id)
+                del self._ticker_subscriptions[pyo3_instrument_id]
 
     async def _unsubscribe_trade_ticks(self, command: UnsubscribeTradeTicks) -> None:
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
@@ -305,7 +324,13 @@ class BybitDataClient(LiveMarketDataClient):
         # Unsubscribe from ticker which includes funding rate updates
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
         ws_client = self._get_ws_client_for_instrument(pyo3_instrument_id)
-        await ws_client.unsubscribe_ticker(pyo3_instrument_id)
+
+        # Reference counting: only unsubscribe if last user of ticker channel
+        if pyo3_instrument_id in self._ticker_subscriptions:
+            self._ticker_subscriptions[pyo3_instrument_id].discard("funding")
+            if not self._ticker_subscriptions[pyo3_instrument_id]:
+                await ws_client.unsubscribe_ticker(pyo3_instrument_id)
+                del self._ticker_subscriptions[pyo3_instrument_id]
 
     def _handle_msg(self, raw: object) -> None:
         try:

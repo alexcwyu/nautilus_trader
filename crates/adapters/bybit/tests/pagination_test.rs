@@ -211,7 +211,7 @@ async fn test_bars_chronological_order_single_page() {
     let (addr, _state) = start_pagination_test_server().await.unwrap();
     let base_url = format!("http://{}", addr);
 
-    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None, None).unwrap();
     init_instrument_cache(&client).await;
 
     let instrument_id = InstrumentId::new(Symbol::from("ETHUSDT-LINEAR"), Venue::from("BYBIT"));
@@ -259,7 +259,7 @@ async fn test_bars_chronological_order_multiple_pages() {
     let (addr, _state) = start_pagination_test_server().await.unwrap();
     let base_url = format!("http://{}", addr);
 
-    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None, None).unwrap();
     init_instrument_cache(&client).await;
 
     let instrument_id = InstrumentId::new(Symbol::from("ETHUSDT-LINEAR"), Venue::from("BYBIT"));
@@ -310,7 +310,7 @@ async fn test_bars_limit_returns_most_recent() {
     let (addr, _state) = start_pagination_test_server().await.unwrap();
     let base_url = format!("http://{}", addr);
 
-    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None).unwrap();
+    let client = BybitHttpClient::new(Some(base_url), Some(60), None, None, None, None).unwrap();
     init_instrument_cache(&client).await;
 
     let instrument_id = InstrumentId::new(Symbol::from("ETHUSDT-LINEAR"), Venue::from("BYBIT"));

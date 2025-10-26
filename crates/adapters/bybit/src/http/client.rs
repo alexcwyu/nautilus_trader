@@ -82,9 +82,10 @@ use crate::{
         },
         models::BybitResponse,
         parse::{
-            parse_account_state, parse_fill_report, parse_inverse_instrument, parse_kline_bar,
-            parse_linear_instrument, parse_option_instrument, parse_order_status_report,
-            parse_position_status_report, parse_spot_instrument, parse_trade_tick,
+            make_bybit_symbol, parse_account_state, parse_fill_report, parse_inverse_instrument,
+            parse_kline_bar, parse_linear_instrument, parse_option_instrument,
+            parse_order_status_report, parse_position_status_report, parse_spot_instrument,
+            parse_trade_tick,
         },
         symbol::BybitSymbol,
         urls::bybit_http_base_url,
@@ -118,7 +119,7 @@ pub struct BybitHttpInnerClient {
 
 impl Default for BybitHttpInnerClient {
     fn default() -> Self {
-        Self::new(None, Some(60), None, None, None)
+        Self::new(None, Some(60), None, None, None, None)
             .expect("Failed to create default BybitHttpInnerClient")
     }
 }
@@ -156,6 +157,7 @@ impl BybitHttpInnerClient {
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        recv_window_ms: Option<u64>,
     ) -> Result<Self, BybitHttpError> {
         let retry_config = RetryConfig {
             max_retries: max_retries.unwrap_or(3),
@@ -183,7 +185,7 @@ impl BybitHttpInnerClient {
                 timeout_secs,
             ),
             credential: None,
-            recv_window_ms: DEFAULT_RECV_WINDOW_MS,
+            recv_window_ms: recv_window_ms.unwrap_or(DEFAULT_RECV_WINDOW_MS),
             retry_manager,
             cancellation_token: CancellationToken::new(),
             instruments_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -205,6 +207,7 @@ impl BybitHttpInnerClient {
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        recv_window_ms: Option<u64>,
     ) -> Result<Self, BybitHttpError> {
         let retry_config = RetryConfig {
             max_retries: max_retries.unwrap_or(3),
@@ -232,7 +235,7 @@ impl BybitHttpInnerClient {
                 timeout_secs,
             ),
             credential: Some(Credential::new(api_key, api_secret)),
-            recv_window_ms: DEFAULT_RECV_WINDOW_MS,
+            recv_window_ms: recv_window_ms.unwrap_or(DEFAULT_RECV_WINDOW_MS),
             retry_manager,
             cancellation_token: CancellationToken::new(),
             instruments_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -2058,11 +2061,8 @@ impl BybitHttpInnerClient {
                 // Bybit returns raw symbol (e.g. "ETHUSDT"), need to add product suffix for cache lookup
                 // Note: instruments are stored in cache by symbol only (without venue)
                 if !order.symbol.is_empty() {
-                    let symbol_with_product = Symbol::new(format!(
-                        "{}{}",
-                        order.symbol.as_str(),
-                        product_type.suffix()
-                    ));
+                    let symbol_with_product =
+                        Symbol::from_ustr_unchecked(make_bybit_symbol(order.symbol, product_type));
                     if let Ok(instrument) = self.instrument_from_cache(&symbol_with_product)
                         && let Ok(report) =
                             parse_order_status_report(&order, &instrument, account_id, ts_init)
@@ -2125,12 +2125,8 @@ impl BybitHttpInnerClient {
         for execution in response.result.list {
             // Get instrument for this execution
             // Bybit returns raw symbol (e.g. "ETHUSDT"), need to add product suffix for cache lookup
-            // TODO: Extract this to a helper
-            let symbol_with_product = Symbol::new(format!(
-                "{}{}",
-                execution.symbol.as_str(),
-                product_type.suffix()
-            ));
+            let symbol_with_product =
+                Symbol::from_ustr_unchecked(make_bybit_symbol(execution.symbol, product_type));
             let instrument = self.instrument_from_cache(&symbol_with_product)?;
 
             if let Ok(report) = parse_fill_report(&execution, account_id, &instrument, ts_init) {
@@ -2279,7 +2275,7 @@ pub struct BybitHttpClient {
 
 impl Default for BybitHttpClient {
     fn default() -> Self {
-        Self::new(None, Some(60), None, None, None)
+        Self::new(None, Some(60), None, None, None, None)
             .expect("Failed to create default BybitHttpClient")
     }
 }
@@ -2305,6 +2301,7 @@ impl BybitHttpClient {
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        recv_window_ms: Option<u64>,
     ) -> Result<Self, BybitHttpError> {
         Ok(Self {
             inner: Arc::new(BybitHttpInnerClient::new(
@@ -2313,6 +2310,7 @@ impl BybitHttpClient {
                 max_retries,
                 retry_delay_ms,
                 retry_delay_max_ms,
+                recv_window_ms,
             )?),
         })
     }
@@ -2331,6 +2329,7 @@ impl BybitHttpClient {
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
+        recv_window_ms: Option<u64>,
     ) -> Result<Self, BybitHttpError> {
         Ok(Self {
             inner: Arc::new(BybitHttpInnerClient::with_credentials(
@@ -2341,6 +2340,7 @@ impl BybitHttpClient {
                 max_retries,
                 retry_delay_ms,
                 retry_delay_max_ms,
+                recv_window_ms,
             )?),
         })
     }
@@ -3080,7 +3080,7 @@ mod tests {
 
     #[rstest]
     fn test_client_creation() {
-        let client = BybitHttpClient::new(None, Some(60), None, None, None);
+        let client = BybitHttpClient::new(None, Some(60), None, None, None, None);
         assert!(client.is_ok());
 
         let client = client.unwrap();
@@ -3095,6 +3095,7 @@ mod tests {
             "test_secret".to_string(),
             Some("https://api-testnet.bybit.com".to_string()),
             Some(60),
+            None,
             None,
             None,
             None,

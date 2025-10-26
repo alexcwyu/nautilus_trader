@@ -1556,8 +1556,8 @@ impl BybitWebSocketClient {
         match msg {
             BybitWebSocketMessage::Orderbook(msg) => {
                 let raw_symbol = msg.data.s;
-                let symbol = product_type
-                    .map_or(raw_symbol, |pt| make_bybit_symbol(raw_symbol.as_str(), pt));
+                let symbol =
+                    product_type.map_or(raw_symbol, |pt| make_bybit_symbol(raw_symbol, pt));
 
                 if let Some(instrument_entry) = instruments
                     .iter()
@@ -1578,8 +1578,8 @@ impl BybitWebSocketClient {
                 let mut data_vec = Vec::new();
                 for trade in &msg.data {
                     let raw_symbol = trade.s;
-                    let symbol = product_type
-                        .map_or(raw_symbol, |pt| make_bybit_symbol(raw_symbol.as_str(), pt));
+                    let symbol =
+                        product_type.map_or(raw_symbol, |pt| make_bybit_symbol(raw_symbol, pt));
 
                     if let Some(instrument_entry) = instruments
                         .iter()
@@ -1602,8 +1602,8 @@ impl BybitWebSocketClient {
             }
             BybitWebSocketMessage::TickerLinear(msg) => {
                 let raw_symbol = msg.data.symbol;
-                let symbol = product_type
-                    .map_or(raw_symbol, |pt| make_bybit_symbol(raw_symbol.as_str(), pt));
+                let symbol =
+                    product_type.map_or(raw_symbol, |pt| make_bybit_symbol(raw_symbol, pt));
 
                 if let Some(instrument_entry) = instruments
                     .iter()
@@ -1764,7 +1764,7 @@ impl BybitWebSocketClient {
                     let mut reports = Vec::new();
                     for order in &msg.data {
                         let raw_symbol = order.symbol;
-                        let symbol = make_bybit_symbol(raw_symbol.as_str(), order.category);
+                        let symbol = make_bybit_symbol(raw_symbol, order.category);
 
                         if let Some(instrument_entry) = instruments
                             .iter()
@@ -1795,7 +1795,7 @@ impl BybitWebSocketClient {
                     let mut reports = Vec::new();
                     for execution in &msg.data {
                         let raw_symbol = execution.symbol;
-                        let symbol = make_bybit_symbol(raw_symbol.as_str(), execution.category);
+                        let symbol = make_bybit_symbol(raw_symbol, execution.category);
 
                         if let Some(instrument_entry) = instruments
                             .iter()
@@ -1870,8 +1870,33 @@ impl BybitWebSocketClient {
                 if resp.ret_code == 0 {
                     tracing::debug!(op = %resp.op, ret_msg = %resp.ret_msg, "Order operation successful");
                 } else {
-                    tracing::warn!(op = %resp.op, ret_code = resp.ret_code, ret_msg = %resp.ret_msg, "Order operation failed");
-                    // TODO: Parse order response into OrderRejected/OrderCancelRejected/OrderModifyRejected
+                    // Create structured error with operation context
+                    // Note: Full rejection events (OrderRejected/OrderCancelRejected/OrderModifyRejected)
+                    // require trader_id and strategy_id which are not available in WebSocket context.
+                    // The Python layer should handle these responses and create appropriate events.
+                    let operation_type = if resp.op.contains("create") {
+                        "order submission"
+                    } else if resp.op.contains("cancel") {
+                        "order cancellation"
+                    } else if resp.op.contains("amend") {
+                        "order modification"
+                    } else {
+                        "order operation"
+                    };
+
+                    tracing::warn!(
+                        op = %resp.op,
+                        ret_code = resp.ret_code,
+                        ret_msg = %resp.ret_msg,
+                        "Order operation failed: {} rejected", operation_type
+                    );
+
+                    let error_msg = format!(
+                        "Bybit {} failed: {} (code: {})",
+                        operation_type, resp.ret_msg, resp.ret_code
+                    );
+                    let error = BybitWebSocketError::new(resp.ret_code, error_msg);
+                    result.push(NautilusWsMessage::Error(error));
                 }
             }
             BybitWebSocketMessage::Error(err) => {
