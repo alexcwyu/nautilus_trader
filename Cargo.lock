@@ -5227,7 +5227,10 @@ version = "0.52.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
+<<<<<<< HEAD
  "arc-swap",
+=======
+>>>>>>> 9d88512ca (Add Rust ExecutionClient structure for dYdX v4 adapter)
  "async-trait",
  "axum",
  "bip32",
@@ -5249,6 +5252,7 @@ dependencies = [
  "prost-types",
  "pyo3",
  "pyo3-async-runtimes",
+ "rand 0.9.2",
  "reqwest",
  "rstest",
  "rust_decimal",
