@@ -2696,7 +2696,6 @@ cdef class Actor(Component):
             If `callback` is not `None` and not of type `Callable`.
 
         """
-        # TODO: Default start value assignment based on requested type of data
         Condition.is_true(self.trader_id is not None, "The actor has not been registered")
         Condition.not_none(client_id, "client_id")
         Condition.not_none(data_type, "data_type")
@@ -3837,7 +3836,6 @@ cdef class Actor(Component):
 
         # Update indicators
         cdef list indicators = self._indicators_for_quotes.get(tick.instrument_id)
-
         if indicators:
             self._handle_indicators_for_quote(indicators, tick)
 
@@ -3849,6 +3847,11 @@ cdef class Actor(Component):
             except Exception as e:
                 self.log.exception(f"Error on handling {repr(tick)}", e)
                 raise
+
+    cpdef void _handle_indicators_for_quote(self, list indicators, QuoteTick tick):
+        cdef Indicator indicator
+        for indicator in indicators:
+            indicator.handle_quote_tick(tick)
 
     cpdef void handle_historical_trade_tick(self, TradeTick tick):
         self.handle_trade_tick(tick, True)
@@ -3873,7 +3876,6 @@ cdef class Actor(Component):
 
         # Update indicators
         cdef list indicators = self._indicators_for_trades.get(tick.instrument_id)
-
         if indicators:
             self._handle_indicators_for_trade(indicators, tick)
 
@@ -3885,6 +3887,11 @@ cdef class Actor(Component):
             except Exception as e:
                 self.log.exception(f"Error on handling {repr(tick)}", e)
                 raise
+
+    cpdef void _handle_indicators_for_trade(self, list indicators, TradeTick tick):
+        cdef Indicator indicator
+        for indicator in indicators:
+            indicator.handle_trade_tick(tick)
 
     cpdef void handle_mark_price(self, MarkPriceUpdate mark_price):
         """
@@ -3984,7 +3991,6 @@ cdef class Actor(Component):
 
         # Update indicators
         cdef list indicators = self._indicators_for_bars.get(bar.bar_type)
-
         if indicators:
             self._handle_indicators_for_bar(indicators, bar)
 
@@ -3996,6 +4002,11 @@ cdef class Actor(Component):
             except Exception as e:
                 self.log.exception(f"Error on handling {repr(bar)}", e)
                 raise
+
+    cpdef void _handle_indicators_for_bar(self, list indicators, Bar bar):
+        cdef Indicator indicator
+        for indicator in indicators:
+            indicator.handle_bar(bar)
 
     cpdef void handle_instrument_status(self, InstrumentStatus data):
         """
@@ -4045,6 +4056,19 @@ cdef class Actor(Component):
                 self.on_instrument_close(update)
             except Exception as e:
                 self._log.exception(f"Error on handling {repr(update)}", e)
+                raise
+
+    cpdef void _handle_order_filled(self, OrderFilled event):
+        if str(event.strategy_id) == str(self.id):
+            # This represents a strategies automatic subscription to it's own
+            # order events, so we don't need to pass this event to the handler twice
+            return
+
+        if self._fsm.state == ComponentState.RUNNING:
+            try:
+                self.on_order_filled(event)
+            except Exception as e:
+                self._log.exception(f"Error on handling {repr(event)}", e)
                 raise
 
     cpdef void handle_data(self, Data data):
@@ -4182,6 +4206,14 @@ cdef class Actor(Component):
                 handler=self.handle_historical_quote_tick,
             )
 
+        cdef int length = response.params.get("data_count", 0)
+        cdef InstrumentId instrument_id = request.instrument_id
+
+        if length > 0:
+            self._log.info(f"Received <QuoteTick[{length}]> data for {instrument_id}")
+        else:
+            self._log.warning(f"Received <QuoteTick[]> data with no ticks for {instrument_id}")
+
         self._finish_response(response.correlation_id)
 
     cpdef void _handle_trade_ticks_response(self, DataResponse response):
@@ -4191,6 +4223,14 @@ cdef class Actor(Component):
                 topic=self._topic_cache.get_trades_topic(request.instrument_id, historical=True),
                 handler=self.handle_historical_trade_tick,
             )
+
+        cdef int length = response.params.get("data_count", 0)
+        cdef InstrumentId instrument_id = request.instrument_id
+
+        if length > 0:
+            self._log.info(f"Received <TradeTick[{length}]> data for {instrument_id}")
+        else:
+            self._log.warning(f"Received <TradeTick[]> data with no ticks for {instrument_id}")
 
         self._finish_response(response.correlation_id)
 
@@ -4202,6 +4242,14 @@ cdef class Actor(Component):
                 handler=self.handle_historical_order_book_depth,
             )
 
+        cdef int length = response.params.get("data_count", 0)
+        cdef InstrumentId instrument_id = request.instrument_id
+
+        if length > 0:
+            self._log.info(f"Received <OrderBookDepth10[{length}]> data for {instrument_id}")
+        else:
+            self._log.warning(f"Received <OrderBookDepth10[]> data with no ticks for {instrument_id}")
+
         self._finish_response(response.correlation_id)
 
     cpdef void _handle_bars_response(self, DataResponse response):
@@ -4212,77 +4260,59 @@ cdef class Actor(Component):
                 handler=self.handle_historical_bar,
             )
 
+        cdef int length = response.params.get("data_count", 0)
+        cdef BarType bar_type = request.bar_type
+
+        if length > 0:
+            self._log.info(f"Received <Bar[{length}]> data for {bar_type}")
+        else:
+            self._log.warning(f"Received <Bar[]> data with no bar for {bar_type}")
+
         self._finish_response(response.correlation_id)
 
     cpdef void _handle_aggregated_bars_response(self, DataResponse response):
-        # Unsubscribe from topics if include_external_data was True
-        include_external_data = response.params.get("include_external_data", False)
-        bar_types = response.params.get("bar_types", ())
-        first_bar_type = bar_types[0] if bar_types else None
+        # Can be useful to keep subscriptions in place for example for later requesting order books that convert to quotes
+        keep_subscriptions = response.params.get("keep_subscriptions", False)
 
-        # Unsubscribe from all requested bar types (historical topics)
-        if first_bar_type is not None:
+        if not keep_subscriptions:
+            # Unsubscribe from all aggregated bar types (historical topics)
+            bar_types = response.params.get("bar_types", ())
             for bar_type in bar_types:
                 self._msgbus.unsubscribe(
                     topic=self._topic_cache.get_bars_topic(bar_type.standard(), historical=True),
                     handler=self.handle_historical_bar,
                 )
 
-        if include_external_data:
             # Unsubscribe from underlying data topic based on first bar type (historical topics)
-            if first_bar_type.is_composite():
-                # Unsubscribe from composite bar topic
-                self._msgbus.unsubscribe(
-                    topic=self._topic_cache.get_bars_topic(first_bar_type.composite().standard(), historical=True),
-                    handler=self.handle_historical_bar,
-                )
-            elif first_bar_type.spec.price_type == PriceType.LAST:
-                # Unsubscribe from trade ticks topic
-                self._msgbus.unsubscribe(
-                    topic=self._topic_cache.get_trades_topic(first_bar_type.instrument_id, historical=True),
-                    handler=self.handle_historical_trade_tick,
-                )
-            else:
-                # Unsubscribe from quote ticks topic
-                self._msgbus.unsubscribe(
-                    topic=self._topic_cache.get_quotes_topic(first_bar_type.instrument_id, historical=True),
-                    handler=self.handle_historical_quote_tick,
-                )
+            include_external_data = response.params.get("include_external_data", False)
+            first_bar_type = bar_types[0] if bar_types else None
+
+            if include_external_data and first_bar_type is not None:
+                if first_bar_type.is_composite():
+                    # Unsubscribe from composite bar topic
+                    self._msgbus.unsubscribe(
+                        topic=self._topic_cache.get_bars_topic(first_bar_type.composite().standard(), historical=True),
+                        handler=self.handle_historical_bar,
+                    )
+                elif first_bar_type.spec.price_type == PriceType.LAST:
+                    # Unsubscribe from trade ticks topic
+                    self._msgbus.unsubscribe(
+                        topic=self._topic_cache.get_trades_topic(first_bar_type.instrument_id, historical=True),
+                        handler=self.handle_historical_trade_tick,
+                    )
+                else:
+                    # Unsubscribe from quote ticks topic
+                    self._msgbus.unsubscribe(
+                        topic=self._topic_cache.get_quotes_topic(first_bar_type.instrument_id, historical=True),
+                        handler=self.handle_historical_quote_tick,
+                    )
 
         self._finish_response(response.correlation_id)
-
-    cpdef void _handle_order_filled(self, OrderFilled event):
-        if str(event.strategy_id) == str(self.id):
-            # This represents a strategies automatic subscription to it's own
-            # order events, so we don't need to pass this event to the handler twice
-            return
-
-        if self._fsm.state == ComponentState.RUNNING:
-            try:
-                self.on_order_filled(event)
-            except Exception as e:
-                self._log.exception(f"Error on handling {repr(event)}", e)
-                raise
 
     cpdef void _finish_response(self, UUID4 request_id):
         callback: Callable | None = self._pending_requests.pop(request_id, None)
         if callback is not None:
             callback(request_id)
-
-    cpdef void _handle_indicators_for_quote(self, list indicators, QuoteTick tick):
-        cdef Indicator indicator
-        for indicator in indicators:
-            indicator.handle_quote_tick(tick)
-
-    cpdef void _handle_indicators_for_trade(self, list indicators, TradeTick tick):
-        cdef Indicator indicator
-        for indicator in indicators:
-            indicator.handle_trade_tick(tick)
-
-    cpdef void _handle_indicators_for_bar(self, list indicators, Bar bar):
-        cdef Indicator indicator
-        for indicator in indicators:
-            indicator.handle_bar(bar)
 
 # -- EGRESS ---------------------------------------------------------------------------------------
 
