@@ -5227,10 +5227,7 @@ version = "0.52.0"
 dependencies = [
  "ahash 0.8.12",
  "anyhow",
-<<<<<<< HEAD
  "arc-swap",
-=======
->>>>>>> 9d88512ca (Add Rust ExecutionClient structure for dYdX v4 adapter)
  "async-trait",
  "axum",
  "bip32",

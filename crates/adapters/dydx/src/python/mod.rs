@@ -17,6 +17,7 @@
 
 pub mod enums;
 pub mod http;
+// TODO: Add websocket module with DydxWebSocketClient Python bindings
 
 use pyo3::prelude::*;
 
@@ -29,5 +30,6 @@ use pyo3::prelude::*;
 pub fn dydx(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__package__", "nautilus_trader.core.nautilus_pyo3.dydx")?;
     m.add_class::<crate::http::client::DydxHttpClient>()?;
+    // TODO: Add DydxWebSocketClient when Python bindings are implemented
     Ok(())
 }
