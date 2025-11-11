@@ -13,24 +13,16 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::ops::Deref;
-
 use alloy_primitives::{Address, I256, U160, U256};
 
-use crate::{
-    defi::{
-        Pool, PoolSwap, SharedChain, SharedDex, SharedPool,
-        data::{
-            block::BlockPosition,
-            swap::RawSwapData,
-            swap_trade_info::{SwapTradeInfo, SwapTradeInfoCalculator},
-        },
-        tick_map::{
-            full_math::FullMath, sqrt_price_math::decode_sqrt_price_x96_to_price_tokens_adjusted,
-            tick::CrossedTick,
-        },
+use crate::defi::{
+    Pool, PoolSwap, SharedChain, SharedDex, SharedPool,
+    data::{
+        block::BlockPosition,
+        swap::RawSwapData,
+        swap_trade_info::{SwapTradeInfo, SwapTradeInfoCalculator},
     },
-    types::Price,
+    tick_map::{full_math::FullMath, tick::CrossedTick},
 };
 
 /// Comprehensive swap quote containing profiling metrics for a hypothetical swap.
@@ -52,8 +44,6 @@ pub struct SwapQuote {
     pub amount1: I256,
     /// Square root price before the swap (Q96 format).
     pub sqrt_price_before_x96: U160,
-    /// Native spot price(token decimals adjusted) before the swap.
-    pub spot_price_before: Price,
     /// Square root price after the swap (Q96 format).
     pub sqrt_price_after_x96: U160,
     /// Tick position before the swap.
@@ -71,16 +61,16 @@ pub struct SwapQuote {
     /// List of tick boundaries crossed during the swap, in order of crossing.
     pub crossed_ticks: Vec<CrossedTick>,
     /// Computed swap trade information in market-oriented format.
-    pub trade_info: SwapTradeInfo,
+    pub trade_info: Option<SwapTradeInfo>,
 }
 
 impl SwapQuote {
     #[allow(clippy::too_many_arguments)]
     /// Creates a [`SwapQuote`] instance with comprehensive swap simulation results.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if trade info computation or price calculations fail.
+    /// The `trade_info` field is initialized to `None` and must be populated by calling
+    /// [`calculate_trade_info()`](Self::calculate_trade_info) or will be lazily computed
+    /// when accessing price impact or slippage methods.
     pub fn new(
         pool: SharedPool,
         amount0: I256,
@@ -94,26 +84,12 @@ impl SwapQuote {
         lp_fee: U256,
         protocol_fee: U256,
         crossed_ticks: Vec<CrossedTick>,
-    ) -> anyhow::Result<Self> {
-        let trade_info_calculator = SwapTradeInfoCalculator::new(
-            &pool.token0,
-            &pool.token1,
-            RawSwapData::new(amount0, amount1, sqrt_price_after_x96),
-        );
-        let trade_info = trade_info_calculator.compute()?;
-        let is_inverted = trade_info_calculator.is_inverted;
-        let spot_price_before = decode_sqrt_price_x96_to_price_tokens_adjusted(
-            sqrt_price_before_x96,
-            pool.token0.decimals,
-            pool.token1.decimals,
-            is_inverted,
-        )?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             pool,
             amount0,
             amount1,
             sqrt_price_before_x96,
-            spot_price_before,
             sqrt_price_after_x96,
             tick_before,
             tick_after,
@@ -122,8 +98,37 @@ impl SwapQuote {
             lp_fee,
             protocol_fee,
             crossed_ticks,
-            trade_info,
-        })
+            trade_info: None,
+        }
+    }
+
+    fn check_if_trade_info_initialized(&mut self) -> anyhow::Result<&SwapTradeInfo> {
+        if self.trade_info.is_none() {
+            self.calculate_trade_info()?;
+        }
+
+        Ok(self.trade_info.as_ref().unwrap())
+    }
+
+    /// Calculates and populates the `trade_info` field with market-oriented trade data.
+    ///
+    /// This method transforms the raw swap quote data (token0/token1 amounts, sqrt prices)
+    /// into standard trading terminology (base/quote, order side, execution price).
+    /// The computation uses the `sqrt_price_before_x96` to calculate price impact and slippage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if trade info computation or price calculations fail.
+    pub fn calculate_trade_info(&mut self) -> anyhow::Result<()> {
+        let trade_info_calculator = SwapTradeInfoCalculator::new(
+            &self.pool.token0,
+            &self.pool.token1,
+            RawSwapData::new(self.amount0, self.amount1, self.sqrt_price_after_x96),
+        );
+        let trade_info = trade_info_calculator.compute(Some(self.sqrt_price_before_x96))?;
+        self.trade_info = Some(trade_info);
+
+        Ok(())
     }
 
     /// Determines swap direction from amount signs.
@@ -191,13 +196,11 @@ impl SwapQuote {
     ///
     /// # Errors
     /// Returns error if price calculations fail
-    pub fn get_price_impact_bps(&self) -> anyhow::Result<u32> {
-        let spot_after = self.trade_info.spot_price;
-        let price_change = spot_after - self.spot_price_before;
-        let price_impact =
-            (price_change.as_f64() / self.spot_price_before.as_f64()).abs() * 10_000.0;
-
-        Ok(price_impact.round() as u32)
+    pub fn get_price_impact_bps(&mut self) -> anyhow::Result<u32> {
+        match self.check_if_trade_info_initialized() {
+            Ok(trade_info) => trade_info.get_price_impact_bps(),
+            Err(e) => anyhow::bail!("Failed to calculate price impact: {}", e),
+        }
     }
 
     /// Calculates slippage in basis points (requires token references for decimal adjustment).
@@ -211,18 +214,17 @@ impl SwapQuote {
     ///
     /// # Errors
     /// Returns error if price calculations fail
-    pub fn get_slippage_bps(&self) -> anyhow::Result<u32> {
-        let execution_price = self.trade_info.execution_price;
-        let price_change = execution_price - self.spot_price_before;
-        let slippage = (price_change.as_f64() / self.spot_price_before.as_f64()).abs() * 10_000.0;
-
-        Ok(slippage.round() as u32)
+    pub fn get_slippage_bps(&mut self) -> anyhow::Result<u32> {
+        match self.check_if_trade_info_initialized() {
+            Ok(trade_info) => trade_info.get_slippage_bps(),
+            Err(e) => anyhow::bail!("Failed to calculate slippage: {}", e),
+        }
     }
 
     /// # Errors
     ///
     /// Returns an error if the actual slippage exceeds the maximum slippage tolerance.
-    pub fn validate_slippage_tolerance(&self, max_slippage_bps: u32) -> anyhow::Result<()> {
+    pub fn validate_slippage_tolerance(&mut self, max_slippage_bps: u32) -> anyhow::Result<()> {
         let actual_slippage = self.get_slippage_bps()?;
         if actual_slippage > max_slippage_bps {
             anyhow::bail!(
@@ -286,14 +288,6 @@ impl SwapQuote {
     }
 }
 
-impl Deref for SwapQuote {
-    type Target = SwapTradeInfo;
-
-    fn deref(&self) -> &Self::Target {
-        &self.trade_info
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -310,8 +304,8 @@ mod tests {
         let amount0 = I256::from_str("287175356684998201516914").unwrap();
         let amount1 = I256::from_str("-270157537808188649").unwrap();
 
-        let swap_quote = SwapQuote::new(
-            rain_pool.clone(),
+        let mut swap_quote = SwapQuote::new(
+            rain_pool,
             amount0,
             amount1,
             sqrt_x96_price_before,
@@ -323,46 +317,40 @@ mod tests {
             U256::ZERO,
             U256::ZERO,
             vec![],
-        )
-        .unwrap();
-        // Check calculated spot price before from previous SQRT X96 price
-        assert_eq!(
-            swap_quote.spot_price_before,
-            decode_sqrt_price_x96_to_price_tokens_adjusted(
-                sqrt_x96_price_before,
-                rain_pool.token0.decimals,
-                rain_pool.token1.decimals,
-                false
-            )
-            .unwrap()
         );
-        assert_eq!(swap_quote.order_side, OrderSide::Sell);
-        assert_eq!(swap_quote.get_input_amount(), amount0.unsigned_abs());
-        assert_eq!(swap_quote.get_output_amount(), amount1.unsigned_abs());
-        // Check with DexScreener to get their trade data calculations
-        assert_eq!(swap_quote.quantity_base.as_f64(), 287175.3566849982);
-        assert_eq!(swap_quote.quantity_quote.as_f64(), 0.2701575378081886);
-        assert_eq!(swap_quote.spot_price.as_f64(), 0.0000009399386483);
-        // Check if expected price impatct bps is matching
-        let expected_price_impact_bps = ((swap_quote.spot_price.as_f64()
-            - swap_quote.spot_price_before.as_f64())
-            / swap_quote.spot_price_before.as_f64())
-        .abs()
-            * 10000.0;
-        assert_eq!(
-            swap_quote.get_price_impact_bps().unwrap(),
-            expected_price_impact_bps.round() as u32
-        );
-        // Check if expected slippage is matching
-        let expected_slippage_bps = ((swap_quote.execution_price.as_f64()
-            - swap_quote.spot_price_before.as_f64())
-            / swap_quote.spot_price_before.as_f64())
-        .abs()
-            * 10000.0;
-        assert_eq!(
-            swap_quote.get_slippage_bps().unwrap(),
-            expected_slippage_bps.round() as u32
-        );
+        swap_quote.calculate_trade_info().unwrap();
+
+        if let Some(swap_trade_info) = &swap_quote.trade_info {
+            assert_eq!(swap_trade_info.order_side, OrderSide::Sell);
+            assert_eq!(swap_quote.get_input_amount(), amount0.unsigned_abs());
+            assert_eq!(swap_quote.get_output_amount(), amount1.unsigned_abs());
+            // Check with DexScreener to get their trade data calculations
+            assert_eq!(swap_trade_info.quantity_base.as_f64(), 287175.3566849982);
+            assert_eq!(swap_trade_info.quantity_quote.as_f64(), 0.2701575378081886);
+            assert_eq!(swap_trade_info.spot_price.as_f64(), 0.0000009399386483);
+            // Check if expected price impatct bps is matching
+            let expected_price_impact_bps = ((swap_trade_info.spot_price.as_f64()
+                - swap_trade_info.spot_price_before.unwrap().as_f64())
+                / swap_trade_info.spot_price_before.unwrap().as_f64())
+            .abs()
+                * 10000.0;
+            assert_eq!(
+                swap_trade_info.get_price_impact_bps().unwrap(),
+                expected_price_impact_bps.round() as u32
+            );
+            // Check if expected slippage is matching
+            let expected_slippage_bps = ((swap_trade_info.execution_price.as_f64()
+                - swap_trade_info.spot_price_before.unwrap().as_f64())
+                / swap_trade_info.spot_price_before.unwrap().as_f64())
+            .abs()
+                * 10000.0;
+            assert_eq!(
+                swap_trade_info.get_slippage_bps().unwrap(),
+                expected_slippage_bps.round() as u32
+            );
+        } else {
+            panic!("Trade info is None");
+        }
     }
 
     #[rstest]
@@ -372,8 +360,8 @@ mod tests {
         let amount0 = I256::from_str("-117180628248242869089291").unwrap();
         let amount1 = I256::from_str("110241020399788696").unwrap();
 
-        let swap_quote = SwapQuote::new(
-            rain_pool.clone(),
+        let mut swap_quote = SwapQuote::new(
+            rain_pool,
             amount0,
             amount1,
             sqrt_x96_price_before,
@@ -385,46 +373,40 @@ mod tests {
             U256::ZERO,
             U256::ZERO,
             vec![],
-        )
-        .unwrap();
-        // Check calculated spot price before from previous SQRT X96 price
-        assert_eq!(
-            swap_quote.spot_price_before,
-            decode_sqrt_price_x96_to_price_tokens_adjusted(
-                sqrt_x96_price_before,
-                rain_pool.token0.decimals,
-                rain_pool.token1.decimals,
-                false
-            )
-            .unwrap()
         );
-        assert_eq!(swap_quote.order_side, OrderSide::Buy);
-        assert_eq!(swap_quote.get_input_amount(), amount1.unsigned_abs());
-        assert_eq!(swap_quote.get_output_amount(), amount0.unsigned_abs());
-        // Check with DexScreener to get their trade data calculations
-        assert_eq!(swap_quote.quantity_base.as_f64(), 117180.62824824287);
-        assert_eq!(swap_quote.quantity_quote.as_f64(), 0.1102410203997886);
-        assert_eq!(swap_quote.spot_price.as_f64(), 0.000000941050309);
-        assert_eq!(swap_quote.execution_price.as_f64(), 0.0000009407785403);
-        // Check if expected price impact bps is matching
-        let expected_price_impact_bps = ((swap_quote.spot_price.as_f64()
-            - swap_quote.spot_price_before.as_f64())
-            / swap_quote.spot_price_before.as_f64())
-        .abs()
-            * 10000.0;
-        assert_eq!(
-            swap_quote.get_price_impact_bps().unwrap(),
-            expected_price_impact_bps.round() as u32
-        );
-        // Check if expected slippage is matching
-        let expected_slippage_bps = ((swap_quote.execution_price.as_f64()
-            - swap_quote.spot_price_before.as_f64())
-            / swap_quote.spot_price_before.as_f64())
-        .abs()
-            * 10000.0;
-        assert_eq!(
-            swap_quote.get_slippage_bps().unwrap(),
-            expected_slippage_bps.round() as u32
-        );
+        swap_quote.calculate_trade_info().unwrap();
+
+        if let Some(swap_trade_info) = &swap_quote.trade_info {
+            assert_eq!(swap_trade_info.order_side, OrderSide::Buy);
+            assert_eq!(swap_quote.get_input_amount(), amount1.unsigned_abs());
+            assert_eq!(swap_quote.get_output_amount(), amount0.unsigned_abs());
+            // Check with DexScreener to get their trade data calculations
+            assert_eq!(swap_trade_info.quantity_base.as_f64(), 117180.62824824287);
+            assert_eq!(swap_trade_info.quantity_quote.as_f64(), 0.1102410203997886);
+            assert_eq!(swap_trade_info.spot_price.as_f64(), 0.000000941050309);
+            assert_eq!(swap_trade_info.execution_price.as_f64(), 0.0000009407785403);
+            // Check if expected price impact bps is matching
+            let expected_price_impact_bps = ((swap_trade_info.spot_price.as_f64()
+                - swap_trade_info.spot_price_before.unwrap().as_f64())
+                / swap_trade_info.spot_price_before.unwrap().as_f64())
+            .abs()
+                * 10000.0;
+            assert_eq!(
+                swap_trade_info.get_price_impact_bps().unwrap(),
+                expected_price_impact_bps.round() as u32
+            );
+            // Check if expected slippage is matching
+            let expected_slippage_bps = ((swap_trade_info.execution_price.as_f64()
+                - swap_trade_info.spot_price_before.unwrap().as_f64())
+                / swap_trade_info.spot_price_before.unwrap().as_f64())
+            .abs()
+                * 10000.0;
+            assert_eq!(
+                swap_trade_info.get_slippage_bps().unwrap(),
+                expected_slippage_bps.round() as u32
+            );
+        } else {
+            panic!("Trade info is None");
+        }
     }
 }
