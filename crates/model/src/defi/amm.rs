@@ -300,7 +300,7 @@ mod tests {
         // We expect WETH to be a base and USDT a quote token
         assert_eq!(pool.get_base_token().symbol, "WETH");
         assert_eq!(pool.get_quote_token().symbol, "USDT");
-        assert_eq!(pool.is_base_quote_inverted(), false);
+        assert!(!pool.is_base_quote_inverted());
         assert_eq!(
             pool.to_full_spec_string(),
             "WETH/USDT-3000.Ethereum:UniswapV3"

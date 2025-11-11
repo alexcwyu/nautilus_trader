@@ -16,9 +16,12 @@
 use std::sync::Arc;
 
 use alloy_primitives::address;
+use nautilus_core::UnixNanos;
 use rstest::fixture;
 
-use crate::defi::{AmmType, Chain, Dex, DexType, SharedChain, SharedDex, Token};
+use crate::defi::{
+    AmmType, Chain, Dex, DexType, Pool, SharedChain, SharedDex, SharedPool, SharedToken, Token,
+};
 
 #[fixture]
 pub fn arbitrum() -> SharedChain {
@@ -44,23 +47,56 @@ pub fn uniswap_v3() -> SharedDex {
 }
 
 #[fixture]
-pub fn weth(arbitrum: SharedChain) -> Token {
-    Token::new(
+pub fn weth(arbitrum: SharedChain) -> SharedToken {
+    Arc::new(Token::new(
         arbitrum,
         address!("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"),
         "Wrapped Ether".to_string(),
         "WETH".to_string(),
         18,
-    )
+    ))
 }
 
 #[fixture]
-pub fn usdc(arbitrum: SharedChain) -> Token {
-    Token::new(
+pub fn usdc(arbitrum: SharedChain) -> SharedToken {
+    Arc::new(Token::new(
         arbitrum,
         address!("0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"),
         "USD Coin".to_string(),
         "USDC".to_string(),
         6, // USDC.e on Arbitrum has 6 decimals
-    )
+    ))
+}
+
+#[fixture]
+pub fn rain_token(arbitrum: SharedChain) -> SharedToken {
+    Arc::new(Token::new(
+        arbitrum,
+        address!("0x25118290e6A5f4139381D072181157035864099d"),
+        "RAIN".to_string(),
+        "RAIN".to_string(),
+        18,
+    ))
+}
+
+#[fixture]
+pub fn rain_pool(
+    arbitrum: SharedChain,
+    uniswap_v3: SharedDex,
+    rain_token: SharedToken,
+    weth: SharedToken,
+) -> SharedPool {
+    let pool = Pool::new(
+        arbitrum,
+        uniswap_v3,
+        address!("0xd13040d4fe917EE704158CfCB3338dCd2838B245"),
+        0,
+        rain_token,
+        weth,
+        Some(100),
+        Some(1),
+        UnixNanos::default(),
+    );
+
+    Arc::new(pool)
 }

@@ -155,13 +155,12 @@ mod tests {
     use crate::defi::{chain::chains, stubs::weth};
 
     #[rstest]
-    fn test_token_constructor(weth: Token) {
-        let token = weth;
-        assert_eq!(token.chain.chain_id, chains::ARBITRUM.chain_id);
-        assert_eq!(token.name, "Wrapped Ether");
-        assert_eq!(token.symbol, "WETH");
-        assert_eq!(token.decimals, 18);
-        assert!(token.is_native_currency());
+    fn test_token_constructor(weth: SharedToken) {
+        assert_eq!(weth.chain.chain_id, chains::ARBITRUM.chain_id);
+        assert_eq!(weth.name, "Wrapped Ether");
+        assert_eq!(weth.symbol, "WETH");
+        assert_eq!(weth.decimals, 18);
+        assert!(weth.is_native_currency());
     }
 
     #[rstest]
