@@ -5623,6 +5623,7 @@ dependencies = [
  "nautilus-core",
  "nautilus-cryptography",
  "nautilus-databento",
+ "nautilus-dydx",
  "nautilus-execution",
  "nautilus-hyperliquid",
  "nautilus-indicators",
