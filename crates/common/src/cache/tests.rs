@@ -805,8 +805,8 @@ fn test_pool() -> Pool {
             .parse()
             .unwrap(),
         12345678,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(3000),
         Some(60),
         UnixNanos::from(1_234_567_890_000_000_000u64),

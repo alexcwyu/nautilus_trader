@@ -57,6 +57,11 @@ use nautilus_data::{client::DataClientAdapter, engine::DataEngine};
 #[cfg(feature = "defi")]
 use nautilus_model::defi::{AmmType, Dex, DexType, chain::chains};
 #[cfg(feature = "defi")]
+use nautilus_model::defi::{
+    Block, Blockchain, DefiData, Pool, PoolLiquidityUpdate, PoolLiquidityUpdateType, PoolProfiler,
+    PoolSwap, Token, data::PoolFeeCollect, data::PoolFlash,
+};
+#[cfg(feature = "defi")]
 use nautilus_model::identifiers::InstrumentId;
 use nautilus_model::{
     data::{
@@ -68,15 +73,6 @@ use nautilus_model::{
     identifiers::{ClientId, TraderId, Venue},
     instruments::{CurrencyPair, Instrument, InstrumentAny, stubs::audusd_sim},
     types::Price,
-};
-#[cfg(feature = "defi")]
-use nautilus_model::{
-    defi::{
-        Block, Blockchain, DefiData, Pool, PoolLiquidityUpdate, PoolLiquidityUpdateType,
-        PoolProfiler, PoolSwap, Token, data::PoolFeeCollect, data::PoolFlash,
-    },
-    enums::OrderSide,
-    types::Quantity,
 };
 use rstest::*;
 
@@ -1921,6 +1917,7 @@ fn test_process_pool_swap(data_engine: Rc<RefCell<DataEngine>>, data_client: Dat
         "Burn",
         "Collect",
     ));
+
     let token0 = Token::new(
         chain.clone(),
         Address::from([0x11; 20]),
@@ -1940,8 +1937,8 @@ fn test_process_pool_swap(data_engine: Rc<RefCell<DataEngine>>, data_client: Dat
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -1976,9 +1973,6 @@ fn test_process_pool_swap(data_engine: Rc<RefCell<DataEngine>>, data_client: Dat
         U160::from(59000000000000u128),
         1000000,
         100,
-        Some(OrderSide::Buy),
-        Some(Quantity::from("1000")),
-        Some(Price::from("500")),
     );
 
     let sub = DefiSubscribeCommand::PoolSwaps(SubscribePoolSwaps {
@@ -2300,8 +2294,8 @@ fn test_process_pool_liquidity_update(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -2405,8 +2399,8 @@ fn test_process_pool_fee_collect(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -2504,8 +2498,8 @@ fn test_process_pool_flash(data_engine: Rc<RefCell<DataEngine>>, data_client: Da
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -2610,8 +2604,8 @@ fn test_pool_updater_processes_swap_updates_profiler(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -2708,9 +2702,6 @@ fn test_pool_updater_processes_swap_updates_profiler(
         new_price,
         1000u128,
         0i32,
-        Some(OrderSide::Buy),
-        Some(Quantity::from("1000")),
-        Some(Price::from("500")),
     );
 
     let mut data_engine = data_engine.borrow_mut();
@@ -2791,8 +2782,8 @@ fn test_pool_updater_processes_mint_updates_profiler(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -2910,8 +2901,8 @@ fn test_pool_updater_processes_burn_updates_profiler(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -3052,8 +3043,8 @@ fn test_pool_updater_processes_collect_updates_profiler(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -3160,8 +3151,8 @@ fn test_pool_updater_processes_flash_updates_profiler(
         dex.clone(),
         Address::from([0x12; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),
@@ -3382,8 +3373,8 @@ fn test_setup_pool_updater_skips_snapshot_when_pool_in_cache(
         dex,
         Address::from([0x88; 20]),
         0u64,
-        token0,
-        token1,
+        Arc::new(token0),
+        Arc::new(token1),
         Some(500u32),
         Some(10u32),
         UnixNanos::from(1),

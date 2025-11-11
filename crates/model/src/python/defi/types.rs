@@ -318,8 +318,8 @@ impl Pool {
             Arc::new(dex),
             address,
             creation_block,
-            token0,
-            token1,
+            Arc::new(token0),
+            Arc::new(token1),
             fee,
             tick_spacing,
             ts_init.into(),
@@ -382,13 +382,13 @@ impl Pool {
     #[getter]
     #[pyo3(name = "token0")]
     fn py_token0(&self) -> Token {
-        self.token0.clone()
+        self.token0.as_ref().clone()
     }
 
     #[getter]
     #[pyo3(name = "token1")]
     fn py_token1(&self) -> Token {
-        self.token1.clone()
+        self.token1.as_ref().clone()
     }
 
     #[getter]

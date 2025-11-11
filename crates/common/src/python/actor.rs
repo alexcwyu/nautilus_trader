@@ -2316,8 +2316,8 @@ mod tests {
                 .parse()
                 .unwrap(),
             12345,
-            token0,
-            token1,
+            Arc::new(token0),
+            Arc::new(token1),
             Some(500),
             Some(10),
             UnixNanos::default(),
@@ -2344,9 +2344,6 @@ mod tests {
             U160::from(59000000000000u128),
             1000000,
             100,
-            Some(nautilus_model::enums::OrderSide::Buy),
-            Some(Quantity::from("1000")),
-            Some(Price::from("1.0")),
         );
 
         assert!(rust_actor.on_pool_swap(&swap).is_ok());
