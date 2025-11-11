@@ -27,7 +27,8 @@ use std::{
 use alloy::primitives::Address;
 use nautilus_core::UnixNanos;
 use nautilus_model::defi::{
-    Block, DexType, Pool, PoolLiquidityUpdate, PoolSwap, SharedChain, SharedDex, SharedPool, Token,
+    Block, DexType, Pool, PoolLiquidityUpdate, PoolSwap, SharedChain, SharedDex, SharedPool,
+    SharedToken, Token,
     data::{PoolFeeCollect, PoolFlash},
     pool_analysis::{position::PoolPosition, snapshot::PoolSnapshot},
     tick_map::tick::PoolTick,
@@ -55,7 +56,7 @@ pub struct BlockchainCache {
     /// Map of DEX identifiers to their corresponding DEX objects.
     dexes: HashMap<DexType, SharedDex>,
     /// Map of token addresses to their corresponding `Token` objects.
-    tokens: HashMap<Address, Token>,
+    tokens: HashMap<Address, SharedToken>,
     /// Cached set of invalid token addresses that failed validation or processing.
     invalid_tokens: HashSet<Address>,
     /// Map of pool addresses to their corresponding `Pool` objects.
@@ -197,8 +198,11 @@ impl BlockchainCache {
                 invalid_tokens.len()
             );
 
-            self.tokens
-                .extend(tokens.into_iter().map(|token| (token.address, token)));
+            self.tokens.extend(
+                tokens
+                    .into_iter()
+                    .map(|token| (token.address, Arc::new(token))),
+            );
             self.invalid_tokens.extend(invalid_tokens);
         }
         Ok(())
@@ -429,7 +433,7 @@ impl BlockchainCache {
         if let Some(database) = &self.database {
             database.add_token(&token).await?;
         }
-        self.tokens.insert(token.address, token);
+        self.tokens.insert(token.address, Arc::new(token));
         Ok(())
     }
 
@@ -449,15 +453,18 @@ impl BlockchainCache {
                 .await?;
         }
 
-        self.tokens
-            .extend(tokens.into_iter().map(|token| (token.address, token)));
+        self.tokens.extend(
+            tokens
+                .into_iter()
+                .map(|token| (token.address, Arc::new(token))),
+        );
 
         Ok(())
     }
 
     /// Updates the in-memory token cache without persisting to the database.
     pub fn insert_token_in_memory(&mut self, token: Token) {
-        self.tokens.insert(token.address, token);
+        self.tokens.insert(token.address, Arc::new(token));
     }
 
     /// Marks a token address as invalid in the in-memory cache without persisting to the database.
@@ -711,7 +718,7 @@ impl BlockchainCache {
 
     /// Returns a reference to the `Token` associated with the given address.
     #[must_use]
-    pub fn get_token(&self, address: &Address) -> Option<&Token> {
+    pub fn get_token(&self, address: &Address) -> Option<&SharedToken> {
         self.tokens.get(address)
     }
 
