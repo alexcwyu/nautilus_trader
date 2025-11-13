@@ -1,0 +1,50 @@
+[workspace] # Explicitly excluded from workspace
+
+[package]
+name = "nautilus-dydx-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.0"
+authors = ["Nautech Systems <info@nautechsystems.io>"]
+license = "AGPL-3.0-only"
+readme = "README.md"
+description = "AGPL-3.0-only licensed execution bridge for dYdX v4 (links against AGPL protobuf code)"
+publish = false # Do not publish to crates.io
+
+[features]
+default = []
+
+[dependencies]
+# Nautilus dependencies (LGPL - compatible with AGPL)
+nautilus-common = { path = "../../common" }
+nautilus-core = { path = "../../core" }
+nautilus-dydx = { path = "../dydx" }
+nautilus-model = { path = "../../model" }
+nautilus-serialization = { path = "../../serialization", features = ["capnp"] }
+
+anyhow = "1.0"
+bip39 = "2.2"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+cosmos-sdk-proto = "0.27"
+cosmrs = { version = "0.22", features = ["cosmwasm", "rpc"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+prost = "0.13"
+prost-types = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "signal"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tonic = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# dYdX v4 protobuf definitions (AGPL-3.0)
+# This is why the bridge exists - linking to AGPL code requires AGPL licensing
+dydx-proto = { version = "0.4.0", features = ["grpc-transport"] }
+
+[[bin]]
+name = "nautilus-dydx-bridge"
+path = "bin/nautilus-dydx-bridge.rs"
