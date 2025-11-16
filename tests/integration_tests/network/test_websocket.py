@@ -16,7 +16,7 @@
 import asyncio
 import sys
 
-import msgspec
+import orjson
 import pytest
 from aiohttp.test_utils import TestServer
 
@@ -76,7 +76,7 @@ async def test_client_send_recv_json(websocket_server):
     # Act
     num_messages = 3
     for _ in range(num_messages):
-        await client.send(msgspec.json.encode({"method": "SUBSCRIBE"}))
+        await client.send(orjson.dumps({"method": "SUBSCRIBE"}))
     await asyncio.sleep(0.3)
     await client.disconnect()
 

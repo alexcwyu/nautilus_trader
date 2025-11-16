@@ -15,7 +15,7 @@
 
 from typing import Any
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
@@ -52,8 +52,7 @@ class BinanceHttpEndpoint:
         self.url_path = url_path
         self._ratelimiter_key = f"binance:{url_path}"
 
-        self.decoder = msgspec.json.Decoder()
-        self.encoder = msgspec.json.Encoder(enc_hook=enc_hook)
+        # decoder removed - using orjson
 
         self._method_request = {
             BinanceSecurityType.NONE: self.client.send_request,
@@ -70,7 +69,7 @@ class BinanceHttpEndpoint:
         params: Any,
         ratelimiter_keys: list[str] | None = None,
     ) -> bytes:
-        payload: dict = self.decoder.decode(self.encoder.encode(params))
+        payload: dict = orjson.loads(orjson.dumps(params))
         if self.methods_desc[method_type] is None:
             raise RuntimeError(
                 f"{method_type.name} not available for {self.url_path}",

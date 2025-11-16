@@ -55,7 +55,7 @@ from nautilus_trader.trading.config import StrategyConfig
 
 
 # %%
-class Strat_mre_config(StrategyConfig, frozen=True):
+class Strat_mre_config(StrategyConfig):
     tradable_instrument_id: str | None = "NQZ5.CME"
 
 

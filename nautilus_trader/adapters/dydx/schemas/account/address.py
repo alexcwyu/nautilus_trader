@@ -18,9 +18,8 @@ Define the schemas for the GetAddress endpoint.
 
 
 import datetime
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.dydx.common.constants import CURRENCY_MAP
 from nautilus_trader.adapters.dydx.common.enums import DYDXEnumParser
@@ -37,7 +36,8 @@ from nautilus_trader.model.objects import Money
 from nautilus_trader.model.objects import Quantity
 
 
-class DYDXPerpetualPosition(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXPerpetualPosition:
     """
     Define the perpetual position.
     """
@@ -131,7 +131,8 @@ class DYDXPerpetualPosition(msgspec.Struct, forbid_unknown_fields=False):
         )
 
 
-class DYDXAssetPosition(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXAssetPosition:
     """
     Define the asset position.
     """
@@ -143,7 +144,8 @@ class DYDXAssetPosition(msgspec.Struct, forbid_unknown_fields=False):
     subaccountNumber: int
 
 
-class DYDXSubaccount(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXSubaccount:
     """
     Define the schema for the subaccount response.
     """
@@ -159,7 +161,8 @@ class DYDXSubaccount(msgspec.Struct, forbid_unknown_fields=False):
     latestProcessedBlockHeight: str | None = None
 
 
-class DYDXSubaccountResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXSubaccountResponse:
     """
     Define the address response message.
     """
@@ -167,7 +170,8 @@ class DYDXSubaccountResponse(msgspec.Struct, forbid_unknown_fields=False):
     subaccount: DYDXSubaccount
 
 
-class DYDXAddressResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXAddressResponse:
     """
     Define the address response message.
     """

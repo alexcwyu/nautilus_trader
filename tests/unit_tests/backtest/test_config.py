@@ -16,7 +16,7 @@
 import pickle
 import sys
 
-import msgspec
+import orjson
 import pandas as pd
 
 # Third-party
@@ -194,7 +194,7 @@ class TestBacktestConfig:
         assert raw
 
     def test_backtest_config_to_json(self):
-        assert msgspec.json.encode(self.backtest_config)
+        assert orjson.dumps(self.backtest_config)
 
 
 class TestBacktestConfigParsing:
@@ -219,7 +219,7 @@ class TestBacktestConfigParsing:
                 ),
             ],
         )
-        msgspec.json.encode(run_config)
+        orjson.dumps(run_config)
 
     @pytest.mark.skipif(sys.platform == "win32", reason="redundant to also test Windows")
     def test_run_config_parse_obj(self) -> None:
@@ -235,7 +235,7 @@ class TestBacktestConfigParsing:
                 ),
             ],
         )
-        raw = msgspec.json.encode(run_config)
+        raw = orjson.dumps(run_config)
         config = BacktestRunConfig.parse(raw)
         assert isinstance(config, BacktestRunConfig)
         node = BacktestNode(configs=[config])
@@ -258,8 +258,8 @@ class TestBacktestConfigParsing:
                 ),
             ],
         )
-        json = msgspec.json.encode(run_config)
-        result = len(msgspec.json.encode(json))
+        json = orjson.dumps(run_config)
+        result = len(orjson.dumps(json))
         assert result > 0
 
     @pytest.mark.skipif(sys.platform == "win32", reason="redundant to also test Windows")
@@ -279,9 +279,9 @@ class TestBacktestConfigParsing:
                 ),
             ],
         )
-        json = msgspec.json.encode(run_config, enc_hook=msgspec_encoding_hook)
-        obj = msgspec.json.decode(json, type=BacktestRunConfig, dec_hook=msgspec_decoding_hook)
-        assert len(msgspec.json.encode(json)) > 0 and obj
+        json = orjson.dumps(run_config, enc_hook=msgspec_encoding_hook)
+        obj = orjson.loads(json, type=BacktestRunConfig, dec_hook=msgspec_decoding_hook)
+        assert len(orjson.dumps(json)) > 0 and obj
 
     @pytest.mark.skipif(sys.platform == "win32", reason="redundant to also test Windows")
     def test_backtest_run_config_id(self) -> None:
@@ -355,7 +355,7 @@ class TestBacktestConfigParsing:
         from nautilus_trader.backtest.__main__ import main
 
         runner = CliRunner()
-        raw = msgspec.json.encode(
+        raw = orjson.dumps(
             [
                 BacktestRunConfig(
                     engine=BacktestEngineConfig(),

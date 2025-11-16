@@ -16,6 +16,8 @@
 import inspect
 from typing import Any
 
+from pydantic import field_validator
+
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.config import ActorConfig
 from nautilus_trader.core.data import Data
@@ -27,12 +29,22 @@ from nautilus_trader.model.events import OrderFilled
 from nautilus_trader.model.instruments import Instrument
 
 
-class MockActorConfig(ActorConfig, frozen=True):
+class MockActorConfig(ActorConfig):
     """
     Provides a mock actor config for testing.
     """
 
-    component_id: str = "ACTOR-001"
+    component_id: str | None = "ACTOR-001"
+
+    @field_validator("component_id", mode="before")
+    @classmethod
+    def _validate_component_id(cls, v: Any) -> str | None:
+        if v is None or isinstance(v, str):
+            return v
+        # Convert ComponentId to str for the mock
+        if hasattr(v, "value"):
+            return v.value
+        return str(v)
 
 
 class MockActor(Actor):

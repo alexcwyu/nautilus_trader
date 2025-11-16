@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.schemas.account import BinanceOrder
@@ -29,7 +28,8 @@ from nautilus_trader.model.objects import Money
 ################################################################################
 
 
-class BinanceSpotBalanceInfo(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotBalanceInfo:
     """
     HTTP response 'inner struct' from Binance Spot/Margin GET /api/v3/account (HMAC
     SHA256).
@@ -51,7 +51,8 @@ class BinanceSpotBalanceInfo(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceSpotAccountInfo(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotAccountInfo:
     """
     HTTP response from Binance Spot/Margin GET /api/v3/account (HMAC SHA256).
     """
@@ -72,7 +73,8 @@ class BinanceSpotAccountInfo(msgspec.Struct, frozen=True):
         return [balance.parse_to_account_balance() for balance in self.balances]
 
 
-class BinanceSpotOrderOco(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotOrderOco:
     """
     HTTP response from Binance Spot/Margin GET /api/v3/orderList (HMAC SHA256).
 

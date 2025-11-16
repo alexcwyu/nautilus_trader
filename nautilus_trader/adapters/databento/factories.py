@@ -117,7 +117,7 @@ class DatabentoLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: DatabentoDataClientConfig,

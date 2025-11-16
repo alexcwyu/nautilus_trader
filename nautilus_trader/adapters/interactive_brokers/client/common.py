@@ -18,12 +18,11 @@ import functools
 from abc import ABC
 from abc import abstractmethod
 from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Annotated
 from typing import Any
 from typing import NamedTuple
 
-import msgspec
 from ibapi.client import EClient
 from ibapi.commission_report import CommissionReport
 from ibapi.common import BarData
@@ -51,12 +50,13 @@ class IBPosition(NamedTuple):
     avg_cost: float
 
 
-class Request(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class Request:
     """
     Container for Data request details.
     """
 
-    req_id: Annotated[int, msgspec.Meta(gt=0)]
+    req_id: int
     name: str | tuple
     handle: Callable
     cancel: Callable
@@ -67,12 +67,13 @@ class Request(msgspec.Struct, frozen=True):
         return hash((self.req_id, self.name))
 
 
-class Subscription(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class Subscription:
     """
     Container for Subscription details.
     """
 
-    req_id: Annotated[int, msgspec.Meta(gt=0)]
+    req_id: int
     name: str | tuple
     handle: functools.partial | Callable
     cancel: Callable
@@ -544,7 +545,8 @@ class BaseMixin:
     ]
 
 
-class IBKRBookLevel(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class IBKRBookLevel:
     """
     Single price level in the order book.
 

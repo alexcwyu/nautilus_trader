@@ -76,7 +76,7 @@ class Last10BarsStatsSerializable(Data):
     volume_total: float = 0.0
 
 
-class DemoStrategyConfig(StrategyConfig, frozen=True):
+class DemoStrategyConfig(StrategyConfig):
     instrument: Instrument
     bar_type: BarType
 

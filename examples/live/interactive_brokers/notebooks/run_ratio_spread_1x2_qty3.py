@@ -65,7 +65,7 @@ from nautilus_trader.trading.strategy import Strategy
 
 
 # %%
-class RatioSpreadTestConfig(StrategyConfig, frozen=True):
+class RatioSpreadTestConfig(StrategyConfig):
     """
     Configuration for 1x2 ratio spread test.
     """

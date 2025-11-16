@@ -18,7 +18,7 @@ import itertools
 import os
 from collections.abc import Callable
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.betfair.client import BetfairHttpClient
 from nautilus_trader.common.component import Logger
@@ -78,7 +78,7 @@ class BetfairStreamClient:
             ssl=self.use_ssl,
             suffix=self.crlf,
             handler=self.handler,
-            heartbeat=(10, msgspec.json.encode({"op": "heartbeat"})),
+            heartbeat=(10, orjson.dumps({"op": "heartbeat"})),
             certs_dir=self.certs_dir,
         )
         self._client = await SocketClient.connect(
@@ -256,8 +256,8 @@ class BetfairOrderStreamClient(BetfairStreamClient):
                     "initialClk": None,
                     "clk": None,
                 }
-                await self.send(msgspec.json.encode(self.auth_message()))
-                await self.send(msgspec.json.encode(subscribe_msg))
+                await self.send(orjson.dumps(self.auth_message()))
+                await self.send(orjson.dumps(subscribe_msg))
                 return
             except Exception as e:
                 self._log.error(f"Failed to send auth message({e}), retrying {i + 1}/{retries}...")
@@ -363,7 +363,7 @@ class BetfairMarketStreamClient(BetfairStreamClient):
             "heartbeatMs": heartbeat_ms,
             "segmentationEnabled": segmentation_enabled,
         }
-        await self.send(msgspec.json.encode(message))
+        await self.send(orjson.dumps(message))
 
     def post_connection(self) -> None:
         self._loop.create_task(self._post_connection())
@@ -376,7 +376,7 @@ class BetfairMarketStreamClient(BetfairStreamClient):
         retries = 5
         for i in range(retries):
             try:
-                await self.send(msgspec.json.encode(self.auth_message()))
+                await self.send(orjson.dumps(self.auth_message()))
                 return
             except Exception as e:
                 self._log.error(f"Failed to send auth message({e}), retrying {i + 1}/{retries}...")

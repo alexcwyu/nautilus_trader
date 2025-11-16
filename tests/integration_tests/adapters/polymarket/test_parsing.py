@@ -15,7 +15,7 @@
 
 import pkgutil
 
-import msgspec
+import orjson
 import pytest
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_MAX_PRICE
@@ -24,9 +24,7 @@ from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_VENU
 from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
 from nautilus_trader.adapters.polymarket.schemas.book import PolymarketBookLevel
 from nautilus_trader.adapters.polymarket.schemas.book import PolymarketBookSnapshot
-from nautilus_trader.adapters.polymarket.schemas.book import PolymarketQuotes
 from nautilus_trader.adapters.polymarket.schemas.book import PolymarketTickSizeChange
-from nautilus_trader.adapters.polymarket.schemas.book import PolymarketTrade
 from nautilus_trader.adapters.polymarket.schemas.user import PolymarketUserOrder
 from nautilus_trader.adapters.polymarket.schemas.user import PolymarketUserTrade
 from nautilus_trader.backtest.engine import BacktestEngine
@@ -51,7 +49,7 @@ def test_parse_instruments() -> None:
         "markets.json",
     )
     assert data
-    response = msgspec.json.decode(data)
+    response = orjson.loads(data)
 
     # Act
     instruments: list[BinaryOption] = []
@@ -76,8 +74,8 @@ def test_parse_order_book_snapshots() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketBookSnapshot)
-    ws_message = decoder.decode(data)
+    # Decoder removed - using orjson with PolymarketBookSnapshot
+    ws_message = orjson.loads(data)
     instrument = TestInstrumentProvider.binary_option()
 
     # Act
@@ -99,8 +97,8 @@ def test_parse_order_book_deltas() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketQuotes)
-    ws_message = decoder.decode(data)
+    # Decoder removed - using orjson with PolymarketQuotes
+    ws_message = orjson.loads(data)
 
     # Assert - Test new schema structure
     assert ws_message.market == "0x5f65177b394277fd294cd75650044e32ba009a95022d88a0c1d565897d72f8f1"
@@ -129,8 +127,8 @@ def test_parse_quote_ticks() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketQuotes)
-    ws_message = decoder.decode(data)
+    # Decoder removed - using orjson with PolymarketQuotes
+    ws_message = orjson.loads(data)
 
     # Assert - Test that we can access the new schema fields
     assert len(ws_message.price_changes) == 3
@@ -154,8 +152,8 @@ def test_parse_trade_tick() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketTrade)
-    ws_message = decoder.decode(data)
+    # Decoder removed - using orjson with PolymarketTrade
+    ws_message = orjson.loads(data)
     instrument = TestInstrumentProvider.binary_option()
 
     # Act
@@ -178,10 +176,10 @@ def test_parse_order_placement() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketUserOrder)
+    # Decoder removed - using orjson with PolymarketUserOrder
 
     # Act
-    msg = decoder.decode(data)
+    msg = orjson.loads(data)
 
     # Assert
     assert isinstance(msg, PolymarketUserOrder)
@@ -195,10 +193,10 @@ def test_parse_order_cancel() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketUserOrder)
+    # Decoder removed - using orjson with PolymarketUserOrder
 
     # Act
-    msg = decoder.decode(data)
+    msg = orjson.loads(data)
 
     # Assert
     assert isinstance(msg, PolymarketUserOrder)
@@ -219,10 +217,10 @@ def test_parse_user_trade(data_file: str) -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketUserTrade)
+    # Decoder removed - using orjson with PolymarketUserTrade
 
     # Act
-    msg = decoder.decode(data)
+    msg = orjson.loads(data)
 
     # Assert
     assert isinstance(msg, PolymarketUserTrade)
@@ -236,8 +234,8 @@ def test_parse_user_trade_to_dict() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketUserTrade)
-    msg = decoder.decode(data)
+    # Decoder removed - using orjson with PolymarketUserTrade
+    msg = orjson.loads(data)
 
     # Act
     values = msg.to_dict()
@@ -337,10 +335,10 @@ def test_parse_tick_size_change() -> None:
     )
     assert data
 
-    decoder = msgspec.json.Decoder(PolymarketTickSizeChange)
+    # Decoder removed - using orjson with PolymarketTickSizeChange
 
     # Act
-    msg = decoder.decode(data)
+    msg = orjson.loads(data)
 
     # Assert
     assert isinstance(msg, PolymarketTickSizeChange)
@@ -499,7 +497,7 @@ def test_parse_empty_book_snapshot_returns_none():
     )
 
     # Act
-    snapshot = msgspec.json.decode(msgspec.json.encode(raw_data), type=PolymarketBookSnapshot)
+    snapshot = orjson.loads(orjson.dumps(raw_data), type=PolymarketBookSnapshot)
     result = snapshot.parse_to_snapshot(instrument=instrument, ts_init=0)
 
     # Assert
@@ -571,7 +569,7 @@ def test_parse_empty_book_snapshot_in_backtest_engine():
     # Act - parse and add data (should skip empty snapshots)
     deltas = []
     for msg in raw_data:
-        snapshot = msgspec.json.decode(msgspec.json.encode(msg), type=PolymarketBookSnapshot)
+        snapshot = orjson.loads(orjson.dumps(msg), type=PolymarketBookSnapshot)
         ob_snapshot = snapshot.parse_to_snapshot(instrument=instrument, ts_init=0)
         if ob_snapshot is not None:
             deltas.append(ob_snapshot)

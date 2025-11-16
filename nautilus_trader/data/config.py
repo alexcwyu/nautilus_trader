@@ -19,7 +19,7 @@ from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.model.identifiers import ClientId
 
 
-class DataEngineConfig(NautilusConfig, frozen=True):
+class DataEngineConfig(NautilusConfig):
     """
     Configuration for ``DataEngine`` instances.
 

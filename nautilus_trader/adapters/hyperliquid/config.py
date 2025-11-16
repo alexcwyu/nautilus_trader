@@ -20,7 +20,7 @@ from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 
 
-class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
+class HyperliquidDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``HyperliquidDataClient`` instances.
 
@@ -51,7 +51,7 @@ class HyperliquidDataClientConfig(LiveDataClientConfig, frozen=True):
     http_timeout_secs: PositiveInt = 10
 
 
-class HyperliquidExecClientConfig(LiveExecClientConfig, frozen=True):
+class HyperliquidExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``HyperliquidExecutionClient`` instances.
 

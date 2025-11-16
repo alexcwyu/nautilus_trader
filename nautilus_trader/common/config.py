@@ -23,9 +23,13 @@ from io import StringIO
 from typing import Annotated
 from typing import Any
 
-import msgspec
+import orjson
 import pandas as pd
-from msgspec import Meta
+from pydantic import BaseModel
+from pydantic import ConfigDict
+from pydantic import Field
+from pydantic import field_validator
+from pydantic import model_validator
 
 from nautilus_trader.common import Environment
 from nautilus_trader.core.correctness import PyCondition
@@ -46,16 +50,16 @@ from nautilus_trader.model.objects import Quantity
 
 
 # An integer constrained to values > 0
-PositiveInt = Annotated[int, Meta(gt=0)]
+PositiveInt = Annotated[int, Field(gt=0)]
 
 # An integer constrained to values >= 0
-NonNegativeInt = Annotated[int, Meta(ge=0)]
+NonNegativeInt = Annotated[int, Field(ge=0)]
 
 # A float constrained to values > 0
-PositiveFloat = Annotated[float, Meta(gt=0.0)]
+PositiveFloat = Annotated[float, Field(gt=0.0)]
 
 # A float constrained to values >= 0
-NonNegativeFloat = Annotated[float, Meta(ge=0.0)]
+NonNegativeFloat = Annotated[float, Field(ge=0.0)]
 
 CUSTOM_ENCODINGS: dict[type, Callable] = {
     pd.DataFrame: lambda x: x.to_json(),
@@ -87,25 +91,13 @@ def resolve_config_path(path: str) -> type[NautilusConfig]:
     return config
 
 
-def nautilus_schema_hook(type_: type[Any]) -> dict[str, Any]:
-    if issubclass(type_, Identifier):
-        return {"type": "string"}
-    if type_ in (Currency, Price, Quantity, Money, BarType, BarSpecification):
-        return {"type": "string"}
-    if type_ in (Decimal, UUID4):
-        return {"type": "string"}
-    if type_ == pd.Timestamp:
-        return {"type": "string", "format": "date-time"}
-    if type_ == pd.Timedelta:
-        return {"type": "string"}
-    if type_ == Environment:
-        return {"type": "string"}
-    if type_ is type:  # Handle <class 'type'>
-        return {"type": "string"}  # Represent type objects as strings
-    raise TypeError(f"Unsupported type for schema generation: {type_}")
+def pydantic_encoder(obj: Any) -> Any:  # noqa: C901 (too complex)
+    """
+    Custom serializer for Nautilus domain types.
 
+    Used by Pydantic's model_serializer for encoding to JSON-compatible primitives.
 
-def msgspec_encoding_hook(obj: Any) -> Any:  # noqa: C901 (too complex)
+    """
     # Check for fully_qualified_name first, before generic type check
     if isinstance(obj, type) and hasattr(obj, "fully_qualified_name"):
         return obj.fully_qualified_name()
@@ -134,15 +126,56 @@ def msgspec_encoding_hook(obj: Any) -> Any:  # noqa: C901 (too complex)
     raise TypeError(f"Encoding objects of type {obj.__class__} is unsupported")
 
 
-def msgspec_decoding_hook(obj_type: type, obj: Any) -> Any:  # noqa: C901 (too complex)
+def serialize_config_value(value: Any) -> Any:
+    """
+    Recursively serialize config values using custom encoder.
+
+    Handles nested dicts, lists, and other containers before falling back to pydantic_encoder.
+    Similar to NautilusConfig._serialize_value but as a standalone function.
+
+    Parameters
+    ----------
+    value : Any
+        The value to serialize.
+
+    Returns
+    -------
+    Any
+        The serialized value.
+
+    """
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {k: serialize_config_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [serialize_config_value(v) for v in value]
+    try:
+        return pydantic_encoder(value)
+    except TypeError:
+        return value
+
+
+def pydantic_decoder(obj_type: type, obj: Any) -> Any:  # noqa: C901 (too complex)
+    """
+    Custom deserializer for Nautilus domain types.
+
+    Used by Pydantic validators for decoding from JSON primitives.
+
+    """
     if obj_type in (Decimal, pd.Timestamp, pd.Timedelta):
         return obj_type(obj)
     if obj_type == UUID4:
         return UUID4.from_str(obj)
     if obj_type == InstrumentId:
         return InstrumentId.from_str(obj)
-    if issubclass(obj_type, Identifier):
-        return obj_type(obj)
+    try:
+        if issubclass(obj_type, Identifier):
+            return obj_type(obj)
+    except TypeError:
+        pass
     if obj_type == BarSpecification:
         return BarSpecification.from_str(obj)
     if obj_type == BarType:
@@ -186,10 +219,119 @@ def tokenize_config(obj: NautilusConfig) -> str:
     return hashlib.sha256(obj.json()).hexdigest()
 
 
-class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
+class NautilusConfig(BaseModel):
     """
     The base class for all Nautilus configuration objects.
     """
+
+    model_config = ConfigDict(
+        frozen=True,
+        extra="forbid",
+        arbitrary_types_allowed=True,
+        ser_json_bytes="base64",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _decode_nautilus_types(cls, data: Any) -> Any:
+        """
+        Decode Nautilus domain types from JSON primitives.
+
+        Pydantic validator that converts string primitives back to domain types during
+        deserialization, enabling JSON round-trips.
+
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # Get field type annotations from the model
+        field_types = {}
+        if hasattr(cls, "model_fields"):
+            for field_name, field_info in cls.model_fields.items():
+                field_types[field_name] = field_info.annotation
+
+        # Process each field in the data
+        decoded_data = {}
+        for key, value in data.items():
+            if key not in field_types:
+                # Unknown field, pass through as-is
+                decoded_data[key] = value
+                continue
+
+            field_type = field_types[key]
+            decoded_data[key] = cls._decode_value(field_type, value)
+
+        return decoded_data
+
+    @classmethod
+    def _decode_value(cls, expected_type: type | None, value: Any) -> Any:
+        """
+        Recursively decode a value based on its expected type.
+
+        Parameters
+        ----------
+        expected_type : type or None
+            The expected type for this value.
+        value : Any
+            The value to decode.
+
+        Returns
+        -------
+        Any
+            The decoded value.
+
+        """
+        # Already the correct type or None
+        if value is None or expected_type is None:
+            return value
+
+        # Handle primitives (already correct type)
+        if isinstance(value, (int, float, bool)) and expected_type in (int, float, bool, Any):
+            return value
+
+        # Handle string values that need conversion to domain types
+        if isinstance(value, str):
+            try:
+                return pydantic_decoder(expected_type, value)
+            except TypeError:
+                # Not a Nautilus domain type, return as-is
+                return value
+
+        # Handle lists
+        if isinstance(value, list):
+            # Try to get the list element type
+            if hasattr(expected_type, "__args__") and expected_type.__args__:
+                element_type = expected_type.__args__[0]
+                return [cls._decode_value(element_type, item) for item in value]
+            return value
+
+        # Handle dicts
+        if isinstance(value, dict):
+            # Try to get dict value type
+            if hasattr(expected_type, "__args__") and len(expected_type.__args__) >= 2:
+                value_type = expected_type.__args__[1]
+                return {k: cls._decode_value(value_type, v) for k, v in value.items()}
+            return value
+
+        # Return as-is for any other type
+        return value
+
+    def _serialize_value(self, value: Any) -> Any:
+        """
+        Recursively serialize values using custom encoder.
+        """
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            return {k: self._serialize_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [self._serialize_value(v) for v in value]
+        try:
+            return pydantic_encoder(value)
+        except TypeError:
+            return value
 
     @property
     def id(self) -> str:
@@ -229,7 +371,7 @@ class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
         dict[str, Any]
 
         """
-        return msgspec.json.schema(cls, schema_hook=nautilus_schema_hook)
+        return cls.model_json_schema()
 
     @classmethod
     def parse(cls, raw: bytes | str) -> Any:
@@ -248,7 +390,13 @@ class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
         Any
 
         """
-        return msgspec.json.decode(raw, type=cls, dec_hook=msgspec_decoding_hook)
+        if isinstance(raw, bytes):
+            data = orjson.loads(raw)
+        else:
+            data = orjson.loads(raw.encode())
+
+        # Let Pydantic validators handle type conversions
+        return cls(**data)
 
     def dict(self) -> dict[str, Any]:
         """
@@ -259,7 +407,9 @@ class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
         dict[str, Any]
 
         """
-        return {k: getattr(self, k) for k in self.__struct_fields__}
+        data = self.model_dump()
+        # Serialize custom types to JSON-compatible primitives
+        return {k: self._serialize_value(v) for k, v in data.items()}
 
     def json(self) -> bytes:
         """
@@ -270,7 +420,9 @@ class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
         bytes
 
         """
-        return msgspec.json.encode(self, enc_hook=msgspec_encoding_hook)
+        data = self.model_dump()
+        serialized = {k: self._serialize_value(v) for k, v in data.items()}
+        return orjson.dumps(serialized)
 
     def json_primitives(self) -> dict[str, Any]:  # type: ignore [valid-type]
         """
@@ -282,7 +434,7 @@ class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
         dict[str, Any]
 
         """
-        return msgspec.json.decode(self.json())
+        return orjson.loads(self.json())
 
     def validate(self) -> bool:
         """
@@ -296,7 +448,7 @@ class NautilusConfig(msgspec.Struct, kw_only=True, frozen=True):
         return bool(self.parse(self.json()))
 
 
-class DatabaseConfig(NautilusConfig, frozen=True):
+class DatabaseConfig(NautilusConfig):
     """
     Configuration for database connections.
 
@@ -351,7 +503,7 @@ class DatabaseConfig(NautilusConfig, frozen=True):
         )
 
 
-class MessageBusConfig(NautilusConfig, frozen=True):
+class MessageBusConfig(NautilusConfig):
     """
     Configuration for ``MessageBus`` instances.
 
@@ -412,7 +564,7 @@ class MessageBusConfig(NautilusConfig, frozen=True):
     heartbeat_interval_secs: PositiveInt | None = None
 
 
-class InstrumentProviderConfig(NautilusConfig, frozen=True):
+class InstrumentProviderConfig(NautilusConfig):
     """
     Configuration for ``InstrumentProvider`` instances.
 
@@ -454,8 +606,25 @@ class InstrumentProviderConfig(NautilusConfig, frozen=True):
     log_warnings: bool = True
     use_gamma_markets: bool = False
 
+    @field_validator("load_ids", mode="before")
+    @classmethod
+    def _validate_load_ids(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, frozenset):
+            # Convert any string items to InstrumentId
+            return frozenset(
+                InstrumentId.from_str(item) if isinstance(item, str) else item for item in v
+            )
+        if isinstance(v, (list, set)):
+            # Convert list/set to frozenset, converting strings to InstrumentId
+            return frozenset(
+                InstrumentId.from_str(item) if isinstance(item, str) else item for item in v
+            )
+        return v
 
-class OrderEmulatorConfig(NautilusConfig, frozen=True):
+
+class OrderEmulatorConfig(NautilusConfig):
     """
     Configuration for ``OrderEmulator`` instances.
 
@@ -469,7 +638,7 @@ class OrderEmulatorConfig(NautilusConfig, frozen=True):
     debug: bool = False
 
 
-class ActorConfig(NautilusConfig, kw_only=True, frozen=True):
+class ActorConfig(NautilusConfig):
     """
     The base model for all actor configurations.
 
@@ -490,8 +659,17 @@ class ActorConfig(NautilusConfig, kw_only=True, frozen=True):
     log_events: bool = True
     log_commands: bool = True
 
+    @field_validator("component_id", mode="before")
+    @classmethod
+    def _validate_component_id(cls, v):
+        if v is None or isinstance(v, ComponentId):
+            return v
+        if isinstance(v, str):
+            return ComponentId(v)
+        return v
 
-class ImportableActorConfig(NautilusConfig, frozen=True):
+
+class ImportableActorConfig(NautilusConfig):
     """
     Configuration for an actor instance.
 
@@ -539,12 +717,12 @@ class ActorFactory:
         PyCondition.type(config, ImportableActorConfig, "config")
         actor_cls = resolve_path(config.actor_path)
         config_cls = resolve_config_path(config.config_path)
-        json = msgspec.json.encode(config.config, enc_hook=msgspec_encoding_hook)
-        config = config_cls.parse(json)
+        json_bytes = orjson.dumps({k: serialize_config_value(v) for k, v in config.config.items()})
+        config = config_cls.parse(json_bytes)
         return actor_cls(config)
 
 
-class LoggingConfig(NautilusConfig, frozen=True):
+class LoggingConfig(NautilusConfig):
     """
     Configuration for standard output and file logging for a ``NautilusKernel``
     instance.
@@ -608,7 +786,7 @@ class LoggingConfig(NautilusConfig, frozen=True):
     clear_log_file: bool = False
 
 
-class ImportableFactoryConfig(NautilusConfig, frozen=True):
+class ImportableFactoryConfig(NautilusConfig):
     """
     Represents an importable (JSON) factory config.
     """
@@ -620,7 +798,7 @@ class ImportableFactoryConfig(NautilusConfig, frozen=True):
         return cls()
 
 
-class ImportableConfig(NautilusConfig, frozen=True):
+class ImportableConfig(NautilusConfig):
     """
     Represents an importable configuration (typically live data client or live execution
     client).
@@ -637,5 +815,5 @@ class ImportableConfig(NautilusConfig, frozen=True):
     def create(self):
         assert ":" in self.path, "`path` variable should be of the form `path.to.module:class`"
         cls = resolve_path(self.path)
-        cfg = msgspec.json.encode(self.config, enc_hook=msgspec_encoding_hook)
-        return msgspec.json.decode(cfg, type=cls)
+        cfg = orjson.dumps({k: serialize_config_value(v) for k, v in self.config.items()})
+        return cls.parse(cfg) if issubclass(cls, NautilusConfig) else orjson.loads(cfg)

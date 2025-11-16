@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+import orjson
 
 from cpython.mem cimport PyMem_Free
 from cpython.mem cimport PyMem_Malloc
@@ -113,7 +113,7 @@ cdef class SyntheticInstrument(Data):
         self._mem = synthetic_instrument_new(
             symbol._mem,
             price_precision,
-            pybytes_to_cstr(msgspec.json.encode([c.value for c in components])),
+            pybytes_to_cstr(orjson.dumps([c.value for c in components])),
             pystr_to_cstr(formula),
             ts_event,
             ts_init,
@@ -198,7 +198,7 @@ cdef class SyntheticInstrument(Data):
 
         """
         cdef bytes components_bytes = cstr_to_pybytes(synthetic_instrument_components_to_cstr(&self._mem))
-        return [InstrumentId.from_str_c(c) for c in msgspec.json.decode(components_bytes)]
+        return [InstrumentId.from_str_c(c) for c in orjson.loads(components_bytes)]
 
     @property
     def formula(self) -> str:

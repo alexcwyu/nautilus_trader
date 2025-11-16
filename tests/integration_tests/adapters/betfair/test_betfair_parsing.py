@@ -18,7 +18,7 @@ from collections import Counter
 from collections import defaultdict
 from copy import copy
 
-import msgspec
+import orjson
 import pytest
 from betfair_parser.spec.betting.enums import PersistenceType
 from betfair_parser.spec.betting.enums import Side
@@ -177,7 +177,7 @@ class TestBetfairParsingStreaming:
     def test_market_definition_to_instrument_updates(self):
         # Arrange
         raw = BetfairStreaming.mcm_market_definition_racing()
-        mcm = msgspec.json.decode(raw, type=MCM)
+        mcm = orjson.loads(raw, type=MCM)
 
         # Act
         updates = self.parser.parse(mcm)
@@ -196,14 +196,14 @@ class TestBetfairParsingStreaming:
 
     def test_market_change_bsp_updates(self):
         raw = b'{"id":"1.205822330","rc":[{"spb":[[1000,32.21]],"id":45368013},{"spb":[[1000,20.5]],"id":49808343},{"atb":[[1.93,10.09]],"id":49808342},{"spb":[[1000,20.5]],"id":39000334},{"spb":[[1000,84.22]],"id":16206031},{"spb":[[1000,18]],"id":10591436},{"spb":[[1000,88.96]],"id":48672282},{"spb":[[1000,18]],"id":19143530},{"spb":[[1000,20.5]],"id":6159479},{"spb":[[1000,10]],"id":25694777},{"spb":[[1000,10]],"id":49808335},{"spb":[[1000,10]],"id":49808334},{"spb":[[1000,20.5]],"id":35672106}],"con":true,"img":false}'
-        mc = msgspec.json.decode(raw, type=MarketChange)
+        mc = orjson.loads(raw, type=MarketChange)
         result = Counter([upd.__class__.__name__ for upd in market_change_to_updates(mc, {}, 0, 0)])
         expected = Counter({"CustomData": 12, "OrderBookDeltas": 1})
         assert result == expected
 
     def test_market_change_ticker(self):
         raw = b'{"id":"1.205822330","rc":[{"atl":[[1.98,0],[1.91,30.38]],"id":49808338},{"atb":[[3.95,2.98]],"id":49808334},{"trd":[[3.95,46.95]],"ltp":3.95,"tv":46.95,"id":49808334}],"con":true,"img":false}'
-        mc = msgspec.json.decode(raw, type=MarketChange)
+        mc = orjson.loads(raw, type=MarketChange)
         result = market_change_to_updates(mc, {}, 0, 0)
         assert result[0] == TradeTick.from_dict(
             {
@@ -392,7 +392,7 @@ class TestBetfairParsing:
             async_=False,
         )
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=PlaceOrders) == expected
+        assert orjson.loads(orjson.dumps(result), type=PlaceOrders) == expected
 
     def test_order_update_to_betfair(self):
         modify = TestCommandStubs.modify_order_command(
@@ -417,7 +417,7 @@ class TestBetfairParsing:
         )
 
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=ReplaceOrders) == expected
+        assert orjson.loads(orjson.dumps(result), type=ReplaceOrders) == expected
 
     def test_order_cancel_to_betfair(self):
         result = order_cancel_to_cancel_order_params(
@@ -433,7 +433,7 @@ class TestBetfairParsing:
             customer_ref="2d89666b1a1e4a75b1934eb3b454c757",
         )
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=CancelOrders) == expected
+        assert orjson.loads(orjson.dumps(result), type=CancelOrders) == expected
 
     @pytest.mark.asyncio()
     async def test_account_statement(self, betfair_client):
@@ -471,7 +471,7 @@ class TestBetfairParsing:
 
     @pytest.mark.asyncio()
     async def test_merge_order_book_deltas(self):
-        raw = msgspec.json.encode(
+        raw = orjson.dumps(
             {
                 "op": "mcm",
                 "clk": "792361654",
@@ -491,7 +491,7 @@ class TestBetfairParsing:
                 "id": 1,
             },
         )
-        mcm = msgspec.json.decode(raw, type=MCM)
+        mcm = orjson.loads(raw, type=MCM)
         updates = self.parser.parse(mcm)
         assert len(updates) == 4
         trade, ticker, deltas, completed = updates
@@ -533,7 +533,7 @@ class TestBetfairParsing:
             customer_order_ref="O-20210410-022422-001-001-1",
         )
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=PlaceInstruction) == expected
+        assert orjson.loads(orjson.dumps(result), type=PlaceInstruction) == expected
 
     def test_make_order_limit_on_close(self):
         order = TestExecStubs.limit_order(
@@ -556,7 +556,7 @@ class TestBetfairParsing:
             customer_order_ref="O-20210410-022422-001-001-1",
         )
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=PlaceInstruction) == expected
+        assert orjson.loads(orjson.dumps(result), type=PlaceInstruction) == expected
 
     def test_make_order_market_buy(self):
         order = TestExecStubs.market_order(order_side=OrderSide.BUY)
@@ -581,7 +581,7 @@ class TestBetfairParsing:
             customer_order_ref="O-20210410-022422-001-001-1",
         )
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=PlaceInstruction) == expected
+        assert orjson.loads(orjson.dumps(result), type=PlaceInstruction) == expected
 
     def test_make_order_market_sell(self):
         order = TestExecStubs.market_order(order_side=OrderSide.SELL)
@@ -606,7 +606,7 @@ class TestBetfairParsing:
             customer_order_ref="O-20210410-022422-001-001-1",
         )
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=PlaceInstruction) == expected
+        assert orjson.loads(orjson.dumps(result), type=PlaceInstruction) == expected
 
     @pytest.mark.parametrize(
         ("side", "liability"),
@@ -625,7 +625,7 @@ class TestBetfairParsing:
         result = place_instructions.market_on_close_order
         expected = MarketOnCloseOrder(liability=liability)
         assert result == expected
-        assert msgspec.json.decode(msgspec.json.encode(result), type=MarketOnCloseOrder) == expected
+        assert orjson.loads(orjson.dumps(result), type=MarketOnCloseOrder) == expected
 
     @pytest.mark.parametrize(
         ("status", "size", "matched", "cancelled", "expected"),
@@ -747,7 +747,7 @@ class TestBetfairParsing:
 
         # Act
         place_instruction = nautilus_order_to_place_instructions(command, self.instrument)
-        result = msgspec.json.decode(msgspec.json.encode(place_instruction))["limitOrder"]
+        result = orjson.loads(orjson.dumps(place_instruction))["limitOrder"]
 
         expected = {
             "size": 100.0,
@@ -782,7 +782,7 @@ class TestBetfairParsing:
                 persistence_type=PersistenceType.PERSIST,
             ),
         )
-        result = msgspec.json.decode(msgspec.json.encode(place_orders))
+        result = orjson.loads(orjson.dumps(place_orders))
         result = {k: v for k, v in result.items() if v}
         expected = {
             "selectionId": "237486",

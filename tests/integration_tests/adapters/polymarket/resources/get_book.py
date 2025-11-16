@@ -15,7 +15,7 @@
 
 from pathlib import Path
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
 
@@ -26,7 +26,7 @@ def main():
     token_id = 23360939988679364027624185518382759743328544433592111535569478055890815567848
     response = client.get_order_book(token_id)
 
-    data = msgspec.json.encode(response)
+    data = orjson.dumps(response)
     Path("http_responses/book.json").write_bytes(data)
 
 

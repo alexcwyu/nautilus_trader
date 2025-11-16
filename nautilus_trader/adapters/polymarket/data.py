@@ -15,7 +15,7 @@
 import asyncio
 from typing import Any
 
-import msgspec
+import orjson
 from py_clob_client.client import ClobClient
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_MAX_PRICE
@@ -131,8 +131,6 @@ class PolymarketDataClient(LiveMarketDataClient):
         # WebSocket API
         self._ws_clients: list[PolymarketWebSocketClient] = []
         self._ws_client_pending_connection: PolymarketWebSocketClient | None = None
-
-        self._decoder_market_msg = msgspec.json.Decoder(MARKET_WS_MESSAGE)
 
         # Tasks
         self._update_instruments_task: asyncio.Task | None = None
@@ -408,16 +406,51 @@ class PolymarketDataClient(LiveMarketDataClient):
     async def _request_bars(self, request: RequestBars) -> None:
         self._log.error("Cannot request historical bars: not published by Polymarket")
 
+    def _decode_ws_message(self, data: dict) -> MARKET_WS_MESSAGE:
+        """
+        Decode a WebSocket message dict into the appropriate dataclass.
+        """
+        # Check for specific fields to determine message type
+        if "price_changes" in data:
+            # PolymarketQuotes
+            price_changes = [PolymarketQuote(**change) for change in data["price_changes"]]
+            return PolymarketQuotes(
+                market=data["market"],
+                price_changes=price_changes,
+                timestamp=data["timestamp"],
+            )
+        elif "bids" in data and "asks" in data:
+            # PolymarketBookSnapshot
+            bids = [PolymarketBookLevel(**b) for b in data["bids"]]
+            asks = [PolymarketBookLevel(**a) for a in data["asks"]]
+            return PolymarketBookSnapshot(
+                market=data["market"],
+                asset_id=data["asset_id"],
+                bids=bids,
+                asks=asks,
+                timestamp=data["timestamp"],
+            )
+        elif "new_tick_size" in data:
+            # PolymarketTickSizeChange
+            return PolymarketTickSizeChange(**data)
+        elif "fee_rate_bps" in data:
+            # PolymarketTrade
+            return PolymarketTrade(**data)
+        else:
+            raise ValueError(f"Unknown message type: {data}")
+
     def _handle_raw_ws_message(self, raw: bytes) -> None:
         # Uncomment for development
         # self._log.info(str(raw), LogColor.MAGENTA)
         try:
-            msg = self._decoder_market_msg.decode(raw)
+            data = orjson.loads(raw)
 
-            if isinstance(msg, list):
-                for item in msg:
-                    self._handle_ws_message(item)
+            if isinstance(data, list):
+                for item in data:
+                    msg = self._decode_ws_message(item)
+                    self._handle_ws_message(msg)
             else:
+                msg = self._decode_ws_message(data)
                 self._handle_ws_message(msg)
         except Exception as e:
             self._log.exception(f"Failed to parse websocket message: {raw.decode()} with error", e)

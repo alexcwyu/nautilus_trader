@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -17,9 +20,8 @@ Define the instrument info endpoint.
 """
 
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.dydx.common.constants import CURRENCY_MAP
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
@@ -42,7 +44,8 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
 
-class ListPerpetualMarketsGetParams(msgspec.Struct, omit_defaults=True):
+@dataclass
+class ListPerpetualMarketsGetParams:
     """
     Represent the dYdX list perpetual markets parameters.
     """
@@ -51,7 +54,8 @@ class ListPerpetualMarketsGetParams(msgspec.Struct, omit_defaults=True):
     ticker: str | None = None
 
 
-class DYDXPerpetualMarketResponseObject(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXPerpetualMarketResponseObject:
     """
     Represent the dYdX perpetual market response object.
     """
@@ -155,11 +159,12 @@ class DYDXPerpetualMarketResponseObject(msgspec.Struct, forbid_unknown_fields=Fa
             taker_fee=taker_fee,
             ts_event=ts_event,
             ts_init=ts_init,
-            info=msgspec.json.Decoder().decode(msgspec.json.Encoder().encode(self)),
+            info=orjson.loads(orjson.dumps(self)),
         )
 
 
-class DYDXListPerpetualMarketsResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXListPerpetualMarketsResponse:
     """
     Represent the dYdX list perpetual markets response object.
     """
@@ -183,9 +188,7 @@ class DYDXListPerpetualMarketsEndpoint(DYDXHttpEndpoint):
             endpoint_type=DYDXEndpointType.NONE,
             name="DYDXListPerpetualMarketsEndpoint",
         )
-        self._response_decoder_list_perpetual_markets = msgspec.json.Decoder(
-            DYDXListPerpetualMarketsResponse,
-        )
+        # response_decoder_list_perpetual_markets removed - using orjson
 
     async def get(
         self,
@@ -198,6 +201,6 @@ class DYDXListPerpetualMarketsEndpoint(DYDXHttpEndpoint):
         raw = await self._method(method_type, params)
 
         if raw is not None:
-            return self._response_decoder_list_perpetual_markets.decode(raw)
+            return DYDXListPerpetualMarketsResponse(**orjson.loads(raw))
 
         return None

@@ -18,9 +18,8 @@ Define the schemas for the GetOrders endpoint.
 
 
 import datetime
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.dydx.common.constants import CURRENCY_MAP
 from nautilus_trader.adapters.dydx.common.enums import DYDXEnumParser
@@ -40,7 +39,8 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
 
-class DYDXOrderResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXOrderResponse:
     """
     Define the schema for the order response.
     """

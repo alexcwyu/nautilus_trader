@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
@@ -50,7 +49,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceUserTrade(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceUserTrade:
     """
     HTTP response from Binance Spot/Margin `GET /api/v3/myTrades` HTTP response from
     Binance USD-M Futures `GET /fapi/v1/userTrades` HTTP response from Binance COIN-M
@@ -117,7 +117,8 @@ class BinanceUserTrade(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceOrder(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceOrder:
     """
     HTTP response from Binance Spot/Margin `GET /api/v3/order` HTTP response from
     Binance USD-M Futures `GET /fapi/v1/order` HTTP response from Binance COIN-M Futures
@@ -252,7 +253,8 @@ class BinanceOrder(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceStatusCode(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceStatusCode:
     """
     HTTP response status code.
     """

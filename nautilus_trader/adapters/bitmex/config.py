@@ -18,7 +18,7 @@ from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 
 
-class BitmexDataClientConfig(LiveDataClientConfig, frozen=True):
+class BitmexDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``BitmexDataClient`` instances.
 
@@ -87,7 +87,7 @@ class BitmexDataClientConfig(LiveDataClientConfig, frozen=True):
     max_requests_per_minute: PositiveInt = 120
 
 
-class BitmexExecClientConfig(LiveExecClientConfig, frozen=True):
+class BitmexExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``BitmexExecutionClient`` instances.
 

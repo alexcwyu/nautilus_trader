@@ -14,8 +14,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import uuid
-
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_MAX_PRICE
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_MIN_PRICE
@@ -34,12 +33,14 @@ from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.instruments import BinaryOption
 
 
-class PolymarketBookLevel(msgspec.Struct, frozen=True):
+@dataclass
+class PolymarketBookLevel:
     price: str
     size: str
 
 
-class PolymarketBookSnapshot(msgspec.Struct, tag="book", tag_field="event_type", frozen=True):
+@dataclass
+class PolymarketBookSnapshot:
     market: str
     asset_id: str
     bids: list[PolymarketBookLevel]
@@ -169,7 +170,8 @@ class PolymarketBookSnapshot(msgspec.Struct, tag="book", tag_field="event_type",
         )
 
 
-class PolymarketQuote(msgspec.Struct, frozen=True):
+@dataclass
+class PolymarketQuote:
     asset_id: str
     price: str
     side: PolymarketOrderSide
@@ -179,7 +181,8 @@ class PolymarketQuote(msgspec.Struct, frozen=True):
     best_ask: str
 
 
-class PolymarketQuotes(msgspec.Struct, tag="price_change", tag_field="event_type", frozen=True):
+@dataclass
+class PolymarketQuotes:
     market: str
     price_changes: list[PolymarketQuote]
     timestamp: str
@@ -243,7 +246,8 @@ class PolymarketQuotes(msgspec.Struct, tag="price_change", tag_field="event_type
         return quotes
 
 
-class PolymarketTrade(msgspec.Struct, tag="last_trade_price", tag_field="event_type", frozen=True):
+@dataclass
+class PolymarketTrade:
     market: str
     asset_id: str
     fee_rate_bps: str
@@ -271,12 +275,8 @@ class PolymarketTrade(msgspec.Struct, tag="last_trade_price", tag_field="event_t
         )
 
 
-class PolymarketTickSizeChange(
-    msgspec.Struct,
-    tag="tick_size_change",
-    tag_field="event_type",
-    frozen=True,
-):
+@dataclass
+class PolymarketTickSizeChange:
     market: str
     asset_id: str
     new_tick_size: str

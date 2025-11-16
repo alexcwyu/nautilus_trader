@@ -43,7 +43,7 @@ from nautilus_trader.trading import Strategy
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
 
-class RequestDemoStrategyConfig(StrategyConfig, frozen=True):
+class RequestDemoStrategyConfig(StrategyConfig):
     instrument_id: InstrumentId
     interval: int
 

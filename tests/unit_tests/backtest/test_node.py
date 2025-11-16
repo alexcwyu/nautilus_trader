@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+import orjson
 import pytest
 
 from nautilus_trader.backtest.engine import BacktestEngineConfig
@@ -160,7 +160,7 @@ class TestBacktestNode:
 
     def test_node_config_from_raw(self):
         # Arrange
-        raw = msgspec.json.encode(
+        raw = orjson.dumps(
             {
                 "engine": {
                     "trader_id": "Test-111",

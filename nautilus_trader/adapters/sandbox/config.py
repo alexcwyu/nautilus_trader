@@ -18,7 +18,7 @@ from decimal import Decimal
 from nautilus_trader.config import LiveExecClientConfig
 
 
-class SandboxExecutionClientConfig(LiveExecClientConfig, frozen=True, kw_only=True):
+class SandboxExecutionClientConfig(LiveExecClientConfig):
     """
     Configuration for ``SandboxExecClient`` instances.
 

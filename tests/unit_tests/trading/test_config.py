@@ -13,7 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+
+import orjson
 
 from nautilus_trader.config import ImportableStrategyConfig
 from nautilus_trader.config import StrategyFactory
@@ -49,7 +50,7 @@ class TestStrategyFactory:
 
     def test_create_from_raw(self):
         # Arrange
-        raw = msgspec.json.encode(
+        raw = orjson.dumps(
             {
                 "strategy_path": "nautilus_trader.examples.strategies.volatility_market_maker:VolatilityMarketMaker",
                 "config_path": "nautilus_trader.examples.strategies.volatility_market_maker:VolatilityMarketMakerConfig",

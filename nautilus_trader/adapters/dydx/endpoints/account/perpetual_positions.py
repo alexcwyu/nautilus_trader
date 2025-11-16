@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -17,8 +20,7 @@ Provide the Get Address HTTP endpoint.
 """
 
 import datetime
-
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
 from nautilus_trader.adapters.dydx.common.enums import DYDXPerpetualPositionStatus
@@ -28,7 +30,8 @@ from nautilus_trader.adapters.dydx.schemas.account.perpetual_positions import DY
 from nautilus_trader.core.nautilus_pyo3 import HttpMethod
 
 
-class DYDXGetPerpetualPositionsGetParams(msgspec.Struct, omit_defaults=True, frozen=True):
+@dataclass(frozen=True)
+class DYDXGetPerpetualPositionsGetParams:
     """
     Define the parameters for the sub account endpoint.
     """
@@ -61,7 +64,7 @@ class DYDXGetPerpetualPositionsEndpoint(DYDXHttpEndpoint):
             name="DYDXGetPerpetualPositionsEndpoint",
         )
         self.http_method = HttpMethod.GET
-        self._get_resp_decoder = msgspec.json.Decoder(DYDXPerpetualPositionsResponse)
+        # get_resp_decoder removed - using orjson
 
     async def get(
         self,
@@ -73,6 +76,6 @@ class DYDXGetPerpetualPositionsEndpoint(DYDXHttpEndpoint):
         raw = await self._method(self.http_method, params)
 
         if raw is not None:
-            return self._get_resp_decoder.decode(raw)
+            return DYDXPerpetualPositionsResponse(**orjson.loads(raw))
 
         return None

@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -16,7 +19,7 @@
 Provide the Get Address HTTP endpoint.
 """
 
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
 from nautilus_trader.adapters.dydx.endpoints.endpoint import DYDXHttpEndpoint
@@ -25,7 +28,8 @@ from nautilus_trader.adapters.dydx.schemas.account.orders import DYDXOrderRespon
 from nautilus_trader.core.nautilus_pyo3 import HttpMethod
 
 
-class DYDXGetOrderGetParams(msgspec.Struct, omit_defaults=True, frozen=True):
+@dataclass(frozen=True)
+class DYDXGetOrderGetParams:
     """
     Define the parameters for the order endpoint.
     """
@@ -54,7 +58,7 @@ class DYDXGetOrderEndpoint(DYDXHttpEndpoint):
             name="DYDXGetOrderEndpoint",
         )
         self.http_method = HttpMethod.GET
-        self._get_resp_decoder = msgspec.json.Decoder(DYDXOrderResponse)
+        # get_resp_decoder removed - using orjson
 
     async def get(self, order_id: str, params: DYDXGetOrderGetParams) -> DYDXOrderResponse | None:
         """
@@ -64,6 +68,6 @@ class DYDXGetOrderEndpoint(DYDXHttpEndpoint):
         raw = await self._method(self.http_method, params, url_path=url_path)
 
         if raw is not None:
-            return self._get_resp_decoder.decode(raw)
+            return DYDXOrderResponse(**orjson.loads(raw))
 
         return None

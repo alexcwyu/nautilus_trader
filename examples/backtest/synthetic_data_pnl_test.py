@@ -68,7 +68,7 @@ def create_6E_instrument(venue: Venue) -> FuturesContract:
     )
 
 
-class MinimalStrategyConfig(StrategyConfig, frozen=True):
+class MinimalStrategyConfig(StrategyConfig):
     instrument_id: InstrumentId
     bar_type: BarType
 

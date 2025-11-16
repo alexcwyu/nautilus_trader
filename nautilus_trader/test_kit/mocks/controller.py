@@ -20,7 +20,7 @@ from nautilus_trader.trading.config import ImportableStrategyConfig
 from nautilus_trader.trading.controller import Controller
 
 
-class ControllerConfig(ActorConfig, frozen=True):
+class ControllerConfig(ActorConfig):
     pass
 
 

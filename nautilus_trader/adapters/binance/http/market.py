@@ -15,8 +15,9 @@
 
 import sys
 import time
+from dataclasses import dataclass
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceKlineInterval
@@ -73,12 +74,11 @@ class BinancePingHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder()
 
     async def get(self) -> dict:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, None)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceTimeHttp(BinanceHttpEndpoint):
@@ -107,12 +107,12 @@ class BinanceTimeHttp(BinanceHttpEndpoint):
         }
         url_path = base_endpoint + "time"
         super().__init__(client, methods, url_path)
-        self._get_resp_decoder = msgspec.json.Decoder(BinanceTime)
+        # get_resp_decoder removed - using orjson
 
     async def get(self) -> BinanceTime:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, None)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceDepthHttp(BinanceHttpEndpoint):
@@ -145,9 +145,10 @@ class BinanceDepthHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(BinanceDepth)
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Orderbook depth GET endpoint parameters.
 
@@ -171,7 +172,7 @@ class BinanceDepthHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> BinanceDepth:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceTradesHttp(BinanceHttpEndpoint):
@@ -204,9 +205,10 @@ class BinanceTradesHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceTrade])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for recent trades.
 
@@ -225,7 +227,7 @@ class BinanceTradesHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceTrade]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceHistoricalTradesHttp(BinanceHttpEndpoint):
@@ -258,9 +260,10 @@ class BinanceHistoricalTradesHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceTrade])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for historical trades.
 
@@ -282,7 +285,7 @@ class BinanceHistoricalTradesHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceTrade]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceAggTradesHttp(BinanceHttpEndpoint):
@@ -316,9 +319,10 @@ class BinanceAggTradesHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceAggTrade])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for aggregate trades.
 
@@ -346,7 +350,7 @@ class BinanceAggTradesHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceAggTrade]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceKlinesHttp(BinanceHttpEndpoint):
@@ -380,9 +384,10 @@ class BinanceKlinesHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceKline])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for klines.
 
@@ -410,7 +415,7 @@ class BinanceKlinesHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceKline]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceTicker24hrHttp(BinanceHttpEndpoint):
@@ -448,10 +453,11 @@ class BinanceTicker24hrHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_obj_resp_decoder = msgspec.json.Decoder(BinanceTicker24hr)
-        self._get_arr_resp_decoder = msgspec.json.Decoder(list[BinanceTicker24hr])
+        # get_obj_resp_decoder removed - using orjson
+        # get_arr_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for 24hr ticker.
 
@@ -477,9 +483,9 @@ class BinanceTicker24hrHttp(BinanceHttpEndpoint):
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
         if params.symbol is not None:
-            return [self._get_obj_resp_decoder.decode(raw)]
+            return [orjson.loads(raw)]
         else:
-            return self._get_arr_resp_decoder.decode(raw)
+            return orjson.loads(raw)
 
 
 class BinanceTickerPriceHttp(BinanceHttpEndpoint):
@@ -518,10 +524,11 @@ class BinanceTickerPriceHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_obj_resp_decoder = msgspec.json.Decoder(BinanceTickerPrice)
-        self._get_arr_resp_decoder = msgspec.json.Decoder(list[BinanceTickerPrice])
+        # get_obj_resp_decoder removed - using orjson
+        # get_arr_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for price ticker.
 
@@ -543,9 +550,9 @@ class BinanceTickerPriceHttp(BinanceHttpEndpoint):
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
         if params.symbol is not None:
-            return [self._get_obj_resp_decoder.decode(raw)]
+            return [orjson.loads(raw)]
         else:
-            return self._get_arr_resp_decoder.decode(raw)
+            return orjson.loads(raw)
 
 
 class BinanceTickerBookHttp(BinanceHttpEndpoint):
@@ -578,10 +585,11 @@ class BinanceTickerBookHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_arr_resp_decoder = msgspec.json.Decoder(list[BinanceTickerBook])
-        self._get_obj_resp_decoder = msgspec.json.Decoder(BinanceTickerBook)
+        # get_arr_resp_decoder removed - using orjson
+        # get_obj_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for order book ticker.
 
@@ -603,9 +611,9 @@ class BinanceTickerBookHttp(BinanceHttpEndpoint):
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
         if params.symbol is not None:
-            return [self._get_obj_resp_decoder.decode(raw)]
+            return [orjson.loads(raw)]
         else:
-            return self._get_arr_resp_decoder.decode(raw)
+            return orjson.loads(raw)
 
 
 class BinanceMarketHttpAPI:

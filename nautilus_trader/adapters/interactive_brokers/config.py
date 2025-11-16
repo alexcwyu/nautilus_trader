@@ -32,7 +32,7 @@ class SymbologyMethod(Enum):
     IB_RAW = "raw"
 
 
-class DockerizedIBGatewayConfig(NautilusConfig, frozen=True):
+class DockerizedIBGatewayConfig(NautilusConfig):
     """
     Configuration for `DockerizedIBGateway` setup when working with containerized
     installations.
@@ -85,7 +85,7 @@ class DockerizedIBGatewayConfig(NautilusConfig, frozen=True):
         return value[0] + "*" * (len(value) - 2) + value[-1] if len(value) > 2 else "*" * len(value)
 
 
-class InteractiveBrokersInstrumentProviderConfig(InstrumentProviderConfig, frozen=True):
+class InteractiveBrokersInstrumentProviderConfig(InstrumentProviderConfig):
     """
     Configuration for instances of `InteractiveBrokersInstrumentProvider`.
 
@@ -193,7 +193,7 @@ class InteractiveBrokersInstrumentProviderConfig(InstrumentProviderConfig, froze
     filter_sec_types: frozenset[str] = frozenset()
 
 
-class InteractiveBrokersDataClientConfig(LiveDataClientConfig, frozen=True):
+class InteractiveBrokersDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``InteractiveBrokersDataClient`` instances.
 
@@ -240,7 +240,7 @@ class InteractiveBrokersDataClientConfig(LiveDataClientConfig, frozen=True):
     request_timeout: int = 60
 
 
-class InteractiveBrokersExecClientConfig(LiveExecClientConfig, frozen=True):
+class InteractiveBrokersExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``InteractiveBrokersExecClient`` instances.
 

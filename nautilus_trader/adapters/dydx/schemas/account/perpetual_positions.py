@@ -17,12 +17,14 @@ Define the schemas for the GetPerpetualPositions endpoint.
 """
 
 
-import msgspec
+
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.dydx.schemas.account.address import DYDXPerpetualPosition
 
 
-class DYDXPerpetualPositionsResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXPerpetualPositionsResponse:
     """
     Define the schema for the asset positions response.
     """

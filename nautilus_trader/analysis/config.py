@@ -18,9 +18,9 @@ Configuration for tearsheet generation and visualization.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from dataclasses import field
 from typing import Any
-
-import msgspec
 
 from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.common.config import PositiveInt
@@ -43,7 +43,8 @@ def _default_charts() -> list[str]:
     ]
 
 
-class GridLayout(msgspec.Struct, frozen=True, kw_only=True):
+@dataclass(frozen=True, kw_only=True)
+class GridLayout:
     """
     Grid layout specification for tearsheet subplots.
 
@@ -64,12 +65,12 @@ class GridLayout(msgspec.Struct, frozen=True, kw_only=True):
 
     rows: int = 4
     cols: int = 2
-    heights: list[float] = msgspec.field(default_factory=_default_heights)
+    heights: list[float] = field(default_factory=_default_heights)
     vertical_spacing: float = 0.10
     horizontal_spacing: float = 0.10
 
 
-class TearsheetConfig(NautilusConfig, frozen=True, kw_only=True):
+class TearsheetConfig(NautilusConfig):
     """
     Configuration for tearsheet generation.
 
@@ -102,7 +103,7 @@ class TearsheetConfig(NautilusConfig, frozen=True, kw_only=True):
 
     """
 
-    charts: list[str] = msgspec.field(default_factory=_default_charts)
+    charts: list[str] = field(default_factory=_default_charts)
     theme: str = "plotly_white"
     layout: GridLayout | None = None
     title: str = "NautilusTrader Backtest Results"

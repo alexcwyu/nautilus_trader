@@ -24,7 +24,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.trading.strategy import Strategy
 
 
-class MyStrategyConfig(StrategyConfig, frozen=True):
+class MyStrategyConfig(StrategyConfig):
     """
     Configuration for ``MyStrategy`` instances.
 

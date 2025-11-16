@@ -15,13 +15,10 @@
 
 import pkgutil
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceExecutionType
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderStatus
-from nautilus_trader.adapters.binance.common.schemas.market import BinanceTickerData
-from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesTradeLiteMsg
-from nautilus_trader.adapters.binance.spot.schemas.user import BinanceSpotOrderUpdateWrapper
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 
@@ -38,8 +35,8 @@ class TestBinanceWebSocketParsing:
         assert raw
 
         # Act
-        decoder = msgspec.json.Decoder(BinanceTickerData)
-        data = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceTickerData
+        data = orjson.loads(raw)
         result = data.parse_to_binance_ticker(
             instrument_id=ETHUSDT.id,
             ts_init=9999999999999991,
@@ -57,8 +54,8 @@ class TestBinanceWebSocketParsing:
         assert raw
 
         # Act
-        decoder = msgspec.json.Decoder(BinanceFuturesTradeLiteMsg)
-        data = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesTradeLiteMsg
+        data = orjson.loads(raw)
 
         # Assert
         assert data.s == "ETHUSDT"
@@ -72,8 +69,8 @@ class TestBinanceWebSocketParsing:
         assert raw
 
         # Act
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Assert
         assert wrapper.data.e.value == "executionReport"
@@ -92,8 +89,8 @@ class TestBinanceWebSocketParsing:
         )
         assert raw
 
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Act: Parse to OrderStatusReport
         from nautilus_trader.adapters.binance.spot.enums import BinanceSpotEnumParser
@@ -130,8 +127,8 @@ class TestBinanceWebSocketParsing:
         )
         assert raw
 
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Act: Parse to OrderStatusReport
         from nautilus_trader.adapters.binance.spot.enums import BinanceSpotEnumParser
@@ -166,8 +163,8 @@ class TestBinanceWebSocketParsing:
         )
         assert raw
 
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Act: Parse to OrderStatusReport
         from nautilus_trader.adapters.binance.spot.enums import BinanceSpotEnumParser
@@ -203,8 +200,8 @@ class TestBinanceWebSocketParsing:
         assert raw
 
         # Act
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Assert: Message should parse successfully
         assert wrapper.data.e.value == "executionReport"
@@ -224,8 +221,8 @@ class TestBinanceWebSocketParsing:
         assert raw
 
         # Act
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Assert: Message should parse successfully
         assert wrapper.data.e.value == "executionReport"
@@ -250,8 +247,8 @@ class TestBinanceWebSocketParsing:
         assert raw
 
         # Act
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Assert: Message should parse successfully
         assert wrapper.data.e.value == "executionReport"

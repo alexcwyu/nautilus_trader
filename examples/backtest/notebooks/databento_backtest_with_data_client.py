@@ -97,7 +97,7 @@ end_time = "2024-05-09T10:01"
 
 
 # %%
-class FuturesStrategyConfig(StrategyConfig, frozen=True):
+class FuturesStrategyConfig(StrategyConfig):
     """
     Configuration for the FuturesStrategy.
     """

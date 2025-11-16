@@ -20,7 +20,7 @@ from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.common.config import PositiveInt
 
 
-class CacheConfig(NautilusConfig, frozen=True):
+class CacheConfig(NautilusConfig):
     """
     Configuration for ``Cache`` instances.
 

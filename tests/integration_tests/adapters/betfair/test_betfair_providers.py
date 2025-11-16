@@ -13,9 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import dataclasses
 import sys
 
-import msgspec
+import orjson
 import pytest
 from betfair_parser.spec.betting import MarketCatalogue
 from betfair_parser.spec.streaming import MCM
@@ -107,11 +108,11 @@ class TestBetfairInstrumentProvider:
     def test_market_update_runner_removed(self) -> None:
         # Arrange
         raw = BetfairStreaming.market_definition_runner_removed()
-        update = msgspec.json.decode(raw, type=MCM)
+        update = orjson.loads(raw, type=MCM)
 
         mc: MarketChange = update.mc[0]
         market_def = mc.market_definition
-        market_def = msgspec.structs.replace(market_def, market_id=mc.id)
+        market_def = dataclasses.replace(market_def, market_id=mc.id)
         instruments = make_instruments(
             market_def,
             currency="GBP",
@@ -133,7 +134,7 @@ class TestBetfairInstrumentProvider:
     def test_list_market_catalogue_parsing(self):
         # Arrange
         raw = BetfairResponses.list_market_catalogue()
-        market_catalogue = msgspec.json.decode(msgspec.json.encode(raw), type=MarketCatalogue)
+        market_catalogue = orjson.loads(orjson.dumps(raw), type=MarketCatalogue)
 
         # Act
         instruments = make_instruments(

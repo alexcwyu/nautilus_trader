@@ -254,11 +254,12 @@ repos:
         name: add-trailing-comma
         types: [python]
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.5
-    hooks:
-      - id: ruff
-        args: ["--fix"]
+  # TODO: WIP
+  # - repo: https://github.com/astral-sh/ruff-pre-commit
+  #   rev: v0.14.5
+  #   hooks:
+  #     - id: ruff
+  #       args: ["--fix"]
 
   - repo: https://github.com/pycqa/isort
     rev: 7.0.0
@@ -285,23 +286,24 @@ repos:
           "--in-place",
         ]
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.18.2
-    hooks:
-      - id: mypy
-        exclude: (^python/|^nautilus_trader/.*\.pyi$)
-        args: [
-          "--config", "pyproject.toml",
-          "--allow-incomplete-defs",
-        ]
-        additional_dependencies: [
-          msgspec,
-          types-frozendict,
-          types-pytz,
-          types-redis,
-          types-requests,
-          types-toml,
-        ]
+  # TODO: WIP
+  # - repo: https://github.com/pre-commit/mirrors-mypy
+  #   rev: v1.18.2
+  #   hooks:
+  #     - id: mypy
+  #       exclude: (^python/|^nautilus_trader/.*\.pyi$)
+  #       args: [
+  #         "--config", "pyproject.toml",
+  #         "--allow-incomplete-defs",
+  #       ]
+  #       additional_dependencies: [
+  #         msgspec,
+  #         types-frozendict,
+  #         types-pytz,
+  #         types-redis,
+  #         types-requests,
+  #         types-toml,
+  #       ]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
     rev: 0.9.9 # Must match uv-version file

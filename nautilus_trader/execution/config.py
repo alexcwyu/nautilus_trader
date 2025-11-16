@@ -17,19 +17,19 @@ from __future__ import annotations
 
 from typing import Any
 
-import msgspec
+import orjson
 
 from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.common.config import PositiveFloat
-from nautilus_trader.common.config import msgspec_encoding_hook
 from nautilus_trader.common.config import resolve_config_path
 from nautilus_trader.common.config import resolve_path
+from nautilus_trader.common.config import serialize_config_value
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ExecAlgorithmId
 
 
-class ExecEngineConfig(NautilusConfig, frozen=True):
+class ExecEngineConfig(NautilusConfig):
     """
     Configuration for ``ExecutionEngine`` instances.
 
@@ -76,7 +76,7 @@ class ExecEngineConfig(NautilusConfig, frozen=True):
     debug: bool = False
 
 
-class ExecAlgorithmConfig(NautilusConfig, kw_only=True, frozen=True):
+class ExecAlgorithmConfig(NautilusConfig):
     """
     The base model for all execution algorithm configurations.
 
@@ -98,7 +98,7 @@ class ExecAlgorithmConfig(NautilusConfig, kw_only=True, frozen=True):
     log_commands: bool = True
 
 
-class ImportableExecAlgorithmConfig(NautilusConfig, frozen=True):
+class ImportableExecAlgorithmConfig(NautilusConfig):
     """
     Configuration for an execution algorithm instance.
 
@@ -146,6 +146,6 @@ class ExecAlgorithmFactory:
         PyCondition.type(config, ImportableExecAlgorithmConfig, "config")
         exec_algorithm_cls = resolve_path(config.exec_algorithm_path)
         config_cls = resolve_config_path(config.config_path)
-        json = msgspec.json.encode(config.config, enc_hook=msgspec_encoding_hook)
-        config = config_cls.parse(json)
+        json_bytes = orjson.dumps({k: serialize_config_value(v) for k, v in config.config.items()})
+        config = config_cls.parse(json_bytes)
         return exec_algorithm_cls(config=config)

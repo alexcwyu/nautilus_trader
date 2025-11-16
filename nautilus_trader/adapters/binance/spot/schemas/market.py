@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.schemas.market import BinanceExchangeFilter
@@ -40,7 +40,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceSpotSymbolInfo(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotSymbolInfo:
     """
     HTTP response 'inner struct' from Binance Spot/Margin GET /api/v3/exchangeInfo.
     """
@@ -81,7 +82,8 @@ class BinanceSpotSymbolInfo(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceSpotExchangeInfo(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotExchangeInfo:
     """
     HTTP response from Binance Spot/Margin GET /api/v3/exchangeInfo.
     """
@@ -93,7 +95,8 @@ class BinanceSpotExchangeInfo(msgspec.Struct, frozen=True):
     symbols: list[BinanceSpotSymbolInfo]
 
 
-class BinanceSpotAvgPrice(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotAvgPrice:
     """
     HTTP response from Binance Spot/Margin GET /api/v3/avgPrice.
     """
@@ -107,7 +110,8 @@ class BinanceSpotAvgPrice(msgspec.Struct, frozen=True):
 ################################################################################
 
 
-class BinanceSpotOrderBookPartialDepthData(msgspec.Struct):
+@dataclass
+class BinanceSpotOrderBookPartialDepthData:
     """
     Websocket message 'inner struct' for 'Binance Spot/Margin Partial Book Depth
     Streams.'.
@@ -164,7 +168,8 @@ class BinanceSpotOrderBookPartialDepthData(msgspec.Struct):
         return OrderBookDeltas(instrument_id=instrument_id, deltas=deltas)
 
 
-class BinanceSpotOrderBookPartialDepthMsg(msgspec.Struct):
+@dataclass
+class BinanceSpotOrderBookPartialDepthMsg:
     """
     WebSocket message for 'Binance Spot/Margin' Partial Book Depth Streams.
     """
@@ -173,7 +178,8 @@ class BinanceSpotOrderBookPartialDepthMsg(msgspec.Struct):
     data: BinanceSpotOrderBookPartialDepthData
 
 
-class BinanceSpotTradeData(msgspec.Struct):
+@dataclass
+class BinanceSpotTradeData:
     """
     WebSocket message 'inner struct' for Binance Spot/Margin Trade Streams.
 
@@ -217,7 +223,8 @@ class BinanceSpotTradeData(msgspec.Struct):
         )
 
 
-class BinanceSpotTradeMsg(msgspec.Struct):
+@dataclass
+class BinanceSpotTradeMsg:
     """
     WebSocket message from Binance Trade Streams.
     """

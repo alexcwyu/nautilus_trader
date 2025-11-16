@@ -1,23 +1,7 @@
-# -------------------------------------------------------------------------------------------------
-#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
-#  https://nautechsystems.io
-#
-#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
-#  You may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-# -------------------------------------------------------------------------------------------------
-
+import dataclasses
 from decimal import Decimal
 from enum import Enum
 from typing import Any
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
@@ -53,6 +37,24 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
 
+# -------------------------------------------------------------------------------------------------
+#  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
+#  https://nautechsystems.io
+#
+#  Licensed under the GNU Lesser General Public License Version 3.0 (the "License");
+#  You may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at https://www.gnu.org/licenses/lgpl-3.0.en.html
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+# -------------------------------------------------------------------------------------------------
+
+
+
+
 def _symbol_info_to_dict(symbol_info: BinanceFuturesSymbolInfo) -> dict:
     """
     Convert symbol info to dict with all enums and nested structs converted to
@@ -67,7 +69,7 @@ def _symbol_info_to_dict(symbol_info: BinanceFuturesSymbolInfo) -> dict:
         if isinstance(value, Enum):
             return value.value
         elif hasattr(value, "__struct_fields__"):
-            return _convert_dict(msgspec.structs.asdict(value))
+            return _convert_dict(dataclasses.asdict(value))
         elif isinstance(value, list):
             return [_convert_value(item) for item in value]
         elif isinstance(value, dict):
@@ -77,7 +79,7 @@ def _symbol_info_to_dict(symbol_info: BinanceFuturesSymbolInfo) -> dict:
     def _convert_dict(d: dict) -> dict:
         return {key: _convert_value(val) for key, val in d.items()}
 
-    return _convert_dict(msgspec.structs.asdict(symbol_info))
+    return _convert_dict(dataclasses.asdict(symbol_info))
 
 
 class BinanceFuturesInstrumentProvider(InstrumentProvider):
@@ -122,8 +124,6 @@ class BinanceFuturesInstrumentProvider(InstrumentProvider):
 
         self._log_warnings = config.log_warnings if config else True
 
-        self._decoder = msgspec.json.Decoder()
-        self._encoder = msgspec.json.Encoder()
 
         # This fee rates map is only applicable for backtesting, as live trading will utilise
         # real-time account update messages provided by Binance.

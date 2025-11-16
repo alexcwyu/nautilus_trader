@@ -24,7 +24,7 @@ from nautilus_trader.config import PositiveInt
 from nautilus_trader.model.identifiers import Venue
 
 
-class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
+class BinanceDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``BinanceDataClient`` instances.
 
@@ -76,7 +76,7 @@ class BinanceDataClientConfig(LiveDataClientConfig, frozen=True):
     use_agg_trade_ticks: bool = False
 
 
-class BinanceExecClientConfig(LiveExecClientConfig, frozen=True):
+class BinanceExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``BinanceExecutionClient`` instances.
 

@@ -24,7 +24,7 @@ from nautilus_trader.model.instruments import Instrument
 from nautilus_trader.trading.strategy import Strategy
 
 
-class DemoStrategyConfig(StrategyConfig, frozen=True):
+class DemoStrategyConfig(StrategyConfig):
     instrument: Instrument
     bar_type: BarType
 

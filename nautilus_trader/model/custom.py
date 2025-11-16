@@ -17,13 +17,13 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-import msgspec
 import pyarrow as pa
 
 from nautilus_trader.core.datetime import unix_nanos_to_iso8601
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.serialization.arrow.serializer import register_arrow
 from nautilus_trader.serialization.base import register_serializable_type
+from nautilus_trader.serialization.compat import MsgPackWrapper as msgpack
 
 
 def customdataclass(*args, **kwargs):  # noqa: C901 (too complex)
@@ -120,7 +120,7 @@ def customdataclass(*args, **kwargs):  # noqa: C901 (too complex)
         if "to_bytes" not in cls.__dict__:
 
             def to_bytes(self) -> bytes:
-                return msgspec.msgpack.encode(self.to_dict())
+                return msgpack.encode(self.to_dict())
 
             cls.to_bytes = to_bytes
 
@@ -128,7 +128,7 @@ def customdataclass(*args, **kwargs):  # noqa: C901 (too complex)
 
             @classmethod
             def from_bytes(cls, data: bytes) -> cls:
-                return cls.from_dict(msgspec.msgpack.decode(data))
+                return cls.from_dict(msgpack.decode(data))
 
             cls.from_bytes = from_bytes
 

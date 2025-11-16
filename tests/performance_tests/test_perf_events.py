@@ -13,7 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+
+import orjson
 
 from nautilus_trader.core.uuid import UUID4
 from nautilus_trader.model.events import OrderDenied
@@ -60,6 +61,6 @@ def test_order_denied_to_dict(benchmark):
 def test_order_denied_to_dict_then_msgspec_to_json(benchmark):
     def call_to_dict_then_json() -> None:
         denied_dict = OrderDenied.to_dict(_STUB_ORDER_DENIED)
-        msgspec.json.encode(denied_dict)
+        orjson.dumps(denied_dict)
 
     benchmark(call_to_dict_then_json)

@@ -127,7 +127,7 @@ class HyperliquidLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: HyperliquidDataClientConfig,
@@ -186,7 +186,7 @@ class HyperliquidLiveExecClientFactory(LiveExecClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: HyperliquidExecClientConfig,

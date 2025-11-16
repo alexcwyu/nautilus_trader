@@ -15,7 +15,7 @@
 
 import click
 import fsspec
-import msgspec
+import orjson
 
 from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.config import BacktestRunConfig
@@ -39,7 +39,7 @@ def main(
         assert raw is not None  # Type checking
         data = raw.encode()
 
-    configs = msgspec.json.decode(
+    configs = orjson.loads(
         data,
         type=list[BacktestRunConfig],
         dec_hook=msgspec_decoding_hook,

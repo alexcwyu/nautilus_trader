@@ -168,7 +168,7 @@ class ParquetBarDataLoader:
         return df
 
 
-class InterestRateProviderConfig(ActorConfig, frozen=True):
+class InterestRateProviderConfig(ActorConfig):
     """
     Configuration for the InterestRateProvider actor.
 

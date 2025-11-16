@@ -52,7 +52,7 @@ from nautilus_trader.trading.config import StrategyConfig
 
 
 # %%
-class Strat_oca_test_config(StrategyConfig, frozen=True):
+class Strat_oca_test_config(StrategyConfig):
     tradable_instrument_id: str | None = "ESZ5.CME"
 
 

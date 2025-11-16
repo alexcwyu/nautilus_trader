@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
 from nautilus_trader.adapters.binance.common.enums import BinanceExchangeFilterType
@@ -48,7 +47,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceTime(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceTime:
     """
     Schema of current server time GET response of `time`
     """
@@ -56,7 +56,8 @@ class BinanceTime(msgspec.Struct, frozen=True):
     serverTime: int
 
 
-class BinanceExchangeFilter(msgspec.Struct):
+@dataclass
+class BinanceExchangeFilter:
     """
     Schema of an exchange filter, within response of GET `exchangeInfo.`
     """
@@ -66,7 +67,8 @@ class BinanceExchangeFilter(msgspec.Struct):
     maxNumAlgoOrders: int | None = None
 
 
-class BinanceRateLimit(msgspec.Struct):
+@dataclass
+class BinanceRateLimit:
     """
     Schema of rate limit info, within response of GET `exchangeInfo.`
     """
@@ -78,7 +80,8 @@ class BinanceRateLimit(msgspec.Struct):
     count: int | None = None  # SPOT/MARGIN rateLimit/order response only
 
 
-class BinanceSymbolFilter(msgspec.Struct):
+@dataclass
+class BinanceSymbolFilter:
     """
     Schema of a symbol filter, within response of GET `exchangeInfo.`
     """
@@ -116,7 +119,8 @@ class BinanceSymbolFilter(msgspec.Struct):
     maxTrailingBelowDelta: int | None = None  # SPOT/MARGIN only
 
 
-class BinanceDepth(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceDepth:
     """
     Schema of a binance orderbook depth.
 
@@ -164,7 +168,8 @@ class BinanceDepth(msgspec.Struct, frozen=True):
         return OrderBookDeltas(instrument_id=instrument_id, deltas=deltas)
 
 
-class BinanceTrade(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceTrade:
     """
     Schema of a single trade.
     """
@@ -198,7 +203,8 @@ class BinanceTrade(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceAggTrade(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceAggTrade:
     """
     Schema of a single compressed aggregate trade.
     """
@@ -233,7 +239,8 @@ class BinanceAggTrade(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceKline(msgspec.Struct, array_like=True):
+@dataclass
+class BinanceKline:
     """
     Array-like schema of single Binance kline.
     """
@@ -277,7 +284,8 @@ class BinanceKline(msgspec.Struct, array_like=True):
         )
 
 
-class BinanceTicker24hr(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceTicker24hr:
     """
     Schema of single Binance 24hr ticker (FULL/MINI).
     """
@@ -311,7 +319,8 @@ class BinanceTicker24hr(msgspec.Struct, frozen=True):
     quoteVolume: str | None = None  # SPOT/MARGIN & USD-M FUTURES only
 
 
-class BinanceTickerPrice(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceTickerPrice:
     """
     Schema of single Binance Price Ticker.
     """
@@ -323,7 +332,8 @@ class BinanceTickerPrice(msgspec.Struct, frozen=True):
     ps: str | None = None  # COIN-M FUTURES only, pair
 
 
-class BinanceTickerBook(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceTickerBook:
     """
     Schema of a single Binance Order Book Ticker.
     """
@@ -342,7 +352,8 @@ class BinanceTickerBook(msgspec.Struct, frozen=True):
 ################################################################################
 
 
-class BinanceDataMsgWrapper(msgspec.Struct):
+@dataclass
+class BinanceDataMsgWrapper:
     """
     Provides a wrapper for data WebSocket messages from Binance.
     """
@@ -351,7 +362,8 @@ class BinanceDataMsgWrapper(msgspec.Struct):
     id: int | None = None
 
 
-class BinanceOrderBookDelta(msgspec.Struct, array_like=True):
+@dataclass
+class BinanceOrderBookDelta:
     """
     Schema of single ask/bid delta.
     """
@@ -387,7 +399,8 @@ class BinanceOrderBookDelta(msgspec.Struct, array_like=True):
         )
 
 
-class BinanceOrderBookData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceOrderBookData:
     """
     WebSocket message 'inner struct' for Binance Partial & Diff.
 
@@ -460,7 +473,8 @@ class BinanceOrderBookData(msgspec.Struct, frozen=True):
         return OrderBookDeltas(instrument_id=instrument_id, deltas=deltas)
 
 
-class BinanceOrderBookMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceOrderBookMsg:
     """
     WebSocket message from Binance Partial & Diff.
 
@@ -472,7 +486,8 @@ class BinanceOrderBookMsg(msgspec.Struct, frozen=True):
     data: BinanceOrderBookData
 
 
-class BinanceQuoteData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceQuoteData:
     """
     WebSocket message from Binance Individual Symbol Book Ticker Streams.
     """
@@ -503,7 +518,8 @@ class BinanceQuoteData(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceQuoteMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceQuoteMsg:
     """
     WebSocket message from Binance Individual Symbol Book Ticker Streams.
     """
@@ -512,7 +528,8 @@ class BinanceQuoteMsg(msgspec.Struct, frozen=True):
     data: BinanceQuoteData
 
 
-class BinanceAggregatedTradeData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceAggregatedTradeData:
     """
     WebSocket message from Binance Aggregate Trade Streams.
     """
@@ -546,7 +563,8 @@ class BinanceAggregatedTradeData(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceAggregatedTradeMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceAggregatedTradeMsg:
     """
     WebSocket message.
     """
@@ -555,7 +573,8 @@ class BinanceAggregatedTradeMsg(msgspec.Struct, frozen=True):
     data: BinanceAggregatedTradeData
 
 
-class BinanceTickerData(msgspec.Struct, kw_only=True, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class BinanceTickerData:
     """
     WebSocket message from Binance 24hr Ticker.
 
@@ -643,7 +662,8 @@ class BinanceTickerData(msgspec.Struct, kw_only=True, frozen=True):
         )
 
 
-class BinanceTickerMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceTickerMsg:
     """
     WebSocket message.
     """
@@ -652,7 +672,8 @@ class BinanceTickerMsg(msgspec.Struct, frozen=True):
     data: BinanceTickerData
 
 
-class BinanceCandlestick(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceCandlestick:
     """
     WebSocket message 'inner struct' for Binance Kline/Candlestick Streams.
 
@@ -725,7 +746,8 @@ class BinanceCandlestick(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceCandlestickData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceCandlestickData:
     """
     WebSocket message 'inner struct'.
     """
@@ -736,7 +758,8 @@ class BinanceCandlestickData(msgspec.Struct, frozen=True):
     k: BinanceCandlestick
 
 
-class BinanceCandlestickMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceCandlestickMsg:
     """
     WebSocket message for Binance Kline/Candlestick Streams.
     """

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import orjson
+
+
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
@@ -24,8 +27,6 @@ backtesting with high-frequency orderbook and trade data.
 import ast
 import asyncio
 
-import msgspec
-
 from nautilus_trader.core.nautilus_pyo3 import HttpClient
 
 
@@ -46,7 +47,7 @@ async def fetch_active_markets(http_client: HttpClient, limit: int = 100) -> lis
     if resp.status != 200:
         raise RuntimeError(f"HTTP error: {resp.status}")
 
-    return msgspec.json.decode(resp.body)
+    return orjson.loads(resp.body)
 
 
 def filter_updown_markets(markets: list[dict], asset: str | None = None) -> list[dict]:

@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+import orjson
 
 from nautilus_trader.accounting.accounts.base import Account
 from nautilus_trader.accounting.accounts.cash import CashAccount
@@ -421,7 +421,7 @@ def transform_custom_data_to_pyo3(data: CustomData) -> nautilus_pyo3.CustomData:
     data_type_pyo3 = transform_data_type_to_pyo3(data.data_type)
     return nautilus_pyo3.CustomData(
         data_type_pyo3,
-        value=msgspec.json.encode(data.data.to_dict()),
+        value=orjson.dumps(data.data.to_dict()),
         ts_event=data.ts_event,
         ts_init=data.ts_init,
     )

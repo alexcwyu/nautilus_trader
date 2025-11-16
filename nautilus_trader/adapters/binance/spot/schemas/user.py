@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
 from nautilus_trader.adapters.binance.common.enums import BinanceExecutionType
@@ -49,7 +48,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceSpotUserMsgData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotUserMsgData:
     """
     Inner struct for execution WebSocket messages from Binance.
     """
@@ -57,7 +57,8 @@ class BinanceSpotUserMsgData(msgspec.Struct, frozen=True):
     e: BinanceSpotEventType
 
 
-class BinanceSpotUserMsgWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotUserMsgWrapper:
     """
     Provides a wrapper for execution WebSocket messages from Binance.
     """
@@ -66,7 +67,8 @@ class BinanceSpotUserMsgWrapper(msgspec.Struct, frozen=True):
     data: BinanceSpotUserMsgData
 
 
-class BinanceSpotBalance(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotBalance:
     """
     Inner struct for Binance Spot/Margin balances.
     """
@@ -87,7 +89,8 @@ class BinanceSpotBalance(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceSpotAccountUpdateMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotAccountUpdateMsg:
     """
     WebSocket message for Binance Spot/Margin Account Update events.
     """
@@ -112,7 +115,8 @@ class BinanceSpotAccountUpdateMsg(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceSpotAccountUpdateWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotAccountUpdateWrapper:
     """
     WebSocket message wrapper for Binance Spot/Margin Account Update events.
     """
@@ -121,7 +125,8 @@ class BinanceSpotAccountUpdateWrapper(msgspec.Struct, frozen=True):
     data: BinanceSpotAccountUpdateMsg
 
 
-class BinanceSpotOrderUpdateData(msgspec.Struct, kw_only=True):
+@dataclass(kw_only=True)
+class BinanceSpotOrderUpdateData:
     """
     WebSocket message 'inner struct' for Binance Spot/Margin Order Update events.
     """
@@ -391,7 +396,8 @@ class BinanceSpotOrderUpdateData(msgspec.Struct, kw_only=True):
             exec_client._log.warning(f"Received unhandled {self}")
 
 
-class BinanceSpotOrderUpdateWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotOrderUpdateWrapper:
     """
     WebSocket message wrapper for Binance Spot/Margin Order Update events.
     """

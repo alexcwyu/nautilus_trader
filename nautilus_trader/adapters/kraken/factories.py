@@ -116,7 +116,7 @@ class KrakenLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str | None,
         config: KrakenDataClientConfig,

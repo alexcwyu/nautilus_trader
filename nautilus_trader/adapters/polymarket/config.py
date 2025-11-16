@@ -21,7 +21,7 @@ from nautilus_trader.config import PositiveInt
 from nautilus_trader.model.identifiers import Venue
 
 
-class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
+class PolymarketDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``PolymarketDataClient`` instances.
 
@@ -84,7 +84,7 @@ class PolymarketDataClientConfig(LiveDataClientConfig, frozen=True):
     drop_quotes_missing_side: bool = True
 
 
-class PolymarketExecClientConfig(LiveExecClientConfig, frozen=True):
+class PolymarketExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``PolymarketExecutionClient`` instances.
 

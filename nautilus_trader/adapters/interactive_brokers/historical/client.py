@@ -17,7 +17,7 @@ import datetime
 import re
 from typing import Literal
 
-import msgspec
+import orjson
 import pandas as pd
 from ibapi.common import MarketDataTypeEnum
 
@@ -82,11 +82,27 @@ class HistoricInteractiveBrokersClient:
             cache_db = None
         elif cache_config.database.type == "redis":
             encoding = cache_config.encoding.lower()
+
+            # Wrapper to make orjson compatible with msgspec interface
+            class _OrjsonWrapper:
+                """
+                Wrapper to provide encode/decode interface for orjson.
+                """
+
+                @staticmethod
+                def encode(obj, **kwargs):
+                    return orjson.dumps(obj)
+                @staticmethod
+                def decode(data, **kwargs):
+                    return orjson.loads(data)
+
+            from nautilus_trader.serialization.serializer import msgpack
+
             cache_db = CacheDatabaseAdapter(
                 trader_id=trader_id,
                 instance_id=UUID4(),
                 serializer=MsgSpecSerializer(
-                    encoding=msgspec.msgpack if encoding == "msgpack" else msgspec.json,
+                    encoding=msgpack if encoding == "msgpack" else _OrjsonWrapper(),
                     timestamps_as_str=True,  # Hardcoded for now
                     timestamps_as_iso8601=cache_config.timestamps_as_iso8601,
                 ),

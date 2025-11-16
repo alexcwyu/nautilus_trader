@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -30,8 +33,6 @@ import os
 from collections.abc import AsyncGenerator
 from math import ceil
 from typing import Any
-
-import msgspec
 
 from nautilus_trader.core.nautilus_pyo3 import HttpClient
 from nautilus_trader.core.nautilus_pyo3 import HttpResponse
@@ -130,7 +131,7 @@ async def _request_markets_page(
         body = resp.body.decode("utf-8", errors="replace")
         raise RuntimeError(f"Gamma Get Markets failed: {resp.status} for url {base_endpoint} with params {effective_params} and body {body}")
 
-    data = msgspec.json.decode(resp.body)
+    data = orjson.loads(resp.body)
     if isinstance(data, list):
         return data
     if isinstance(data, dict) and "data" in data:
@@ -205,11 +206,11 @@ def normalize_gamma_market_to_clob_format(gamma_market: dict[str, Any]) -> dict[
     outcome_prices = gamma_market.get("outcomePrices", [])
 
     if isinstance(clob_token_ids, str):
-        clob_token_ids = msgspec.json.decode(clob_token_ids)
+        clob_token_ids = orjson.loads(clob_token_ids)
     if isinstance(outcomes, str):
-        outcomes = msgspec.json.decode(outcomes)
+        outcomes = orjson.loads(outcomes)
     if isinstance(outcome_prices, str):
-        outcome_prices = msgspec.json.decode(outcome_prices)
+        outcome_prices = orjson.loads(outcome_prices)
 
     for i, (token_id, outcome) in enumerate(zip(clob_token_ids, outcomes, strict=False)):
         token_entry = {

@@ -52,10 +52,15 @@ from nautilus_trader.common.config import NonNegativeInt
 from nautilus_trader.common.config import OrderEmulatorConfig
 from nautilus_trader.common.config import PositiveFloat
 from nautilus_trader.common.config import PositiveInt
-from nautilus_trader.common.config import msgspec_decoding_hook
-from nautilus_trader.common.config import msgspec_encoding_hook
+from nautilus_trader.common.config import pydantic_decoder
+from nautilus_trader.common.config import pydantic_encoder
 from nautilus_trader.common.config import register_config_decoding
 from nautilus_trader.common.config import register_config_encoding
+
+
+# Backward compatibility aliases
+msgspec_encoding_hook = pydantic_encoder
+msgspec_decoding_hook = pydantic_decoder
 from nautilus_trader.common.config import resolve_config_path
 from nautilus_trader.common.config import resolve_path
 from nautilus_trader.common.config import tokenize_config

@@ -15,9 +15,10 @@
 
 import asyncio
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
+from nautilus_trader.adapters.binance.common.schemas.market import BinanceOrderBookMsg
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
 from nautilus_trader.adapters.binance.data import BinanceCommonDataClient
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEnumParser
@@ -115,17 +116,10 @@ class BinanceFuturesDataClient(BinanceCommonDataClient):
         self._ws_handlers["@markPrice"] = self._handle_mark_price
         self._ws_handlers["!markPrice@arr"] = self._handle_mark_price_all
 
-        # Websocket msgspec decoders
-        self._decoder_futures_trade_msg = msgspec.json.Decoder(BinanceFuturesTradeMsg)
-        self._decoder_futures_mark_price_msg = msgspec.json.Decoder(BinanceFuturesMarkPriceMsg)
-        self._decoder_futures_mark_price_all_msg = msgspec.json.Decoder(
-            BinanceFuturesMarkPriceAllMsg,
-        )
-
     # -- WEBSOCKET HANDLERS ---------------------------------------------------------------------------------
 
     def _handle_book_partial_update(self, raw: bytes) -> None:
-        msg = self._decoder_order_book_msg.decode(raw)
+        msg = BinanceOrderBookMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         book_snapshot: OrderBookDeltas = msg.data.parse_to_order_book_deltas(
             instrument_id=instrument_id,
@@ -143,7 +137,7 @@ class BinanceFuturesDataClient(BinanceCommonDataClient):
 
     def _handle_trade(self, raw: bytes) -> None:
         # NOTE @trade is an undocumented endpoint for Futures exchanges
-        msg = self._decoder_futures_trade_msg.decode(raw)
+        msg = BinanceFuturesTradeMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         try:
             trade_tick: TradeTick = msg.data.parse_to_trade_tick(
@@ -178,10 +172,10 @@ class BinanceFuturesDataClient(BinanceCommonDataClient):
         )
 
     def _handle_mark_price(self, raw: bytes) -> None:
-        msg = self._decoder_futures_mark_price_msg.decode(raw)
+        msg = BinanceFuturesMarkPriceMsg(**orjson.loads(raw))
         self._handle_mark_price_data(msg.data)
 
     def _handle_mark_price_all(self, raw: bytes) -> None:
-        msg = self._decoder_futures_mark_price_all_msg.decode(raw)
+        msg = BinanceFuturesMarkPriceAllMsg(**orjson.loads(raw))
         for data in msg.data:
             self._handle_mark_price_data(data)

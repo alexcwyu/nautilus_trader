@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -22,7 +25,6 @@ from collections import defaultdict
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-import msgspec
 import pandas as pd
 from grpc.aio._call import AioRpcError
 from v4_proto.dydxprotocol.clob.order_pb2 import Order as DYDXOrder
@@ -269,20 +271,6 @@ class DYDXExecutionClient(LiveExecutionClient):
         )
 
         # Decoders
-        self._decoder_ws_msg_general = msgspec.json.Decoder(DYDXWsMessageGeneral)
-        self._decoder_ws_msg_subaccounts_subscribed = msgspec.json.Decoder(
-            DYDXWsSubaccountsSubscribed,
-        )
-        self._decoder_ws_msg_subaccounts_channel = msgspec.json.Decoder(
-            DYDXWsSubaccountsChannelData,
-        )
-        self._decoder_ws_block_height_subscribed = msgspec.json.Decoder(
-            DYDXWsBlockHeightSubscribedData,
-        )
-        self._decoder_ws_block_height_channel = msgspec.json.Decoder(DYDXWsBlockHeightChannelData)
-        self._decoder_ws_instruments = msgspec.json.Decoder(DYDXWsMarketChannelData)
-        self._decoder_ws_instruments_subscribed = msgspec.json.Decoder(DYDXWsMarketSubscribedData)
-
         # Hot caches
         self._order_builders: dict[InstrumentId, OrderBuilder] = {}
         self._generate_order_status_retries: dict[ClientOrderId, int] = {}
@@ -737,7 +725,7 @@ class DYDXExecutionClient(LiveExecutionClient):
 
     def _handle_ws_message(self, raw: bytes) -> None:  # noqa: C901
         try:
-            ws_message = self._decoder_ws_msg_general.decode(raw)
+            ws_message = DYDXWsMessageGeneral(**orjson.loads(raw))
             ws_message_channel = ws_message.channel
             ws_message_type = ws_message.type
 
@@ -798,7 +786,7 @@ class DYDXExecutionClient(LiveExecutionClient):
 
     def _handle_markets(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsMarketChannelData = self._decoder_ws_instruments.decode(raw)
+            msg: DYDXWsMarketChannelData = DYDXWsMarketChannelData(**orjson.loads(raw))
 
             if msg.contents.oraclePrices is not None:
                 for symbol, oracle_price_market in msg.contents.oraclePrices.items():
@@ -810,7 +798,7 @@ class DYDXExecutionClient(LiveExecutionClient):
 
     def _handle_markets_subscribed(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsMarketSubscribedData = self._decoder_ws_instruments_subscribed.decode(raw)
+            msg: DYDXWsMarketSubscribedData = DYDXWsMarketSubscribedData(**orjson.loads(raw))
 
             for symbol, oracle_price_market in msg.contents.markets.items():
                 if oracle_price_market.oraclePrice is not None:
@@ -886,7 +874,7 @@ class DYDXExecutionClient(LiveExecutionClient):
 
     def _handle_subaccounts_channel_data(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsSubaccountsChannelData = self._decoder_ws_msg_subaccounts_channel.decode(raw)
+            msg: DYDXWsSubaccountsChannelData = DYDXWsSubaccountsChannelData(**orjson.loads(raw))
 
             if msg.contents.fills is not None:
                 for fill_msg in msg.contents.fills:

@@ -48,7 +48,7 @@ from nautilus_trader.trading.config import StrategyConfig
 
 
 # %%
-class SimpleConditionsConfig(StrategyConfig, frozen=True):
+class SimpleConditionsConfig(StrategyConfig):
     tradable_instrument_id: str | None = "ESZ5.CME"
 
 

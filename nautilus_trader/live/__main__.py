@@ -15,7 +15,7 @@
 
 import click
 import fsspec
-import msgspec
+import orjson
 
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
@@ -35,7 +35,7 @@ def main(
         with fsspec.open(fsspec_url, "rb") as f:
             raw = f.read().decode()
     assert raw is not None  # Type checking
-    config: TradingNodeConfig = msgspec.json.decode(raw, type=TradingNodeConfig)
+    config: TradingNodeConfig = orjson.loads(raw, type=TradingNodeConfig)
     node = TradingNode(config=config)
     node.build()
     if start:

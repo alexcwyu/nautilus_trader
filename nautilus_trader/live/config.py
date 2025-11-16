@@ -15,7 +15,7 @@
 
 from __future__ import annotations
 
-import msgspec
+import orjson
 
 from nautilus_trader.common import Environment
 from nautilus_trader.common.config import ActorConfig
@@ -37,7 +37,7 @@ from nautilus_trader.system.config import NautilusKernelConfig
 from nautilus_trader.trading.config import ImportableControllerConfig
 
 
-class LiveDataEngineConfig(DataEngineConfig, frozen=True):
+class LiveDataEngineConfig(DataEngineConfig):
     """
     Configuration for ``LiveDataEngine`` instances.
 
@@ -55,7 +55,7 @@ class LiveDataEngineConfig(DataEngineConfig, frozen=True):
     graceful_shutdown_on_exception: bool = False
 
 
-class LiveRiskEngineConfig(RiskEngineConfig, frozen=True):
+class LiveRiskEngineConfig(RiskEngineConfig):
     """
     Configuration for ``LiveRiskEngine`` instances.
 
@@ -73,7 +73,7 @@ class LiveRiskEngineConfig(RiskEngineConfig, frozen=True):
     graceful_shutdown_on_exception: bool = False
 
 
-class LiveExecEngineConfig(ExecEngineConfig, frozen=True):
+class LiveExecEngineConfig(ExecEngineConfig):
     """
     Configuration for ``LiveExecEngine`` instances.
 
@@ -225,7 +225,7 @@ class LiveExecEngineConfig(ExecEngineConfig, frozen=True):
     graceful_shutdown_on_exception: bool = False
 
 
-class RoutingConfig(NautilusConfig, frozen=True):
+class RoutingConfig(NautilusConfig):
     """
     Configuration for live client message routing.
 
@@ -243,7 +243,7 @@ class RoutingConfig(NautilusConfig, frozen=True):
     venues: frozenset[str] | None = None
 
 
-class LiveDataClientConfig(NautilusConfig, frozen=True):
+class LiveDataClientConfig(NautilusConfig):
     """
     Configuration for ``LiveDataClient`` instances.
 
@@ -263,7 +263,7 @@ class LiveDataClientConfig(NautilusConfig, frozen=True):
     routing: RoutingConfig = RoutingConfig()
 
 
-class LiveExecClientConfig(NautilusConfig, frozen=True):
+class LiveExecClientConfig(NautilusConfig):
     """
     Configuration for ``LiveExecutionClient`` instances.
 
@@ -280,7 +280,7 @@ class LiveExecClientConfig(NautilusConfig, frozen=True):
     routing: RoutingConfig = RoutingConfig()
 
 
-class ControllerConfig(ActorConfig, kw_only=True, frozen=True):
+class ControllerConfig(ActorConfig):
     """
     The base model for all controller configurations.
     """
@@ -301,11 +301,11 @@ class ControllerFactory:
         PyCondition.type(trader, Trader, "trader")
         controller_cls = resolve_path(config.controller_path)
         config_cls = resolve_config_path(config.config_path)
-        config = config_cls.parse(msgspec.json.encode(config.config))
+        config = config_cls.parse(orjson.dumps(config.config))
         return controller_cls(config=config, trader=trader)
 
 
-class TradingNodeConfig(NautilusKernelConfig, frozen=True):
+class TradingNodeConfig(NautilusKernelConfig):
     """
     Configuration for ``TradingNode`` instances.
 
@@ -338,4 +338,4 @@ class TradingNodeConfig(NautilusKernelConfig, frozen=True):
 
     def __post_init__(self):
         if isinstance(self.trader_id, str):
-            msgspec.structs.force_setattr(self, "trader_id", TraderId(self.trader_id))
+            object.__setattr__(self, "trader_id", TraderId(self.trader_id))

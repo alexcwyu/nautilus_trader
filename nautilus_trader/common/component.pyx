@@ -23,8 +23,8 @@ from typing import Any
 from typing import Callable
 
 import cython
-import msgspec
 import numpy as np
+import orjson
 import pandas as pd
 import pytz
 
@@ -1294,7 +1294,7 @@ cpdef LogGuard init_logging(
         pystr_to_cstr(directory) if directory else NULL,
         pystr_to_cstr(file_name) if file_name else NULL,
         pystr_to_cstr(file_format) if file_format else NULL,
-        pybytes_to_cstr(msgspec.json.encode(component_levels)) if component_levels else NULL,
+        pybytes_to_cstr(orjson.dumps(component_levels)) if component_levels else NULL,
         colors,
         bypass,
         print_config,

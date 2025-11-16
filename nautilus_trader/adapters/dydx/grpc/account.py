@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -24,7 +27,6 @@ import bech32
 import ecdsa
 import google
 import grpc
-import msgspec
 from bip_utils import Bip39SeedGenerator
 from bip_utils import Bip44
 from bip_utils import Bip44Coins
@@ -225,7 +227,7 @@ class DYDXAccountGRPCAPI:
         # spawning background gRPC threads during object construction, which in
         # turn avoids noisy shutdown warnings if a client instance is created
         # but never used.
-        self._grpc_service_config: str = msgspec.json.encode(
+        self._grpc_service_config: str = orjson.dumps(
             {
                 "methodConfig": [
                     {

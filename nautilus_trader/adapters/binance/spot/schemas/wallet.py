@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+from dataclasses import dataclass
 
 
 ################################################################################
@@ -21,7 +21,8 @@ import msgspec
 ################################################################################
 
 
-class BinanceSpotTradeFee(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceSpotTradeFee:
     """
     Schema of a single Binance Spot/Margin tradeFee.
     """

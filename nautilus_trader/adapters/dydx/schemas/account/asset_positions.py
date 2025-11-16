@@ -17,12 +17,14 @@ Define the schemas for the GetAssetPositions endpoint.
 """
 
 
-import msgspec
+
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.dydx.schemas.account.address import DYDXAssetPosition
 
 
-class DYDXAssetPositionsResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXAssetPositionsResponse:
     """
     Define the schema for the asset positions response.
     """

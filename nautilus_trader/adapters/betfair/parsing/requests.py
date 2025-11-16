@@ -17,7 +17,7 @@ import hashlib
 from functools import lru_cache
 from typing import Literal
 
-import msgspec
+import orjson
 import pandas as pd
 from betfair_parser.spec.accounts.type_definitions import AccountDetailsResponse
 from betfair_parser.spec.accounts.type_definitions import AccountFundsResponse
@@ -508,7 +508,7 @@ def create_customer_strategy_ref(trader_id: str, strategy_id: str) -> str:
         "trader_id": trader_id,
         "strategy_id": strategy_id,
     }
-    return hashlib.shake_256(msgspec.json.encode(data)).hexdigest(8)[:15]
+    return hashlib.shake_256(orjson.dumps(data)).hexdigest(8)[:15]
 
 
 def hashed_trade_id(
@@ -523,7 +523,7 @@ def hashed_trade_id(
     average_price_matched: float | None = None,
     size_matched: float | None = None,
 ) -> TradeId:
-    data: bytes = msgspec.json.encode(
+    data: bytes = orjson.dumps(
         (
             bet_id,
             price,
@@ -537,7 +537,7 @@ def hashed_trade_id(
             size_matched,
         ),
     )
-    return TradeId(hashlib.shake_256(msgspec.json.encode(data)).hexdigest(18))
+    return TradeId(hashlib.shake_256(orjson.dumps(data)).hexdigest(18))
 
 
 def order_to_trade_id(uo: BetfairOrder) -> TradeId:

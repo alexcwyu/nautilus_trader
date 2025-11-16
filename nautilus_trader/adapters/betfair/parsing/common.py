@@ -16,7 +16,7 @@
 import hashlib
 from functools import lru_cache
 
-import msgspec
+import orjson
 from betfair_parser.spec.common import Handicap
 from betfair_parser.spec.common import MarketId
 from betfair_parser.spec.common import OrderSide as BetSide
@@ -115,4 +115,4 @@ def min_fill_size(time_in_force) -> Size | None:
 
 def hash_market_trade(timestamp: int, price: float, volume: float) -> str:
     data = (timestamp, price, volume)
-    return hashlib.shake_256(msgspec.json.encode(data)).hexdigest(18)
+    return hashlib.shake_256(orjson.dumps(data)).hexdigest(18)

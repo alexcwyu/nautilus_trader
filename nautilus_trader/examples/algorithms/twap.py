@@ -32,7 +32,7 @@ from nautilus_trader.model.orders import MarketOrder
 from nautilus_trader.model.orders import Order
 
 
-class TWAPExecAlgorithmConfig(ExecAlgorithmConfig, frozen=True):
+class TWAPExecAlgorithmConfig(ExecAlgorithmConfig):
     """
     Configuration for ``TWAPExecAlgorithm`` instances.
 

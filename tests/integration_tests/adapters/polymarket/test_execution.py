@@ -21,6 +21,7 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 import msgspec
+import orjson
 import pytest
 from py_clob_client.client import ClobClient
 
@@ -290,7 +291,7 @@ class TestPolymarketExecutionClient:
             resource="user_trade1.json",
         )
 
-        msg_data = msgspec.json.decode(raw_message)
+        msg_data = orjson.loads(raw_message)
         trade_id = msg_data["id"]
         taker_order_id = msg_data["taker_order_id"]
 
@@ -319,8 +320,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade2.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
 
         client_order_id, venue_order_id = self._setup_test_order_with_venue_id(
             "0x5b605a0e8e40f3402d3cb3bc19edad6733ed23fbc079d2a09ee399c3487ace81",
@@ -353,8 +354,8 @@ class TestPolymarketExecutionClient:
             resource="order_placement.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
 
         client_order_id, venue_order_id = self._setup_test_order_with_venue_id(
             "0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
@@ -393,8 +394,8 @@ class TestPolymarketExecutionClient:
             resource="order_placement.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = fast_exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = fast_exec_client._decoder_user_msg.decode(orjson.dumps(msg))
         venue_order_id = VenueOrderId(
             "0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
         )
@@ -418,8 +419,8 @@ class TestPolymarketExecutionClient:
             resource="order_placement.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
         venue_order_id = VenueOrderId(
             "0x0f76f4dc6eaf3332f4100f2e8a0b4a927351dd64646b7bb12f37df775c657a78",
         )
@@ -472,8 +473,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade1.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
 
         client_order_id, venue_order_id = self._setup_test_order_with_venue_id(
             "0x3ad09f225ebe141dfbdb3824f31cb457e8e0301ca4e0a06311e543f5328b9dea",
@@ -512,8 +513,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade1.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = fast_exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = fast_exec_client._decoder_user_msg.decode(orjson.dumps(msg))
         venue_order_id = VenueOrderId(
             "0x3ad09f225ebe141dfbdb3824f31cb457e8e0301ca4e0a06311e543f5328b9dea",
         )
@@ -537,8 +538,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade1.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
         venue_order_id = VenueOrderId(
             "0x3ad09f225ebe141dfbdb3824f31cb457e8e0301ca4e0a06311e543f5328b9dea",
         )
@@ -597,8 +598,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade3.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
 
         client_order_id, venue_order_id = self._setup_test_order_with_venue_id(
             "0x3ad09f225ebe141dfbdb3824f31cb457e8e0301ca4e0a06311e543f5328b9dea",
@@ -628,8 +629,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade4.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
 
         first_client_order_id, first_venue_order_id = self._setup_test_order_with_venue_id(
             "0x67b598cab933c71389176573822be763192a35a8c37e49999a11d611a5882e7d",
@@ -674,7 +675,7 @@ class TestPolymarketExecutionClient:
             package="tests.integration_tests.adapters.polymarket.resources.ws_messages",
             resource="user_trade4.json",
         )
-        ws_data = msgspec.json.decode(raw_ws_message)
+        ws_data = orjson.loads(raw_ws_message)
 
         # Convert WS format to REST format
         rest_data = {
@@ -745,7 +746,7 @@ class TestPolymarketExecutionClient:
         Test handling message that fails to decode.
         """
         # Arrange
-        unknown_message = msgspec.json.encode([{"unknown_field": "unknown_value"}])
+        unknown_message = orjson.dumps([{"unknown_field": "unknown_value"}])
 
         # Act & Assert - should handle gracefully via exception handling
         self.exec_client._handle_ws_message(unknown_message)
@@ -815,8 +816,8 @@ class TestPolymarketExecutionClient:
             resource="user_trade1.json",
         )
 
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
 
         # Act
         self.exec_client._add_trade_to_cache(msg, raw_message)
@@ -989,7 +990,7 @@ class TestPolymarketExecutionClient:
         Test handling websocket messages for unknown instruments gracefully.
         """
         # Arrange - Create a trade message for an instrument not in cache
-        raw_message = msgspec.json.encode(
+        raw_message = orjson.dumps(
             [
                 {
                     "asset_id": "99999999999999999999999999999999999999999999999999999999999999999999999999999",
@@ -1281,8 +1282,8 @@ class TestPolymarketExecutionClient:
             package="tests.integration_tests.adapters.polymarket.resources.ws_messages",
             resource="user_trade1.json",
         )
-        msg = msgspec.json.decode(raw_message)
-        msg = self.exec_client._decoder_user_msg.decode(msgspec.json.encode(msg))
+        msg = orjson.loads(raw_message)
+        msg = self.exec_client._decoder_user_msg.decode(orjson.dumps(msg))
         await self.exec_client._wait_for_ack_trade(msg, venue_order_id)
 
         # Assert

@@ -18,7 +18,7 @@ from __future__ import annotations
 from nautilus_trader.common.config import NautilusConfig
 
 
-class RiskEngineConfig(NautilusConfig, frozen=True):
+class RiskEngineConfig(NautilusConfig):
     """
     Configuration for ``RiskEngine`` instances.
 

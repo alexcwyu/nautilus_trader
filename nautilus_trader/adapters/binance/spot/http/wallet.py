@@ -13,7 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+
+from dataclasses import dataclass
+
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
@@ -58,9 +61,10 @@ class BinanceSpotTradeFeeHttp(BinanceHttpEndpoint):
             methods,
             endpoint_path,
         )
-        self._get_arr_resp_decoder = msgspec.json.Decoder(list[BinanceSpotTradeFee])
+        # get_arr_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET parameters for requesting trade fees.
 
@@ -82,7 +86,7 @@ class BinanceSpotTradeFeeHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceSpotTradeFee]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_arr_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotWalletHttpAPI:

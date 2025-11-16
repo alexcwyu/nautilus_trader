@@ -53,7 +53,7 @@ catalog = load_catalog(catalog_folder)
 
 
 # %%
-class DataSubscriberConfig(StrategyConfig, frozen=True):
+class DataSubscriberConfig(StrategyConfig):
     instrument_ids: list[InstrumentId] | None = None
 
 

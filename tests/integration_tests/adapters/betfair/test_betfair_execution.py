@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
-import msgspec
+import orjson
 import pytest
 from betfair_parser.spec.streaming import OCM
 from betfair_parser.spec.streaming import MatchedOrder
@@ -506,7 +506,7 @@ async def test_order_stream_empty_image(exec_client, events):
 async def test_order_stream_new_full_image(exec_client, setup_order_state, cache, events):
     # Arrange
     raw = BetfairStreaming.ocm_NEW_FULL_IMAGE()
-    ocm = msgspec.json.decode(raw, type=OCM)
+    ocm = orjson.loads(raw, type=OCM)
     await setup_order_state(ocm)
     order = cache.orders()[0]
     exec_client.generate_order_filled(
@@ -602,7 +602,7 @@ async def test_order_stream_filled_multiple_prices(
         order_id=int(venue_order_id.value),
     )
     await setup_order_state(order_change_message)
-    exec_client.handle_order_stream_update(msgspec.json.encode(order_change_message))
+    exec_client.handle_order_stream_update(orjson.dumps(order_change_message))
     await asyncio.sleep(0)
     order = cache.order(client_order_id=ClientOrderId("1"))
     assert order
@@ -617,7 +617,7 @@ async def test_order_stream_filled_multiple_prices(
         avp=1.50,
     )
     await setup_order_state(order_change_message)
-    exec_client.handle_order_stream_update(msgspec.json.encode(order_change_message))
+    exec_client.handle_order_stream_update(orjson.dumps(order_change_message))
     await asyncio.sleep(0)
 
     # Assert
@@ -793,7 +793,7 @@ async def test_various_betfair_order_fill_scenarios(
             status=status,
             **raw,
         )
-        exec_client.handle_order_stream_update(msgspec.json.encode(order_change_message))
+        exec_client.handle_order_stream_update(orjson.dumps(order_change_message))
         await asyncio.sleep(0)
 
     # Assert
@@ -817,7 +817,7 @@ async def test_order_filled_avp_update(exec_client, setup_order_state):
         avp=1.50,
         sm=10,
     )
-    exec_client.handle_order_stream_update(msgspec.json.encode(order_change_message))
+    exec_client.handle_order_stream_update(orjson.dumps(order_change_message))
     await asyncio.sleep(0)
 
     order_change_message = BetfairStreaming.generate_order_change_message(
@@ -828,7 +828,7 @@ async def test_order_filled_avp_update(exec_client, setup_order_state):
         avp=1.50,
         sm=10,
     )
-    exec_client.handle_order_stream_update(msgspec.json.encode(order_change_message))
+    exec_client.handle_order_stream_update(orjson.dumps(order_change_message))
     await asyncio.sleep(0)
 
 

@@ -17,7 +17,7 @@ from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.model.identifiers import InstrumentId
 
 
-class DatabentoDataClientConfig(LiveDataClientConfig, frozen=True):
+class DatabentoDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``DatabentoDataClient`` instances.
 

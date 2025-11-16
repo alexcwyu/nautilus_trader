@@ -21,7 +21,7 @@ from nautilus_trader.model.orders import Order
 from nautilus_trader.model.orders import OrderList
 
 
-class MyExecAlgorithmConfig(ExecAlgorithmConfig, frozen=True):
+class MyExecAlgorithmConfig(ExecAlgorithmConfig):
     """
     Configuration for ``MyExecAlgorithm`` instances.
 

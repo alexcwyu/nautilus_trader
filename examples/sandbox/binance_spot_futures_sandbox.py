@@ -49,7 +49,7 @@ from nautilus_trader.trading.config import StrategyConfig
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
 
-class TestStrategyConfig(StrategyConfig, frozen=True):
+class TestStrategyConfig(StrategyConfig):
     futures_client_id: ClientId
     futures_instrument_id: InstrumentId
     spot_instrument_id: InstrumentId

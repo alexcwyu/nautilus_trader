@@ -15,7 +15,7 @@
 
 import datetime as dt
 
-import msgspec
+import orjson
 
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
@@ -152,7 +152,7 @@ def create_replay_normalized_request_options(
         "with_disconnect_messages": True,
     }
 
-    json_options = msgspec.json.encode(options)
+    json_options = orjson.dumps(options)
     return nautilus_pyo3.ReplayNormalizedRequestOptions.from_json(json_options)
 
 
@@ -171,5 +171,5 @@ def create_stream_normalized_request_options(
         "with_disconnect_messages": True,
     }
 
-    json_options = msgspec.json.encode(options)
+    json_options = orjson.dumps(options)
     return nautilus_pyo3.StreamNormalizedRequestOptions.from_json(json_options)

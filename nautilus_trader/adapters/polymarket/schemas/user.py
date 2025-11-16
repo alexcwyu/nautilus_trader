@@ -13,10 +13,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import asdict
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-import msgspec
 import pandas as pd
 
 from nautilus_trader.adapters.polymarket.common.enums import PolymarketEventType
@@ -47,7 +48,8 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money
 
 
-class PolymarketUserOrder(msgspec.Struct, tag="order", tag_field="event_type", frozen=True):
+@dataclass
+class PolymarketUserOrder:
     """
     Represents a Polymarket user order status update.
 
@@ -137,7 +139,8 @@ class PolymarketUserOrder(msgspec.Struct, tag="order", tag_field="event_type", f
         )
 
 
-class PolymarketUserTrade(msgspec.Struct, tag="trade", tag_field="event_type", frozen=True):
+@dataclass
+class PolymarketUserTrade:
     """
     Represents a Polymarket user trade.
 
@@ -169,7 +172,7 @@ class PolymarketUserTrade(msgspec.Struct, tag="trade", tag_field="event_type", f
     type: PolymarketEventType  # TRADE
 
     def to_dict(self) -> dict[str, Any]:
-        return msgspec.json.decode(msgspec.json.encode(self))
+        return asdict(self)
 
     def get_filled_user_order_ids(self, maker_address: str, api_key: str) -> list[str]:
         if self.trader_side == PolymarketLiquiditySide.TAKER:
@@ -267,7 +270,8 @@ class PolymarketUserTrade(msgspec.Struct, tag="trade", tag_field="event_type", f
         )
 
 
-class PolymarketOpenOrder(msgspec.Struct, frozen=True):
+@dataclass
+class PolymarketOpenOrder:
     """
     Represents a Polymarket active order.
 

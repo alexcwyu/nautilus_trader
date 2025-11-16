@@ -16,7 +16,6 @@
 import asyncio
 from typing import Any
 
-import msgspec
 from py_clob_client.client import ClobClient
 
 from nautilus_trader.adapters.polymarket.common.constants import POLYMARKET_VENUE
@@ -90,8 +89,6 @@ class PolymarketInstrumentProvider(InstrumentProvider):
         self._http_client = http_client or HttpClient(timeout_secs=30)
 
         self._log_warnings = config.log_warnings if config else True
-        self._decoder = msgspec.json.Decoder()
-        self._encoder = msgspec.json.Encoder()
 
     async def load_all_async(self, filters: dict | None = None) -> None:
         await self._load_markets([], filters)

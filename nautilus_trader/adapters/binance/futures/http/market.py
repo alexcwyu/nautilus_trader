@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
@@ -52,12 +52,12 @@ class BinanceFuturesExchangeInfoHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(BinanceFuturesExchangeInfo)
+        # get_resp_decoder removed - using orjson
 
     async def get(self) -> BinanceFuturesExchangeInfo:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, None)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesMarketHttpAPI(BinanceMarketHttpAPI):

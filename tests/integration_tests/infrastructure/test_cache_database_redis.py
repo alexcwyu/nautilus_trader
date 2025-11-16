@@ -18,7 +18,6 @@ import sys
 import time
 from decimal import Decimal
 
-import msgspec
 import pytest
 
 from nautilus_trader.backtest.engine import BacktestEngine
@@ -55,6 +54,7 @@ from nautilus_trader.model.position import Position
 from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
+from nautilus_trader.serialization.compat import MsgPackWrapper as msgpack
 from nautilus_trader.serialization.serializer import MsgSpecSerializer
 from nautilus_trader.test_kit.functions import eventually
 from nautilus_trader.test_kit.mocks.actors import MockActor
@@ -131,7 +131,7 @@ class TestCacheDatabaseAdapter:
         self.database = CacheDatabaseAdapter(
             trader_id=self.trader_id,
             instance_id=UUID4(),
-            serializer=MsgSpecSerializer(encoding=msgspec.msgpack, timestamps_as_str=True),
+            serializer=MsgSpecSerializer(encoding=msgpack, timestamps_as_str=True),
             config=CacheConfig(database=DatabaseConfig()),
         )
 
@@ -1179,7 +1179,7 @@ class TestRedisCacheDatabaseIntegrity:
         self.database = CacheDatabaseAdapter(
             trader_id=self.trader_id,
             instance_id=UUID4(),
-            serializer=MsgSpecSerializer(encoding=msgspec.msgpack, timestamps_as_str=True),
+            serializer=MsgSpecSerializer(encoding=msgpack, timestamps_as_str=True),
             config=CacheConfig(database=DatabaseConfig()),
         )
 

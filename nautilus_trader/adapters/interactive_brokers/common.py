@@ -53,7 +53,7 @@ TickTypeMapping = {
 }
 
 
-class ComboLeg(NautilusConfig, frozen=True, omit_defaults=True, repr_omit_defaults=True):
+class ComboLeg(NautilusConfig):
     """
     Class representing a leg within combo orders.
     """
@@ -69,7 +69,7 @@ class ComboLeg(NautilusConfig, frozen=True, omit_defaults=True, repr_omit_defaul
     exemptCode: int = -1
 
 
-class DeltaNeutralContract(NautilusConfig, frozen=True, repr_omit_defaults=True):
+class DeltaNeutralContract(NautilusConfig):
     """
     Delta-Neutral Contract.
     """
@@ -79,7 +79,7 @@ class DeltaNeutralContract(NautilusConfig, frozen=True, repr_omit_defaults=True)
     price: float = 0.0
 
 
-class IBContract(NautilusConfig, frozen=True, repr_omit_defaults=True):
+class IBContract(NautilusConfig):
     """
     Class describing an instrument's definition with additional fields for
     options/futures.
@@ -165,7 +165,7 @@ class IBContract(NautilusConfig, frozen=True, repr_omit_defaults=True):
     max_expiry_days: int | None = None
 
 
-class IBOrderTags(NautilusConfig, frozen=True, repr_omit_defaults=True):
+class IBOrderTags(NautilusConfig):
     """
     Used to attach to Nautilus Order Tags for IB specific order parameters.
     """
@@ -208,7 +208,7 @@ class IBOrderTags(NautilusConfig, frozen=True, repr_omit_defaults=True):
         return self.value
 
 
-class IBContractDetails(NautilusConfig, frozen=True, repr_omit_defaults=True):
+class IBContractDetails(NautilusConfig):
     """
     ContractDetails class to be used internally in Nautilus for ease of
     encoding/decoding.

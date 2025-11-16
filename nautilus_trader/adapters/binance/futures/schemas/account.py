@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceFuturesPositionSide
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEnumParser
@@ -37,7 +36,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceFuturesBalanceInfo(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesBalanceInfo:
     """
     HTTP response 'inner struct' from Binance Futures GET /fapi/v2/account (HMAC
     SHA256).
@@ -82,7 +82,8 @@ class BinanceFuturesBalanceInfo(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceFuturesAccountInfo(msgspec.Struct, kw_only=True, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class BinanceFuturesAccountInfo:
     """
     HTTP response from Binance Futures GET /fapi/v2/account (HMAC SHA256).
     """
@@ -117,7 +118,8 @@ class BinanceFuturesAccountInfo(msgspec.Struct, kw_only=True, frozen=True):
         return [asset.parse_to_margin_balance() for asset in self.assets]
 
 
-class BinanceFuturesPositionRisk(msgspec.Struct, kw_only=True, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class BinanceFuturesPositionRisk:
     """
     HTTP response from Binance Futures GET /fapi/v3/positionRisk (HMAC SHA256).
 
@@ -199,7 +201,8 @@ class BinanceFuturesPositionRisk(msgspec.Struct, kw_only=True, frozen=True):
         )
 
 
-class BinanceFuturesDualSidePosition(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesDualSidePosition:
     """
     HTTP response from Binance Futures GET /fapi/v1/positionSide/dual (HMAC SHA256).
     """
@@ -207,7 +210,8 @@ class BinanceFuturesDualSidePosition(msgspec.Struct, frozen=True):
     dualSidePosition: bool
 
 
-class BinanceFuturesFeeRates(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesFeeRates:
     """
     Represents a Binance Futures fee tier.
 
@@ -220,7 +224,8 @@ class BinanceFuturesFeeRates(msgspec.Struct, frozen=True):
     taker: str
 
 
-class BinanceFuturesLeverage(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesLeverage:
     """
     HTTP response from Binance Futures POST /fapi/v1/leverage.
     """
@@ -230,7 +235,8 @@ class BinanceFuturesLeverage(msgspec.Struct, frozen=True):
     symbol: str
 
 
-class BinanceFuturesSymbolConfig(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesSymbolConfig:
     """
     HTTP response from Binance Futures GET /fapi/v1/symbolConfig.
 
@@ -247,7 +253,8 @@ class BinanceFuturesSymbolConfig(msgspec.Struct, frozen=True):
     maxNotionalValue: str
 
 
-class BinanceFuturesMarginTypeResponse(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesMarginTypeResponse:
     """
     HTTP response from Binance Futures `POST /fapi/v1/marginType`.
     """

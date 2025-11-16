@@ -15,7 +15,7 @@
 
 import asyncio
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
@@ -104,16 +104,10 @@ class BinanceSpotDataClient(BinanceCommonDataClient):
             config=config,
         )
 
-        # Websocket msgspec decoders
-        self._decoder_spot_trade = msgspec.json.Decoder(BinanceSpotTradeMsg)
-        self._decoder_spot_order_book_partial_depth = msgspec.json.Decoder(
-            BinanceSpotOrderBookPartialDepthMsg,
-        )
-
     # -- WEBSOCKET HANDLERS ---------------------------------------------------------------------------------
 
     def _handle_book_partial_update(self, raw: bytes) -> None:
-        msg = self._decoder_spot_order_book_partial_depth.decode(raw)
+        msg = BinanceSpotOrderBookPartialDepthMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(
             msg.stream.partition("@")[0],
         )
@@ -131,7 +125,7 @@ class BinanceSpotDataClient(BinanceCommonDataClient):
             self._handle_data(book_snapshot)
 
     def _handle_trade(self, raw: bytes) -> None:
-        msg = self._decoder_spot_trade.decode(raw)
+        msg = BinanceSpotTradeMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         trade_tick: TradeTick = msg.data.parse_to_trade_tick(
             instrument_id=instrument_id,

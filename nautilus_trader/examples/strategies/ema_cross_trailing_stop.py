@@ -49,7 +49,7 @@ from nautilus_trader.trading.strategy import Strategy
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
 
-class EMACrossTrailingStopConfig(StrategyConfig, frozen=True):
+class EMACrossTrailingStopConfig(StrategyConfig):
     """
     Configuration for ``EMACrossTrailingStop`` instances.
 

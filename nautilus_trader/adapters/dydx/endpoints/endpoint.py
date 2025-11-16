@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -18,9 +21,6 @@ Define the base class for dYdX endpoints.
 
 from typing import Any
 
-import msgspec
-from msgspec import DecodeError
-
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
 from nautilus_trader.adapters.dydx.http.client import DYDXHttpClient
 from nautilus_trader.adapters.dydx.http.errors import DYDXError
@@ -30,6 +30,10 @@ from nautilus_trader.core.nautilus_pyo3 import HttpError
 from nautilus_trader.core.nautilus_pyo3 import HttpMethod
 from nautilus_trader.core.nautilus_pyo3 import HttpTimeoutError
 from nautilus_trader.live.retry import RetryManagerPool
+
+
+# orjson.JSONDecodeError replaced with orjson.JSONorjson.JSONDecodeError
+
 
 
 class DYDXHttpEndpoint:
@@ -52,8 +56,8 @@ class DYDXHttpEndpoint:
         self.url_path = url_path
         self.name = name
 
-        self.decoder = msgspec.json.Decoder()
-        self.encoder = msgspec.json.Encoder()
+        # decoder removed - using orjson
+        # encoder removed - using orjson
 
         self._method_request: dict[DYDXEndpointType, Any] = {
             DYDXEndpointType.NONE: self.client.send_request,
@@ -67,7 +71,7 @@ class DYDXHttpEndpoint:
             delay_max_ms=5_000,
             backoff_factor=2,
             logger=Logger(name="DYDXHttpEndpoint"),
-            exc_types=(HttpTimeoutError, HttpError, DYDXError, DecodeError),
+            exc_types=(HttpTimeoutError, HttpError, DYDXError, orjson.JSONDecodeError),
             retry_check=should_retry,
         )
 
@@ -77,7 +81,7 @@ class DYDXHttpEndpoint:
         params: Any | None = None,
         url_path: str | None = None,
     ) -> bytes | None:
-        payload: dict[str, Any] = self.decoder.decode(self.encoder.encode(params))
+        payload: dict[str, Any] = orjson.loads(orjson.dumps(params))
         method_call = self._method_request[self.endpoint_type]
         url_path = url_path or self.url_path
         retry_name = self.name or "http_call"

@@ -136,7 +136,7 @@ class BitmexLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str | None,
         config: BitmexDataClientConfig,
@@ -206,7 +206,7 @@ class BitmexLiveExecClientFactory(LiveExecClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str | None,
         config: BitmexExecClientConfig,

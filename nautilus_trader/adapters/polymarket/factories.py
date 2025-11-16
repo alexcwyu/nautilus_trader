@@ -134,7 +134,7 @@ class PolymarketLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: PolymarketDataClientConfig,
@@ -197,7 +197,7 @@ class PolymarketLiveExecClientFactory(LiveExecClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: PolymarketExecClientConfig,

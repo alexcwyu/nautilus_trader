@@ -19,7 +19,7 @@ Unit tests for the HTTP endpoints.
 from decimal import Decimal
 from pathlib import Path
 
-import msgspec
+import orjson
 import pytest
 
 from nautilus_trader.adapters.dydx.common.constants import DYDX_VENUE
@@ -64,10 +64,10 @@ def list_perpetual_markets_response() -> DYDXListPerpetualMarketsResponse:
     """
     Create an perpetual markets endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXListPerpetualMarketsResponse)
+    # Decoder removed - using orjson with DYDXListPerpetualMarketsResponse
 
     with Path("tests/test_data/dydx/http/list_perpetual_markets.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -75,10 +75,10 @@ def addresses_response() -> DYDXAddressResponse:
     """
     Create an addresses endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXAddressResponse)
+    # Decoder removed - using orjson with DYDXAddressResponse
 
     with Path("tests/test_data/dydx/http/addresses.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -86,10 +86,10 @@ def subaccount_response() -> DYDXSubaccountResponse:
     """
     Create an subaccount endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXSubaccountResponse)
+    # Decoder removed - using orjson with DYDXSubaccountResponse
 
     with Path("tests/test_data/dydx/http/subaccount.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -97,10 +97,10 @@ def asset_positions_response() -> DYDXAssetPositionsResponse:
     """
     Create an asset positions endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXAssetPositionsResponse)
+    # Decoder removed - using orjson with DYDXAssetPositionsResponse
 
     with Path("tests/test_data/dydx/http/asset_positions.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -108,10 +108,10 @@ def perpetual_positions_response() -> DYDXPerpetualPositionsResponse:
     """
     Create an perpetual positions endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXPerpetualPositionsResponse)
+    # Decoder removed - using orjson with DYDXPerpetualPositionsResponse
 
     with Path("tests/test_data/dydx/http/list_perpetual_positions.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -120,7 +120,7 @@ def orders_response() -> list[DYDXOrderResponse]:
     Create an orders endpoint response.
     """
     with Path("tests/test_data/dydx/http/orders.json").open() as file_reader:
-        return msgspec.json.decode(file_reader.read(), type=list[DYDXOrderResponse], strict=True)
+        return orjson.loads(file_reader.read(), type=list[DYDXOrderResponse], strict=True)
 
 
 @pytest.fixture
@@ -128,10 +128,10 @@ def order_response() -> DYDXOrderResponse:
     """
     Create an endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXOrderResponse)
+    # Decoder removed - using orjson with DYDXOrderResponse
 
     with Path("tests/test_data/dydx/http/order.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -139,10 +139,10 @@ def conditional_order_response() -> DYDXOrderResponse:
     """
     Create an endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXOrderResponse)
+    # Decoder removed - using orjson with DYDXOrderResponse
 
     with Path("tests/test_data/dydx/http/conditional_order.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 @pytest.fixture
@@ -150,10 +150,10 @@ def fills_response() -> DYDXFillsResponse:
     """
     Create an addresses endpoint response.
     """
-    decoder = msgspec.json.Decoder(DYDXFillsResponse)
+    # Decoder removed - using orjson with DYDXFillsResponse
 
     with Path("tests/test_data/dydx/http/fills.json").open() as file_reader:
-        return decoder.decode(file_reader.read())
+        return orjson.loads(file_reader.read())
 
 
 def test_addresses(addresses_response: DYDXAddressResponse) -> None:
@@ -272,11 +272,11 @@ def test_fills_with_affiliate_rev_share() -> None:
     """
     # Arrange
     expected_num_fills = 1
-    decoder = msgspec.json.Decoder(DYDXFillsResponse)
+    # Decoder removed - using orjson with DYDXFillsResponse
 
     # Act
     with Path("tests/test_data/dydx/http/v4_fills.json").open() as file_reader:
-        fills_response = decoder.decode(file_reader.read())
+        fills_response = orjson.loads(file_reader.read())
 
     # Assert
     assert len(fills_response.fills) == expected_num_fills
@@ -533,11 +533,11 @@ def test_list_perpetual_markets_v8() -> None:
     """
     # Prepare
     expected_num_markets = 1
-    decoder = msgspec.json.Decoder(DYDXListPerpetualMarketsResponse)
+    # Decoder removed - using orjson with DYDXListPerpetualMarketsResponse
 
     # Act
     with Path("tests/test_data/dydx/http/list_perpetual_markets_v8.json").open() as file_reader:
-        list_perpetual_markets_response = decoder.decode(file_reader.read())
+        list_perpetual_markets_response = orjson.loads(file_reader.read())
 
     # Assert
     assert len(list_perpetual_markets_response.markets) == expected_num_markets
@@ -550,13 +550,13 @@ def test_list_perpetual_markets_null_oracle_price() -> None:
     """
     # Prepare
     expected_num_markets = 101
-    decoder = msgspec.json.Decoder(DYDXListPerpetualMarketsResponse)
+    # Decoder removed - using orjson with DYDXListPerpetualMarketsResponse
 
     # Act
     with Path(
         "tests/test_data/dydx/http/list_perpetual_markets_empty_oracle_price.json",
     ).open() as file_reader:
-        list_perpetual_markets_response = decoder.decode(file_reader.read())
+        list_perpetual_markets_response = orjson.loads(file_reader.read())
 
     # Assert
     assert len(list_perpetual_markets_response.markets) == expected_num_markets

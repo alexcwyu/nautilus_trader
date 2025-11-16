@@ -1,3 +1,10 @@
+from pathlib import Path
+
+import orjson
+
+from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
+
+
 # -------------------------------------------------------------------------------------------------
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
@@ -13,11 +20,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from pathlib import Path
 
-import msgspec
-
-from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
 
 
 def save_historical_trades() -> None:
@@ -27,7 +30,7 @@ def save_historical_trades() -> None:
     print(response)
 
     path = Path("trades_history.json")
-    path.write_bytes(msgspec.json.encode(response))
+    path.write_bytes(orjson.dumps(response))
 
 
 if __name__ == "__main__":

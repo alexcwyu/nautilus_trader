@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+from dataclasses import dataclass
 
 
 ################################################################################
@@ -21,7 +21,8 @@ import msgspec
 ################################################################################
 
 
-class BinanceListenKey(msgspec.Struct):
+@dataclass
+class BinanceListenKey:
     """
     HTTP response from creating a new Binance user listen key.
     """

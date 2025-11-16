@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -18,8 +21,6 @@ Provides a dYdX asynchronous HTTP client.
 
 import urllib.parse
 from typing import Any
-
-import msgspec
 
 import nautilus_trader
 from nautilus_trader.adapters.dydx.http.errors import DYDXError
@@ -149,7 +150,7 @@ class DYDXHttpClient:
             http_method,
             url=self._base_url + url_path,
             headers=self._headers,
-            body=msgspec.json.encode(payload) if payload else None,
+            body=orjson.dumps(payload) if payload else None,
             keys=ratelimiter_keys,
             timeout_secs=timeout_secs,
         )
@@ -157,14 +158,14 @@ class DYDXHttpClient:
         if BAD_REQUEST_ERROR_CODE <= response.status < INTERNAL_SERVER_ERROR_CODE:
             raise DYDXError(
                 status=response.status,
-                message=msgspec.json.decode(response.body) if response.body else str(None),
+                message=orjson.loads(response.body) if response.body else str(None),
                 headers=response.headers,
             )
 
         if response.status >= INTERNAL_SERVER_ERROR_CODE:
             raise DYDXError(
                 status=response.status,
-                message=msgspec.json.decode(response.body) if response.body else str(None),
+                message=orjson.loads(response.body) if response.body else str(None),
                 headers=response.headers,
             )
 

@@ -13,14 +13,15 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+import orjson
 
 from nautilus_trader.cache.config import CacheConfig
 from nautilus_trader.cache.transformers import transform_account_from_pyo3
 from nautilus_trader.cache.transformers import transform_currency_from_pyo3
 from nautilus_trader.cache.transformers import transform_instrument_from_pyo3
 from nautilus_trader.cache.transformers import transform_order_from_pyo3
-from nautilus_trader.common.config import msgspec_encoding_hook
+from nautilus_trader.common.config import pydantic_encoder
+from nautilus_trader.common.config import serialize_config_value
 from nautilus_trader.core import nautilus_pyo3
 
 from cpython.datetime cimport datetime
@@ -162,7 +163,7 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
         self._backing = nautilus_pyo3.RedisCacheDatabase(
             trader_id=nautilus_pyo3.TraderId(trader_id.value),
             instance_id=nautilus_pyo3.UUID4.from_str(instance_id.value),
-            config_json=msgspec.json.encode(config, enc_hook=msgspec_encoding_hook),
+            config_json=orjson.dumps({k: serialize_config_value(v) for k, v in config.dict().items()}),
         )
 
 # -- COMMANDS -------------------------------------------------------------------------------------
@@ -512,7 +513,7 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
         if not result:
             return {}
 
-        cdef dict raw_index = msgspec.json.decode(result[0])
+        cdef dict raw_index = orjson.loads(result[0])
         return {ClientOrderId(k): PositionId(v) for k, v in raw_index.items()}
 
     cpdef dict load_index_order_client(self):
@@ -528,7 +529,7 @@ cdef class CacheDatabaseAdapter(CacheDatabaseFacade):
         if not result:
             return {}
 
-        cdef dict raw_index = msgspec.json.decode(result[0])
+        cdef dict raw_index = orjson.loads(result[0])
         return {ClientOrderId(k): ClientId(v) for k, v in raw_index.items()}
 
     cpdef Currency load_currency(self, str code):

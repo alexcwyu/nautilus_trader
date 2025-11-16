@@ -17,18 +17,18 @@ from __future__ import annotations
 
 from typing import Any
 
-import msgspec
+import orjson
 
 from nautilus_trader.common.config import NautilusConfig
-from nautilus_trader.common.config import msgspec_encoding_hook
 from nautilus_trader.common.config import resolve_config_path
 from nautilus_trader.common.config import resolve_path
+from nautilus_trader.common.config import serialize_config_value
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import StrategyId
 
 
-class StrategyConfig(NautilusConfig, kw_only=True, frozen=True):
+class StrategyConfig(NautilusConfig):
     """
     The base model for all trading strategy configurations.
 
@@ -78,7 +78,7 @@ class StrategyConfig(NautilusConfig, kw_only=True, frozen=True):
     log_rejected_due_post_only_as_warning: bool = True
 
 
-class ImportableStrategyConfig(NautilusConfig, frozen=True):
+class ImportableStrategyConfig(NautilusConfig):
     """
     Configuration for a trading strategy instance.
 
@@ -126,12 +126,12 @@ class StrategyFactory:
         PyCondition.type(config, ImportableStrategyConfig, "config")
         strategy_cls = resolve_path(config.strategy_path)
         config_cls = resolve_config_path(config.config_path)
-        json = msgspec.json.encode(config.config, enc_hook=msgspec_encoding_hook)
-        config = config_cls.parse(json)
+        json_bytes = orjson.dumps({k: serialize_config_value(v) for k, v in config.config.items()})
+        config = config_cls.parse(json_bytes)
         return strategy_cls(config=config)
 
 
-class ImportableControllerConfig(NautilusConfig, frozen=True):
+class ImportableControllerConfig(NautilusConfig):
     """
     Configuration for a controller instance.
 

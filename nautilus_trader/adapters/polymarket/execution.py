@@ -20,7 +20,7 @@ from collections import defaultdict
 from collections.abc import Coroutine
 from typing import Any
 
-import msgspec
+import orjson
 from py_clob_client.client import BalanceAllowanceParams
 from py_clob_client.client import ClobClient
 from py_clob_client.client import MarketOrderArgs
@@ -205,14 +205,11 @@ class PolymarketExecutionClient(LiveExecutionClient):
             exc_types=(PolyApiException,),
             retry_check=should_retry,
         )
-        self._decoder_order_report = msgspec.json.Decoder(PolymarketOpenOrder)
-        self._decoder_trade_report = msgspec.json.Decoder(PolymarketTradeReport)
 
         # WebSocket API
         self._ws_auth = ws_auth
         self._ws_client: PolymarketWebSocketClient = self._create_websocket_client()
         self._ws_clients: dict[InstrumentId, PolymarketWebSocketClient] = {}
-        self._decoder_user_msg = msgspec.json.Decoder(USER_WS_MESSAGE)
 
         # Hot caches
         self._active_markets: set[str] = set()
@@ -347,7 +344,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
             if response.status >= 400:
                 raise RuntimeError(f"HTTP {response.status}: Failed to fetch positions")
 
-            data = msgspec.json.decode(response.body)
+            data = orjson.loads(response.body)
             if not data:
                 break
             if isinstance(data, list):
@@ -395,8 +392,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 # Uncomment for development
                 # self._log.info(f"Processing {len(response)} orders", LogColor.MAGENTA)
                 for json_obj in response:
-                    raw = msgspec.json.encode(json_obj)
-                    polymarket_order = self._decoder_order_report.decode(raw)
+                    polymarket_order = PolymarketOpenOrder(**json_obj)
 
                     instrument_id = get_polymarket_instrument_id(
                         polymarket_order.market,
@@ -580,8 +576,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
                 return None
             # Uncomment for development
             # self._log.info(str(response), LogColor.MAGENTA)
-            raw_response = msgspec.json.encode(response)
-            polymarket_order = self._decoder_order_report.decode(raw_response)
+            polymarket_order = PolymarketOpenOrder(**response)
             instrument_id = get_polymarket_instrument_id(
                 polymarket_order.market,
                 polymarket_order.asset_id,
@@ -705,8 +700,7 @@ class PolymarketExecutionClient(LiveExecutionClient):
         parsed_fill_keys: set[tuple[TradeId, VenueOrderId]],
         reports: list[FillReport],
     ) -> None:
-        raw = msgspec.json.encode(json_obj)
-        polymarket_trade = self._decoder_trade_report.decode(raw)
+        polymarket_trade = PolymarketTradeReport(**json_obj)
 
         instrument_id = get_polymarket_instrument_id(
             polymarket_trade.market,
@@ -1188,15 +1182,30 @@ class PolymarketExecutionClient(LiveExecutionClient):
         finally:
             await self._retry_manager_pool.release(retry_manager)
 
+    def _decode_user_ws_message(self, data: dict) -> USER_WS_MESSAGE:
+        """
+        Decode a user WebSocket message dict into the appropriate dataclass.
+        """
+        # Check for specific fields to determine message type
+        if "order_type" in data:
+            # PolymarketUserOrder
+            return PolymarketUserOrder(**data)
+        elif "fee_rate_bps" in data:
+            # PolymarketUserTrade
+            return PolymarketUserTrade(**data)
+        else:
+            raise ValueError(f"Unknown user message type: {data}")
+
     def _handle_ws_message(self, raw: bytes) -> None:
         try:
             if self._config.log_raw_ws_messages:
                 self._log.info(
-                    str(json.dumps(msgspec.json.decode(raw), indent=4)),
+                    str(json.dumps(orjson.loads(raw), indent=4)),
                     color=LogColor.MAGENTA,
                 )
 
-            msg = self._decoder_user_msg.decode(raw)
+            data = orjson.loads(raw)
+            msg = self._decode_user_ws_message(data)
             if isinstance(msg, PolymarketUserOrder):
                 self._handle_ws_order_msg(msg, wait_for_ack=True)
             elif isinstance(msg, PolymarketUserTrade):

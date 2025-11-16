@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+import orjson
 import pyarrow as pa
 
 from nautilus_trader.common.messages import ComponentStateChanged
@@ -197,7 +197,7 @@ NAUTILUS_ARROW_SCHEMA = {
             "reconciliation": pa.bool_(),
         },
         metadata={
-            "options_fields": msgspec.json.encode(
+            "options_fields": orjson.dumps(
                 [
                     "price",
                     "trigger_price",

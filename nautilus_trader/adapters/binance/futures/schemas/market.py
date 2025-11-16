@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
@@ -40,7 +39,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceFuturesAsset(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesAsset:
     """
     HTTP response 'inner struct' from Binance Futures GET /fapi/v1/exchangeInfo.
     """
@@ -50,7 +50,8 @@ class BinanceFuturesAsset(msgspec.Struct, frozen=True):
     autoAssetExchange: str
 
 
-class BinanceFuturesSymbolInfo(msgspec.Struct, kw_only=True, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class BinanceFuturesSymbolInfo:
     """
     HTTP response 'inner struct' from Binance Futures GET /fapi/v1/exchangeInfo.
     """
@@ -99,7 +100,8 @@ class BinanceFuturesSymbolInfo(msgspec.Struct, kw_only=True, frozen=True):
         )
 
 
-class BinanceFuturesExchangeInfo(msgspec.Struct, kw_only=True, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class BinanceFuturesExchangeInfo:
     """
     HTTP response from Binance Futures GET /fapi/v1/exchangeInfo.
     """
@@ -112,7 +114,8 @@ class BinanceFuturesExchangeInfo(msgspec.Struct, kw_only=True, frozen=True):
     symbols: list[BinanceFuturesSymbolInfo]
 
 
-class BinanceFuturesMarkFunding(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesMarkFunding:
     """
     HTTP response from Binance Futures GET /fapi/v1/premiumIndex.
     """
@@ -129,7 +132,8 @@ class BinanceFuturesMarkFunding(msgspec.Struct, frozen=True):
     time: int
 
 
-class BinanceFuturesFundRate(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesFundRate:
     """
     HTTP response from Binance Futures GET /fapi/v1/fundingRate.
     """
@@ -144,7 +148,8 @@ class BinanceFuturesFundRate(msgspec.Struct, frozen=True):
 ################################################################################
 
 
-class BinanceFuturesTradeData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesTradeData:
     """
     WebSocket message 'inner struct' for Binance Futures Trade Streams.
 
@@ -201,7 +206,8 @@ class BinanceFuturesTradeData(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceFuturesTradeMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesTradeMsg:
     """
     WebSocket message from Binance Futures Trade Streams.
     """
@@ -210,7 +216,8 @@ class BinanceFuturesTradeMsg(msgspec.Struct, frozen=True):
     data: BinanceFuturesTradeData
 
 
-class BinanceFuturesMarkPriceData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesMarkPriceData:
     """
     WebSocket message 'inner struct' for Binance Futures Mark Price Update events.
     """
@@ -241,7 +248,8 @@ class BinanceFuturesMarkPriceData(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceFuturesMarkPriceMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesMarkPriceMsg:
     """
     WebSocket message from Binance Futures Mark Price Update events.
     """
@@ -250,7 +258,8 @@ class BinanceFuturesMarkPriceMsg(msgspec.Struct, frozen=True):
     data: BinanceFuturesMarkPriceData
 
 
-class BinanceFuturesMarkPriceAllMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesMarkPriceAllMsg:
     """
     WebSocket message from Binance Futures All Mark Price Update events.
     """

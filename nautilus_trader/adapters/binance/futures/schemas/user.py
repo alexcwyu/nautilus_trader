@@ -13,9 +13,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
 from nautilus_trader.adapters.binance.common.enums import BinanceExecutionType
@@ -55,7 +54,8 @@ from nautilus_trader.model.objects import Quantity
 ################################################################################
 
 
-class BinanceFuturesUserMsgData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesUserMsgData:
     """
     Inner struct for execution WebSocket messages from Binance.
     """
@@ -63,7 +63,8 @@ class BinanceFuturesUserMsgData(msgspec.Struct, frozen=True):
     e: BinanceFuturesEventType
 
 
-class BinanceFuturesUserMsgWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesUserMsgWrapper:
     """
     Provides a wrapper for execution WebSocket messages from Binance.
     """
@@ -72,7 +73,8 @@ class BinanceFuturesUserMsgWrapper(msgspec.Struct, frozen=True):
     stream: str | None = None
 
 
-class MarginCallPosition(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class MarginCallPosition:
     """
     Inner struct position for Binance Futures Margin Call events.
     """
@@ -87,7 +89,8 @@ class MarginCallPosition(msgspec.Struct, frozen=True):
     mm: str  # Maintenance Margin Required
 
 
-class BinanceFuturesMarginCallMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesMarginCallMsg:
     """
     WebSocket message for Binance Futures Margin Call events.
     """
@@ -98,7 +101,8 @@ class BinanceFuturesMarginCallMsg(msgspec.Struct, frozen=True):
     p: list[MarginCallPosition]
 
 
-class BinanceFuturesBalance(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesBalance:
     """
     Inner struct balance for Binance Futures Balance and Position update event.
     """
@@ -121,7 +125,8 @@ class BinanceFuturesBalance(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceFuturesPosition(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesPosition:
     """
     Inner struct position for Binance Futures Balance and Position update event.
     """
@@ -136,7 +141,8 @@ class BinanceFuturesPosition(msgspec.Struct, frozen=True):
     ps: BinanceFuturesPositionSide
 
 
-class BinanceFuturesAccountUpdateData(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesAccountUpdateData:
     """
     WebSocket message for Binance Futures Balance and Position Update events.
     """
@@ -149,7 +155,8 @@ class BinanceFuturesAccountUpdateData(msgspec.Struct, frozen=True):
         return [balance.parse_to_account_balance() for balance in self.B]
 
 
-class BinanceFuturesAccountUpdateMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesAccountUpdateMsg:
     """
     WebSocket message for Binance Futures Balance and Position Update events.
     """
@@ -171,7 +178,8 @@ class BinanceFuturesAccountUpdateMsg(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceFuturesAccountUpdateWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesAccountUpdateWrapper:
     """
     WebSocket message wrapper for Binance Futures Balance and Position Update events.
     """
@@ -180,7 +188,8 @@ class BinanceFuturesAccountUpdateWrapper(msgspec.Struct, frozen=True):
     data: BinanceFuturesAccountUpdateMsg
 
 
-class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
+@dataclass(frozen=True, kw_only=True)
+class BinanceFuturesOrderData:
     """
     WebSocket message 'inner struct' for Binance Futures Order Update events.
 
@@ -608,7 +617,8 @@ class BinanceFuturesOrderData(msgspec.Struct, kw_only=True, frozen=True):
             exec_client._log.warning(f"Received unhandled {self}")
 
 
-class BinanceFuturesOrderUpdateMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesOrderUpdateMsg:
     """
     WebSocket message for Binance Futures Order Update events.
     """
@@ -619,7 +629,8 @@ class BinanceFuturesOrderUpdateMsg(msgspec.Struct, frozen=True):
     o: BinanceFuturesOrderData
 
 
-class BinanceFuturesOrderUpdateWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesOrderUpdateWrapper:
     """
     WebSocket message wrapper for Binance Futures Order Update events.
     """
@@ -628,7 +639,8 @@ class BinanceFuturesOrderUpdateWrapper(msgspec.Struct, frozen=True):
     data: BinanceFuturesOrderUpdateMsg
 
 
-class BinanceFuturesTradeLiteMsg(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesTradeLiteMsg:
     """
     WebSocket message for Binance Futures Trade Lite events.
     """
@@ -686,7 +698,8 @@ class BinanceFuturesTradeLiteMsg(msgspec.Struct, frozen=True):
         )
 
 
-class BinanceFuturesTradeLiteWrapper(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class BinanceFuturesTradeLiteWrapper:
     """
     WebSocket message wrapper for Binance Futures Trade Lite events.
     """

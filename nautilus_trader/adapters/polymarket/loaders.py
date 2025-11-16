@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -20,7 +23,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import msgspec
 import pandas as pd
 
 from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
@@ -296,7 +298,7 @@ class PolymarketDataLoader:
                 f"HTTP request failed with status {response.status}: {response.body.decode('utf-8')}",
             )
 
-        return msgspec.json.decode(response.body)
+        return orjson.loads(response.body)
 
     @staticmethod
     async def find_market_by_slug(
@@ -365,7 +367,7 @@ class PolymarketDataLoader:
                 f"HTTP request failed with status {response.status}: {response.body.decode('utf-8')}",
             )
 
-        return msgspec.json.decode(response.body)
+        return orjson.loads(response.body)
 
     async def fetch_orderbook_history(
         self,
@@ -423,7 +425,7 @@ class PolymarketDataLoader:
                     f"HTTP request failed with status {response.status}: {response.body.decode('utf-8')}",
                 )
 
-            data = msgspec.json.decode(response.body)
+            data = orjson.loads(response.body)
 
             snapshots = data.get("snapshots", [])
             all_snapshots.extend(snapshots)
@@ -485,7 +487,7 @@ class PolymarketDataLoader:
                 f"HTTP request failed with status {response.status}: {response.body.decode('utf-8')}",
             )
 
-        data = msgspec.json.decode(response.body)
+        data = orjson.loads(response.body)
 
         return data.get("history", [])
 

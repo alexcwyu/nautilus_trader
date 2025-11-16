@@ -16,7 +16,6 @@
 import time
 from collections import defaultdict
 
-import msgspec
 import pandas as pd
 
 from nautilus_trader.common.providers import InstrumentProvider
@@ -50,8 +49,6 @@ class TardisInstrumentProvider(InstrumentProvider):
         self._client = client
 
         self._log_warnings = config.log_warnings if config else True
-        self._decoder = msgspec.json.Decoder()
-        self._encoder = msgspec.json.Encoder()
 
     async def load_all_async(self, filters: dict | None = None) -> None:
         if filters is None or not filters.get("venues"):

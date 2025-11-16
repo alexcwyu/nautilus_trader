@@ -17,7 +17,7 @@ import platform
 import sys
 from collections.abc import Callable
 
-import msgspec
+import orjson
 import pytest
 from betfair_parser.spec.streaming import MCM
 from betfair_parser.spec.streaming import OCM
@@ -178,7 +178,7 @@ def test_message_handler_processes_status_message(message_collector):
     # Arrange
     handler, messages = message_collector
     raw_message = (
-        msgspec.json.encode(
+        orjson.dumps(
             {
                 "op": "status",
                 "id": 1,
@@ -206,7 +206,7 @@ def test_message_handler_processes_order_change_message(message_collector):
     # Arrange
     handler, messages = message_collector
     raw_message = (
-        msgspec.json.encode(
+        orjson.dumps(
             {
                 "op": "ocm",
                 "id": 2,
@@ -256,7 +256,7 @@ def test_betfair_messages_not_mistaken_for_fix():
     [
         (b'{"op":"connection","connectionId":"123"}\r\n', Connection),
         (
-            msgspec.json.encode(
+            orjson.dumps(
                 {
                     "op": "status",
                     "id": 1,
@@ -269,9 +269,9 @@ def test_betfair_messages_not_mistaken_for_fix():
             + b"\r\n",
             Status,
         ),
-        (msgspec.json.encode({"op": "mcm", "id": 1, "clk": "ABC", "pt": 123}) + b"\r\n", MCM),
+        (orjson.dumps({"op": "mcm", "id": 1, "clk": "ABC", "pt": 123}) + b"\r\n", MCM),
         (
-            msgspec.json.encode({"op": "ocm", "id": 1, "clk": "XYZ", "pt": 999, "oc": []})
+            orjson.dumps({"op": "ocm", "id": 1, "clk": "XYZ", "pt": 999, "oc": []})
             + b"\r\n",
             OCM,
         ),
@@ -296,7 +296,7 @@ def test_multiple_messages_processed_in_sequence(message_collector):
     handler, messages = message_collector
     raw_messages = [
         b'{"op":"connection","connectionId":"conn-1"}\r\n',
-        msgspec.json.encode(
+        orjson.dumps(
             {
                 "op": "status",
                 "id": 1,
@@ -308,7 +308,7 @@ def test_multiple_messages_processed_in_sequence(message_collector):
         )
         + b"\r\n",
         BetfairStreaming.mcm_HEARTBEAT(),
-        msgspec.json.encode({"op": "ocm", "id": 2, "clk": "XYZ", "pt": 999, "oc": []}) + b"\r\n",
+        orjson.dumps({"op": "ocm", "id": 2, "clk": "XYZ", "pt": 999, "oc": []}) + b"\r\n",
     ]
 
     # Act

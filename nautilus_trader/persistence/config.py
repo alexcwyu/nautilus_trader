@@ -24,7 +24,7 @@ from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.persistence.writer import RotationMode
 
 
-class StreamingConfig(NautilusConfig, frozen=True):
+class StreamingConfig(NautilusConfig):
     """
     Configuration for streaming live or backtest runs to the catalog in feather format.
 
@@ -86,7 +86,7 @@ class StreamingConfig(NautilusConfig, frozen=True):
         )
 
 
-class DataCatalogConfig(NautilusConfig, frozen=True):
+class DataCatalogConfig(NautilusConfig):
     """
     Configuration for a data catalog.
 

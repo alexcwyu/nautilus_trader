@@ -36,7 +36,7 @@ from nautilus_trader.trading.config import ImportableControllerConfig
 from nautilus_trader.trading.strategy import ImportableStrategyConfig
 
 
-class NautilusKernelConfig(NautilusConfig, frozen=True):
+class NautilusKernelConfig(NautilusConfig):
     """
     Configuration for a ``NautilusKernel`` core system instance.
 

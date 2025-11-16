@@ -18,9 +18,9 @@ from typing import Any
 
 import pandas as pd
 import pytz
-from msgspec import msgpack
 
-from nautilus_trader.common.config import msgspec_encoding_hook as _base_msgspec_encoding_hook
+from nautilus_trader.common.config import pydantic_encoder as _base_pydantic_encoder
+from nautilus_trader.serialization.compat import MsgPackWrapper
 
 from libc.stdint cimport uint64_t
 
@@ -31,6 +31,10 @@ from nautilus_trader.serialization.base cimport Serializer
 
 
 cdef tuple[str, int, float, bool] _PRIMITIVES = (str, int, float, bool)
+
+
+# Global msgpack wrapper instance to match msgspec.msgpack interface
+msgpack = MsgPackWrapper()
 
 
 cdef class MsgSpecSerializer(Serializer):
@@ -167,4 +171,4 @@ def _serializer_encoding_hook(obj: Any) -> Any:
         return obj.value
     if isinstance(obj, pd.Timedelta):
         return obj.value
-    return _base_msgspec_encoding_hook(obj)
+    return _base_pydantic_encoder(obj)

@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 
-import msgspec
+import orjson
 
 from nautilus_trader.cache.base import CacheFacade
 from nautilus_trader.cache.cache import Cache
@@ -46,7 +46,7 @@ from nautilus_trader.common.component import register_component_clock
 from nautilus_trader.common.component import set_backtest_force_stop
 from nautilus_trader.common.component import set_logging_pyo3
 from nautilus_trader.common.config import InvalidConfiguration
-from nautilus_trader.common.config import msgspec_encoding_hook
+from nautilus_trader.common.config import serialize_config_value
 from nautilus_trader.common.enums import LogColor
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.common.enums import log_level_from_str
@@ -82,6 +82,32 @@ from nautilus_trader.portfolio.base import PortfolioFacade
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
 from nautilus_trader.serialization.serializer import MsgSpecSerializer
+from nautilus_trader.serialization.serializer import msgpack
+
+
+# Wrapper to make orjson compatible with msgspec interface
+class _OrjsonWrapper:
+    """
+    Wrapper to provide encode/decode interface for orjson.
+    """
+
+    @staticmethod
+    def encode(obj, **kwargs):
+        """
+        Encode object to JSON bytes.
+        """
+        return orjson.dumps(obj)
+
+    @staticmethod
+    def decode(data, **kwargs):
+        """
+        Decode JSON bytes to object.
+        """
+        return orjson.loads(data)
+
+
+# Create instance for use as encoding parameter
+_orjson_encoding = _OrjsonWrapper()
 from nautilus_trader.trading.controller import Controller
 from nautilus_trader.trading.strategy import Strategy
 from nautilus_trader.trading.trader import Trader
@@ -291,7 +317,7 @@ class NautilusKernel:
             self._msgbus_db = nautilus_pyo3.RedisMessageBusDatabase(
                 trader_id=nautilus_pyo3.TraderId(self._trader_id.value),
                 instance_id=nautilus_pyo3.UUID4.from_str(self._instance_id.value),
-                config_json=msgspec.json.encode(config.message_bus, enc_hook=msgspec_encoding_hook),
+                config_json=orjson.dumps({k: serialize_config_value(v) for k, v in config.message_bus.dict().items()}),
             )
         else:
             raise ValueError(
@@ -311,7 +337,7 @@ class NautilusKernel:
                 trader_id=self._trader_id,
                 instance_id=self._instance_id,
                 serializer=MsgSpecSerializer(
-                    encoding=msgspec.msgpack if encoding == "msgpack" else msgspec.json,
+                    encoding=msgpack if encoding == "msgpack" else _orjson_encoding,
                     timestamps_as_str=True,  # Hardcoded for now
                     timestamps_as_iso8601=config.cache.timestamps_as_iso8601,
                 ),
@@ -332,13 +358,13 @@ class NautilusKernel:
         if config.message_bus:
             encoding = config.message_bus.encoding.lower()
             self._msgbus_serializer = MsgSpecSerializer(
-                encoding=msgspec.msgpack if encoding == "msgpack" else msgspec.json,
+                encoding=msgpack if encoding == "msgpack" else _orjson_encoding,
                 timestamps_as_str=True,  # Hardcoded for now
                 timestamps_as_iso8601=config.message_bus.timestamps_as_iso8601,
             )
 
         if self._msgbus_serializer is None:
-            self._msgbus_serializer = MsgSpecSerializer(encoding=msgspec.json)
+            self._msgbus_serializer = MsgSpecSerializer(encoding=_orjson_encoding)
 
         self._msgbus = MessageBus(
             trader_id=self._trader_id,

@@ -22,7 +22,7 @@ from nautilus_trader.core.nautilus_pyo3 import OKXMarginMode
 from nautilus_trader.core.nautilus_pyo3 import OKXVipLevel
 
 
-class OKXDataClientConfig(LiveDataClientConfig, frozen=True):
+class OKXDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``OKXDataClient`` instances.
 
@@ -89,7 +89,7 @@ class OKXDataClientConfig(LiveDataClientConfig, frozen=True):
     vip_level: OKXVipLevel | None = None
 
 
-class OKXExecClientConfig(LiveExecClientConfig, frozen=True):
+class OKXExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``OKXExecutionClient`` instances.
 

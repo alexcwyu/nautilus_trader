@@ -1222,7 +1222,7 @@ def run_backtest(test_callback=None, with_data=True, log_path=None):
     node.dispose()
 
 
-class OptionConfig(StrategyConfig, frozen=True):
+class OptionConfig(StrategyConfig):
     future_id: InstrumentId
     option_id: InstrumentId
     option_id2: InstrumentId
@@ -1392,7 +1392,7 @@ class OptionStrategy(Strategy):
         self.msgbus.publish(topic="test", msg=str(msg))
 
 
-class StratTestConfig(StrategyConfig):  # type: ignore [misc]
+class StratTestConfig(StrategyConfig):
     instrument: Instrument
     bar_type: BarType
 

@@ -15,7 +15,7 @@
 
 import asyncio
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.config import BinanceExecClientConfig
@@ -126,15 +126,6 @@ class BinanceSpotExecutionClient(BinanceCommonExecutionClient):
             BinanceSpotEventType.balanceUpdate: self._handle_balance_update,
         }
 
-        # Websocket spot schema decoders
-        self._decoder_spot_user_msg_wrapper = msgspec.json.Decoder(BinanceSpotUserMsgWrapper)
-        self._decoder_spot_order_update_wrapper = msgspec.json.Decoder(
-            BinanceSpotOrderUpdateWrapper,
-        )
-        self._decoder_spot_account_update_wrapper = msgspec.json.Decoder(
-            BinanceSpotAccountUpdateWrapper,
-        )
-
     async def _update_account_state(self) -> None:
         account_info: BinanceSpotAccountInfo = (
             await self._spot_http_account.query_spot_account_info(
@@ -238,17 +229,17 @@ class BinanceSpotExecutionClient(BinanceCommonExecutionClient):
 
     def _handle_user_ws_message(self, raw: bytes) -> None:
         try:
-            wrapper = self._decoder_spot_user_msg_wrapper.decode(raw)
+            wrapper = BinanceSpotUserMsgWrapper(**orjson.loads(raw))
             self._spot_user_ws_handlers[wrapper.data.e](raw)
         except Exception as e:
             self._log.exception(f"Error on handling {raw!r}", e)
 
     def _handle_account_update(self, raw: bytes) -> None:
-        account_msg = self._decoder_spot_account_update_wrapper.decode(raw)
+        account_msg = BinanceSpotAccountUpdateWrapper(**orjson.loads(raw))
         account_msg.data.handle_account_update(self)
 
     def _handle_execution_report(self, raw: bytes) -> None:
-        order_msg = self._decoder_spot_order_update_wrapper.decode(raw)
+        order_msg = BinanceSpotOrderUpdateWrapper(**orjson.loads(raw))
         order_msg.data.handle_execution_report(self)
 
     def _handle_list_status(self, raw: bytes) -> None:

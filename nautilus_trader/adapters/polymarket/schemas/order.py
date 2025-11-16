@@ -13,13 +13,14 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.polymarket.common.enums import PolymarketOrderSide
 from nautilus_trader.adapters.polymarket.common.enums import PolymarketSignatureType
 
 
-class PolymarketOrder(msgspec.Struct, frozen=True):
+@dataclass
+class PolymarketOrder:
     """
     Represents a Polymarket limit order.
 
@@ -44,7 +45,8 @@ class PolymarketOrder(msgspec.Struct, frozen=True):
     signature: str  # hex encoded string
 
 
-class PolymarketMakerOrder(msgspec.Struct, frozen=True):
+@dataclass
+class PolymarketMakerOrder:
     """
     Represents a Polymarket maker order (included for trades).
 

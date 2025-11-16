@@ -15,7 +15,7 @@
 
 import asyncio
 
-import msgspec
+import orjson
 import pytest
 
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
@@ -29,7 +29,7 @@ from nautilus_trader.model.identifiers import StrategyId
 from nautilus_trader.test_kit.functions import ensure_all_tasks_completed
 
 
-RAW_CONFIG = msgspec.json.encode(
+RAW_CONFIG = orjson.dumps(
     {
         "environment": "live",
         "trader_id": "Test-111",

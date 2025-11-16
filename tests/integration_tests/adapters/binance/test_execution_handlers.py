@@ -17,10 +17,8 @@ import json
 import pkgutil
 from unittest.mock import call
 
-import msgspec
+import orjson
 
-from nautilus_trader.adapters.binance.futures.schemas.user import BinanceFuturesOrderUpdateWrapper
-from nautilus_trader.adapters.binance.spot.schemas.user import BinanceSpotOrderUpdateWrapper
 from nautilus_trader.model.enums import LiquiditySide
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.identifiers import ClientOrderId
@@ -46,8 +44,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_trade.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -73,8 +71,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_trade_l_zero.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -105,8 +103,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_trade_l_zero_canceled.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -128,8 +126,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_trade_l_zero_expired.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -151,8 +149,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_trade_l_zero_new.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -175,8 +173,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_calculated.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -206,8 +204,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_trade_prevention.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -228,8 +226,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_canceled.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -250,8 +248,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_expired.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -272,8 +270,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_rejected.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked exec_client
         exec_client = mocker.MagicMock()
@@ -296,8 +294,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_new_price_match.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked order with different price than in message
         mock_order = mocker.MagicMock()
@@ -339,8 +337,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_new_stop_limit_price_match.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked order with different price than in message
         mock_order = mocker.MagicMock()
@@ -385,8 +383,8 @@ class TestBinanceSpotExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_spot_execution_report_new_limit_if_touched_price_match.json",
         )
-        decoder = msgspec.json.Decoder(BinanceSpotOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceSpotOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked order with different price than in message
         mock_order = mocker.MagicMock()
@@ -438,8 +436,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_liquidation.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         exec_client = mocker.MagicMock()
         exec_client.account_id = mocker.MagicMock()
@@ -483,8 +481,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_adl.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         exec_client = mocker.MagicMock()
         exec_client.account_id = mocker.MagicMock()
@@ -527,8 +525,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_settlement.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         exec_client = mocker.MagicMock()
         exec_client.account_id = mocker.MagicMock()
@@ -569,8 +567,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_liquidation_zero_qty.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         exec_client = mocker.MagicMock()
         exec_client._cache.strategy_id_for_order.return_value = None
@@ -594,13 +592,13 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_liquidation.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         data = json.loads(raw)
         data["data"]["o"]["N"] = None
         data["data"]["o"]["n"] = None
-        wrapper = decoder.decode(json.dumps(data).encode())
+        wrapper = orjson.loads(json.dumps(data).encode())
 
         exec_client = mocker.MagicMock()
         exec_client.account_id = mocker.MagicMock()
@@ -637,8 +635,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_new_price_match.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked order with different price than in message
         mock_order = mocker.MagicMock()
@@ -678,8 +676,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_new_stop_limit_price_match.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked order with different price than in message
         mock_order = mocker.MagicMock()
@@ -720,8 +718,8 @@ class TestBinanceFuturesExecutionHandlers:
             package="tests.integration_tests.adapters.binance.resources.ws_messages",
             resource="ws_futures_order_update_new_limit_if_touched_price_match.json",
         )
-        decoder = msgspec.json.Decoder(BinanceFuturesOrderUpdateWrapper)
-        wrapper = decoder.decode(raw)
+        # Decoder removed - using orjson with BinanceFuturesOrderUpdateWrapper
+        wrapper = orjson.loads(raw)
 
         # Create mocked order with different price than in message
         mock_order = mocker.MagicMock()

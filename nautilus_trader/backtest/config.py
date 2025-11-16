@@ -18,7 +18,7 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-import msgspec
+import orjson
 import pandas as pd
 
 from nautilus_trader.cache.config import CacheConfig
@@ -27,9 +27,9 @@ from nautilus_trader.common.config import ActorConfig
 from nautilus_trader.common.config import ImportableActorConfig
 from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.common.config import NonNegativeInt
-from nautilus_trader.common.config import msgspec_encoding_hook
 from nautilus_trader.common.config import resolve_config_path
 from nautilus_trader.common.config import resolve_path
+from nautilus_trader.common.config import serialize_config_value
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.data.config import DataEngineConfig
@@ -106,7 +106,7 @@ def parse_filters_expr(s: str | None):
         raise ValueError(f"Failed to parse filter expression '{s}': {e}")
 
 
-class BacktestVenueConfig(NautilusConfig, frozen=True):
+class BacktestVenueConfig(NautilusConfig):
     """
     Represents a venue configuration for one specific backtest engine.
 
@@ -203,7 +203,7 @@ class BacktestVenueConfig(NautilusConfig, frozen=True):
     price_protection_points: int = 0
 
 
-class BacktestDataConfig(NautilusConfig, frozen=True):
+class BacktestDataConfig(NautilusConfig):
     """
     Represents the data configuration for one specific backtest run.
 
@@ -364,7 +364,7 @@ class BacktestDataConfig(NautilusConfig, frozen=True):
         return dt_to_unix_nanos(self.end_time)
 
 
-class BacktestEngineConfig(NautilusKernelConfig, frozen=True):
+class BacktestEngineConfig(NautilusKernelConfig):
     """
     Configuration for ``BacktestEngine`` instances.
 
@@ -415,10 +415,10 @@ class BacktestEngineConfig(NautilusKernelConfig, frozen=True):
 
     def __post_init__(self):
         if isinstance(self.trader_id, str):
-            msgspec.structs.force_setattr(self, "trader_id", TraderId(self.trader_id))
+            object.__setattr__(self, "trader_id", TraderId(self.trader_id))
 
 
-class BacktestRunConfig(NautilusConfig, frozen=True):
+class BacktestRunConfig(NautilusConfig):
     """
     Represents the configuration for one specific backtest run.
 
@@ -470,13 +470,13 @@ class BacktestRunConfig(NautilusConfig, frozen=True):
     data_clients: dict[str, type[LiveDataClientConfig]] | None = None
 
 
-class SimulationModuleConfig(ActorConfig, frozen=True):
+class SimulationModuleConfig(ActorConfig):
     """
     Configuration for ``SimulationModule`` instances.
     """
 
 
-class FillModelConfig(NautilusConfig, frozen=True):
+class FillModelConfig(NautilusConfig):
     """
     Configuration for ``FillModel`` instances.
 
@@ -499,7 +499,7 @@ class FillModelConfig(NautilusConfig, frozen=True):
     random_seed: int | None = None
 
 
-class ImportableFillModelConfig(NautilusConfig, frozen=True):
+class ImportableFillModelConfig(NautilusConfig):
     """
     Configuration for a fill model instance.
 
@@ -547,12 +547,12 @@ class FillModelFactory:
         PyCondition.type(config, ImportableFillModelConfig, "config")
         fill_model_cls = resolve_path(config.fill_model_path)
         config_cls = resolve_config_path(config.config_path)
-        json = msgspec.json.encode(config.config, enc_hook=msgspec_encoding_hook)
+        json = orjson.dumps({k: serialize_config_value(v) for k, v in config.config.items()})
         config_obj = config_cls.parse(json)
         return fill_model_cls(config=config_obj)
 
 
-class LatencyModelConfig(NautilusConfig, frozen=True):
+class LatencyModelConfig(NautilusConfig):
     """
     Configuration for ``LatencyModel`` instances.
 
@@ -575,7 +575,7 @@ class LatencyModelConfig(NautilusConfig, frozen=True):
     cancel_latency_nanos: NonNegativeInt = 0
 
 
-class ImportableLatencyModelConfig(NautilusConfig, frozen=True):
+class ImportableLatencyModelConfig(NautilusConfig):
     """
     Configuration for a latency model instance.
 
@@ -623,18 +623,18 @@ class LatencyModelFactory:
         PyCondition.type(config, ImportableLatencyModelConfig, "config")
         latency_model_cls = resolve_path(config.latency_model_path)
         config_cls = resolve_config_path(config.config_path)
-        json = msgspec.json.encode(config.config, enc_hook=msgspec_encoding_hook)
+        json = orjson.dumps({k: serialize_config_value(v) for k, v in config.config.items()})
         config_obj = config_cls.parse(json)
         return latency_model_cls(config=config_obj)
 
 
-class FeeModelConfig(NautilusConfig, frozen=True):
+class FeeModelConfig(NautilusConfig):
     """
     Base configuration for ``FeeModel`` instances.
     """
 
 
-class MakerTakerFeeModelConfig(FeeModelConfig, frozen=True):
+class MakerTakerFeeModelConfig(FeeModelConfig):
     """
     Configuration for ``MakerTakerFeeModel`` instances.
 
@@ -643,7 +643,7 @@ class MakerTakerFeeModelConfig(FeeModelConfig, frozen=True):
     """
 
 
-class FixedFeeModelConfig(FeeModelConfig, frozen=True):
+class FixedFeeModelConfig(FeeModelConfig):
     """
     Configuration for ``FixedFeeModel`` instances.
 
@@ -660,7 +660,7 @@ class FixedFeeModelConfig(FeeModelConfig, frozen=True):
     charge_commission_once: bool = True
 
 
-class PerContractFeeModelConfig(FeeModelConfig, frozen=True):
+class PerContractFeeModelConfig(FeeModelConfig):
     """
     Configuration for ``PerContractFeeModel`` instances.
 
@@ -674,7 +674,7 @@ class PerContractFeeModelConfig(FeeModelConfig, frozen=True):
     commission: str
 
 
-class ImportableFeeModelConfig(NautilusConfig, frozen=True):
+class ImportableFeeModelConfig(NautilusConfig):
     """
     Configuration for a fee model instance.
 
@@ -722,12 +722,12 @@ class FeeModelFactory:
         PyCondition.type(config, ImportableFeeModelConfig, "config")
         fee_model_cls = resolve_path(config.fee_model_path)
         config_cls = resolve_config_path(config.config_path)
-        json = msgspec.json.encode(config.config, enc_hook=msgspec_encoding_hook)
+        json = orjson.dumps({k: serialize_config_value(v) for k, v in config.config.items()})
         config_obj = config_cls.parse(json)
         return fee_model_cls(config=config_obj)
 
 
-class FXRolloverInterestConfig(SimulationModuleConfig, frozen=True):
+class FXRolloverInterestConfig(SimulationModuleConfig):
     """
     Provides an FX rollover interest simulation module.
 
@@ -741,7 +741,7 @@ class FXRolloverInterestConfig(SimulationModuleConfig, frozen=True):
     rate_data: pd.DataFrame  # TODO: This could probably just become JSON data
 
 
-class MarginModelConfig(NautilusConfig, frozen=True):
+class MarginModelConfig(NautilusConfig):
     """
     Configuration for margin calculation models.
 

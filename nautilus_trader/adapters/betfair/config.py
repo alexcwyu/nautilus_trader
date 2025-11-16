@@ -20,7 +20,7 @@ from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import LiveExecClientConfig
 
 
-class BetfairDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
+class BetfairDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``BetfairDataClient`` instances.
 
@@ -64,7 +64,7 @@ class BetfairDataClientConfig(LiveDataClientConfig, kw_only=True, frozen=True):
     proxy_url: str | None = None
 
 
-class BetfairExecClientConfig(LiveExecClientConfig, kw_only=True, frozen=True):
+class BetfairExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``BetfairExecClient`` instances.
 

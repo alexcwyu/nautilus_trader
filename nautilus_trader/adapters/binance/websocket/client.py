@@ -19,7 +19,7 @@ from collections.abc import Callable
 from typing import Any
 from weakref import WeakSet
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
 from nautilus_trader.common.component import LiveClock
@@ -701,6 +701,6 @@ class BinanceWebSocketClient:
         self._log.debug(f"ws-client {client_id}: SENDING: {msg}")
 
         try:
-            await client.send_text(msgspec.json.encode(msg))
+            await client.send_text(orjson.dumps(msg))
         except WebSocketClientError as e:
             self._log.error(f"ws-client {client_id}: {e!s}")

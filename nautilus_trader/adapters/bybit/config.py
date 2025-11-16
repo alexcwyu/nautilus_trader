@@ -24,7 +24,7 @@ from nautilus_trader.core.nautilus_pyo3 import BybitPositionMode
 from nautilus_trader.core.nautilus_pyo3 import BybitProductType
 
 
-class BybitDataClientConfig(LiveDataClientConfig, frozen=True):
+class BybitDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``BybitDataClient`` instances.
 
@@ -86,7 +86,7 @@ class BybitDataClientConfig(LiveDataClientConfig, frozen=True):
     bars_timestamp_on_close: bool = True
 
 
-class BybitExecClientConfig(LiveExecClientConfig, frozen=True):
+class BybitExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``BybitExecutionClient`` instances.
 

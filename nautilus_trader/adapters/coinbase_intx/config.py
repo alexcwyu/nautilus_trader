@@ -20,7 +20,7 @@ from nautilus_trader.config import PositiveInt
 from nautilus_trader.model.identifiers import Venue
 
 
-class CoinbaseIntxDataClientConfig(LiveDataClientConfig, frozen=True):
+class CoinbaseIntxDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``CoinbaseIntxDataClient`` instances.
 
@@ -58,7 +58,7 @@ class CoinbaseIntxDataClientConfig(LiveDataClientConfig, frozen=True):
     http_timeout_secs: PositiveInt | None = 60
 
 
-class CoinbaseIntxExecClientConfig(LiveExecClientConfig, frozen=True):
+class CoinbaseIntxExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``CoinbaseIntxExecClient`` instances.
 

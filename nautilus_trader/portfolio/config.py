@@ -19,7 +19,7 @@ from nautilus_trader.common.config import NautilusConfig
 from nautilus_trader.common.config import PositiveInt
 
 
-class PortfolioConfig(NautilusConfig, frozen=True):
+class PortfolioConfig(NautilusConfig):
     """
     Configuration for ``Portfolio`` instances.
 

@@ -13,9 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
 from typing import Any
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceNewOrderRespType
@@ -68,9 +69,9 @@ class BinanceSpotOpenOrdersHttp(BinanceOpenOrdersHttp):
             base_endpoint,
             methods,
         )
-        self._delete_resp_decoder = msgspec.json.Decoder()
 
-    class DeleteParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class DeleteParameters:
         """
         Parameters of openOrders SPOT/MARGIN DELETE request. Includes OCO orders.
 
@@ -92,7 +93,7 @@ class BinanceSpotOpenOrdersHttp(BinanceOpenOrdersHttp):
     async def _delete(self, params: DeleteParameters) -> list[dict[str, Any]]:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
-        return self._delete_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotOrderOcoHttp(BinanceHttpEndpoint):
@@ -121,9 +122,10 @@ class BinanceSpotOrderOcoHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(BinanceSpotOrderOco)
+        # resp_decoder removed - using orjson
 
-    class PostParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PostParameters:
         """
         OCO order creation POST endpoint parameters.
 
@@ -202,7 +204,7 @@ class BinanceSpotOrderOcoHttp(BinanceHttpEndpoint):
     async def _post(self, params: PostParameters) -> BinanceSpotOrderOco:
         method_type = HttpMethod.POST
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotOrderListHttp(BinanceHttpEndpoint):
@@ -234,9 +236,10 @@ class BinanceSpotOrderListHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(BinanceSpotOrderOco)
+        # resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         OrderList (OCO) GET endpoint parameters.
 
@@ -261,7 +264,8 @@ class BinanceSpotOrderListHttp(BinanceHttpEndpoint):
         origClientOrderId: str | None = None
         recvWindow: str | None = None
 
-    class DeleteParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class DeleteParameters:
         """
         OrderList (OCO) DELETE endpoint parameters.
 
@@ -296,12 +300,12 @@ class BinanceSpotOrderListHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> BinanceSpotOrderOco:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def delete(self, params: DeleteParameters) -> BinanceSpotOrderOco:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotAllOrderListHttp(BinanceHttpEndpoint):
@@ -330,9 +334,10 @@ class BinanceSpotAllOrderListHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(list[BinanceSpotOrderOco])
+        # resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of allOrderList GET request.
 
@@ -369,7 +374,7 @@ class BinanceSpotAllOrderListHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceSpotOrderOco]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotOpenOrderListHttp(BinanceHttpEndpoint):
@@ -398,9 +403,10 @@ class BinanceSpotOpenOrderListHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(list[BinanceSpotOrderOco])
+        # resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of allOrderList GET request.
 
@@ -419,7 +425,7 @@ class BinanceSpotOpenOrderListHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceSpotOrderOco]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotAccountHttp(BinanceHttpEndpoint):
@@ -448,9 +454,10 @@ class BinanceSpotAccountHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(BinanceSpotAccountInfo)
+        # resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of account GET request.
 
@@ -469,7 +476,7 @@ class BinanceSpotAccountHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> BinanceSpotAccountInfo:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotOrderRateLimitHttp(BinanceHttpEndpoint):
@@ -498,9 +505,10 @@ class BinanceSpotOrderRateLimitHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(list[BinanceRateLimit])
+        # resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of rateLimit/order GET request.
 
@@ -519,7 +527,7 @@ class BinanceSpotOrderRateLimitHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceRateLimit]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotAccountHttpAPI(BinanceAccountHttpAPI):

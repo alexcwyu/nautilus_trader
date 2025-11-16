@@ -13,6 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+
 import msgspec
 
 from nautilus_trader.common.component import TestClock

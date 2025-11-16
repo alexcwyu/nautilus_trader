@@ -45,7 +45,7 @@ from nautilus_trader.trading.strategy import Strategy
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
 
-class EMACrossTWAPConfig(StrategyConfig, frozen=True):
+class EMACrossTWAPConfig(StrategyConfig):
     """
     Configuration for ``EMACrossTWAP`` instances.
 

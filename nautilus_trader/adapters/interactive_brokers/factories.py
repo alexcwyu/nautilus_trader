@@ -175,7 +175,7 @@ class InteractiveBrokersLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: InteractiveBrokersDataClientConfig,
@@ -248,7 +248,7 @@ class InteractiveBrokersLiveExecClientFactory(LiveExecClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: InteractiveBrokersExecClientConfig,

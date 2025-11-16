@@ -13,10 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import asdict
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
-
-import msgspec
 
 from nautilus_trader.adapters.polymarket.common.enums import PolymarketLiquiditySide
 from nautilus_trader.adapters.polymarket.common.enums import PolymarketOrderSide
@@ -37,7 +37,8 @@ from nautilus_trader.model.instruments import BinaryOption
 from nautilus_trader.model.objects import Money
 
 
-class PolymarketTradeReport(msgspec.Struct, frozen=True):
+@dataclass
+class PolymarketTradeReport:
     """
     Represents a Polymarket trade report.
 
@@ -67,7 +68,7 @@ class PolymarketTradeReport(msgspec.Struct, frozen=True):
     trader_side: PolymarketLiquiditySide
 
     def to_dict(self) -> dict[str, Any]:
-        return msgspec.json.decode(msgspec.json.encode(self))
+        return asdict(self)
 
     def get_filled_user_order_ids(self, maker_address: str, api_key: str) -> list[str]:
         if self.trader_side == PolymarketLiquiditySide.TAKER:

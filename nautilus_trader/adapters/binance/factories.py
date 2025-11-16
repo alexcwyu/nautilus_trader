@@ -230,7 +230,7 @@ class BinanceLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: BinanceDataClientConfig,
@@ -339,7 +339,7 @@ class BinanceLiveExecClientFactory(LiveExecClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: BinanceExecClientConfig,

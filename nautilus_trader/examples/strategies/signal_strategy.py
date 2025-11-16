@@ -25,7 +25,7 @@ from nautilus_trader.trading.strategy import Strategy
 # *** THIS IS A TEST STRATEGY ***
 
 
-class SignalStrategyConfig(StrategyConfig, frozen=True):
+class SignalStrategyConfig(StrategyConfig):
     """
     Configuration for ``SignalStrategy`` instances.
 

@@ -17,7 +17,7 @@
 import ast
 import asyncio
 
-import msgspec
+import orjson
 
 from nautilus_trader.core.nautilus_pyo3 import HttpClient
 
@@ -34,7 +34,7 @@ async def main():
 
     client = HttpClient(timeout_secs=30)
     resp = await client.get(base_url, params=params)
-    data = msgspec.json.decode(resp.body)
+    data = orjson.loads(resp.body)
 
     for market in data:
         slug = market.get("slug", "")

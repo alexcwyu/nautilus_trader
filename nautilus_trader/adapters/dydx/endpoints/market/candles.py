@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -18,8 +21,7 @@ Define the candles / bars endpoint.
 
 
 import datetime
-
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXCandlesResolution
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
@@ -29,7 +31,8 @@ from nautilus_trader.adapters.dydx.schemas.ws import DYDXCandle
 from nautilus_trader.core.nautilus_pyo3 import HttpMethod
 
 
-class DYDXCandlesGetParams(msgspec.Struct, omit_defaults=True):
+@dataclass
+class DYDXCandlesGetParams:
     """
     Represent the dYdX list perpetual markets parameters.
     """
@@ -40,7 +43,8 @@ class DYDXCandlesGetParams(msgspec.Struct, omit_defaults=True):
     toISO: datetime.datetime | None = None
 
 
-class DYDXCandlesResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXCandlesResponse:
     """
     Represent the dYdX candles response object.
     """
@@ -65,7 +69,7 @@ class DYDXCandlesEndpoint(DYDXHttpEndpoint):
             name="DYDXCandlesEndpoint",
         )
         self.method_type = HttpMethod.GET
-        self._decoder = msgspec.json.Decoder(DYDXCandlesResponse)
+        # decoder removed - using orjson
 
     async def get(self, symbol: str, params: DYDXCandlesGetParams) -> DYDXCandlesResponse | None:
         """
@@ -75,6 +79,6 @@ class DYDXCandlesEndpoint(DYDXHttpEndpoint):
         raw = await self._method(self.method_type, params=params, url_path=url_path)
 
         if raw is not None:
-            return self._decoder.decode(raw)
+            return DYDXCandlesResponse(**orjson.loads(raw))
 
         return None

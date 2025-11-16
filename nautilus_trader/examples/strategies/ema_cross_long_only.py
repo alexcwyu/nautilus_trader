@@ -42,7 +42,7 @@ from nautilus_trader.trading.strategy import Strategy
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
 
-class EMACrossLongOnlyConfig(StrategyConfig, frozen=True):
+class EMACrossLongOnlyConfig(StrategyConfig):
     """
     Configuration for ``EMACrossLongOnly`` instances.
 

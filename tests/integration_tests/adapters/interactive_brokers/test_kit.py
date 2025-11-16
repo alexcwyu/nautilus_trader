@@ -18,7 +18,7 @@ import gzip
 import pickle
 from decimal import Decimal
 
-import msgspec
+import orjson
 import pandas as pd
 import pytz
 from ibapi.commission_report import CommissionReport
@@ -516,7 +516,7 @@ class IBTestDataStubs:
     @staticmethod
     def account_values(fn: str = "account_values.json") -> list[dict]:
         with open(RESPONSES_PATH / fn, "rb") as f:
-            raw = msgspec.json.decode(f.read())
+            raw = orjson.loads(f.read())
             return raw
 
     @staticmethod
@@ -534,7 +534,7 @@ class IBTestDataStubs:
         trades = []
         with gzip.open(RESPONSES_PATH / "historic/bars.json.gz", "rb") as f:
             for line in f:
-                data = msgspec.json.decode(line)
+                data = orjson.loads(line)
                 data["date"] = str(pd.Timestamp(data["date"]).to_pydatetime())
                 tick = BarData()
                 for key, value in data.items():

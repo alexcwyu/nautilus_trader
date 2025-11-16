@@ -15,7 +15,7 @@
 
 from pathlib import Path
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.polymarket.factories import get_polymarket_http_client
 
@@ -25,7 +25,7 @@ def main():
     client = get_polymarket_http_client()
     response = client.get_markets()
 
-    data = msgspec.json.encode(response)
+    data = orjson.dumps(response)
     Path("http_responses/markets.json").write_bytes(data)
 
     # print(client.get_simplified_markets())

@@ -17,7 +17,7 @@ from nautilus_trader.common.config import PositiveInt
 from nautilus_trader.config import LiveDataClientConfig
 
 
-class TardisDataClientConfig(LiveDataClientConfig, frozen=True):
+class TardisDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``TardisDataClient`` instances.
 

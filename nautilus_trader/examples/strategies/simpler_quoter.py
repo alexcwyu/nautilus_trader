@@ -24,7 +24,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.trading.strategy import Strategy
 
 
-class SimpleQuoterStrategyConfig(StrategyConfig, frozen=True):
+class SimpleQuoterStrategyConfig(StrategyConfig):
     """
     Configuration for the simple quoter strategy.
     """

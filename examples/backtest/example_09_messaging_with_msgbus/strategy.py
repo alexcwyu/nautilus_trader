@@ -47,7 +47,7 @@ class Each10thBarEvent(Event):
     TOPIC: str = "each_10th_bar_event"  # Topic name for message bus publish/subscribe
 
 
-class DemoStrategyConfig(StrategyConfig, frozen=True):
+class DemoStrategyConfig(StrategyConfig):
     """
     Configuration for the demo strategy.
     """

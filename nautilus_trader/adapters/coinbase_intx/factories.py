@@ -105,7 +105,7 @@ class CoinbaseIntxLiveDataClientFactory(LiveDataClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: CoinbaseIntxDataClientConfig,
@@ -165,7 +165,7 @@ class CoinbaseIntxLiveExecClientFactory(LiveExecClientFactory):
     """
 
     @staticmethod
-    def create(  # type: ignore
+    def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
         config: CoinbaseIntxExecClientConfig,

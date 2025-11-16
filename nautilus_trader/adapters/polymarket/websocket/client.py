@@ -21,7 +21,7 @@ from enum import unique
 from typing import Any
 from weakref import WeakSet
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.polymarket.common.credentials import PolymarketWebSocketAuth
 from nautilus_trader.common.component import LiveClock
@@ -257,6 +257,6 @@ class PolymarketWebSocketClient:
         self._log.debug(f"SENDING: {msg}")
 
         try:
-            await self._client.send_text(msgspec.json.encode(msg))
+            await self._client.send_text(orjson.dumps(msg))
         except WebSocketClientError as e:
             self._log.error(str(e))

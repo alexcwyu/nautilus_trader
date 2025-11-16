@@ -14,11 +14,11 @@
 # -------------------------------------------------------------------------------------------------
 
 from collections.abc import Generator
+from dataclasses import replace
 from os import PathLike
 from typing import BinaryIO
 
 import fsspec
-import msgspec
 from betfair_parser.spec.streaming import MCM
 from betfair_parser.spec.streaming import OCM
 from betfair_parser.spec.streaming import Connection
@@ -64,7 +64,7 @@ class BetfairParser:
         ts_init = ts_init or ts_event
         for mc in mcm.mc:
             if mc.market_definition is not None:
-                market_def = msgspec.structs.replace(mc.market_definition, market_id=mc.id)
+                market_def = replace(mc.market_definition, market_id=mc.id)
                 self.market_definitions[mc.id] = market_def
                 instruments = make_instruments(
                     market_def,
@@ -131,8 +131,8 @@ def betting_instruments_from_file(
         for mcm in iter_stream(f):
             for mc in mcm.mc:
                 if mc.market_definition:
-                    market_def = msgspec.structs.replace(mc.market_definition, market_id=mc.id)
-                    mc = msgspec.structs.replace(mc, market_definition=market_def)
+                    market_def = replace(mc.market_definition, market_id=mc.id)
+                    mc = replace(mc, market_definition=market_def)
                     new_instruments = make_instruments(
                         mc.market_definition,
                         currency=currency,

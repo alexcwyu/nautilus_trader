@@ -43,7 +43,7 @@ from nautilus_trader.trading.strategy import Strategy
 # *** IT IS NOT INTENDED TO BE USED TO TRADE LIVE WITH REAL MONEY. ***
 
 
-class EMACrossConfig(StrategyConfig, frozen=True):
+class EMACrossConfig(StrategyConfig):
     """
     Configuration for ``EMACross`` instances.
 

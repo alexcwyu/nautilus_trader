@@ -14,11 +14,12 @@
 # -------------------------------------------------------------------------------------------------
 
 import bz2
+import dataclasses
 import gzip
 import pathlib
 from unittest.mock import MagicMock
 
-import msgspec
+import orjson
 import pandas as pd
 from aiohttp import ClientResponse
 from betfair_parser.spec.betting.type_definitions import MarketFilter
@@ -135,11 +136,11 @@ class BetfairTestStubs:
                 if "id" in response:
                     response["id"] = request.id
                 resp = MagicMock(spec=ClientResponse)
-                resp.body = msgspec.json.encode(response)
+                resp.body = orjson.dumps(response)
                 return resp
             elif request.endpoint_type == EndpointType.NAVIGATION:
                 resp = MagicMock(spec=ClientResponse)
-                resp.body = msgspec.json.encode(BetfairResponses.navigation_list_navigation())
+                resp.body = orjson.dumps(BetfairResponses.navigation_list_navigation())
                 return resp
             else:
                 raise KeyError(rpc_method)
@@ -287,7 +288,7 @@ class BetfairRequests:
     @staticmethod
     def load(filename, cls=None):
         raw = (RESOURCES_PATH / "requests" / filename).read_bytes()
-        return msgspec.json.decode(raw, type=cls) if cls is not None else msgspec.json.decode(raw)
+        return orjson.loads(raw, type=cls) if cls is not None else orjson.loads(raw)
 
     @staticmethod
     def account_details():
@@ -330,7 +331,7 @@ class BetfairResponses:
     @staticmethod
     def load(filename: str) -> None:
         raw = (RESOURCES_PATH / "responses" / filename).read_bytes()
-        data = msgspec.json.decode(raw)
+        data = orjson.loads(raw)
         return data
 
     @staticmethod
@@ -455,7 +456,7 @@ class BetfairStreaming:
     @staticmethod
     def decode(raw: bytes, iterate: bool = False):
         if iterate:
-            return [stream_decode(msgspec.json.encode(r)) for r in msgspec.json.decode(raw)]
+            return [stream_decode(orjson.dumps(r)) for r in orjson.loads(raw)]
         return stream_decode(raw)
 
     @staticmethod
@@ -463,14 +464,14 @@ class BetfairStreaming:
         raw = (RESOURCES_PATH / "streaming" / filename).read_bytes()
         message = BetfairStreaming.decode(raw=raw, iterate=iterate)
         if iterate:
-            return [msgspec.json.encode(r) for r in message]
+            return [orjson.dumps(r) for r in message]
         else:
-            return msgspec.json.encode(message)
+            return orjson.dumps(message)
 
     @staticmethod
     def load_many(filename) -> list[bytes]:
-        lines = msgspec.json.decode((RESOURCES_PATH / "streaming" / filename).read_bytes())
-        return [msgspec.json.encode(line) for line in lines]
+        lines = orjson.loads((RESOURCES_PATH / "streaming" / filename).read_bytes())
+        return [orjson.dumps(line) for line in lines]
 
     @staticmethod
     def market_definition():
@@ -789,7 +790,7 @@ class BetfairDataProvider:
         instruments: list[BettingInstrument] = []
         for mc in mcm.mc:
             if mc.market_definition:
-                market_def = msgspec.structs.replace(mc.market_definition, market_id=mc.id)
+                market_def = dataclasses.replace(mc.market_definition, market_id=mc.id)
                 instruments.extend(
                     market_definition_to_instruments(
                         market_def,

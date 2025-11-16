@@ -128,7 +128,7 @@ options_data = databento_data(
 
 
 # %%
-class OptionConfig(StrategyConfig, frozen=True):
+class OptionConfig(StrategyConfig):
     future_id: InstrumentId
     option_id: InstrumentId
     option_id2: InstrumentId

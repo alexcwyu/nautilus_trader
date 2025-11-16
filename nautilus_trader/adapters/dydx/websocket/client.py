@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -22,8 +25,6 @@ from collections.abc import Awaitable
 from collections.abc import Callable
 from typing import Any
 from weakref import WeakSet
-
-import msgspec
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXCandlesResolution
 from nautilus_trader.adapters.dydx.common.enums import DYDXChannel
@@ -96,8 +97,6 @@ class DYDXWebsocketClient:
         self._delay_initial_ms = delay_initial_ms
         self._delay_max_ms = delay_max_ms
         self._backoff_factor = backoff_factor
-        self._decoder_ws_msg_general = msgspec.json.Decoder(DYDXWsMessageGeneral)
-
     def is_connected(self) -> bool:
         """
         Return whether the client is connected.
@@ -203,7 +202,7 @@ class DYDXWebsocketClient:
             The received message in bytes.
 
         """
-        ws_message = self._decoder_ws_msg_general.decode(raw)
+        ws_message = DYDXWsMessageGeneral(**orjson.loads(raw))
 
         if (
             ws_message.type == "error"
@@ -571,7 +570,7 @@ class DYDXWebsocketClient:
 
         self._log.debug(f"SENDING: {msg}")
 
-        data = msgspec.json.encode(msg)
+        data = orjson.dumps(msg)
 
         retry_manager = await self._retry_manager_pool.acquire()
         try:

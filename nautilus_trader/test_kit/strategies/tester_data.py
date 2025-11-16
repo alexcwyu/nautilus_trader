@@ -39,7 +39,7 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.instruments import Instrument
 
 
-class DataTesterConfig(ActorConfig, frozen=True):
+class DataTesterConfig(ActorConfig):
     """
     Configuration for ``DataTester`` instances.
     """

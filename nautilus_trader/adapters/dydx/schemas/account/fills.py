@@ -18,9 +18,8 @@ Define the schemas for the GetFills endpoint.
 
 
 import datetime
+from dataclasses import dataclass
 from decimal import Decimal
-
-import msgspec
 
 from nautilus_trader.adapters.dydx.common.constants import DEFAULT_CURRENCY
 from nautilus_trader.adapters.dydx.common.enums import DYDXEnumParser
@@ -42,7 +41,8 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 
 
-class DYDXFillResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXFillResponse:
     """
     Define the schema for a fill.
     """
@@ -98,7 +98,8 @@ class DYDXFillResponse(msgspec.Struct, forbid_unknown_fields=False):
         )
 
 
-class DYDXFillsResponse(msgspec.Struct, forbid_unknown_fields=False):
+@dataclass
+class DYDXFillsResponse:
     """
     Define the schema for the fills response.
     """

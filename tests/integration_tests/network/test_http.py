@@ -17,7 +17,7 @@ from collections.abc import Callable
 from collections.abc import Coroutine
 from typing import Any
 
-import msgspec
+import orjson
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -81,7 +81,7 @@ async def test_client_post_with_body(test_server: Coroutine) -> None:
     client = HttpClient()
     url = f"http://{server.host}:{server.port}/post"
     body = {"key1": "value1", "key2": "value2"}
-    body_bytes = msgspec.json.encode(body)
+    body_bytes = orjson.dumps(body)
 
     # Act
     response: HttpResponse = await client.request(HttpMethod.POST, url, headers={}, body=body_bytes)

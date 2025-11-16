@@ -13,7 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+
+from dataclasses import dataclass
+
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
@@ -54,9 +57,10 @@ class BinanceSpotExchangeInfoHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(BinanceSpotExchangeInfo)
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET exchangeInfo parameters.
 
@@ -78,7 +82,7 @@ class BinanceSpotExchangeInfoHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters | None = None) -> BinanceSpotExchangeInfo:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotAvgPriceHttp(BinanceHttpEndpoint):
@@ -107,9 +111,10 @@ class BinanceSpotAvgPriceHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(BinanceSpotAvgPrice)
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         GET avgPrice parameters.
 
@@ -125,7 +130,7 @@ class BinanceSpotAvgPriceHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> BinanceSpotAvgPrice:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceSpotMarketHttpAPI(BinanceMarketHttpAPI):

@@ -32,7 +32,7 @@ from nautilus_trader.trading.strategy import Strategy
 # *** THIS IS A TEST STRATEGY ***
 
 
-class SubscribeStrategyConfig(StrategyConfig, frozen=True):
+class SubscribeStrategyConfig(StrategyConfig):
     """
     Configuration for ``SubscribeStrategy`` instances.
 

@@ -21,7 +21,7 @@ from nautilus_trader.config import LiveExecClientConfig
 from nautilus_trader.config import PositiveInt
 
 
-class DYDXDataClientConfig(LiveDataClientConfig, frozen=True):
+class DYDXDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``DYDXDataClient`` instances.
 
@@ -55,7 +55,7 @@ class DYDXDataClientConfig(LiveDataClientConfig, frozen=True):
     proxy_url: str | None = None
 
 
-class DYDXExecClientConfig(LiveExecClientConfig, frozen=True):
+class DYDXExecClientConfig(LiveExecClientConfig):
     """
     Configuration for ``DYDXExecutionClient`` instances.
 

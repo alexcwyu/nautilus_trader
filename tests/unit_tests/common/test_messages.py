@@ -77,7 +77,7 @@ def test_component_state_changed_event():
 
 def test_serializing_component_state_changed_with_unserializable_config_raises() -> None:
     # Arrange
-    class MyType(ActorConfig, frozen=True):
+    class MyType(ActorConfig):
         values: list[int]
 
     config = {"key": MyType(values=[1, 2, 3])}

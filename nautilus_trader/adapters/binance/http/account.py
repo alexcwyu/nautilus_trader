@@ -13,7 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+
+from dataclasses import dataclass
+
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceFuturesPositionSide
@@ -89,9 +92,10 @@ class BinanceOrderHttp(BinanceHttpEndpoint):
             url_path,
         )
 
-        self._resp_decoder = msgspec.json.Decoder(BinanceOrder)
+        # resp_decoder removed - using orjson
 
-    class GetDeleteParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetDeleteParameters:
         """
         Order management GET & DELETE endpoint parameters.
 
@@ -120,7 +124,8 @@ class BinanceOrderHttp(BinanceHttpEndpoint):
         origClientOrderId: str | None = None
         recvWindow: str | None = None
 
-    class PostParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PostParameters:
         """
         Order creation POST endpoint parameters.
 
@@ -242,7 +247,8 @@ class BinanceOrderHttp(BinanceHttpEndpoint):
         goodTillDate: int | None = None
         recvWindow: str | None = None
 
-    class PutParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PutParameters:
         """
         Order amendment PUT endpoint parameters.
 
@@ -280,22 +286,22 @@ class BinanceOrderHttp(BinanceHttpEndpoint):
     async def get(self, params: GetDeleteParameters) -> BinanceOrder:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def delete(self, params: GetDeleteParameters) -> BinanceOrder:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def post(self, params: PostParameters) -> BinanceOrder:
         method_type = HttpMethod.POST
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def put(self, params: PutParameters) -> BinanceOrder:
         method_type = HttpMethod.PUT
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceAllOrdersHttp(BinanceHttpEndpoint):
@@ -328,9 +334,10 @@ class BinanceAllOrdersHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceOrder])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of allOrders GET request.
 
@@ -366,7 +373,7 @@ class BinanceAllOrdersHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceOrder]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceOpenOrdersHttp(BinanceHttpEndpoint):
@@ -406,9 +413,10 @@ class BinanceOpenOrdersHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceOrder])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of openOrders GET request.
 
@@ -430,7 +438,7 @@ class BinanceOpenOrdersHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceOrder]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceUserTradesHttp(BinanceHttpEndpoint):
@@ -462,9 +470,10 @@ class BinanceUserTradesHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceUserTrade])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of allOrders GET request.
 
@@ -503,7 +512,7 @@ class BinanceUserTradesHttp(BinanceHttpEndpoint):
     async def _get(self, params: GetParameters) -> list[BinanceUserTrade]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceAccountHttpAPI:

@@ -17,7 +17,7 @@ from nautilus_trader.config import LiveDataClientConfig
 from nautilus_trader.config import PositiveInt
 
 
-class KrakenDataClientConfig(LiveDataClientConfig, frozen=True):
+class KrakenDataClientConfig(LiveDataClientConfig):
     """
     Configuration for ``KrakenDataClient`` instances.
 

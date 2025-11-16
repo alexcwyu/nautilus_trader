@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -16,7 +19,7 @@
 Provide the Get AssetPositions HTTP endpoint.
 """
 
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
 from nautilus_trader.adapters.dydx.endpoints.endpoint import DYDXHttpEndpoint
@@ -25,7 +28,8 @@ from nautilus_trader.adapters.dydx.schemas.account.asset_positions import DYDXAs
 from nautilus_trader.core.nautilus_pyo3 import HttpMethod
 
 
-class DYDXGetAssetPositionsGetParams(msgspec.Struct, omit_defaults=True, frozen=True):
+@dataclass(frozen=True)
+class DYDXGetAssetPositionsGetParams:
     """
     Define the parameters for the Get Asset Positions endpoint.
     """
@@ -54,7 +58,7 @@ class DYDXGetAssetPositionsEndpoint(DYDXHttpEndpoint):
             name="DYDXGetAssetPositionsEndpoint",
         )
         self.http_method = HttpMethod.GET
-        self._get_resp_decoder = msgspec.json.Decoder(DYDXAssetPositionsResponse)
+        # get_resp_decoder removed - using orjson
 
     async def get(
         self,
@@ -66,6 +70,6 @@ class DYDXGetAssetPositionsEndpoint(DYDXHttpEndpoint):
         raw = await self._method(self.http_method, params)
 
         if raw is not None:
-            return self._get_resp_decoder.decode(raw)
+            return DYDXAssetPositionsResponse(**orjson.loads(raw))
 
         return None

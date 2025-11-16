@@ -18,14 +18,18 @@ Define a dYdX exception.
 
 from typing import Any
 
+import orjson
 from grpc.aio._call import AioRpcError
-from msgspec import DecodeError
 
 from nautilus_trader.adapters.dydx.common.constants import DYDX_RETRY_ERRORS_GRPC
 from nautilus_trader.adapters.dydx.grpc.errors import DYDXGRPCError
 from nautilus_trader.core.nautilus_pyo3 import HttpError
 from nautilus_trader.core.nautilus_pyo3 import HttpTimeoutError
 from nautilus_trader.core.nautilus_pyo3 import WebSocketClientError
+
+
+# orjson.JSONDecodeError replaced with orjson.JSONorjson.JSONDecodeError
+
 
 
 class DYDXError(Exception):
@@ -61,4 +65,4 @@ def should_retry(error: BaseException) -> bool:
     if isinstance(error, DYDXGRPCError):
         return error.code in DYDX_RETRY_ERRORS_GRPC
 
-    return bool(isinstance(error, AioRpcError | DYDXError | HttpError | HttpTimeoutError | WebSocketClientError | DecodeError))
+    return bool(isinstance(error, AioRpcError | DYDXError | HttpError | HttpTimeoutError | WebSocketClientError | orjson.JSONDecodeError))

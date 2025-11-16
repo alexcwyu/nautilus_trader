@@ -46,7 +46,7 @@ from nautilus_trader.trading.strategy import Strategy
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 
-class BybitOptionsDataCollectorConfig(StrategyConfig, frozen=True):
+class BybitOptionsDataCollectorConfig(StrategyConfig):
     """
     Configuration for the Bybit Options Data Collector Strategy.
     """

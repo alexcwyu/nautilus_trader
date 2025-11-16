@@ -15,7 +15,7 @@
 
 from collections.abc import Iterable
 
-import msgspec
+import orjson
 import pandas as pd
 from betfair_parser.spec.betting.enums import MarketProjection
 from betfair_parser.spec.betting.type_definitions import MarketCatalogue
@@ -46,7 +46,7 @@ from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Money
 
 
-class BetfairInstrumentProviderConfig(InstrumentProviderConfig, frozen=True, kw_only=True):
+class BetfairInstrumentProviderConfig(InstrumentProviderConfig):
     """
     Configuration for ``BetfairInstrumentProvider`` instances.
 
@@ -220,7 +220,7 @@ def market_catalog_to_instruments(
             min_notional=min_notional,
             ts_event=ts_event,
             ts_init=ts_init,
-            info=msgspec.json.decode(bf_encode(market_catalog).decode()),
+            info=orjson.loads(bf_encode(market_catalog).decode()),
         )
         instruments.append(instrument)
     return instruments
@@ -264,7 +264,7 @@ def market_definition_to_instruments(
             min_notional=min_notional,
             ts_event=ts_event,
             ts_init=ts_init,
-            info=msgspec.json.decode(msgspec.json.encode(market_definition)),
+            info=orjson.loads(orjson.dumps(market_definition)),
         )
         instruments.append(instrument)
     return instruments
@@ -344,7 +344,7 @@ async def load_markets(
 
 
 def parse_market_catalog(catalog: list[dict]) -> list[MarketCatalogue]:
-    raw = msgspec.json.encode(catalog)
+    raw = orjson.dumps(catalog)
     return bf_decode(raw, type=list[MarketCatalogue])
 
 

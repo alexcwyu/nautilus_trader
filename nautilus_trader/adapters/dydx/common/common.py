@@ -17,7 +17,7 @@ from nautilus_trader.config import NautilusConfig
 from nautilus_trader.model.objects import Price
 
 
-class DYDXOrderTags(NautilusConfig, frozen=True, repr_omit_defaults=True):
+class DYDXOrderTags(NautilusConfig):
     """
     Used to attach to Nautilus Order Tags for dYdX specific order parameters.
     """

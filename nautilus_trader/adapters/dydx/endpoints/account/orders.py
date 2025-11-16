@@ -17,8 +17,9 @@ Provide the Get Address HTTP endpoint.
 """
 
 import datetime
+from dataclasses import dataclass
 
-import msgspec
+import orjson
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
 from nautilus_trader.adapters.dydx.common.enums import DYDXOrderSide
@@ -30,7 +31,8 @@ from nautilus_trader.adapters.dydx.schemas.account.orders import DYDXOrderRespon
 from nautilus_trader.core.nautilus_pyo3 import HttpMethod
 
 
-class DYDXGetOrdersGetParams(msgspec.Struct, omit_defaults=True, frozen=True):
+@dataclass(frozen=True)
+class DYDXGetOrdersGetParams:
     """
     Define the parameters for the order endpoint.
     """
@@ -75,6 +77,6 @@ class DYDXGetOrdersEndpoint(DYDXHttpEndpoint):
         raw = await self._method(self.http_method, params)
 
         if raw is not None:
-            return msgspec.json.decode(raw, type=list[DYDXOrderResponse], strict=True)
+            return orjson.loads(raw, type=list[DYDXOrderResponse], strict=True)
 
         return None

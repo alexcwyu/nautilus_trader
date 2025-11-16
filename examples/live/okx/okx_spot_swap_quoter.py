@@ -62,7 +62,7 @@ order_qty_swap = Decimal("0.01")  # In base currency (ETH contracts)
 tob_offset_ticks = 100
 
 
-class SpotSwapQuoterConfig(StrategyConfig, frozen=True, kw_only=True):
+class SpotSwapQuoterConfig(StrategyConfig):
     """
     Configuration for the spot and swap quoter strategy.
     """

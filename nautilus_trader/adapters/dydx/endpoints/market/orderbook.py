@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -17,7 +20,6 @@ Define the orderbook snapshot endpoint.
 """
 
 
-import msgspec
 
 from nautilus_trader.adapters.dydx.common.enums import DYDXEndpointType
 from nautilus_trader.adapters.dydx.endpoints.endpoint import DYDXHttpEndpoint
@@ -49,7 +51,7 @@ class DYDXOrderBookSnapshotEndpoint(DYDXHttpEndpoint):
             name="DYDXOrderBookSnapshotEndpoint",
         )
         self.method_type = HttpMethod.GET
-        self._decoder = msgspec.json.Decoder(DYDXWsOrderbookMessageSnapshotContents)
+        # decoder removed - using orjson
 
     async def get(self, symbol: str) -> DYDXWsOrderbookMessageSnapshotContents | None:
         """
@@ -70,6 +72,6 @@ class DYDXOrderBookSnapshotEndpoint(DYDXHttpEndpoint):
         raw = await self._method(self.method_type, url_path=url_path)
 
         if raw is not None:
-            return self._decoder.decode(raw)
+            return DYDXWsOrderbookMessageSnapshotContents(**orjson.loads(raw))
 
         return None

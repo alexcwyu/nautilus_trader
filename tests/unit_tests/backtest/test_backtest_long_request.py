@@ -177,7 +177,7 @@ def run_backtest_long_request(test_callback=None):
     return results, future_symbols
 
 
-class LongRequestStrategyConfig(StrategyConfig, frozen=True):
+class LongRequestStrategyConfig(StrategyConfig):
     symbol_id: InstrumentId
     historical_start_delay: int = 10
     historical_end_delay: int = 1
@@ -387,7 +387,7 @@ def run_backtest_request_join(test_callback=None):
     return results, future_symbols
 
 
-class RequestJoinStrategyConfig(StrategyConfig, frozen=True):
+class RequestJoinStrategyConfig(StrategyConfig):
     symbol_id_1: InstrumentId
     symbol_id_2: InstrumentId
     historical_start_delay: int = 10

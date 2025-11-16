@@ -34,3 +34,6 @@ datas = "datas" # Intentional plural variable naming for vectors
 
 # NumPy/scientific computing functions
 arange = "arange" # NumPy array range function (not a typo of "arrange")
+
+# Pydantic configuration parameters
+ser = "ser" # Part of ser_json_bytes Pydantic ConfigDict parameter

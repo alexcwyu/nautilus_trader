@@ -13,7 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+
+from dataclasses import dataclass
+
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
@@ -71,11 +74,10 @@ class BinanceListenKeyHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._post_resp_decoder = msgspec.json.Decoder(BinanceListenKey)
-        self._put_resp_decoder = msgspec.json.Decoder()
-        self._delete_resp_decoder = msgspec.json.Decoder()
+        # post_resp_decoder removed - using orjson
 
-    class PostParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PostParameters:
         """
         POST parameters for creating listen keys.
 
@@ -88,7 +90,8 @@ class BinanceListenKeyHttp(BinanceHttpEndpoint):
 
         symbol: BinanceSymbol | None = None  # MARGIN_ISOLATED only, mandatory
 
-    class PutDeleteParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PutDeleteParameters:
         """
         PUT & DELETE parameters for managing listen keys.
 
@@ -107,17 +110,17 @@ class BinanceListenKeyHttp(BinanceHttpEndpoint):
     async def _post(self, params: PostParameters | None = None) -> BinanceListenKey:
         method_type = HttpMethod.POST
         raw = await self._method(method_type, params)
-        return self._post_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def _put(self, params: PutDeleteParameters | None = None) -> dict:
         method_type = HttpMethod.PUT
         raw = await self._method(method_type, params)
-        return self._put_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def _delete(self, params: PutDeleteParameters | None = None) -> dict:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
-        return self._delete_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceUserDataHttpAPI:

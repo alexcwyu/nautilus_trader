@@ -159,7 +159,7 @@ class DYDXLiveDataClientFactory(LiveDataClientFactory):
     def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
-        config: DYDXDataClientConfig,  # type: ignore[override]
+        config: DYDXDataClientConfig,
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,
@@ -223,7 +223,7 @@ class DYDXLiveExecClientFactory(LiveExecClientFactory):
     def create(
         loop: asyncio.AbstractEventLoop,
         name: str,
-        config: DYDXExecClientConfig,  # type: ignore[override]
+        config: DYDXExecClientConfig,
         msgbus: MessageBus,
         cache: Cache,
         clock: LiveClock,

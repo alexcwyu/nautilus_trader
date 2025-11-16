@@ -1,4 +1,7 @@
 # -------------------------------------------------------------------------------------------------
+import orjson
+
+
 #  Copyright (C) 2015-2025 Nautech Systems Pty Ltd. All rights reserved.
 #  https://nautechsystems.io
 #
@@ -21,7 +24,6 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-import msgspec
 import pandas as pd
 
 from nautilus_trader.adapters.dydx.common.constants import DYDX_VENUE
@@ -35,7 +37,6 @@ from nautilus_trader.adapters.dydx.http.client import DYDXHttpClient
 from nautilus_trader.adapters.dydx.http.market import DYDXMarketHttpAPI
 from nautilus_trader.adapters.dydx.providers import DYDXInstrumentProvider
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsCandlesChannelData
-from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsCandlesSubscribedData
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsMarketChannelData
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsMarketSubscribedData
 from nautilus_trader.adapters.dydx.schemas.ws import DYDXWsMessageGeneral
@@ -140,18 +141,6 @@ class DYDXDataClient(LiveMarketDataClient):
         self._enum_parser = DYDXEnumParser()
 
         # Decoders
-        self._decoder_ws_msg_general = msgspec.json.Decoder(DYDXWsMessageGeneral)
-        self._decoder_ws_orderbook = msgspec.json.Decoder(DYDXWsOrderbookChannelData)
-        self._decoder_ws_orderbook_batched = msgspec.json.Decoder(DYDXWsOrderbookBatchedData)
-        self._decoder_ws_orderbook_snapshot = msgspec.json.Decoder(
-            DYDXWsOrderbookSnapshotChannelData,
-        )
-        self._decoder_ws_trade = msgspec.json.Decoder(DYDXWsTradeChannelData)
-        self._decoder_ws_kline = msgspec.json.Decoder(DYDXWsCandlesChannelData)
-        self._decoder_ws_kline_subscribed = msgspec.json.Decoder(DYDXWsCandlesSubscribedData)
-        self._decoder_ws_instruments = msgspec.json.Decoder(DYDXWsMarketChannelData)
-        self._decoder_ws_instruments_subscribed = msgspec.json.Decoder(DYDXWsMarketSubscribedData)
-
         self._ws_client = DYDXWebsocketClient(
             clock=clock,
             handler=self._handle_ws_message,
@@ -302,7 +291,7 @@ class DYDXDataClient(LiveMarketDataClient):
             ("v4_markets", "subscribed"): self._handle_markets_subscribed,
         }
         try:
-            ws_message = self._decoder_ws_msg_general.decode(raw)
+            ws_message = DYDXWsMessageGeneral(**orjson.loads(raw))
             key = (ws_message.channel, ws_message.type)
 
             if key in callbacks:
@@ -327,7 +316,7 @@ class DYDXDataClient(LiveMarketDataClient):
 
     def _handle_trade(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsTradeChannelData = self._decoder_ws_trade.decode(raw)
+            msg: DYDXWsTradeChannelData = DYDXWsTradeChannelData(**orjson.loads(raw))
             symbol = msg.id
             instrument_id: InstrumentId = self._get_cached_instrument_id(symbol)
 
@@ -355,7 +344,7 @@ class DYDXDataClient(LiveMarketDataClient):
 
     def _handle_orderbook(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsOrderbookChannelData = self._decoder_ws_orderbook.decode(raw)
+            msg: DYDXWsOrderbookChannelData = DYDXWsOrderbookChannelData(**orjson.loads(raw))
 
             symbol = msg.id
             instrument_id: InstrumentId = self._get_cached_instrument_id(symbol)
@@ -382,7 +371,7 @@ class DYDXDataClient(LiveMarketDataClient):
 
     def _handle_orderbook_batched(self, raw: bytes) -> None:
         try:
-            msg = self._decoder_ws_orderbook_batched.decode(raw)
+            msg = DYDXWsOrderbookBatchedData(**orjson.loads(raw))
 
             symbol = msg.id
             instrument_id: InstrumentId = self._get_cached_instrument_id(symbol)
@@ -675,7 +664,7 @@ class DYDXDataClient(LiveMarketDataClient):
 
     def _handle_kline(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsCandlesChannelData = self._decoder_ws_kline.decode(raw)
+            msg: DYDXWsCandlesChannelData = DYDXWsCandlesChannelData(**orjson.loads(raw))
 
             symbol = msg.contents.ticker
             instrument_id: InstrumentId = self._get_cached_instrument_id(symbol)
@@ -721,7 +710,7 @@ class DYDXDataClient(LiveMarketDataClient):
 
     def _handle_markets(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsMarketChannelData = self._decoder_ws_instruments.decode(raw)
+            msg: DYDXWsMarketChannelData = DYDXWsMarketChannelData(**orjson.loads(raw))
 
             if msg.contents.oraclePrices is not None:
                 ts_init = self._clock.timestamp_ns()
@@ -752,7 +741,7 @@ class DYDXDataClient(LiveMarketDataClient):
 
     def _handle_markets_subscribed(self, raw: bytes) -> None:
         try:
-            msg: DYDXWsMarketSubscribedData = self._decoder_ws_instruments_subscribed.decode(raw)
+            msg: DYDXWsMarketSubscribedData = DYDXWsMarketSubscribedData(**orjson.loads(raw))
             ts_init = self._clock.timestamp_ns()
 
             for symbol, oracle_price_market in msg.contents.markets.items():

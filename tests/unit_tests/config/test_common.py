@@ -15,7 +15,7 @@
 
 from decimal import Decimal
 
-import msgspec
+import orjson
 import pandas as pd
 import pytest
 
@@ -147,7 +147,7 @@ def test_json_primitives() -> None:
 
 def test_importable_config_simple() -> None:
     # Arrange
-    raw = msgspec.json.encode(
+    raw = orjson.dumps(
         {
             "path": "nautilus_trader.adapters.binance.config:BinanceDataClientConfig",
             "config": {
@@ -157,7 +157,7 @@ def test_importable_config_simple() -> None:
     )
 
     # Act
-    config = msgspec.json.decode(raw, type=ImportableConfig).create()
+    config = orjson.loads(raw, type=ImportableConfig).create()
 
     # Assert
     assert config.api_key == "abc"

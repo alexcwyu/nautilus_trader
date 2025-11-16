@@ -17,7 +17,7 @@ import asyncio
 import decimal
 from decimal import Decimal
 
-import msgspec
+import orjson
 import pandas as pd
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
@@ -214,13 +214,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
             "@depth20": self._handle_book_partial_update,
         }
 
-        # WebSocket msgspec decoders
-        self._decoder_data_msg_wrapper = msgspec.json.Decoder(BinanceDataMsgWrapper)
-        self._decoder_order_book_msg = msgspec.json.Decoder(BinanceOrderBookMsg)
-        self._decoder_quote_msg = msgspec.json.Decoder(BinanceQuoteMsg)
-        self._decoder_ticker_msg = msgspec.json.Decoder(BinanceTickerMsg)
-        self._decoder_candlestick_msg = msgspec.json.Decoder(BinanceCandlestickMsg)
-        self._decoder_agg_trade_msg = msgspec.json.Decoder(BinanceAggregatedTradeMsg)
+        # WebSocket decoders removed - using orjson with type hints
 
         # Retry logic (hardcoded for now)
         self._max_retries: int = 3
@@ -936,7 +930,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
 
     def _handle_ws_message(self, raw: bytes) -> None:
         try:
-            wrapper = self._decoder_data_msg_wrapper.decode(raw)
+            wrapper = BinanceDataMsgWrapper(**orjson.loads(raw))
             if not wrapper.stream:
                 return  # Control message response
 
@@ -953,7 +947,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
             self._log.exception(f"Error handling websocket message {raw!r}", e)
 
     def _handle_book_diff_update(self, raw: bytes) -> None:
-        msg = self._decoder_order_book_msg.decode(raw)
+        msg = BinanceOrderBookMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         book_deltas: OrderBookDeltas = msg.data.parse_to_order_book_deltas(
             instrument_id=instrument_id,
@@ -969,7 +963,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         self._handle_data(book_deltas)
 
     def _handle_book_ticker(self, raw: bytes) -> None:
-        msg = self._decoder_quote_msg.decode(raw)
+        msg = BinanceQuoteMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         quote_tick: QuoteTick = msg.data.parse_to_quote_tick(
             instrument_id=instrument_id,
@@ -978,7 +972,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         self._handle_data(quote_tick)
 
     def _handle_ticker(self, raw: bytes) -> None:
-        msg = self._decoder_ticker_msg.decode(raw)
+        msg = BinanceTickerMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         ticker: BinanceTicker = msg.data.parse_to_binance_ticker(
             instrument_id=instrument_id,
@@ -992,7 +986,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         self._handle_data(custom)
 
     def _handle_kline(self, raw: bytes) -> None:
-        msg = self._decoder_candlestick_msg.decode(raw)
+        msg = BinanceCandlestickMsg(**orjson.loads(raw))
         if not msg.data.k.x:
             return  # Not closed yet
         instrument_id = self._get_cached_instrument_id(msg.data.s)
@@ -1010,7 +1004,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         raise NotImplementedError("Please implement trade handling in child class.")
 
     def _handle_agg_trade(self, raw: bytes) -> None:
-        msg = self._decoder_agg_trade_msg.decode(raw)
+        msg = BinanceAggregatedTradeMsg(**orjson.loads(raw))
         instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.s)
         trade_tick: TradeTick = msg.data.parse_to_trade_tick(
             instrument_id=instrument_id,

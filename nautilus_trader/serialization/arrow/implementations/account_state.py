@@ -15,7 +15,7 @@
 
 from typing import Any
 
-import msgspec
+import orjson
 import pandas as pd
 import pyarrow as pa
 from pyarrow import RecordBatch
@@ -32,10 +32,10 @@ def serialize(state: AccountState) -> RecordBatch:
 
     # Ensure 'info' is encoded as bytes
     if "info" in base and isinstance(base["info"], dict):
-        base["info"] = msgspec.json.encode(base["info"])
+        base["info"] = orjson.dumps(base["info"])
 
-    encoded_balances = msgspec.json.encode(base["balances"])
-    encoded_margins = msgspec.json.encode(base["margins"])
+    encoded_balances = orjson.dumps(base["balances"])
+    encoded_margins = orjson.dumps(base["margins"])
 
     del base["balances"]
     del base["margins"]
@@ -122,7 +122,7 @@ def _deserialize(values: list[Any]) -> AccountState:
 
     # Ensure 'info' is decoded to a dict
     if "info" in state:
-        state["info"] = msgspec.json.decode(state["info"])
+        state["info"] = orjson.loads(state["info"])
     else:
         state["info"] = []
 

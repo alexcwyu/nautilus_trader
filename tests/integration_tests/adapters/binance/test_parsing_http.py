@@ -15,10 +15,8 @@
 
 import pkgutil
 
-import msgspec
+import orjson
 
-from nautilus_trader.adapters.binance.common.schemas.market import BinanceDepth
-from nautilus_trader.adapters.binance.futures.schemas.account import BinanceFuturesSymbolConfig
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
@@ -35,10 +33,10 @@ class TestBinanceHttpParsing:
             resource="http_spot_market_depth.json",
         )
         assert raw
-        decoder = msgspec.json.Decoder(BinanceDepth)
+        # Decoder removed - using orjson with BinanceDepth
 
         # Act
-        data = decoder.decode(raw)
+        data = orjson.loads(raw)
         result = data.parse_to_order_book_snapshot(
             instrument_id=ETHUSDT.id,
             ts_init=2,
@@ -62,10 +60,10 @@ class TestBinanceHttpParsing:
             resource="http_futures_account_symbol_config.json",
         )
         assert raw
-        decoder = msgspec.json.Decoder(list[BinanceFuturesSymbolConfig])
+        # Decoder removed - using orjson with list[BinanceFuturesSymbolConfig]
 
         # Act
-        data = decoder.decode(raw)
+        data = orjson.loads(raw)
 
         # Assert
         assert len(data) == 2

@@ -17,7 +17,7 @@ import asyncio
 from asyncio import TaskGroup
 from decimal import Decimal
 
-import msgspec
+import orjson
 
 from nautilus_trader.accounting.accounts.margin import MarginAccount
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
@@ -147,18 +147,6 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
 
         self._leverages = config.futures_leverages
         self._margin_types = config.futures_margin_types
-
-        # WebSocket futures schema decoders
-        self._decoder_futures_user_msg_wrapper = msgspec.json.Decoder(BinanceFuturesUserMsgWrapper)
-        self._decoder_futures_order_update_wrapper = msgspec.json.Decoder(
-            BinanceFuturesOrderUpdateWrapper,
-        )
-        self._decoder_futures_account_update_wrapper = msgspec.json.Decoder(
-            BinanceFuturesAccountUpdateWrapper,
-        )
-        self._decoder_futures_trade_lite_wrapper = msgspec.json.Decoder(
-            BinanceFuturesTradeLiteWrapper,
-        )
 
     async def _update_account_state(self) -> None:
         account_info: BinanceFuturesAccountInfo = (
@@ -427,7 +415,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
 
     def _handle_user_ws_message(self, raw: bytes) -> None:
         try:
-            wrapper = self._decoder_futures_user_msg_wrapper.decode(raw)
+            wrapper = BinanceFuturesUserMsgWrapper(**orjson.loads(raw))
             if not wrapper.stream or not wrapper.data:
                 return  # Control message response
 
@@ -436,11 +424,11 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
             self._log.exception(f"Error on handling {raw!r}", e)
 
     def _handle_account_update(self, raw: bytes) -> None:
-        account_update = self._decoder_futures_account_update_wrapper.decode(raw)
+        account_update = BinanceFuturesAccountUpdateWrapper(**orjson.loads(raw))
         account_update.data.handle_account_update(self)
 
     def _handle_order_trade_update(self, raw: bytes) -> None:
-        order_update = self._decoder_futures_order_update_wrapper.decode(raw)
+        order_update = BinanceFuturesOrderUpdateWrapper(**orjson.loads(raw))
         if not (self._use_trade_lite and order_update.data.o.x == BinanceExecutionType.TRADE):
             order_update.data.o.handle_order_trade_update(self)
 
@@ -454,7 +442,7 @@ class BinanceFuturesExecutionClient(BinanceCommonExecutionClient):
         self._log.warning("Listen key expired")  # Implement
 
     def _handle_trade_lite(self, raw: bytes) -> None:
-        trade_lite = self._decoder_futures_trade_lite_wrapper.decode(raw)
+        trade_lite = BinanceFuturesTradeLiteWrapper(**orjson.loads(raw))
         if not self._use_trade_lite:
             self._log.debug(
                 "TradeLite event received but not enabled in config",

@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import Mock
 
-import msgspec.json
+import orjson
 import pytest
 
 from nautilus_trader.adapters.polymarket.common.parsing import parse_polymarket_instrument
@@ -36,7 +36,7 @@ def markets_list_data():
         "markets_list.json",
     )
     assert data
-    return msgspec.json.decode(data)
+    return orjson.loads(data)
 
 
 @pytest.fixture
@@ -46,7 +46,7 @@ def market_details_data():
         "market.json",
     )
     assert data
-    return msgspec.json.decode(data)
+    return orjson.loads(data)
 
 
 @pytest.fixture
@@ -56,7 +56,7 @@ def orderbook_history_data():
         "orderbook_history.json",
     )
     assert data
-    return msgspec.json.decode(data)
+    return orjson.loads(data)
 
 
 @pytest.fixture
@@ -66,7 +66,7 @@ def price_history_data():
         "price_history.json",
     )
     assert data
-    return msgspec.json.decode(data)
+    return orjson.loads(data)
 
 
 @pytest.fixture
@@ -91,7 +91,7 @@ async def test_fetch_markets(markets_list_data):
     mock_http_client = MagicMock(spec=nautilus_pyo3.HttpClient)
     mock_response = Mock()
     mock_response.status = 200
-    mock_response.body = msgspec.json.encode(markets_list_data)
+    mock_response.body = orjson.dumps(markets_list_data)
     mock_http_client.get = AsyncMock(return_value=mock_response)
 
     # Act
@@ -113,7 +113,7 @@ async def test_find_market_by_slug(markets_list_data):
     mock_http_client = MagicMock(spec=nautilus_pyo3.HttpClient)
     mock_response = Mock()
     mock_response.status = 200
-    mock_response.body = msgspec.json.encode(markets_list_data)
+    mock_response.body = orjson.dumps(markets_list_data)
     mock_http_client.get = AsyncMock(return_value=mock_response)
 
     # Act
@@ -134,7 +134,7 @@ async def test_find_market_by_slug_not_found(markets_list_data):
     mock_http_client = MagicMock(spec=nautilus_pyo3.HttpClient)
     mock_response = Mock()
     mock_response.status = 200
-    mock_response.body = msgspec.json.encode(markets_list_data)
+    mock_response.body = orjson.dumps(markets_list_data)
     mock_http_client.get = AsyncMock(return_value=mock_response)
 
     # Act & Assert
@@ -151,7 +151,7 @@ async def test_fetch_market_details(market_details_data):
     mock_http_client = MagicMock(spec=nautilus_pyo3.HttpClient)
     mock_response = Mock()
     mock_response.status = 200
-    mock_response.body = msgspec.json.encode(market_details_data)
+    mock_response.body = orjson.dumps(market_details_data)
     mock_http_client.get = AsyncMock(return_value=mock_response)
     condition_id = "0xdd22472e552920b8438158ea7238bfadfa4f736aa4cee91a6b86c39ead110917"
 
@@ -174,7 +174,7 @@ async def test_fetch_orderbook_history(test_instrument, orderbook_history_data):
     mock_http_client = MagicMock(spec=nautilus_pyo3.HttpClient)
     mock_response = Mock()
     mock_response.status = 200
-    mock_response.body = msgspec.json.encode(orderbook_history_data)
+    mock_response.body = orjson.dumps(orderbook_history_data)
     mock_http_client.get = AsyncMock(return_value=mock_response)
 
     token_id = "60487116984468020978247225474488676749601001829886755968952521846780452448915"
@@ -209,11 +209,11 @@ async def test_fetch_orderbook_history_with_pagination(test_instrument):
 
     mock_response1 = Mock()
     mock_response1.status = 200
-    mock_response1.body = msgspec.json.encode(page1_data)
+    mock_response1.body = orjson.dumps(page1_data)
 
     mock_response2 = Mock()
     mock_response2.status = 200
-    mock_response2.body = msgspec.json.encode(page2_data)
+    mock_response2.body = orjson.dumps(page2_data)
 
     mock_http_client.get = AsyncMock(side_effect=[mock_response1, mock_response2])
 
@@ -233,7 +233,7 @@ async def test_fetch_price_history(test_instrument, price_history_data):
     mock_http_client = MagicMock(spec=nautilus_pyo3.HttpClient)
     mock_response = Mock()
     mock_response.status = 200
-    mock_response.body = msgspec.json.encode(price_history_data)
+    mock_response.body = orjson.dumps(price_history_data)
     mock_http_client.get = AsyncMock(return_value=mock_response)
 
     token_id = "60487116984468020978247225474488676749601001829886755968952521846780452448915"

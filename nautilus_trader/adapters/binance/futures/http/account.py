@@ -13,9 +13,10 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from typing import Any
 
-import msgspec
+from dataclasses import dataclass
+
+import orjson
 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.common.enums import BinanceSecurityType
@@ -70,10 +71,11 @@ class BinanceFuturesPositionModeHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(BinanceFuturesDualSidePosition)
-        self._post_resp_decoder = msgspec.json.Decoder(BinanceStatusCode)
+        # get_resp_decoder removed - using orjson
+        # post_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of positionSide/dual GET request.
 
@@ -89,7 +91,8 @@ class BinanceFuturesPositionModeHttp(BinanceHttpEndpoint):
         timestamp: str
         recvWindow: str | None = None
 
-    class PostParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PostParameters:
         """
         Parameters of positionSide/dual POST request.
 
@@ -112,12 +115,12 @@ class BinanceFuturesPositionModeHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> BinanceFuturesDualSidePosition:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
     async def post(self, params: PostParameters) -> BinanceStatusCode:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._post_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesAllOpenOrdersHttp(BinanceHttpEndpoint):
@@ -148,9 +151,10 @@ class BinanceFuturesAllOpenOrdersHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._delete_resp_decoder = msgspec.json.Decoder(BinanceStatusCode)
+        # delete_resp_decoder removed - using orjson
 
-    class DeleteParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class DeleteParameters:
         """
         Parameters of allOpenOrders DELETE request.
 
@@ -172,7 +176,7 @@ class BinanceFuturesAllOpenOrdersHttp(BinanceHttpEndpoint):
     async def delete(self, params: DeleteParameters) -> BinanceStatusCode:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
-        return self._delete_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesCancelMultipleOrdersHttp(BinanceHttpEndpoint):
@@ -203,12 +207,10 @@ class BinanceFuturesCancelMultipleOrdersHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._delete_resp_decoder = msgspec.json.Decoder(
-            list[BinanceOrder] | dict[str, Any],
-            strict=False,
-        )
+        # delete_resp_decoder removed - using orjson
 
-    class DeleteParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class DeleteParameters:
         """
         Parameters of batchOrders DELETE request.
 
@@ -232,7 +234,7 @@ class BinanceFuturesCancelMultipleOrdersHttp(BinanceHttpEndpoint):
     async def delete(self, params: DeleteParameters) -> list[BinanceOrder]:
         method_type = HttpMethod.DELETE
         raw = await self._method(method_type, params)
-        return self._delete_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesAccountHttp(BinanceHttpEndpoint):
@@ -263,9 +265,10 @@ class BinanceFuturesAccountHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._resp_decoder = msgspec.json.Decoder(BinanceFuturesAccountInfo)
+        # resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of account GET request.
 
@@ -284,7 +287,7 @@ class BinanceFuturesAccountHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> BinanceFuturesAccountInfo:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesPositionRiskHttp(BinanceHttpEndpoint):
@@ -315,9 +318,10 @@ class BinanceFuturesPositionRiskHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceFuturesPositionRisk])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of positionRisk GET request.
 
@@ -339,7 +343,7 @@ class BinanceFuturesPositionRiskHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceFuturesPositionRisk]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesSymbolConfigHttp(BinanceHttpEndpoint):
@@ -368,9 +372,10 @@ class BinanceFuturesSymbolConfigHttp(BinanceHttpEndpoint):
             methods,
             url_path,
         )
-        self._get_resp_decoder = msgspec.json.Decoder(list[BinanceFuturesSymbolConfig])
+        # get_resp_decoder removed - using orjson
 
-    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class GetParameters:
         """
         Parameters of symbolConfig GET request.
 
@@ -392,7 +397,7 @@ class BinanceFuturesSymbolConfigHttp(BinanceHttpEndpoint):
     async def get(self, params: GetParameters) -> list[BinanceFuturesSymbolConfig]:
         method_type = HttpMethod.GET
         raw = await self._method(method_type, params)
-        return self._get_resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesLeverageHttp(BinanceHttpEndpoint):
@@ -418,9 +423,10 @@ class BinanceFuturesLeverageHttp(BinanceHttpEndpoint):
         url_path = base_endpoint + "leverage"
 
         super().__init__(client, methods, url_path)
-        self._resp_decoder = msgspec.json.Decoder(BinanceFuturesLeverage)
+        # resp_decoder removed - using orjson
 
-    class PostParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PostParameters:
         """
         Initial leverage POST endpoint parameters.
 
@@ -447,7 +453,7 @@ class BinanceFuturesLeverageHttp(BinanceHttpEndpoint):
     ) -> BinanceFuturesLeverage:
         method_type = HttpMethod.POST
         raw = await self._method(method_type, params)
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesMarginTypeHttp(BinanceHttpEndpoint):
@@ -472,9 +478,10 @@ class BinanceFuturesMarginTypeHttp(BinanceHttpEndpoint):
         }
         url_path = base_endpoint + "marginType"
         super().__init__(client, methods, url_path)
-        self._resp_decoder = msgspec.json.Decoder(BinanceFuturesMarginTypeResponse)
+        # resp_decoder removed - using orjson
 
-    class PostParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+    @dataclass(frozen=True)
+    class PostParameters:
         """
         Margin type POST endpoint parameters.
 
@@ -505,7 +512,7 @@ class BinanceFuturesMarginTypeHttp(BinanceHttpEndpoint):
             if e.message["msg"] == "No need to change margin type.":
                 return BinanceFuturesMarginTypeResponse(code=200, msg="success")
             raise
-        return self._resp_decoder.decode(raw)
+        return orjson.loads(raw)
 
 
 class BinanceFuturesAccountHttpAPI(BinanceAccountHttpAPI):

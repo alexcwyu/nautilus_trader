@@ -13,7 +13,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+from dataclasses import dataclass
 
 from nautilus_trader.adapters.env import get_env_key
 
@@ -38,7 +38,8 @@ def get_polymarket_funder() -> str:
     return get_env_key("POLYMARKET_FUNDER")
 
 
-class PolymarketWebSocketAuth(msgspec.Struct, frozen=True):
+@dataclass(frozen=True)
+class PolymarketWebSocketAuth:
     apiKey: str
     secret: str
     passphrase: str

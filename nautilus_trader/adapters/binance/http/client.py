@@ -17,7 +17,7 @@ import base64
 import urllib.parse
 from typing import Any
 
-import msgspec
+import orjson
 
 import nautilus_trader
 from nautilus_trader.adapters.binance.common.enums import BinanceKeyType
@@ -195,7 +195,7 @@ class BinanceHttpClient:
             http_method,
             url=self._base_url + url_path,
             headers=self._headers,
-            body=msgspec.json.encode(payload) if payload else None,
+            body=orjson.dumps(payload) if payload else None,
             keys=ratelimiter_keys,
         )
 
@@ -203,8 +203,8 @@ class BinanceHttpClient:
 
         if response.status >= 400:
             try:
-                message = msgspec.json.decode(response_body) if response_body else None
-            except msgspec.DecodeError:
+                message = orjson.loads(response_body) if response_body else None
+            except orjson.JSONDecodeError:
                 message = response_body.decode()
 
             if response.status >= 500:

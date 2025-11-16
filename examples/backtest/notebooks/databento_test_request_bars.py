@@ -101,7 +101,7 @@ futures_data_trades = databento_data(
 
 
 # %%
-class TestHistoricalAggConfig(StrategyConfig, frozen=True):
+class TestHistoricalAggConfig(StrategyConfig):
     symbol_id: InstrumentId
     historical_start_delay: int = 10
     historical_end_delay: int = 1
