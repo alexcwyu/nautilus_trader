@@ -5016,6 +5016,7 @@ dependencies = [
  "nautilus-common",
  "nautilus-core",
  "nautilus-data",
+ "nautilus-execution",
  "nautilus-infrastructure",
  "nautilus-live",
  "nautilus-model",
