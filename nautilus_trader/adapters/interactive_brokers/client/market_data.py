@@ -776,6 +776,11 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         if not (subscription := self._subscriptions.get(req_id=req_id)):
             return
 
+        # Skip invalid prices (IB uses -1.0 to indicate unavailable/invalid prices)
+        if price < 0:
+            self._log.warning(f"Ignoring invalid tick price: {price} for req_id={req_id}, tick_type={tick_type}")
+            return
+
         # Store the price data for this subscription
         if req_id not in self._subscription_tick_data:
             self._subscription_tick_data[req_id] = {}
@@ -797,6 +802,12 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         Process tick size data from reqMktData for spread instruments.
         """
         if not (subscription := self._subscriptions.get(req_id=req_id)):
+            return
+
+        # Skip invalid sizes (negative or extremely large values)
+        # IB may send invalid sizes when prices are invalid
+        if size < 0 or size > Decimal("1e10"):
+            self._log.warning(f"Ignoring invalid tick size: {size} for req_id={req_id}, tick_type={tick_type}")
             return
 
         # Store the size data for this subscription
@@ -828,7 +839,8 @@ class InteractiveBrokersClientMarketDataMixin(BaseMixin):
         ask_price = tick_data.get(2)
         ask_size = tick_data.get(3, 1)
 
-        if bid_price is not None and ask_price is not None:
+        # Validate that both prices are present and valid (positive)
+        if bid_price is not None and ask_price is not None and bid_price >= 0 and ask_price >= 0:
             # Create quote tick
             instrument_id = InstrumentId.from_str(subscription.name[0])
             instrument = self._cache.instrument(instrument_id)
