@@ -1222,7 +1222,9 @@ cdef class BarType:
     def __eq__(self, BarType other) -> bool:
         if other is None:
             return False
-        return self.to_str() == other.to_str()
+
+        # We remove the AggregationSource information
+        return self.to_str()[:-9] == other.to_str()[:-9]
 
     def __lt__(self, BarType other) -> bool:
         return self.to_str() < other.to_str()
@@ -1237,7 +1239,8 @@ cdef class BarType:
         return self.to_str() >= other.to_str()
 
     def __hash__(self) -> int:
-        return hash(self.to_str())
+        # We remove the AggregationSource information
+        return hash(self.to_str()[:-9])
 
     def __str__(self) -> str:
         return self.to_str()

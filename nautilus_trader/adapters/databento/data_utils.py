@@ -285,7 +285,6 @@ def save_data_to_catalog(
     if definition_file is not None:
         nautilus_definition = loader.from_dbn_file(
             definition_file,
-            as_legacy_cython=True,
             use_exchange_as_venue=use_exchange_as_venue,
         )
         catalog.write_data(nautilus_definition)
@@ -293,7 +292,7 @@ def save_data_to_catalog(
         nautilus_definition = None
 
     if data_file is not None:
-        nautilus_data = loader.from_dbn_file(data_file, as_legacy_cython=False)
+        nautilus_data = loader.from_dbn_file(data_file)
         catalog.write_data(nautilus_data)
     else:
         nautilus_data = None

@@ -432,7 +432,7 @@ impl Display for BarSpecification {
 /// Represents a bar type including the instrument ID, bar specification and
 /// aggregation source.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialOrd, Ord)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model")
@@ -725,6 +725,41 @@ impl Display for BarType {
                 )
             }
         }
+    }
+}
+
+impl BarType {
+    /// Returns a string representation without aggregation source information.
+    /// This is used for equality comparison and hashing to ignore aggregation sources.
+    fn to_str_without_aggregation_source(self) -> String {
+        match self {
+            Self::Standard {
+                instrument_id,
+                spec,
+                ..
+            } => format!("{instrument_id}-{spec}"),
+            Self::Composite {
+                instrument_id,
+                spec,
+                ..
+            } => format!("{instrument_id}-{spec}"),
+        }
+    }
+}
+
+impl PartialEq for BarType {
+    fn eq(&self, other: &Self) -> bool {
+        // We remove the AggregationSource information
+        self.to_str_without_aggregation_source() == other.to_str_without_aggregation_source()
+    }
+}
+
+impl Eq for BarType {}
+
+impl Hash for BarType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // We remove the AggregationSource information
+        self.to_str_without_aggregation_source().hash(state);
     }
 }
 
@@ -1304,6 +1339,24 @@ mod tests {
         assert_eq!(bar_type1, bar_type1);
         assert_eq!(bar_type1, bar_type2);
         assert_ne!(bar_type1, bar_type3);
+    }
+
+    #[rstest]
+    fn test_bar_type_equality_ignores_aggregation_source() {
+        // Build bar types that differ only by aggregation source.
+        let bar_type = BarType::from_str("ESM4.XCME-1-MINUTE-LAST-EXTERNAL").unwrap();
+        let bar_type2_str = bar_type.to_string().replace("EXTERNAL", "INTERNAL");
+        let bar_type2 = BarType::from_str(&bar_type2_str).unwrap();
+        let mut test_dict = std::collections::HashMap::new();
+
+        // Insert the first bar type into the map.
+        test_dict.insert(bar_type, 2);
+
+        // Assert that both variants hash to the same bucket and are equal.
+        assert!(test_dict.contains_key(&bar_type));
+        assert!(test_dict.contains_key(&bar_type2));
+        assert_eq!(bar_type, bar_type2);
+        assert_ne!(bar_type.to_string(), bar_type2.to_string());
     }
 
     #[rstest]
