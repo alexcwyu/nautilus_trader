@@ -18,9 +18,16 @@
 //! This module contains request and response message structures for both
 //! market data and order management WebSocket streams.
 
+use nautilus_model::{
+    data::{Bar, Data, OrderBookDeltas},
+    events::{OrderCancelRejected, OrderRejected},
+    identifiers::ClientOrderId,
+    reports::{FillReport, OrderStatusReport},
+};
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
+use super::error::ArchitectWsErrorResponse;
 use crate::common::enums::{
     ArchitectCandleWidth, ArchitectMarketDataLevel, ArchitectOrderSide, ArchitectOrderStatus,
     ArchitectTimeInForce,
@@ -614,6 +621,100 @@ pub struct ArchitectWsCancelRejected {
     /// Rejection text/description.
     #[serde(default)]
     pub txt: Option<String>,
+}
+
+/// Nautilus domain message for Architect market data WebSocket.
+///
+/// This enum contains fully-parsed Nautilus domain objects ready for consumption
+/// by the data client without additional processing.
+#[derive(Debug, Clone)]
+pub enum ArchitectMdWsMessage {
+    /// Market data (trades, quotes).
+    Data(Vec<Data>),
+    /// Order book deltas.
+    Deltas(OrderBookDeltas),
+    /// Bar/candle data.
+    Bar(Bar),
+    /// Error from venue or client.
+    Error(ArchitectWsError),
+    /// WebSocket reconnected notification.
+    Reconnected,
+}
+
+/// Nautilus domain message for Architect orders WebSocket.
+///
+/// This enum contains fully-parsed Nautilus domain objects ready for consumption
+/// by the execution client without additional processing.
+#[derive(Debug, Clone)]
+pub enum ArchitectOrdersWsMessage {
+    /// Order status reports from order updates.
+    OrderStatusReports(Vec<OrderStatusReport>),
+    /// Fill reports from executions.
+    FillReports(Vec<FillReport>),
+    /// Order rejected event (from failed order submission).
+    OrderRejected(OrderRejected),
+    /// Order cancel rejected event (from failed cancel operation).
+    OrderCancelRejected(OrderCancelRejected),
+    /// Error from venue or client.
+    Error(ArchitectWsError),
+    /// WebSocket reconnected notification.
+    Reconnected,
+    /// Authentication successful notification.
+    Authenticated,
+}
+
+/// Represents an error event surfaced by the WebSocket client.
+#[derive(Debug, Clone)]
+pub struct ArchitectWsError {
+    /// Error code from Architect.
+    pub code: Option<String>,
+    /// Human readable message.
+    pub message: String,
+    /// Optional request ID related to the failure.
+    pub request_id: Option<i64>,
+}
+
+impl ArchitectWsError {
+    /// Creates a new error with the provided message.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+            request_id: None,
+        }
+    }
+
+    /// Creates a new error with code and message.
+    #[must_use]
+    pub fn with_code(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: Some(code.into()),
+            message: message.into(),
+            request_id: None,
+        }
+    }
+}
+
+impl From<ArchitectWsErrorResponse> for ArchitectWsError {
+    fn from(resp: ArchitectWsErrorResponse) -> Self {
+        Self {
+            code: resp.code,
+            message: resp.message.unwrap_or_else(|| "Unknown error".to_string()),
+            request_id: resp.rid,
+        }
+    }
+}
+
+/// Metadata for pending order operations.
+///
+/// Used to correlate order responses with the original request.
+#[derive(Debug, Clone)]
+pub struct OrderMetadata {
+    /// Client order ID for correlation.
+    pub client_order_id: ClientOrderId,
+    /// Instrument symbol.
+    pub symbol: Ustr,
 }
 
 #[cfg(test)]

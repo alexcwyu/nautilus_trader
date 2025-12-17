@@ -13,31 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! WebSocket client for Architect real-time data and execution.
-//!
-//! This module provides a two-layer WebSocket client architecture:
-//! - Outer client: Orchestrator managing state and subscriptions
-//! - Inner handler: I/O boundary running in dedicated Tokio task
-//!
-//! Features:
-//! - Public and private WebSocket streams
-//! - Bearer token authentication
-//! - Automatic reconnection
-//! - Heartbeat/ping-pong
-//! - Subscription state management
-//! - Message parsing and routing
+//! Orders WebSocket client and handler for Architect.
 
-pub mod data;
-pub mod error;
-pub mod messages;
-pub mod orders;
+pub mod client;
+pub mod handler;
 
-pub use data::HandlerCommand as DataHandlerCommand;
-pub use data::{ArchitectMdWebSocketClient, ArchitectWsClientError, ArchitectWsResult};
-pub use messages::{
-    ArchitectMdWsMessage, ArchitectOrdersWsMessage, ArchitectWsError, OrderMetadata,
-};
-pub use orders::HandlerCommand as OrdersHandlerCommand;
-pub use orders::{
+pub use client::{
     ArchitectOrdersWebSocketClient, ArchitectOrdersWsClientError, ArchitectOrdersWsResult,
 };
+pub use handler::HandlerCommand;
