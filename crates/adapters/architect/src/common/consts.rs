@@ -27,6 +27,10 @@ pub static ARCHITECT_VENUE: LazyLock<Venue> = LazyLock::new(|| Venue::new(Ustr::
 pub const ARCHITECT_HTTP_URL: &str = "https://x.architect.co/api";
 pub const ARCHITECT_HTTP_SANDBOX_URL: &str = "https://sandbox.x.architect.co/api";
 
+// HTTP order management endpoints (separate base URL)
+pub const ARCHITECT_ORDERS_URL: &str = "https://x.architect.co/orders";
+pub const ARCHITECT_ORDERS_SANDBOX_URL: &str = "https://sandbox.x.architect.co/orders";
+
 // WebSocket endpoints (URLs to be confirmed based on actual WebSocket documentation)
 pub const ARCHITECT_WS_PUBLIC_URL: &str = "wss://x.architect.co/ws/public";
 pub const ARCHITECT_WS_PRIVATE_URL: &str = "wss://x.architect.co/ws/private";

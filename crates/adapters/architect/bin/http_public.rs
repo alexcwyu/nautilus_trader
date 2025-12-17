@@ -28,7 +28,10 @@
 //! ```
 
 use nautilus_architect::{
-    common::consts::{ARCHITECT_HTTP_SANDBOX_URL, ARCHITECT_HTTP_URL},
+    common::consts::{
+        ARCHITECT_HTTP_SANDBOX_URL, ARCHITECT_HTTP_URL, ARCHITECT_ORDERS_SANDBOX_URL,
+        ARCHITECT_ORDERS_URL,
+    },
     http::client::ArchitectRawHttpClient,
 };
 
@@ -43,10 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(false);
 
-    let base_url = if is_sandbox {
-        ARCHITECT_HTTP_SANDBOX_URL
+    let (base_url, orders_base_url) = if is_sandbox {
+        (ARCHITECT_HTTP_SANDBOX_URL, ARCHITECT_ORDERS_SANDBOX_URL)
     } else {
-        ARCHITECT_HTTP_URL
+        (ARCHITECT_HTTP_URL, ARCHITECT_ORDERS_URL)
     };
 
     tracing::info!("Connecting to Architect HTTP API: {base_url}");
@@ -56,8 +59,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tracing::info!("");
 
-    let client =
-        ArchitectRawHttpClient::new(Some(base_url.to_string()), Some(30), None, None, None, None)?;
+    let client = ArchitectRawHttpClient::new(
+        Some(base_url.to_string()),
+        Some(orders_base_url.to_string()),
+        Some(30),
+        None,
+        None,
+        None,
+        None,
+    )?;
 
     // ─────────────────────────────────────────────────────────────────────────────
     // TEST 1: Get all instruments

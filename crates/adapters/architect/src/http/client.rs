@@ -35,12 +35,24 @@ use tokio_util::sync::CancellationToken;
 use super::{
     error::ArchitectHttpError,
     models::{
-        ArchitectBalancesResponse, ArchitectInstrument, ArchitectInstrumentsResponse,
-        ArchitectPositionsResponse, ArchitectTicker, ArchitectTickersResponse, ArchitectWhoAmI,
+        ArchitectAuthenticateResponse, ArchitectBalancesResponse, ArchitectCancelOrderResponse,
+        ArchitectCandle, ArchitectCandleResponse, ArchitectCandlesResponse, ArchitectFillsResponse,
+        ArchitectFundingRatesResponse, ArchitectInstrument, ArchitectInstrumentsResponse,
+        ArchitectOpenOrdersResponse, ArchitectPlaceOrderResponse, ArchitectPositionsResponse,
+        ArchitectRiskSnapshotResponse, ArchitectTicker, ArchitectTickersResponse,
+        ArchitectTransactionsResponse, ArchitectWhoAmI, AuthenticateApiKeyRequest,
+        CancelOrderRequest, PlaceOrderRequest,
     },
-    query::{GetInstrumentParams, GetTickerParams},
+    query::{
+        GetCandleParams, GetCandlesParams, GetFundingRatesParams, GetInstrumentParams,
+        GetTickerParams, GetTransactionsParams,
+    },
 };
-use crate::common::{consts::ARCHITECT_HTTP_URL, credential::Credential};
+use crate::common::{
+    consts::{ARCHITECT_HTTP_URL, ARCHITECT_ORDERS_URL},
+    credential::Credential,
+    enums::ArchitectCandleWidth,
+};
 
 /// Default Architect REST API rate limit.
 ///
@@ -57,6 +69,7 @@ const ARCHITECT_GLOBAL_RATE_KEY: &str = "architect:global";
 /// returning venue-specific response types. It does not parse to Nautilus domain types.
 pub struct ArchitectRawHttpClient {
     base_url: String,
+    orders_base_url: String,
     client: HttpClient,
     credential: Option<Credential>,
     session_token: Option<String>,
@@ -66,7 +79,7 @@ pub struct ArchitectRawHttpClient {
 
 impl Default for ArchitectRawHttpClient {
     fn default() -> Self {
-        Self::new(None, Some(60), None, None, None, None)
+        Self::new(None, None, Some(60), None, None, None, None)
             .expect("Failed to create default ArchitectRawHttpClient")
     }
 }
@@ -75,6 +88,7 @@ impl Debug for ArchitectRawHttpClient {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArchitectRawHttpClient")
             .field("base_url", &self.base_url)
+            .field("orders_base_url", &self.orders_base_url)
             .field("has_credentials", &self.credential.is_some())
             .field("has_session_token", &self.session_token.is_some())
             .finish()
@@ -100,6 +114,7 @@ impl ArchitectRawHttpClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_url: Option<String>,
+        orders_base_url: Option<String>,
         timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
@@ -121,6 +136,7 @@ impl ArchitectRawHttpClient {
 
         Ok(Self {
             base_url: base_url.unwrap_or_else(|| ARCHITECT_HTTP_URL.to_string()),
+            orders_base_url: orders_base_url.unwrap_or_else(|| ARCHITECT_ORDERS_URL.to_string()),
             client: HttpClient::new(
                 Self::default_headers(),
                 vec![],
@@ -149,6 +165,7 @@ impl ArchitectRawHttpClient {
         api_key: String,
         api_secret: String,
         base_url: Option<String>,
+        orders_base_url: Option<String>,
         timeout_secs: Option<u64>,
         max_retries: Option<u32>,
         retry_delay_ms: Option<u64>,
@@ -170,6 +187,7 @@ impl ArchitectRawHttpClient {
 
         Ok(Self {
             base_url: base_url.unwrap_or_else(|| ARCHITECT_HTTP_URL.to_string()),
+            orders_base_url: orders_base_url.unwrap_or_else(|| ARCHITECT_ORDERS_URL.to_string()),
             client: HttpClient::new(
                 Self::default_headers(),
                 vec![],
@@ -234,14 +252,26 @@ impl ArchitectRawHttpClient {
         method: Method,
         endpoint: &str,
         params: Option<&P>,
-        _body: Option<Vec<u8>>,
+        body: Option<Vec<u8>>,
+        authenticate: bool,
+    ) -> Result<T, ArchitectHttpError> {
+        self.send_request_to_url(&self.base_url, method, endpoint, params, body, authenticate)
+            .await
+    }
+
+    async fn send_request_to_url<T: DeserializeOwned, P: Serialize>(
+        &self,
+        base_url: &str,
+        method: Method,
+        endpoint: &str,
+        params: Option<&P>,
+        body: Option<Vec<u8>>,
         authenticate: bool,
     ) -> Result<T, ArchitectHttpError> {
         let endpoint = endpoint.to_string();
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{base_url}{endpoint}");
 
-        // Serialize params for GET requests
-        let params_str = if method == Method::GET {
+        let params_str = if method == Method::GET || method == Method::DELETE {
             params
                 .map(serde_urlencoded::to_string)
                 .transpose()
@@ -257,6 +287,7 @@ impl ArchitectRawHttpClient {
             let method = method.clone();
             let endpoint = endpoint.clone();
             let params_str = params_str.clone();
+            let body = body.clone();
 
             async move {
                 let mut headers = Self::default_headers();
@@ -264,6 +295,10 @@ impl ArchitectRawHttpClient {
                 if authenticate {
                     let auth_headers = self.auth_headers()?;
                     headers.extend(auth_headers);
+                }
+
+                if body.is_some() {
+                    headers.insert("Content-Type".to_string(), "application/json".to_string());
                 }
 
                 let full_url = if let Some(ref query) = params_str {
@@ -285,25 +320,25 @@ impl ArchitectRawHttpClient {
                         full_url,
                         None,
                         Some(headers),
-                        None, // body
+                        body,
                         None,
                         Some(rate_limit_keys),
                     )
                     .await?;
 
                 let status = response.status;
-                let body = String::from_utf8_lossy(&response.body).to_string();
+                let response_body = String::from_utf8_lossy(&response.body).to_string();
 
                 if !status.is_success() {
                     return Err(ArchitectHttpError::UnexpectedStatus {
                         status: status.as_u16(),
-                        body,
+                        body: response_body,
                     });
                 }
 
-                serde_json::from_str(&body).map_err(|e| {
+                serde_json::from_str(&response_body).map_err(|e| {
                     ArchitectHttpError::JsonError(format!(
-                        "Failed to deserialize response: {e}\nBody: {body}"
+                        "Failed to deserialize response: {e}\nBody: {response_body}"
                     ))
                 })
             }
@@ -452,6 +487,268 @@ impl ArchitectRawHttpClient {
             Some(&params),
             None,
             false,
+        )
+        .await
+    }
+
+    /// Authenticates using API key and secret to obtain a session token.
+    ///
+    /// # Endpoint
+    /// `POST /authenticate`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn authenticate(
+        &self,
+        api_key: &str,
+        api_secret: &str,
+        expiration_seconds: i32,
+    ) -> Result<ArchitectAuthenticateResponse, ArchitectHttpError> {
+        let request = AuthenticateApiKeyRequest::new(api_key, api_secret, expiration_seconds);
+        let body = serde_json::to_vec(&request).map_err(|e| {
+            ArchitectHttpError::JsonError(format!("Failed to serialize request: {e}"))
+        })?;
+        self.send_request::<ArchitectAuthenticateResponse, ()>(
+            Method::POST,
+            "/authenticate",
+            None,
+            Some(body),
+            false,
+        )
+        .await
+    }
+
+    /// Places a new order.
+    ///
+    /// # Endpoint
+    /// `POST /place_order` (orders base URL)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn place_order(
+        &self,
+        request: &PlaceOrderRequest,
+    ) -> Result<ArchitectPlaceOrderResponse, ArchitectHttpError> {
+        let body = serde_json::to_vec(request).map_err(|e| {
+            ArchitectHttpError::JsonError(format!("Failed to serialize request: {e}"))
+        })?;
+        self.send_request_to_url::<ArchitectPlaceOrderResponse, ()>(
+            &self.orders_base_url,
+            Method::POST,
+            "/place_order",
+            None,
+            Some(body),
+            true,
+        )
+        .await
+    }
+
+    /// Cancels an existing order.
+    ///
+    /// # Endpoint
+    /// `POST /cancel_order` (orders base URL)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn cancel_order(
+        &self,
+        order_id: &str,
+    ) -> Result<ArchitectCancelOrderResponse, ArchitectHttpError> {
+        let request = CancelOrderRequest::new(order_id);
+        let body = serde_json::to_vec(&request).map_err(|e| {
+            ArchitectHttpError::JsonError(format!("Failed to serialize request: {e}"))
+        })?;
+        self.send_request_to_url::<ArchitectCancelOrderResponse, ()>(
+            &self.orders_base_url,
+            Method::POST,
+            "/cancel_order",
+            None,
+            Some(body),
+            true,
+        )
+        .await
+    }
+
+    /// Fetches all open orders.
+    ///
+    /// # Endpoint
+    /// `GET /open_orders` (orders base URL)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_open_orders(&self) -> Result<ArchitectOpenOrdersResponse, ArchitectHttpError> {
+        self.send_request_to_url::<ArchitectOpenOrdersResponse, ()>(
+            &self.orders_base_url,
+            Method::GET,
+            "/open_orders",
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches all fills/trades.
+    ///
+    /// # Endpoint
+    /// `GET /fills`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_fills(&self) -> Result<ArchitectFillsResponse, ArchitectHttpError> {
+        self.send_request::<ArchitectFillsResponse, ()>(Method::GET, "/fills", None, None, true)
+            .await
+    }
+
+    /// Fetches historical candles.
+    ///
+    /// # Endpoint
+    /// `GET /candles`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_candles(
+        &self,
+        symbol: &str,
+        start_timestamp_ns: i64,
+        end_timestamp_ns: i64,
+        candle_width: ArchitectCandleWidth,
+    ) -> Result<ArchitectCandlesResponse, ArchitectHttpError> {
+        let params =
+            GetCandlesParams::new(symbol, start_timestamp_ns, end_timestamp_ns, candle_width);
+        self.send_request::<ArchitectCandlesResponse, _>(
+            Method::GET,
+            "/candles",
+            Some(&params),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches the current (incomplete) candle.
+    ///
+    /// # Endpoint
+    /// `GET /candles/current`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_current_candle(
+        &self,
+        symbol: &str,
+        candle_width: ArchitectCandleWidth,
+    ) -> Result<ArchitectCandle, ArchitectHttpError> {
+        let params = GetCandleParams::new(symbol, candle_width);
+        let response = self
+            .send_request::<ArchitectCandleResponse, _>(
+                Method::GET,
+                "/candles/current",
+                Some(&params),
+                None,
+                true,
+            )
+            .await?;
+        Ok(response.candle)
+    }
+
+    /// Fetches the last completed candle.
+    ///
+    /// # Endpoint
+    /// `GET /candles/last`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_last_candle(
+        &self,
+        symbol: &str,
+        candle_width: ArchitectCandleWidth,
+    ) -> Result<ArchitectCandle, ArchitectHttpError> {
+        let params = GetCandleParams::new(symbol, candle_width);
+        let response = self
+            .send_request::<ArchitectCandleResponse, _>(
+                Method::GET,
+                "/candles/last",
+                Some(&params),
+                None,
+                true,
+            )
+            .await?;
+        Ok(response.candle)
+    }
+
+    /// Fetches funding rates for a symbol.
+    ///
+    /// # Endpoint
+    /// `GET /funding-rates`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_funding_rates(
+        &self,
+        symbol: &str,
+        start_timestamp_ns: i64,
+        end_timestamp_ns: i64,
+    ) -> Result<ArchitectFundingRatesResponse, ArchitectHttpError> {
+        let params = GetFundingRatesParams::new(symbol, start_timestamp_ns, end_timestamp_ns);
+        self.send_request::<ArchitectFundingRatesResponse, _>(
+            Method::GET,
+            "/funding-rates",
+            Some(&params),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches the current risk snapshot.
+    ///
+    /// # Endpoint
+    /// `GET /risk-snapshot`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_risk_snapshot(
+        &self,
+    ) -> Result<ArchitectRiskSnapshotResponse, ArchitectHttpError> {
+        self.send_request::<ArchitectRiskSnapshotResponse, ()>(
+            Method::GET,
+            "/risk-snapshot",
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Fetches transactions filtered by type.
+    ///
+    /// # Endpoint
+    /// `GET /transactions`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response cannot be parsed.
+    pub async fn get_transactions(
+        &self,
+        transaction_types: Vec<String>,
+    ) -> Result<ArchitectTransactionsResponse, ArchitectHttpError> {
+        let params = GetTransactionsParams::new(transaction_types);
+        self.send_request::<ArchitectTransactionsResponse, _>(
+            Method::GET,
+            "/transactions",
+            Some(&params),
+            None,
+            true,
         )
         .await
     }
