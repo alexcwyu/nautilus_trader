@@ -26,3 +26,6 @@
 //! - Heartbeat/ping-pong
 //! - Subscription state management
 //! - Message parsing and routing
+
+pub mod error;
+pub mod messages;
