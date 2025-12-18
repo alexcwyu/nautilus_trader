@@ -379,6 +379,15 @@ impl ArchitectMdWebSocketClient {
     pub async fn unsubscribe(&self, symbol: &str) -> ArchitectWsResult<()> {
         let request_id = self.next_request_id();
 
+        for level in [
+            ArchitectMarketDataLevel::Level1,
+            ArchitectMarketDataLevel::Level2,
+            ArchitectMarketDataLevel::Level3,
+        ] {
+            let topic = format!("{symbol}:{level:?}");
+            self.subscriptions.mark_unsubscribe(&topic);
+        }
+
         self.send_cmd(HandlerCommand::Unsubscribe {
             request_id,
             symbol: symbol.to_string(),
@@ -420,6 +429,9 @@ impl ArchitectMdWebSocketClient {
         width: ArchitectCandleWidth,
     ) -> ArchitectWsResult<()> {
         let request_id = self.next_request_id();
+        let topic = format!("candles:{symbol}:{width:?}");
+
+        self.subscriptions.mark_unsubscribe(&topic);
 
         self.send_cmd(HandlerCommand::UnsubscribeCandles {
             request_id,

@@ -30,8 +30,12 @@ use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
 use crate::websocket::messages::{
-    ArchitectOrdersWsMessage, ArchitectWsCancelOrder, ArchitectWsError, ArchitectWsGetOpenOrders,
-    ArchitectWsPlaceOrder, OrderMetadata,
+    ArchitectOrdersWsMessage, ArchitectWsCancelOrder, ArchitectWsCancelOrderResponse,
+    ArchitectWsCancelRejected, ArchitectWsError, ArchitectWsGetOpenOrders,
+    ArchitectWsOpenOrdersResponse, ArchitectWsOrderAcknowledged, ArchitectWsOrderCanceled,
+    ArchitectWsOrderDoneForDay, ArchitectWsOrderExpired, ArchitectWsOrderFilled,
+    ArchitectWsOrderPartiallyFilled, ArchitectWsOrderRejected, ArchitectWsOrderReplaced,
+    ArchitectWsPlaceOrder, ArchitectWsPlaceOrderResponse, OrderMetadata,
 };
 
 /// Commands sent from the outer client to the inner orders handler.
@@ -304,64 +308,182 @@ impl FeedHandler {
     ) -> Option<Vec<ArchitectOrdersWsMessage>> {
         let obj = value.as_object()?;
 
-        // Check message type field "t"
+        // Response messages have "rid" + "res", event messages have "t"
+        if obj.contains_key("rid") && obj.contains_key("res") {
+            return self.parse_response_message(value);
+        }
+
         let msg_type = obj.get("t").and_then(|v| v.as_str())?;
 
         match msg_type {
             "h" => {
-                // Heartbeat - just log and ignore
                 tracing::trace!("Received heartbeat");
                 None
             }
-            "n" => {
-                // Order acknowledged
-                // TODO: Parse to OrderStatusReport
-                tracing::debug!("Received order acknowledged");
-                None
-            }
-            "f" => {
-                // Order filled
-                // TODO: Parse to FillReport
-                tracing::debug!("Received order filled");
-                None
-            }
-            "c" => {
-                // Order canceled
-                // TODO: Parse to OrderStatusReport
-                tracing::debug!("Received order canceled");
-                None
-            }
-            "j" => {
-                // Order rejected
-                // TODO: Parse to OrderRejected event
-                tracing::debug!("Received order rejected");
-                None
-            }
-            "x" => {
-                // Order expired
-                // TODO: Parse to OrderStatusReport
-                tracing::debug!("Received order expired");
-                None
-            }
-            "e" => {
-                // Cancel rejected
-                // TODO: Parse to OrderCancelRejected event
-                tracing::debug!("Received cancel rejected");
-                None
-            }
-            _ => {
-                // Check for response messages (have "rid" field)
-                if obj.contains_key("rid") {
-                    tracing::debug!("Received response message");
-                    // TODO: Parse place/cancel/open orders responses
-                    return None;
+            "n" => match serde_json::from_value::<ArchitectWsOrderAcknowledged>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order acknowledged: {} {}", msg.o.oid, msg.o.s);
+                    Some(vec![ArchitectOrdersWsMessage::OrderAcknowledged(msg)])
                 }
-
+                Err(e) => {
+                    tracing::error!("Failed to parse order acknowledged: {e}");
+                    None
+                }
+            },
+            "p" => match serde_json::from_value::<ArchitectWsOrderPartiallyFilled>(value) {
+                Ok(msg) => {
+                    tracing::debug!(
+                        "Order partially filled: {} {} @ {}",
+                        msg.o.oid,
+                        msg.xs.q,
+                        msg.xs.p
+                    );
+                    Some(vec![ArchitectOrdersWsMessage::OrderPartiallyFilled(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order partially filled: {e}");
+                    None
+                }
+            },
+            "f" => match serde_json::from_value::<ArchitectWsOrderFilled>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order filled: {} {} @ {}", msg.o.oid, msg.xs.q, msg.xs.p);
+                    Some(vec![ArchitectOrdersWsMessage::OrderFilled(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order filled: {e}");
+                    None
+                }
+            },
+            "c" => match serde_json::from_value::<ArchitectWsOrderCanceled>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order canceled: {} reason={}", msg.o.oid, msg.xr);
+                    Some(vec![ArchitectOrdersWsMessage::OrderCanceled(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order canceled: {e}");
+                    None
+                }
+            },
+            "j" => match serde_json::from_value::<ArchitectWsOrderRejected>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order rejected: {} reason={}", msg.o.oid, msg.r);
+                    Some(vec![ArchitectOrdersWsMessage::OrderRejectedRaw(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order rejected: {e}");
+                    None
+                }
+            },
+            "x" => match serde_json::from_value::<ArchitectWsOrderExpired>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order expired: {}", msg.o.oid);
+                    Some(vec![ArchitectOrdersWsMessage::OrderExpired(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order expired: {e}");
+                    None
+                }
+            },
+            "r" => match serde_json::from_value::<ArchitectWsOrderReplaced>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order replaced: {}", msg.o.oid);
+                    Some(vec![ArchitectOrdersWsMessage::OrderReplaced(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order replaced: {e}");
+                    None
+                }
+            },
+            "d" => match serde_json::from_value::<ArchitectWsOrderDoneForDay>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Order done for day: {}", msg.o.oid);
+                    Some(vec![ArchitectOrdersWsMessage::OrderDoneForDay(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse order done for day: {e}");
+                    None
+                }
+            },
+            "e" => match serde_json::from_value::<ArchitectWsCancelRejected>(value) {
+                Ok(msg) => {
+                    tracing::debug!("Cancel rejected: {} reason={}", msg.oid, msg.r);
+                    Some(vec![ArchitectOrdersWsMessage::CancelRejected(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse cancel rejected: {e}");
+                    None
+                }
+            },
+            _ => {
                 tracing::warn!("Unknown message type: {msg_type}");
                 Some(vec![ArchitectOrdersWsMessage::Error(
                     ArchitectWsError::new(format!("Unknown message type: {msg_type}")),
                 )])
             }
+        }
+    }
+
+    fn parse_response_message(
+        &mut self,
+        value: serde_json::Value,
+    ) -> Option<Vec<ArchitectOrdersWsMessage>> {
+        let obj = value.as_object()?;
+        let res = obj.get("res")?;
+
+        if res.is_object() {
+            if res.get("oid").is_some() {
+                match serde_json::from_value::<ArchitectWsPlaceOrderResponse>(value) {
+                    Ok(msg) => {
+                        tracing::debug!(
+                            "Place order response: rid={} oid={}",
+                            msg.rid,
+                            msg.res.oid
+                        );
+                        Some(vec![ArchitectOrdersWsMessage::PlaceOrderResponse(msg)])
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse place order response: {e}");
+                        None
+                    }
+                }
+            } else if res.get("cxl_rx").is_some() {
+                match serde_json::from_value::<ArchitectWsCancelOrderResponse>(value) {
+                    Ok(msg) => {
+                        tracing::debug!(
+                            "Cancel order response: rid={} cxl_rx={}",
+                            msg.rid,
+                            msg.res.cxl_rx
+                        );
+                        Some(vec![ArchitectOrdersWsMessage::CancelOrderResponse(msg)])
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to parse cancel order response: {e}");
+                        None
+                    }
+                }
+            } else {
+                tracing::warn!("Unknown response object format");
+                None
+            }
+        } else if res.is_array() {
+            match serde_json::from_value::<ArchitectWsOpenOrdersResponse>(value) {
+                Ok(msg) => {
+                    tracing::debug!(
+                        "Open orders response: rid={} count={}",
+                        msg.rid,
+                        msg.res.len()
+                    );
+                    Some(vec![ArchitectOrdersWsMessage::OpenOrdersResponse(msg)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse open orders response: {e}");
+                    None
+                }
+            }
+        } else {
+            tracing::warn!("Unknown response format");
+            None
         }
     }
 }

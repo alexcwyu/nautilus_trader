@@ -32,12 +32,14 @@ pub mod error;
 pub mod messages;
 pub mod orders;
 
-pub use data::HandlerCommand as DataHandlerCommand;
-pub use data::{ArchitectMdWebSocketClient, ArchitectWsClientError, ArchitectWsResult};
+pub use data::{
+    ArchitectMdWebSocketClient, ArchitectWsClientError, ArchitectWsResult,
+    HandlerCommand as DataHandlerCommand,
+};
 pub use messages::{
     ArchitectMdWsMessage, ArchitectOrdersWsMessage, ArchitectWsError, OrderMetadata,
 };
-pub use orders::HandlerCommand as OrdersHandlerCommand;
 pub use orders::{
     ArchitectOrdersWebSocketClient, ArchitectOrdersWsClientError, ArchitectOrdersWsResult,
+    HandlerCommand as OrdersHandlerCommand,
 };

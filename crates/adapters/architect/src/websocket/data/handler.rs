@@ -32,8 +32,10 @@ use ustr::Ustr;
 use crate::{
     common::enums::{ArchitectCandleWidth, ArchitectMarketDataLevel},
     websocket::messages::{
-        ArchitectMdSubscribe, ArchitectMdSubscribeCandles, ArchitectMdUnsubscribe,
-        ArchitectMdUnsubscribeCandles, ArchitectMdWsMessage, ArchitectWsError,
+        ArchitectMdBookL1, ArchitectMdBookL2, ArchitectMdBookL3, ArchitectMdCandle,
+        ArchitectMdHeartbeat, ArchitectMdSubscribe, ArchitectMdSubscribeCandles, ArchitectMdTicker,
+        ArchitectMdTrade, ArchitectMdUnsubscribe, ArchitectMdUnsubscribeCandles,
+        ArchitectMdWsMessage, ArchitectWsError,
     },
 };
 
@@ -365,29 +367,113 @@ impl FeedHandler {
         let msg_type = obj.get("t").and_then(|v| v.as_str())?;
 
         match msg_type {
-            "h" => {
-                // Heartbeat - just log and ignore
-                tracing::trace!("Received heartbeat");
-                None
-            }
+            "h" => match serde_json::from_value::<ArchitectMdHeartbeat>(value) {
+                Ok(heartbeat) => {
+                    tracing::trace!("Received heartbeat ts={}", heartbeat.ts);
+                    Some(vec![ArchitectMdWsMessage::Heartbeat(heartbeat)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse heartbeat: {e}");
+                    None
+                }
+            },
             "s" => {
-                // Ticker or trade message
-                // TODO: Parse to TradeTick and emit as Data
-                tracing::debug!("Received ticker/trade message");
-                None
+                // Differentiate ticker vs trade by presence of "d" (direction) field
+                if obj.contains_key("d") {
+                    match serde_json::from_value::<ArchitectMdTrade>(value) {
+                        Ok(trade) => {
+                            tracing::debug!(
+                                "Received trade: {} {} @ {}",
+                                trade.s,
+                                trade.q,
+                                trade.p
+                            );
+                            Some(vec![ArchitectMdWsMessage::Trade(trade)])
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to parse trade: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    match serde_json::from_value::<ArchitectMdTicker>(value) {
+                        Ok(ticker) => {
+                            tracing::debug!("Received ticker: {} @ {}", ticker.s, ticker.p);
+                            Some(vec![ArchitectMdWsMessage::Ticker(ticker)])
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to parse ticker: {e}");
+                            None
+                        }
+                    }
+                }
             }
-            "c" => {
-                // Candle message
-                // TODO: Parse to Bar and emit
-                tracing::debug!("Received candle message");
-                None
-            }
-            "1" | "2" | "3" => {
-                // Order book L1/L2/L3 message
-                // TODO: Parse to OrderBookDeltas and emit
-                tracing::debug!("Received book L{msg_type} message");
-                None
-            }
+            "t" => match serde_json::from_value::<ArchitectMdTrade>(value) {
+                Ok(trade) => {
+                    tracing::debug!("Received trade: {} {} @ {}", trade.s, trade.q, trade.p);
+                    Some(vec![ArchitectMdWsMessage::Trade(trade)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse trade: {e}");
+                    None
+                }
+            },
+            "c" => match serde_json::from_value::<ArchitectMdCandle>(value) {
+                Ok(candle) => {
+                    tracing::debug!(
+                        "Received candle: {} {} O={} C={}",
+                        candle.symbol,
+                        candle.width,
+                        candle.open,
+                        candle.close
+                    );
+                    Some(vec![ArchitectMdWsMessage::Candle(candle)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse candle: {e}");
+                    None
+                }
+            },
+            "1" => match serde_json::from_value::<ArchitectMdBookL1>(value) {
+                Ok(book) => {
+                    tracing::debug!("Received book L1: {}", book.s);
+                    Some(vec![ArchitectMdWsMessage::BookL1(book)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse book L1: {e}");
+                    None
+                }
+            },
+            "2" => match serde_json::from_value::<ArchitectMdBookL2>(value) {
+                Ok(book) => {
+                    tracing::debug!(
+                        "Received book L2: {} ({} bids, {} asks)",
+                        book.s,
+                        book.b.len(),
+                        book.a.len()
+                    );
+                    Some(vec![ArchitectMdWsMessage::BookL2(book)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse book L2: {e}");
+                    None
+                }
+            },
+            "3" => match serde_json::from_value::<ArchitectMdBookL3>(value) {
+                Ok(book) => {
+                    tracing::debug!(
+                        "Received book L3: {} ({} bids, {} asks)",
+                        book.s,
+                        book.b.len(),
+                        book.a.len()
+                    );
+                    Some(vec![ArchitectMdWsMessage::BookL3(book)])
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse book L3: {e}");
+                    None
+                }
+            },
             _ => {
                 tracing::warn!("Unknown message type: {msg_type}");
                 Some(vec![ArchitectMdWsMessage::Error(ArchitectWsError::new(

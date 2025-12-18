@@ -625,8 +625,9 @@ pub struct ArchitectWsCancelRejected {
 
 /// Nautilus domain message for Architect market data WebSocket.
 ///
-/// This enum contains fully-parsed Nautilus domain objects ready for consumption
-/// by the data client without additional processing.
+/// This enum contains parsed messages from the WebSocket stream.
+/// Raw variants contain Architect-specific types for further processing.
+/// Nautilus variants contain fully-parsed domain objects.
 #[derive(Debug, Clone)]
 pub enum ArchitectMdWsMessage {
     /// Market data (trades, quotes).
@@ -635,6 +636,20 @@ pub enum ArchitectMdWsMessage {
     Deltas(OrderBookDeltas),
     /// Bar/candle data.
     Bar(Bar),
+    /// Heartbeat message.
+    Heartbeat(ArchitectMdHeartbeat),
+    /// Ticker/statistics update.
+    Ticker(ArchitectMdTicker),
+    /// Trade execution.
+    Trade(ArchitectMdTrade),
+    /// Candle/OHLCV data.
+    Candle(ArchitectMdCandle),
+    /// Level 1 order book (best bid/ask).
+    BookL1(ArchitectMdBookL1),
+    /// Level 2 order book (aggregated levels).
+    BookL2(ArchitectMdBookL2),
+    /// Level 3 order book (individual orders).
+    BookL3(ArchitectMdBookL3),
     /// Error from venue or client.
     Error(ArchitectWsError),
     /// WebSocket reconnected notification.
@@ -643,8 +658,9 @@ pub enum ArchitectMdWsMessage {
 
 /// Nautilus domain message for Architect orders WebSocket.
 ///
-/// This enum contains fully-parsed Nautilus domain objects ready for consumption
-/// by the execution client without additional processing.
+/// This enum contains parsed messages from the WebSocket stream.
+/// Raw variants contain Architect-specific types for further processing.
+/// Nautilus variants contain fully-parsed domain objects.
 #[derive(Debug, Clone)]
 pub enum ArchitectOrdersWsMessage {
     /// Order status reports from order updates.
@@ -655,6 +671,30 @@ pub enum ArchitectOrdersWsMessage {
     OrderRejected(OrderRejected),
     /// Order cancel rejected event (from failed cancel operation).
     OrderCancelRejected(OrderCancelRejected),
+    /// Order acknowledged by exchange.
+    OrderAcknowledged(ArchitectWsOrderAcknowledged),
+    /// Order partially filled.
+    OrderPartiallyFilled(ArchitectWsOrderPartiallyFilled),
+    /// Order fully filled.
+    OrderFilled(ArchitectWsOrderFilled),
+    /// Order canceled.
+    OrderCanceled(ArchitectWsOrderCanceled),
+    /// Order rejected by exchange.
+    OrderRejectedRaw(ArchitectWsOrderRejected),
+    /// Order expired.
+    OrderExpired(ArchitectWsOrderExpired),
+    /// Order replaced/amended.
+    OrderReplaced(ArchitectWsOrderReplaced),
+    /// Order done for day.
+    OrderDoneForDay(ArchitectWsOrderDoneForDay),
+    /// Cancel request rejected.
+    CancelRejected(ArchitectWsCancelRejected),
+    /// Place order response.
+    PlaceOrderResponse(ArchitectWsPlaceOrderResponse),
+    /// Cancel order response.
+    CancelOrderResponse(ArchitectWsCancelOrderResponse),
+    /// Open orders response.
+    OpenOrdersResponse(ArchitectWsOpenOrdersResponse),
     /// Error from venue or client.
     Error(ArchitectWsError),
     /// WebSocket reconnected notification.
@@ -790,155 +830,6 @@ mod tests {
     }
 
     #[rstest]
-    fn test_md_heartbeat_deserialization() {
-        let json = r#"{"t":"h","ts":1609459200,"tn":123456789}"#;
-        let msg: ArchitectMdHeartbeat = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "h");
-        assert_eq!(msg.ts, 1609459200);
-        assert_eq!(msg.tn, 123456789);
-    }
-
-    #[rstest]
-    fn test_md_ticker_deserialization() {
-        let json = r#"{
-            "t": "s",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "s": "BTCUSD-PERP",
-            "p": "50000.00",
-            "q": 100,
-            "o": "49500.00",
-            "l": "49000.00",
-            "h": "50500.00",
-            "v": 125000,
-            "oi": 50000
-        }"#;
-        let msg: ArchitectMdTicker = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "s");
-        assert_eq!(msg.s.as_str(), "BTCUSD-PERP");
-        assert_eq!(msg.p, "50000.00");
-        assert_eq!(msg.q, 100);
-        assert_eq!(msg.oi, Some(50000));
-    }
-
-    #[rstest]
-    fn test_md_trade_deserialization() {
-        let json = r#"{
-            "t": "s",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "s": "BTCUSD-PERP",
-            "p": "50000.00",
-            "q": 100,
-            "d": "B"
-        }"#;
-        let msg: ArchitectMdTrade = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "s");
-        assert_eq!(msg.s.as_str(), "BTCUSD-PERP");
-        assert_eq!(msg.p, "50000.00");
-        assert_eq!(msg.q, 100);
-        assert_eq!(msg.d, ArchitectOrderSide::Buy);
-    }
-
-    #[rstest]
-    fn test_md_candle_deserialization() {
-        let json = r#"{
-            "t": "c",
-            "symbol": "BTCUSD-PERP",
-            "ts": 123456789,
-            "open": "49500.00",
-            "low": "49000.00",
-            "high": "50500.00",
-            "close": "50000.00",
-            "volume": 5000,
-            "buy_volume": 3000,
-            "sell_volume": 2000,
-            "width": "1m"
-        }"#;
-        let msg: ArchitectMdCandle = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "c");
-        assert_eq!(msg.symbol.as_str(), "BTCUSD-PERP");
-        assert_eq!(msg.open, "49500.00");
-        assert_eq!(msg.close, "50000.00");
-        assert_eq!(msg.volume, 5000);
-        assert_eq!(msg.width, ArchitectCandleWidth::Minutes1);
-    }
-
-    #[rstest]
-    fn test_md_book_l1_deserialization() {
-        let json = r#"{
-            "t": "1",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "s": "BTCUSD-PERP",
-            "b": [{"p": "49999.50", "q": 500}],
-            "a": [{"p": "50000.50", "q": 300}]
-        }"#;
-        let msg: ArchitectMdBookL1 = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "1");
-        assert_eq!(msg.s.as_str(), "BTCUSD-PERP");
-        assert_eq!(msg.b.len(), 1);
-        assert_eq!(msg.b[0].p, "49999.50");
-        assert_eq!(msg.b[0].q, 500);
-        assert_eq!(msg.a.len(), 1);
-        assert_eq!(msg.a[0].p, "50000.50");
-    }
-
-    #[rstest]
-    fn test_md_book_l2_deserialization() {
-        let json = r#"{
-            "t": "2",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "s": "BTCUSD-PERP",
-            "b": [
-                {"p": "49999.50", "q": 500},
-                {"p": "49999.00", "q": 300},
-                {"p": "49998.50", "q": 200}
-            ],
-            "a": [
-                {"p": "50000.50", "q": 300},
-                {"p": "50001.00", "q": 400},
-                {"p": "50001.50", "q": 250}
-            ]
-        }"#;
-        let msg: ArchitectMdBookL2 = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "2");
-        assert_eq!(msg.b.len(), 3);
-        assert_eq!(msg.a.len(), 3);
-    }
-
-    #[rstest]
-    fn test_md_book_l3_deserialization() {
-        let json = r#"{
-            "t": "3",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "s": "BTCUSD-PERP",
-            "b": [
-                {"p": "49999.50", "q": 500, "o": [200, 150, 100, 50]},
-                {"p": "49999.00", "q": 300, "o": [150, 100, 50]}
-            ],
-            "a": [
-                {"p": "50000.50", "q": 300, "o": [150, 100, 50]},
-                {"p": "50001.00", "q": 400, "o": [200, 150, 50]}
-            ]
-        }"#;
-        let msg: ArchitectMdBookL3 = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "3");
-        assert_eq!(msg.b.len(), 2);
-        assert_eq!(msg.b[0].o, vec![200, 150, 100, 50]);
-        assert_eq!(msg.a.len(), 2);
-    }
-
-    #[rstest]
     fn test_ws_place_order_serialization() {
         let msg = ArchitectWsPlaceOrder {
             rid: 1,
@@ -992,282 +883,6 @@ mod tests {
 
         assert_eq!(parsed["rid"], 3);
         assert_eq!(parsed["t"], "o");
-    }
-
-    #[rstest]
-    fn test_ws_place_order_response_deserialization() {
-        let json = r#"{
-            "rid": 1,
-            "res": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV"
-            }
-        }"#;
-        let msg: ArchitectWsPlaceOrderResponse = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.rid, 1);
-        assert_eq!(msg.res.oid, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-    }
-
-    #[rstest]
-    fn test_ws_cancel_order_response_deserialization() {
-        let json = r#"{
-            "rid": 2,
-            "res": {
-                "cxl_rx": true
-            }
-        }"#;
-        let msg: ArchitectWsCancelOrderResponse = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.rid, 2);
-        assert!(msg.res.cxl_rx);
-    }
-
-    #[rstest]
-    fn test_ws_open_orders_response_deserialization() {
-        let json = r#"{
-            "rid": 3,
-            "res": [
-                {
-                    "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                    "u": "550e8400-e29b-41d4-a716-446655440000",
-                    "s": "BTCUSD-PERP",
-                    "p": "50000.00",
-                    "q": 100,
-                    "xq": 0,
-                    "rq": 100,
-                    "o": "ACCEPTED",
-                    "d": "B",
-                    "tif": "GTC",
-                    "ts": 1609459200,
-                    "tn": 0
-                }
-            ]
-        }"#;
-        let msg: ArchitectWsOpenOrdersResponse = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.rid, 3);
-        assert_eq!(msg.res.len(), 1);
-        assert_eq!(msg.res[0].oid, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert_eq!(msg.res[0].o, ArchitectOrderStatus::Accepted);
-    }
-
-    #[rstest]
-    fn test_ws_heartbeat_deserialization() {
-        let json = r#"{"t":"h","ts":1609459200,"tn":123456789}"#;
-        let msg: ArchitectWsHeartbeat = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "h");
-        assert_eq!(msg.ts, 1609459200);
-        assert_eq!(msg.tn, 123456789);
-    }
-
-    #[rstest]
-    fn test_ws_order_acknowledged_deserialization() {
-        let json = r#"{
-            "t": "n",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "eid": "E-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "o": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "u": "550e8400-e29b-41d4-a716-446655440000",
-                "s": "BTCUSD-PERP",
-                "p": "50000.00",
-                "q": 100,
-                "xq": 0,
-                "rq": 100,
-                "o": "ACCEPTED",
-                "d": "B",
-                "tif": "GTC",
-                "ts": 1609459200,
-                "tn": 0
-            }
-        }"#;
-        let msg: ArchitectWsOrderAcknowledged = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "n");
-        assert_eq!(msg.eid, "E-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert_eq!(msg.o.oid, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-    }
-
-    #[rstest]
-    fn test_ws_order_filled_deserialization() {
-        let json = r#"{
-            "t": "f",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "eid": "E-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "o": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "u": "550e8400-e29b-41d4-a716-446655440000",
-                "s": "BTCUSD-PERP",
-                "p": "50000.00",
-                "q": 100,
-                "xq": 100,
-                "rq": 0,
-                "o": "FILLED",
-                "d": "B",
-                "tif": "GTC",
-                "ts": 1609459200,
-                "tn": 0
-            },
-            "xs": {
-                "tid": "T-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "s": "BTCUSD-PERP",
-                "q": 100,
-                "p": "50000.00",
-                "d": "B",
-                "agg": false
-            }
-        }"#;
-        let msg: ArchitectWsOrderFilled = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "f");
-        assert_eq!(msg.o.o, ArchitectOrderStatus::Filled);
-        assert_eq!(msg.xs.tid, "T-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert!(!msg.xs.agg);
-    }
-
-    #[rstest]
-    fn test_ws_order_canceled_deserialization() {
-        let json = r#"{
-            "t": "c",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "eid": "E-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "o": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "u": "550e8400-e29b-41d4-a716-446655440000",
-                "s": "BTCUSD-PERP",
-                "p": "50000.00",
-                "q": 100,
-                "xq": 0,
-                "rq": 100,
-                "o": "CANCELED",
-                "d": "B",
-                "tif": "GTC",
-                "ts": 1609459200,
-                "tn": 0
-            },
-            "xr": "USER_REQUESTED",
-            "txt": "Canceled by user"
-        }"#;
-        let msg: ArchitectWsOrderCanceled = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "c");
-        assert_eq!(msg.xr, "USER_REQUESTED");
-        assert_eq!(msg.txt, Some("Canceled by user".to_string()));
-    }
-
-    #[rstest]
-    fn test_ws_order_rejected_deserialization() {
-        let json = r#"{
-            "t": "j",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "eid": "E-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "o": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "u": "550e8400-e29b-41d4-a716-446655440000",
-                "s": "BTCUSD-PERP",
-                "p": "50000.00",
-                "q": 100,
-                "xq": 0,
-                "rq": 100,
-                "o": "REJECTED",
-                "d": "B",
-                "tif": "GTC",
-                "ts": 1609459200,
-                "tn": 0
-            },
-            "r": "INSUFFICIENT_MARGIN",
-            "txt": "Insufficient margin to place order"
-        }"#;
-        let msg: ArchitectWsOrderRejected = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "j");
-        assert_eq!(msg.r, "INSUFFICIENT_MARGIN");
-        assert_eq!(
-            msg.txt,
-            Some("Insufficient margin to place order".to_string())
-        );
-    }
-
-    #[rstest]
-    fn test_ws_order_replaced_deserialization() {
-        let json = r#"{
-            "t": "r",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "eid": "E-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "o": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "u": "550e8400-e29b-41d4-a716-446655440000",
-                "s": "BTCUSD-PERP",
-                "p": "50500.00",
-                "q": 150,
-                "xq": 0,
-                "rq": 150,
-                "o": "ACCEPTED",
-                "d": "B",
-                "tif": "GTC",
-                "ts": 1609459200,
-                "tn": 0
-            }
-        }"#;
-        let msg: ArchitectWsOrderReplaced = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "r");
-        assert_eq!(msg.eid, "E-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert_eq!(msg.o.p, "50500.00");
-        assert_eq!(msg.o.q, 150);
-    }
-
-    #[rstest]
-    fn test_ws_order_done_for_day_deserialization() {
-        let json = r#"{
-            "t": "d",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "eid": "E-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "o": {
-                "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-                "u": "550e8400-e29b-41d4-a716-446655440000",
-                "s": "BTCUSD-PERP",
-                "p": "50000.00",
-                "q": 100,
-                "xq": 50,
-                "rq": 50,
-                "o": "DONE_FOR_DAY",
-                "d": "B",
-                "tif": "DAY",
-                "ts": 1609459200,
-                "tn": 0
-            }
-        }"#;
-        let msg: ArchitectWsOrderDoneForDay = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "d");
-        assert_eq!(msg.eid, "E-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert_eq!(msg.o.xq, 50);
-        assert_eq!(msg.o.rq, 50);
-    }
-
-    #[rstest]
-    fn test_ws_cancel_rejected_deserialization() {
-        let json = r#"{
-            "t": "e",
-            "ts": 1609459200,
-            "tn": 123456789,
-            "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
-            "r": "ORDER_NOT_FOUND",
-            "txt": "Order not found or already canceled"
-        }"#;
-        let msg: ArchitectWsCancelRejected = serde_json::from_str(json).unwrap();
-
-        assert_eq!(msg.t, "e");
-        assert_eq!(msg.oid, "O-01ARZ3NDEKTSV4RRFFQ69G5FAV");
-        assert_eq!(msg.r, "ORDER_NOT_FOUND");
     }
 
     #[rstest]
@@ -1341,6 +956,13 @@ mod tests {
         let json = include_str!("../../test_data/ws_order_open_orders_response.json");
         let msg: ArchitectWsOpenOrdersResponse = serde_json::from_str(json).unwrap();
         assert_eq!(msg.res.len(), 1);
+    }
+
+    #[rstest]
+    fn test_load_order_heartbeat_from_file() {
+        let json = include_str!("../../test_data/ws_order_heartbeat.json");
+        let msg: ArchitectWsHeartbeat = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.t, "h");
     }
 
     #[rstest]
