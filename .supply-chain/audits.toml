@@ -1,4 +1,7 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.base32]]
+who = "Chris Sellers <chris@cjdsellers.io>"
+criteria = "safe-to-deploy"
+version = "0.5.1"

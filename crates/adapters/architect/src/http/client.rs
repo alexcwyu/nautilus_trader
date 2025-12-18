@@ -214,7 +214,10 @@ impl ArchitectRawHttpClient {
     }
 
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())])
+        HashMap::from([
+            (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ])
     }
 
     fn rate_limiter_quotas() -> Vec<(String, Quota)> {
@@ -505,10 +508,36 @@ impl ArchitectRawHttpClient {
         api_secret: &str,
         expiration_seconds: i32,
     ) -> Result<ArchitectAuthenticateResponse, ArchitectHttpError> {
-        let request = AuthenticateApiKeyRequest::new(api_key, api_secret, expiration_seconds);
+        self.authenticate_with_totp(api_key, api_secret, expiration_seconds, None)
+            .await
+    }
+
+    /// Authenticates with the Architect API using API key credentials and optional 2FA.
+    ///
+    /// # Endpoint
+    /// `POST /authenticate`
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - 400: 2FA is required but `totp` was not provided.
+    /// - 401: Invalid credentials.
+    pub async fn authenticate_with_totp(
+        &self,
+        api_key: &str,
+        api_secret: &str,
+        expiration_seconds: i32,
+        totp: Option<&str>,
+    ) -> Result<ArchitectAuthenticateResponse, ArchitectHttpError> {
+        let mut request = AuthenticateApiKeyRequest::new(api_key, api_secret, expiration_seconds);
+        if let Some(code) = totp {
+            request = request.with_totp(code);
+        }
+
         let body = serde_json::to_vec(&request).map_err(|e| {
             ArchitectHttpError::JsonError(format!("Failed to serialize request: {e}"))
         })?;
+
         self.send_request::<ArchitectAuthenticateResponse, ()>(
             Method::POST,
             "/authenticate",

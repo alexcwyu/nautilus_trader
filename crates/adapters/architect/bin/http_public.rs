@@ -15,16 +15,12 @@
 
 //! Manual verification script for Architect HTTP public endpoints.
 //!
-//! Tests the instruments, instrument, and tickers endpoints to verify
-//! connectivity and response parsing.
+//! Tests the instruments endpoint to verify connectivity and response parsing.
+//! Defaults to sandbox environment.
 //!
 //! Usage:
 //! ```bash
-//! # Test against production (default)
 //! cargo run --bin architect-http-public -p nautilus-architect
-//!
-//! # Test against sandbox
-//! ARCHITECT_IS_SANDBOX=true cargo run --bin architect-http-public -p nautilus-architect
 //! ```
 
 use nautilus_architect::{
@@ -44,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_sandbox = std::env::var("ARCHITECT_IS_SANDBOX")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     let (base_url, orders_base_url) = if is_sandbox {
         (ARCHITECT_HTTP_SANDBOX_URL, ARCHITECT_ORDERS_SANDBOX_URL)
@@ -57,7 +53,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Environment: {}",
         if is_sandbox { "SANDBOX" } else { "PRODUCTION" }
     );
-    tracing::info!("");
 
     let client = ArchitectRawHttpClient::new(
         Some(base_url.to_string()),
@@ -69,85 +64,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     )?;
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // TEST 1: Get all instruments
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    tracing::info!("TEST 1: Request all instruments");
-    tracing::info!("─────────────────────────────────────");
-
+    tracing::info!("Fetching all instruments...");
     let start = std::time::Instant::now();
     let instruments_response = client.get_instruments().await?;
     let elapsed = start.elapsed();
 
     tracing::info!(
-        "SUCCESS: Fetched {} instruments in {:.2}s",
+        "Fetched {} instruments in {:.2}s",
         instruments_response.instruments.len(),
         elapsed.as_secs_f64()
     );
 
-    if !instruments_response.instruments.is_empty() {
-        tracing::info!("   Sample instruments:");
-        for inst in instruments_response.instruments.iter().take(5) {
-            tracing::info!(
-                "   - {} ({:?}) - tick: {}, min_size: {}",
-                inst.symbol,
-                inst.state,
-                inst.tick_size,
-                inst.minimum_order_size
-            );
-        }
-        if instruments_response.instruments.len() > 5 {
-            tracing::info!(
-                "   ... and {} more",
-                instruments_response.instruments.len() - 5
-            );
-        }
+    for inst in instruments_response.instruments.iter().take(5) {
+        tracing::info!(
+            "  {} ({:?}) tick={} min_size={}",
+            inst.symbol,
+            inst.state,
+            inst.tick_size,
+            inst.minimum_order_size
+        );
     }
-    tracing::info!("");
-
-    // ─────────────────────────────────────────────────────────────────────────────
-    // TEST 2: Get single instrument
-    // ─────────────────────────────────────────────────────────────────────────────
+    if instruments_response.instruments.len() > 5 {
+        tracing::info!(
+            "  ... and {} more",
+            instruments_response.instruments.len() - 5
+        );
+    }
 
     let test_symbol = instruments_response
         .instruments
         .first()
         .map_or("EURUSD-PERP", |i| i.symbol.as_str());
 
-    tracing::info!("TEST 2: Request single instrument ({test_symbol})");
-    tracing::info!("─────────────────────────────────────");
-
+    tracing::info!("Fetching single instrument: {test_symbol}");
     let start = std::time::Instant::now();
     let instrument = client.get_instrument(test_symbol).await?;
     let elapsed = start.elapsed();
 
     tracing::info!(
-        "SUCCESS: Fetched instrument {} in {:.2}s",
+        "Fetched {} in {:.2}s",
         instrument.symbol,
         elapsed.as_secs_f64()
     );
-    tracing::info!("   State: {:?}", instrument.state);
-    tracing::info!("   Tick size: {}", instrument.tick_size);
-    tracing::info!("   Min order size: {}", instrument.minimum_order_size);
-    tracing::info!("   Quote currency: {}", instrument.quote_currency);
-    tracing::info!("   Multiplier: {}", instrument.multiplier);
-    tracing::info!("");
+    tracing::info!("  State: {:?}", instrument.state);
+    tracing::info!("  Tick size: {}", instrument.tick_size);
+    tracing::info!("  Min order size: {}", instrument.minimum_order_size);
+    tracing::info!("  Quote currency: {}", instrument.quote_currency);
+    tracing::info!("  Multiplier: {}", instrument.multiplier);
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    // SUMMARY
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    tracing::info!("═══════════════════════════════════════");
-    tracing::info!("ALL TESTS COMPLETED SUCCESSFULLY");
-    tracing::info!("═══════════════════════════════════════");
-    tracing::info!("");
-    tracing::info!("Summary:");
-    tracing::info!(
-        "  [PASS] get_instruments: {} instruments fetched",
-        instruments_response.instruments.len()
-    );
-    tracing::info!("  [PASS] get_instrument: {} fetched", test_symbol);
+    tracing::info!("Done");
 
     Ok(())
 }

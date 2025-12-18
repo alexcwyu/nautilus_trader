@@ -456,6 +456,10 @@ criteria = "safe-to-deploy"
 version = "0.2.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.base32]]
+version = "0.5.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.base64ct]]
 version = "1.8.1"
 criteria = "safe-to-deploy"
@@ -2418,6 +2422,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.tonic-build]]
 version = "0.13.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.totp-rs]]
+version = "5.7.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.tower]]

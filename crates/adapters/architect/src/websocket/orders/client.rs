@@ -19,7 +19,7 @@ use std::{
     fmt::Debug,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -83,7 +83,7 @@ impl std::error::Error for ArchitectOrdersWsClientError {}
 pub struct ArchitectOrdersWebSocketClient {
     url: String,
     heartbeat: Option<u64>,
-    connection_mode: Arc<ArcSwap<std::sync::atomic::AtomicU8>>,
+    connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<ArchitectOrdersWsMessage>>>,
     signal: Arc<AtomicBool>,
@@ -128,7 +128,7 @@ impl ArchitectOrdersWebSocketClient {
     pub fn new(url: String, account_id: AccountId, heartbeat: Option<u64>) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
-        let initial_mode = std::sync::atomic::AtomicU8::new(ConnectionMode::Closed.as_u8());
+        let initial_mode = AtomicU8::new(ConnectionMode::Closed.as_u8());
         let connection_mode = Arc::new(ArcSwap::from_pointee(initial_mode));
 
         Self {
@@ -446,6 +446,26 @@ impl ArchitectOrdersWebSocketClient {
             .await?;
 
         Ok(request_id)
+    }
+
+    /// Returns a stream of messages from the WebSocket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once or before connecting.
+    pub fn stream(
+        &mut self,
+    ) -> impl futures_util::Stream<Item = ArchitectOrdersWsMessage> + use<'_> {
+        let rx = self
+            .out_rx
+            .take()
+            .expect("Stream receiver already taken or client not connected");
+        let mut rx = Arc::try_unwrap(rx).expect("Cannot take ownership - other references exist");
+        async_stream::stream! {
+            while let Some(msg) = rx.recv().await {
+                yield msg;
+            }
+        }
     }
 
     /// Disconnects the WebSocket connection gracefully.

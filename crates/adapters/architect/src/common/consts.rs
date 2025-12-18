@@ -31,9 +31,10 @@ pub const ARCHITECT_HTTP_SANDBOX_URL: &str = "https://sandbox.x.architect.co/api
 pub const ARCHITECT_ORDERS_URL: &str = "https://x.architect.co/orders";
 pub const ARCHITECT_ORDERS_SANDBOX_URL: &str = "https://sandbox.x.architect.co/orders";
 
-// WebSocket endpoints (URLs to be confirmed based on actual WebSocket documentation)
-pub const ARCHITECT_WS_PUBLIC_URL: &str = "wss://x.architect.co/ws/public";
-pub const ARCHITECT_WS_PRIVATE_URL: &str = "wss://x.architect.co/ws/private";
+// Market data WebSocket endpoints
+pub const ARCHITECT_WS_PUBLIC_URL: &str = "wss://x.architect.co/md/ws";
+pub const ARCHITECT_WS_SANDBOX_PUBLIC_URL: &str = "wss://sandbox.x.architect.co/md/ws";
 
-pub const ARCHITECT_WS_SANDBOX_PUBLIC_URL: &str = "wss://sandbox.x.architect.co/ws/public";
-pub const ARCHITECT_WS_SANDBOX_PRIVATE_URL: &str = "wss://sandbox.x.architect.co/ws/private";
+// Orders WebSocket endpoints (requires Bearer token authentication)
+pub const ARCHITECT_WS_PRIVATE_URL: &str = "wss://x.architect.co/orders/ws";
+pub const ARCHITECT_WS_SANDBOX_PRIVATE_URL: &str = "wss://sandbox.x.architect.co/orders/ws";

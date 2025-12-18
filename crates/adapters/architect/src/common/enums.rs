@@ -18,6 +18,78 @@
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
+use super::consts::{
+    ARCHITECT_HTTP_SANDBOX_URL, ARCHITECT_HTTP_URL, ARCHITECT_ORDERS_SANDBOX_URL,
+    ARCHITECT_ORDERS_URL, ARCHITECT_WS_PRIVATE_URL, ARCHITECT_WS_PUBLIC_URL,
+    ARCHITECT_WS_SANDBOX_PRIVATE_URL, ARCHITECT_WS_SANDBOX_PUBLIC_URL,
+};
+
+/// Architect API environment.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Display,
+    Eq,
+    PartialEq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+)]
+pub enum ArchitectEnvironment {
+    /// Sandbox/test environment.
+    #[default]
+    Sandbox,
+    /// Production/live environment.
+    Production,
+}
+
+impl ArchitectEnvironment {
+    /// Returns the HTTP API base URL for this environment.
+    #[must_use]
+    pub const fn http_url(&self) -> &'static str {
+        match self {
+            Self::Sandbox => ARCHITECT_HTTP_SANDBOX_URL,
+            Self::Production => ARCHITECT_HTTP_URL,
+        }
+    }
+
+    /// Returns the Orders API base URL for this environment.
+    #[must_use]
+    pub const fn orders_url(&self) -> &'static str {
+        match self {
+            Self::Sandbox => ARCHITECT_ORDERS_SANDBOX_URL,
+            Self::Production => ARCHITECT_ORDERS_URL,
+        }
+    }
+
+    /// Returns the market data WebSocket URL for this environment.
+    #[must_use]
+    pub const fn ws_md_url(&self) -> &'static str {
+        match self {
+            Self::Sandbox => ARCHITECT_WS_SANDBOX_PUBLIC_URL,
+            Self::Production => ARCHITECT_WS_PUBLIC_URL,
+        }
+    }
+
+    /// Returns the orders WebSocket URL for this environment.
+    #[must_use]
+    pub const fn ws_orders_url(&self) -> &'static str {
+        match self {
+            Self::Sandbox => ARCHITECT_WS_SANDBOX_PRIVATE_URL,
+            Self::Production => ARCHITECT_WS_PRIVATE_URL,
+        }
+    }
+}
+
 /// Instrument state as returned by the Architect API.
 ///
 /// # References

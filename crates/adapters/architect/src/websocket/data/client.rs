@@ -19,7 +19,7 @@ use std::{
     fmt::Debug,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -76,9 +76,11 @@ impl std::error::Error for ArchitectWsClientError {}
 /// Market data WebSocket client for Architect.
 ///
 /// Provides streaming market data including tickers, trades, order books, and candles.
+/// Requires Bearer token authentication obtained via the HTTP `/api/authenticate` endpoint.
 pub struct ArchitectMdWebSocketClient {
     url: String,
     heartbeat: Option<u64>,
+    auth_token: Option<String>,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<ArchitectMdWsMessage>>>,
@@ -86,7 +88,7 @@ pub struct ArchitectMdWebSocketClient {
     task_handle: Option<Arc<tokio::task::JoinHandle<()>>>,
     subscriptions: SubscriptionState,
     instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
-    request_id_counter: Arc<std::sync::atomic::AtomicI64>,
+    request_id_counter: Arc<AtomicI64>,
 }
 
 impl Debug for ArchitectMdWebSocketClient {
@@ -104,6 +106,7 @@ impl Clone for ArchitectMdWebSocketClient {
         Self {
             url: self.url.clone(),
             heartbeat: self.heartbeat,
+            auth_token: self.auth_token.clone(),
             connection_mode: Arc::clone(&self.connection_mode),
             cmd_tx: Arc::clone(&self.cmd_tx),
             out_rx: None, // Each clone gets its own receiver
@@ -118,8 +121,10 @@ impl Clone for ArchitectMdWebSocketClient {
 
 impl ArchitectMdWebSocketClient {
     /// Creates a new Architect market data WebSocket client.
+    ///
+    /// The `auth_token` is a Bearer token obtained from the HTTP `/api/authenticate` endpoint.
     #[must_use]
-    pub fn new(url: String, heartbeat: Option<u64>) -> Self {
+    pub fn new(url: String, auth_token: String, heartbeat: Option<u64>) -> Self {
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
         let initial_mode = AtomicU8::new(ConnectionMode::Closed.as_u8());
@@ -128,6 +133,7 @@ impl ArchitectMdWebSocketClient {
         Self {
             url,
             heartbeat: heartbeat.or(Some(DEFAULT_HEARTBEAT_SECS)),
+            auth_token: Some(auth_token),
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -135,7 +141,7 @@ impl ArchitectMdWebSocketClient {
             task_handle: None,
             subscriptions: SubscriptionState::new(ARCHITECT_TOPIC_DELIMITER),
             instruments_cache: Arc::new(DashMap::new()),
-            request_id_counter: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            request_id_counter: Arc::new(AtomicI64::new(1)),
         }
     }
 
@@ -177,7 +183,6 @@ impl ArchitectMdWebSocketClient {
         let symbol = instrument.symbol().inner();
         self.instruments_cache.insert(symbol, instrument.clone());
 
-        // If connected, also send to handler
         if self.is_active() {
             let cmd = HandlerCommand::UpdateInstrument(Box::new(instrument));
             let cmd_tx = self.cmd_tx.clone();
@@ -204,14 +209,17 @@ impl ArchitectMdWebSocketClient {
 
         let (raw_handler, raw_rx) = channel_message_handler();
 
-        // No-op ping handler: handler owns the WebSocketClient and responds to pings directly
-        let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {
-            // Handler responds to pings internally via select! loop
-        });
+        // No-op: ping responses are handled internally by the WebSocketClient
+        let ping_handler: PingHandler = Arc::new(move |_payload: Vec<u8>| {});
+
+        let mut headers = vec![("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string())];
+        if let Some(ref token) = self.auth_token {
+            headers.push(("Authorization".to_string(), format!("Bearer {token}")));
+        }
 
         let config = WebSocketConfig {
             url: self.url.clone(),
-            headers: vec![("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string())],
+            headers,
             message_handler: Some(raw_handler),
             heartbeat: self.heartbeat,
             heartbeat_msg: None, // Architect server sends heartbeats
@@ -439,6 +447,24 @@ impl ArchitectMdWebSocketClient {
             width,
         })
         .await
+    }
+
+    /// Returns a stream of messages from the WebSocket.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once or before connecting.
+    pub fn stream(&mut self) -> impl futures_util::Stream<Item = ArchitectMdWsMessage> + use<'_> {
+        let rx = self
+            .out_rx
+            .take()
+            .expect("Stream receiver already taken or client not connected");
+        let mut rx = Arc::try_unwrap(rx).expect("Cannot take ownership - other references exist");
+        async_stream::stream! {
+            while let Some(msg) = rx.recv().await {
+                yield msg;
+            }
+        }
     }
 
     /// Disconnects the WebSocket connection gracefully.
