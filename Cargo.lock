@@ -5703,6 +5703,7 @@ name = "nautilus-pyo3"
 version = "0.52.0"
 dependencies = [
  "nautilus-analysis",
+ "nautilus-architect",
  "nautilus-binance",
  "nautilus-bitmex",
  "nautilus-blockchain",

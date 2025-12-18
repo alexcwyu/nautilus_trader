@@ -77,6 +77,10 @@ impl std::error::Error for ArchitectWsClientError {}
 ///
 /// Provides streaming market data including tickers, trades, order books, and candles.
 /// Requires Bearer token authentication obtained via the HTTP `/api/authenticate` endpoint.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
+)]
 pub struct ArchitectMdWebSocketClient {
     url: String,
     heartbeat: Option<u64>,

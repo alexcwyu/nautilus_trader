@@ -15,26 +15,31 @@
 
 //! Python bindings for the Architect adapter.
 
+pub mod http;
+pub mod urls;
+pub mod websocket;
+
 use pyo3::prelude::*;
 
-/// Registers the Architect adapter Python module.
+use crate::{
+    common::enums::ArchitectEnvironment, http::client::ArchitectRawHttpClient,
+    websocket::data::ArchitectMdWebSocketClient,
+};
+
+/// Loaded as `nautilus_pyo3.architect`.
 ///
-/// This function is called automatically when the Python extension module is loaded.
-/// It registers all exported classes, functions, and types with the Python interpreter.
+/// # Errors
+///
+/// Returns a `PyErr` if registering any module components fails.
 #[pymodule]
-pub fn architect(_: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Register HTTP client when implemented
-    // m.add_class::<ArchitectHttpClient>()?;
-
-    // Register WebSocket client when implemented
-    // m.add_class::<ArchitectWebSocketClient>()?;
-
-    // Register configuration types
-    // m.add_class::<ArchitectDataClientConfig>()?;
-    // m.add_class::<ArchitectExecClientConfig>()?;
-
-    // Register enums when implemented
-    // m.add_class::<ArchitectProductType>()?;
+pub fn architect(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<ArchitectRawHttpClient>()?;
+    m.add_class::<ArchitectMdWebSocketClient>()?;
+    m.add_class::<ArchitectEnvironment>()?;
+    m.add_function(wrap_pyfunction!(urls::py_get_architect_http_url, m)?)?;
+    m.add_function(wrap_pyfunction!(urls::py_get_architect_orders_url, m)?)?;
+    m.add_function(wrap_pyfunction!(urls::py_get_architect_ws_md_url, m)?)?;
+    m.add_function(wrap_pyfunction!(urls::py_get_architect_ws_orders_url, m)?)?;
 
     Ok(())
 }

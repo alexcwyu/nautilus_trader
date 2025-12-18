@@ -67,6 +67,10 @@ const ARCHITECT_GLOBAL_RATE_KEY: &str = "architect:global";
 ///
 /// This client handles request/response operations with the Architect API,
 /// returning venue-specific response types. It does not parse to Nautilus domain types.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
+)]
 pub struct ArchitectRawHttpClient {
     base_url: String,
     orders_base_url: String,
@@ -96,6 +100,12 @@ impl Debug for ArchitectRawHttpClient {
 }
 
 impl ArchitectRawHttpClient {
+    /// Returns the base URL for this client.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Cancel all pending HTTP requests.
     pub fn cancel_all_requests(&self) {
         self.cancellation_token.cancel();
