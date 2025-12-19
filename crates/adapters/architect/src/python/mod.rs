@@ -16,13 +16,12 @@
 //! Python bindings for the Architect adapter.
 
 pub mod http;
-pub mod urls;
 pub mod websocket;
 
 use pyo3::prelude::*;
 
 use crate::{
-    common::enums::ArchitectEnvironment, http::client::ArchitectRawHttpClient,
+    common::enums::ArchitectEnvironment, http::client::ArchitectHttpClient,
     websocket::data::ArchitectMdWebSocketClient,
 };
 
@@ -33,13 +32,9 @@ use crate::{
 /// Returns a `PyErr` if registering any module components fails.
 #[pymodule]
 pub fn architect(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<ArchitectRawHttpClient>()?;
+    m.add_class::<ArchitectHttpClient>()?;
     m.add_class::<ArchitectMdWebSocketClient>()?;
     m.add_class::<ArchitectEnvironment>()?;
-    m.add_function(wrap_pyfunction!(urls::py_get_architect_http_url, m)?)?;
-    m.add_function(wrap_pyfunction!(urls::py_get_architect_orders_url, m)?)?;
-    m.add_function(wrap_pyfunction!(urls::py_get_architect_ws_md_url, m)?)?;
-    m.add_function(wrap_pyfunction!(urls::py_get_architect_ws_orders_url, m)?)?;
 
     Ok(())
 }

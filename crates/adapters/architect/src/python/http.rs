@@ -18,10 +18,10 @@
 use nautilus_core::python::to_pyvalue_err;
 use pyo3::prelude::*;
 
-use crate::http::{client::ArchitectRawHttpClient, error::ArchitectHttpError};
+use crate::http::{client::ArchitectHttpClient, error::ArchitectHttpError};
 
 #[pymethods]
-impl ArchitectRawHttpClient {
+impl ArchitectHttpClient {
     #[new]
     #[pyo3(signature = (
         base_url=None,
@@ -103,11 +103,6 @@ impl ArchitectRawHttpClient {
     #[pyo3(name = "cancel_all_requests")]
     pub fn py_cancel_all_requests(&self) {
         self.cancel_all_requests();
-    }
-
-    #[pyo3(name = "set_session_token")]
-    pub fn py_set_session_token(&mut self, token: String) {
-        self.set_session_token(token);
     }
 }
 

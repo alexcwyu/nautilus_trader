@@ -19,18 +19,27 @@ use std::{
     collections::HashMap,
     fmt::{Debug, Formatter},
     num::NonZeroU32,
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use nautilus_core::consts::NAUTILUS_USER_AGENT;
+use dashmap::DashMap;
+use nautilus_core::{
+    consts::NAUTILUS_USER_AGENT, nanos::UnixNanos, time::get_atomic_clock_realtime,
+};
+use nautilus_model::instruments::{Instrument, any::InstrumentAny};
 use nautilus_network::{
     http::HttpClient,
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryManager},
 };
 use reqwest::{Method, header::USER_AGENT};
+use rust_decimal::Decimal;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio_util::sync::CancellationToken;
+use ustr::Ustr;
 
 use super::{
     error::ArchitectHttpError,
@@ -43,6 +52,7 @@ use super::{
         ArchitectTransactionsResponse, ArchitectWhoAmI, AuthenticateApiKeyRequest,
         CancelOrderRequest, PlaceOrderRequest,
     },
+    parse::parse_perp_instrument,
     query::{
         GetCandleParams, GetCandlesParams, GetFundingRatesParams, GetInstrumentParams,
         GetTickerParams, GetTransactionsParams,
@@ -51,7 +61,7 @@ use super::{
 use crate::common::{
     consts::{ARCHITECT_HTTP_URL, ARCHITECT_ORDERS_URL},
     credential::Credential,
-    enums::ArchitectCandleWidth,
+    enums::{ArchitectCandleWidth, ArchitectInstrumentState},
 };
 
 /// Default Architect REST API rate limit.
@@ -67,10 +77,6 @@ const ARCHITECT_GLOBAL_RATE_KEY: &str = "architect:global";
 ///
 /// This client handles request/response operations with the Architect API,
 /// returning venue-specific response types. It does not parse to Nautilus domain types.
-#[cfg_attr(
-    feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
-)]
 pub struct ArchitectRawHttpClient {
     base_url: String,
     orders_base_url: String,
@@ -790,5 +796,234 @@ impl ArchitectRawHttpClient {
             true,
         )
         .await
+    }
+}
+
+// ------------------------------------------------------------------------------------------------
+
+/// High-level HTTP client for the Architect REST API.
+///
+/// This client wraps the underlying [`ArchitectRawHttpClient`] to provide a convenient
+/// interface for Python bindings and instrument caching.
+#[derive(Debug)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.architect")
+)]
+pub struct ArchitectHttpClient {
+    pub(crate) inner: Arc<ArchitectRawHttpClient>,
+    pub(crate) instruments_cache: Arc<DashMap<Ustr, InstrumentAny>>,
+    cache_initialized: AtomicBool,
+}
+
+impl Clone for ArchitectHttpClient {
+    fn clone(&self) -> Self {
+        let cache_initialized = AtomicBool::new(false);
+
+        let is_initialized = self.cache_initialized.load(Ordering::Acquire);
+        if is_initialized {
+            cache_initialized.store(true, Ordering::Release);
+        }
+
+        Self {
+            inner: self.inner.clone(),
+            instruments_cache: self.instruments_cache.clone(),
+            cache_initialized,
+        }
+    }
+}
+
+impl Default for ArchitectHttpClient {
+    fn default() -> Self {
+        Self::new(None, None, None, None, None, None, None)
+            .expect("Failed to create default ArchitectHttpClient")
+    }
+}
+
+impl ArchitectHttpClient {
+    /// Creates a new [`ArchitectHttpClient`] using the default Architect HTTP URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retry manager cannot be created.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base_url: Option<String>,
+        orders_base_url: Option<String>,
+        timeout_secs: Option<u64>,
+        max_retries: Option<u32>,
+        retry_delay_ms: Option<u64>,
+        retry_delay_max_ms: Option<u64>,
+        proxy_url: Option<String>,
+    ) -> Result<Self, ArchitectHttpError> {
+        Ok(Self {
+            inner: Arc::new(ArchitectRawHttpClient::new(
+                base_url,
+                orders_base_url,
+                timeout_secs,
+                max_retries,
+                retry_delay_ms,
+                retry_delay_max_ms,
+                proxy_url,
+            )?),
+            instruments_cache: Arc::new(DashMap::new()),
+            cache_initialized: AtomicBool::new(false),
+        })
+    }
+
+    /// Creates a new [`ArchitectHttpClient`] configured with credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP client cannot be created.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_credentials(
+        api_key: String,
+        api_secret: String,
+        base_url: Option<String>,
+        orders_base_url: Option<String>,
+        timeout_secs: Option<u64>,
+        max_retries: Option<u32>,
+        retry_delay_ms: Option<u64>,
+        retry_delay_max_ms: Option<u64>,
+        proxy_url: Option<String>,
+    ) -> Result<Self, ArchitectHttpError> {
+        Ok(Self {
+            inner: Arc::new(ArchitectRawHttpClient::with_credentials(
+                api_key,
+                api_secret,
+                base_url,
+                orders_base_url,
+                timeout_secs,
+                max_retries,
+                retry_delay_ms,
+                retry_delay_max_ms,
+                proxy_url,
+            )?),
+            instruments_cache: Arc::new(DashMap::new()),
+            cache_initialized: AtomicBool::new(false),
+        })
+    }
+
+    /// Returns the base URL for this client.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        self.inner.base_url()
+    }
+
+    /// Cancel all pending HTTP requests.
+    pub fn cancel_all_requests(&self) {
+        self.inner.cancel_all_requests();
+    }
+
+    /// Generates a timestamp for initialization.
+    fn generate_ts_init(&self) -> UnixNanos {
+        get_atomic_clock_realtime().get_time_ns()
+    }
+
+    /// Checks if the client is initialized.
+    ///
+    /// The client is considered initialized if any instruments have been cached from the venue.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        self.cache_initialized.load(Ordering::Acquire)
+    }
+
+    /// Returns a snapshot of all instrument symbols currently held in the internal cache.
+    #[must_use]
+    pub fn get_cached_symbols(&self) -> Vec<String> {
+        self.instruments_cache
+            .iter()
+            .map(|entry| entry.key().to_string())
+            .collect()
+    }
+
+    /// Caches multiple instruments.
+    ///
+    /// Any existing instruments with the same symbols will be replaced.
+    pub fn cache_instruments(&self, instruments: Vec<InstrumentAny>) {
+        for inst in instruments {
+            self.instruments_cache
+                .insert(inst.raw_symbol().inner(), inst);
+        }
+        self.cache_initialized.store(true, Ordering::Release);
+    }
+
+    /// Caches a single instrument.
+    ///
+    /// Any existing instrument with the same symbol will be replaced.
+    pub fn cache_instrument(&self, instrument: InstrumentAny) {
+        self.instruments_cache
+            .insert(instrument.raw_symbol().inner(), instrument);
+        self.cache_initialized.store(true, Ordering::Release);
+    }
+
+    /// Gets an instrument from the cache by symbol.
+    pub fn get_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
+        self.instruments_cache
+            .get(symbol)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Requests all instruments from Architect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or instrument parsing fails.
+    pub async fn request_instruments(
+        &self,
+        maker_fee: Option<Decimal>,
+        taker_fee: Option<Decimal>,
+    ) -> anyhow::Result<Vec<InstrumentAny>> {
+        let resp = self
+            .inner
+            .get_instruments()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let maker_fee = maker_fee.unwrap_or(Decimal::ZERO);
+        let taker_fee = taker_fee.unwrap_or(Decimal::ZERO);
+        let ts_init = self.generate_ts_init();
+
+        let mut instruments: Vec<InstrumentAny> = Vec::new();
+        for inst in &resp.instruments {
+            if inst.state == ArchitectInstrumentState::Suspended {
+                tracing::debug!("Skipping suspended instrument: {}", inst.symbol);
+                continue;
+            }
+
+            match parse_perp_instrument(inst, maker_fee, taker_fee, ts_init, ts_init) {
+                Ok(instrument) => instruments.push(instrument),
+                Err(e) => {
+                    tracing::warn!("Failed to parse instrument {}: {e}", inst.symbol);
+                }
+            }
+        }
+
+        Ok(instruments)
+    }
+
+    /// Requests a single instrument from Architect by symbol.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or instrument parsing fails.
+    pub async fn request_instrument(
+        &self,
+        symbol: &str,
+        maker_fee: Option<Decimal>,
+        taker_fee: Option<Decimal>,
+    ) -> anyhow::Result<InstrumentAny> {
+        let resp = self
+            .inner
+            .get_instrument(symbol)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let maker_fee = maker_fee.unwrap_or(Decimal::ZERO);
+        let taker_fee = taker_fee.unwrap_or(Decimal::ZERO);
+        let ts_init = self.generate_ts_init();
+
+        parse_perp_instrument(&resp, maker_fee, taker_fee, ts_init, ts_init)
     }
 }
