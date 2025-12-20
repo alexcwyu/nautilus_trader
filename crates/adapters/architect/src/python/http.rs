@@ -16,7 +16,8 @@
 //! Python bindings for the Architect HTTP client.
 
 use nautilus_core::python::to_pyvalue_err;
-use pyo3::prelude::*;
+use nautilus_model::identifiers::AccountId;
+use pyo3::{IntoPyObjectExt, prelude::*, types::PyList};
 
 use crate::http::{client::ArchitectHttpClient, error::ArchitectHttpError};
 
@@ -103,6 +104,90 @@ impl ArchitectHttpClient {
     #[pyo3(name = "cancel_all_requests")]
     pub fn py_cancel_all_requests(&self) {
         self.cancel_all_requests();
+    }
+
+    /// Request order status reports from Architect.
+    ///
+    /// Returns a list of `OrderStatusReport` for all open orders.
+    #[pyo3(name = "request_order_status_reports")]
+    fn py_request_order_status_reports<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let reports = client
+                .request_order_status_reports(account_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_reports: PyResult<Vec<_>> = reports
+                    .into_iter()
+                    .map(|report| report.into_py_any(py))
+                    .collect();
+                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    /// Request fill reports from Architect.
+    ///
+    /// Returns a list of `FillReport` for recent fills.
+    #[pyo3(name = "request_fill_reports")]
+    fn py_request_fill_reports<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let reports = client
+                .request_fill_reports(account_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_reports: PyResult<Vec<_>> = reports
+                    .into_iter()
+                    .map(|report| report.into_py_any(py))
+                    .collect();
+                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    /// Request position reports from Architect.
+    ///
+    /// Returns a list of `PositionStatusReport` for current positions.
+    #[pyo3(name = "request_position_reports")]
+    fn py_request_position_reports<'py>(
+        &self,
+        py: Python<'py>,
+        account_id: AccountId,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let reports = client
+                .request_position_reports(account_id)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let py_reports: PyResult<Vec<_>> = reports
+                    .into_iter()
+                    .map(|report| report.into_py_any(py))
+                    .collect();
+                let pylist = PyList::new(py, py_reports?).unwrap().into_any().unbind();
+                Ok(pylist)
+            })
+        })
     }
 }
 

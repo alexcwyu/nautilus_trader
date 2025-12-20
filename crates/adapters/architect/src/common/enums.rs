@@ -15,7 +15,7 @@
 
 //! Enumerations that model Architect string enums across HTTP and WebSocket payloads.
 
-use nautilus_model::enums::AggressorSide;
+use nautilus_model::enums::{AggressorSide, OrderSide, OrderStatus, PositionSide, TimeInForce};
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
@@ -170,6 +170,24 @@ impl From<ArchitectOrderSide> for AggressorSide {
     }
 }
 
+impl From<ArchitectOrderSide> for OrderSide {
+    fn from(side: ArchitectOrderSide) -> Self {
+        match side {
+            ArchitectOrderSide::Buy => Self::Buy,
+            ArchitectOrderSide::Sell => Self::Sell,
+        }
+    }
+}
+
+impl From<ArchitectOrderSide> for PositionSide {
+    fn from(side: ArchitectOrderSide) -> Self {
+        match side {
+            ArchitectOrderSide::Buy => Self::Long,
+            ArchitectOrderSide::Sell => Self::Short,
+        }
+    }
+}
+
 /// Order status as returned by the Architect API.
 ///
 /// # References
@@ -217,6 +235,23 @@ pub enum ArchitectOrderStatus {
     Unknown,
 }
 
+impl From<ArchitectOrderStatus> for OrderStatus {
+    fn from(status: ArchitectOrderStatus) -> Self {
+        match status {
+            ArchitectOrderStatus::Pending => Self::Submitted,
+            ArchitectOrderStatus::Accepted => Self::Accepted,
+            ArchitectOrderStatus::PartiallyFilled => Self::PartiallyFilled,
+            ArchitectOrderStatus::Filled => Self::Filled,
+            ArchitectOrderStatus::Canceled => Self::Canceled,
+            ArchitectOrderStatus::Rejected => Self::Rejected,
+            ArchitectOrderStatus::Expired => Self::Expired,
+            ArchitectOrderStatus::Replaced => Self::Accepted,
+            ArchitectOrderStatus::DoneForDay => Self::Canceled,
+            ArchitectOrderStatus::Unknown => Self::Initialized,
+        }
+    }
+}
+
 /// Time in force for order validity.
 ///
 /// # References
@@ -248,6 +283,16 @@ pub enum ArchitectTimeInForce {
     Ioc,
     /// Day order: valid until end of trading day.
     Day,
+}
+
+impl From<ArchitectTimeInForce> for TimeInForce {
+    fn from(tif: ArchitectTimeInForce) -> Self {
+        match tif {
+            ArchitectTimeInForce::Gtc => Self::Gtc,
+            ArchitectTimeInForce::Ioc => Self::Ioc,
+            ArchitectTimeInForce::Day => Self::Day,
+        }
+    }
 }
 
 /// Market data subscription level.

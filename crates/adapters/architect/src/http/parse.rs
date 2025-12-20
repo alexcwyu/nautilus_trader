@@ -21,15 +21,22 @@ use anyhow::Context;
 use nautilus_core::{UUID4, nanos::UnixNanos};
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType},
-    enums::{AccountType, AggregationSource, BarAggregation, PriceType},
+    enums::{
+        AccountType, AggregationSource, BarAggregation, LiquiditySide, OrderSide, OrderType,
+        PositionSideSpecified, PriceType,
+    },
     events::AccountState,
-    identifiers::{AccountId, InstrumentId, Symbol},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, TradeId, VenueOrderId},
     instruments::{CryptoPerpetual, Instrument, any::InstrumentAny},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
-use super::models::{ArchitectBalancesResponse, ArchitectCandle, ArchitectInstrument};
+use super::models::{
+    ArchitectBalancesResponse, ArchitectCandle, ArchitectFill, ArchitectInstrument,
+    ArchitectOpenOrder, ArchitectPosition,
+};
 use crate::common::{consts::ARCHITECT_VENUE, enums::ArchitectCandleWidth, parse::parse_decimal};
 
 /// Parses a Price from a string field.
@@ -248,6 +255,216 @@ pub fn parse_account_state(
         ts_event,
         ts_init,
         None,
+    ))
+}
+
+/// Parses an Architect open order into a Nautilus [`OrderStatusReport`].
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Price or quantity fields cannot be parsed.
+/// - Timestamp conversion fails.
+pub fn parse_order_status_report(
+    order: &ArchitectOpenOrder,
+    account_id: AccountId,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    let instrument_id = instrument.id();
+    let venue_order_id = VenueOrderId::new(&order.oid);
+    let order_side = order.d.into();
+    let order_status = order.o.into();
+    let time_in_force = order.tif.into();
+
+    // Architect only supports limit orders currently
+    let order_type = OrderType::Limit;
+
+    // Parse quantity (Architect uses i64 contracts)
+    let quantity = Quantity::new(order.q as f64, instrument.size_precision());
+    let filled_qty = Quantity::new(order.xq as f64, instrument.size_precision());
+
+    // Parse price
+    let price = parse_price_with_precision(&order.p, instrument.price_precision(), "order.p")?;
+
+    // Architect timestamps are in Unix epoch seconds
+    let ts_event = UnixNanos::from((order.ts as u64) * 1_000_000_000);
+
+    let mut report = OrderStatusReport::new(
+        account_id,
+        instrument_id,
+        None,
+        venue_order_id,
+        order_side,
+        order_type,
+        time_in_force,
+        order_status,
+        quantity,
+        filled_qty,
+        ts_event,
+        ts_event,
+        ts_init,
+        Some(UUID4::new()),
+    );
+
+    // Add client order ID if tag is present
+    if let Some(ref tag) = order.tag
+        && !tag.is_empty()
+    {
+        report = report.with_client_order_id(ClientOrderId::new(tag.as_str()));
+    }
+
+    report = report.with_price(price);
+
+    // Calculate average price if there are fills
+    if order.xq > 0 {
+        let avg_px = price.as_f64();
+        report = report.with_avg_px(avg_px)?;
+    }
+
+    Ok(report)
+}
+
+/// Parses an Architect fill into a Nautilus [`FillReport`].
+///
+/// Note: Architect fills don't include order ID, side, or liquidity information
+/// in the fills endpoint response, so we use default values where necessary.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Price or quantity fields cannot be parsed.
+/// - Fee parsing fails.
+pub fn parse_fill_report(
+    fill: &ArchitectFill,
+    account_id: AccountId,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<FillReport> {
+    let instrument_id = instrument.id();
+
+    // Architect fills use execution_id as the unique identifier
+    let venue_order_id = VenueOrderId::new(&fill.execution_id);
+    let trade_id = TradeId::new_checked(&fill.execution_id)
+        .context("Invalid execution_id in Architect fill")?;
+
+    // Architect doesn't provide order side in fills, infer from quantity sign
+    let order_side = if fill.quantity >= 0 {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+
+    let last_px =
+        parse_price_with_precision(&fill.price, instrument.price_precision(), "fill.price")?;
+    let last_qty = Quantity::new(
+        fill.quantity.unsigned_abs() as f64,
+        instrument.size_precision(),
+    );
+
+    // Parse fee (Architect returns positive fee, Nautilus uses negative for costs)
+    let fee_f64 = fill
+        .fee
+        .parse::<f64>()
+        .with_context(|| format!("Failed to parse fee='{}'", fill.fee))?;
+    let currency = Currency::USD();
+    let commission = Money::new(-fee_f64, currency);
+
+    let liquidity_side = if fill.is_taker {
+        LiquiditySide::Taker
+    } else {
+        LiquiditySide::Maker
+    };
+
+    let ts_event = UnixNanos::from(
+        fill.timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .unsigned_abs(),
+    );
+
+    Ok(FillReport::new(
+        account_id,
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        order_side,
+        last_qty,
+        last_px,
+        commission,
+        liquidity_side,
+        None,
+        None,
+        ts_event,
+        ts_init,
+        None,
+    ))
+}
+
+/// Parses an Architect position into a Nautilus [`PositionStatusReport`].
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Position quantity parsing fails.
+/// - Timestamp conversion fails.
+pub fn parse_position_status_report(
+    position: &ArchitectPosition,
+    account_id: AccountId,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<PositionStatusReport> {
+    let instrument_id = instrument.id();
+
+    // Determine position side and quantity from open_quantity sign
+    let (position_side, quantity) = if position.open_quantity > 0 {
+        (
+            PositionSideSpecified::Long,
+            Quantity::new(position.open_quantity as f64, instrument.size_precision()),
+        )
+    } else if position.open_quantity < 0 {
+        (
+            PositionSideSpecified::Short,
+            Quantity::new(
+                position.open_quantity.unsigned_abs() as f64,
+                instrument.size_precision(),
+            ),
+        )
+    } else {
+        (
+            PositionSideSpecified::Flat,
+            Quantity::new(0.0, instrument.size_precision()),
+        )
+    };
+
+    // Calculate average entry price from notional / quantity
+    let avg_px_open = if position.open_quantity != 0 {
+        let notional =
+            Decimal::from_str(&position.open_notional).context("Failed to parse open_notional")?;
+        let qty_dec = Decimal::from(position.open_quantity.abs());
+        Some(notional / qty_dec)
+    } else {
+        None
+    };
+
+    let ts_last = UnixNanos::from(
+        position
+            .timestamp
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .unsigned_abs(),
+    );
+
+    Ok(PositionStatusReport::new(
+        account_id,
+        instrument_id,
+        position_side,
+        quantity,
+        ts_last,
+        ts_init,
+        None,
+        None,
+        avg_px_open,
     ))
 }
 

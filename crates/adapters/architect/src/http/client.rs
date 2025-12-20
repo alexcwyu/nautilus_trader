@@ -34,6 +34,7 @@ use nautilus_model::{
     events::AccountState,
     identifiers::AccountId,
     instruments::{Instrument, any::InstrumentAny},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
 };
 use nautilus_network::{
     http::HttpClient,
@@ -57,7 +58,10 @@ use super::{
         ArchitectTransactionsResponse, ArchitectWhoAmI, AuthenticateApiKeyRequest,
         CancelOrderRequest, PlaceOrderRequest,
     },
-    parse::{parse_account_state, parse_bar, parse_perp_instrument},
+    parse::{
+        parse_account_state, parse_bar, parse_fill_report, parse_order_status_report,
+        parse_perp_instrument, parse_position_status_report,
+    },
     query::{
         GetCandleParams, GetCandlesParams, GetFundingRatesParams, GetInstrumentParams,
         GetTickerParams, GetTransactionsParams,
@@ -1145,5 +1149,122 @@ impl ArchitectHttpClient {
         }
 
         Ok(bars)
+    }
+
+    /// Requests open orders from Architect and parses them to Nautilus [`OrderStatusReport`].
+    ///
+    /// Requires instruments to be cached for parsing order details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The HTTP request fails.
+    /// - An order's instrument is not found in the cache.
+    /// - Order parsing fails.
+    pub async fn request_order_status_reports(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<Vec<OrderStatusReport>> {
+        let orders = self
+            .inner
+            .get_open_orders()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        let mut reports = Vec::with_capacity(orders.len());
+
+        for order in &orders {
+            let instrument = self
+                .get_instrument(&order.s)
+                .ok_or_else(|| anyhow::anyhow!("Instrument {} not found in cache", order.s))?;
+
+            match parse_order_status_report(order, account_id, &instrument, ts_init) {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    tracing::warn!("Failed to parse order {}: {e}", order.oid);
+                }
+            }
+        }
+
+        Ok(reports)
+    }
+
+    /// Requests fills from Architect and parses them to Nautilus [`FillReport`].
+    ///
+    /// Requires instruments to be cached for parsing fill details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The HTTP request fails.
+    /// - A fill's instrument is not found in the cache.
+    /// - Fill parsing fails.
+    pub async fn request_fill_reports(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<Vec<FillReport>> {
+        let response = self
+            .inner
+            .get_fills()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        let mut reports = Vec::with_capacity(response.fills.len());
+
+        for fill in &response.fills {
+            let instrument = self
+                .get_instrument(&fill.symbol)
+                .ok_or_else(|| anyhow::anyhow!("Instrument {} not found in cache", fill.symbol))?;
+
+            match parse_fill_report(fill, account_id, &instrument, ts_init) {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    tracing::warn!("Failed to parse fill {}: {e}", fill.execution_id);
+                }
+            }
+        }
+
+        Ok(reports)
+    }
+
+    /// Requests positions from Architect and parses them to Nautilus [`PositionStatusReport`].
+    ///
+    /// Requires instruments to be cached for parsing position details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The HTTP request fails.
+    /// - A position's instrument is not found in the cache.
+    /// - Position parsing fails.
+    pub async fn request_position_reports(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let response = self
+            .inner
+            .get_positions()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        let mut reports = Vec::with_capacity(response.positions.len());
+
+        for position in &response.positions {
+            let instrument = self.get_instrument(&position.symbol).ok_or_else(|| {
+                anyhow::anyhow!("Instrument {} not found in cache", position.symbol)
+            })?;
+
+            match parse_position_status_report(position, account_id, &instrument, ts_init) {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    tracing::warn!("Failed to parse position for {}: {e}", position.symbol);
+                }
+            }
+        }
+
+        Ok(reports)
     }
 }
