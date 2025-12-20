@@ -15,6 +15,7 @@
 
 //! Enumerations that model Architect string enums across HTTP and WebSocket payloads.
 
+use nautilus_model::enums::AggressorSide;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
 
@@ -158,6 +159,15 @@ pub enum ArchitectOrderSide {
     #[serde(rename = "S")]
     #[strum(serialize = "S")]
     Sell,
+}
+
+impl From<ArchitectOrderSide> for AggressorSide {
+    fn from(side: ArchitectOrderSide) -> Self {
+        match side {
+            ArchitectOrderSide::Buy => Self::Buyer,
+            ArchitectOrderSide::Sell => Self::Seller,
+        }
+    }
 }
 
 /// Order status as returned by the Architect API.

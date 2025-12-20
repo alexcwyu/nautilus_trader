@@ -24,11 +24,18 @@ use std::{
 };
 
 use ahash::AHashMap;
-use nautilus_model::instruments::{Instrument, InstrumentAny};
+use nautilus_core::{nanos::UnixNanos, time::get_atomic_clock_realtime};
+use nautilus_model::{
+    data::Data,
+    instruments::{Instrument, InstrumentAny},
+};
 use nautilus_network::websocket::{SubscriptionState, WebSocketClient};
 use tokio_tungstenite::tungstenite::Message;
 use ustr::Ustr;
 
+use super::parse::{
+    parse_book_l1_quote, parse_book_l2_deltas, parse_book_l3_deltas, parse_trade_tick,
+};
 use crate::{
     common::enums::{ArchitectCandleWidth, ArchitectMarketDataLevel},
     websocket::messages::{
@@ -122,6 +129,11 @@ impl FeedHandler {
             instruments: AHashMap::new(),
             message_queue: VecDeque::new(),
         }
+    }
+
+    /// Generates the current timestamp for `ts_init`.
+    fn generate_ts_init(&self) -> UnixNanos {
+        get_atomic_clock_realtime().get_time_ns()
     }
 
     /// Returns the next message from the handler.
@@ -388,6 +400,22 @@ impl FeedHandler {
                                 trade.q,
                                 trade.p
                             );
+
+                            // Try to parse to Nautilus TradeTick if instrument is cached
+                            if let Some(instrument) = self.instruments.get(&trade.s) {
+                                let ts_init = self.generate_ts_init();
+                                match parse_trade_tick(&trade, instrument, ts_init) {
+                                    Ok(tick) => {
+                                        return Some(vec![ArchitectMdWsMessage::Data(vec![
+                                            Data::Trade(tick),
+                                        ])]);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to parse trade to TradeTick: {e}");
+                                    }
+                                }
+                            }
+
                             Some(vec![ArchitectMdWsMessage::Trade(trade)])
                         }
                         Err(e) => {
@@ -411,6 +439,22 @@ impl FeedHandler {
             "t" => match serde_json::from_value::<ArchitectMdTrade>(value) {
                 Ok(trade) => {
                     tracing::debug!("Received trade: {} {} @ {}", trade.s, trade.q, trade.p);
+
+                    // Try to parse to Nautilus TradeTick if instrument is cached
+                    if let Some(instrument) = self.instruments.get(&trade.s) {
+                        let ts_init = self.generate_ts_init();
+                        match parse_trade_tick(&trade, instrument, ts_init) {
+                            Ok(tick) => {
+                                return Some(vec![ArchitectMdWsMessage::Data(vec![Data::Trade(
+                                    tick,
+                                )])]);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse trade to TradeTick: {e}");
+                            }
+                        }
+                    }
+
                     Some(vec![ArchitectMdWsMessage::Trade(trade)])
                 }
                 Err(e) => {
@@ -437,6 +481,23 @@ impl FeedHandler {
             "1" => match serde_json::from_value::<ArchitectMdBookL1>(value) {
                 Ok(book) => {
                     tracing::debug!("Received book L1: {}", book.s);
+
+                    // Try to parse to Nautilus QuoteTick if instrument is cached
+                    if let Some(instrument) = self.instruments.get(&book.s) {
+                        let ts_init = self.generate_ts_init();
+                        match parse_book_l1_quote(&book, instrument, ts_init) {
+                            Ok(quote) => {
+                                return Some(vec![ArchitectMdWsMessage::Data(vec![Data::Quote(
+                                    quote,
+                                )])]);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse L1 to QuoteTick: {e}");
+                            }
+                        }
+                    }
+
+                    // Fall back to raw message if no instrument or parse failed
                     Some(vec![ArchitectMdWsMessage::BookL1(book)])
                 }
                 Err(e) => {
@@ -452,6 +513,21 @@ impl FeedHandler {
                         book.b.len(),
                         book.a.len()
                     );
+
+                    // Try to parse to Nautilus OrderBookDeltas if instrument is cached
+                    if let Some(instrument) = self.instruments.get(&book.s) {
+                        let ts_init = self.generate_ts_init();
+                        match parse_book_l2_deltas(&book, instrument, ts_init) {
+                            Ok(deltas) => {
+                                return Some(vec![ArchitectMdWsMessage::Deltas(deltas)]);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse L2 to OrderBookDeltas: {e}");
+                            }
+                        }
+                    }
+
+                    // Fall back to raw message if no instrument or parse failed
                     Some(vec![ArchitectMdWsMessage::BookL2(book)])
                 }
                 Err(e) => {
@@ -467,6 +543,21 @@ impl FeedHandler {
                         book.b.len(),
                         book.a.len()
                     );
+
+                    // Try to parse to Nautilus OrderBookDeltas if instrument is cached
+                    if let Some(instrument) = self.instruments.get(&book.s) {
+                        let ts_init = self.generate_ts_init();
+                        match parse_book_l3_deltas(&book, instrument, ts_init) {
+                            Ok(deltas) => {
+                                return Some(vec![ArchitectMdWsMessage::Deltas(deltas)]);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse L3 to OrderBookDeltas: {e}");
+                            }
+                        }
+                    }
+
+                    // Fall back to raw message if no instrument or parse failed
                     Some(vec![ArchitectMdWsMessage::BookL3(book)])
                 }
                 Err(e) => {

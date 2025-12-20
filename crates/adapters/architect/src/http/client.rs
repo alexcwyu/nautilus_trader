@@ -29,7 +29,12 @@ use dashmap::DashMap;
 use nautilus_core::{
     consts::NAUTILUS_USER_AGENT, nanos::UnixNanos, time::get_atomic_clock_realtime,
 };
-use nautilus_model::instruments::{Instrument, any::InstrumentAny};
+use nautilus_model::{
+    data::Bar,
+    events::AccountState,
+    identifiers::AccountId,
+    instruments::{Instrument, any::InstrumentAny},
+};
 use nautilus_network::{
     http::HttpClient,
     ratelimiter::quota::Quota,
@@ -52,7 +57,7 @@ use super::{
         ArchitectTransactionsResponse, ArchitectWhoAmI, AuthenticateApiKeyRequest,
         CancelOrderRequest, PlaceOrderRequest,
     },
-    parse::parse_perp_instrument,
+    parse::{parse_account_state, parse_bar, parse_perp_instrument},
     query::{
         GetCandleParams, GetCandlesParams, GetFundingRatesParams, GetInstrumentParams,
         GetTickerParams, GetTransactionsParams,
@@ -958,6 +963,43 @@ impl ArchitectHttpClient {
         self.cache_initialized.store(true, Ordering::Release);
     }
 
+    /// Authenticates with Architect using API credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or credentials are invalid.
+    pub async fn authenticate(
+        &self,
+        api_key: &str,
+        api_secret: &str,
+        expiration_seconds: i32,
+    ) -> Result<String, ArchitectHttpError> {
+        let resp = self
+            .inner
+            .authenticate(api_key, api_secret, expiration_seconds)
+            .await?;
+        Ok(resp.token)
+    }
+
+    /// Authenticates with Architect using API credentials and TOTP.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or credentials are invalid.
+    pub async fn authenticate_with_totp(
+        &self,
+        api_key: &str,
+        api_secret: &str,
+        expiration_seconds: i32,
+        totp_code: Option<&str>,
+    ) -> Result<String, ArchitectHttpError> {
+        let resp = self
+            .inner
+            .authenticate_with_totp(api_key, api_secret, expiration_seconds, totp_code)
+            .await?;
+        Ok(resp.token)
+    }
+
     /// Gets an instrument from the cache by symbol.
     pub fn get_instrument(&self, symbol: &Ustr) -> Option<InstrumentAny> {
         self.instruments_cache
@@ -1025,5 +1067,83 @@ impl ArchitectHttpClient {
         let ts_init = self.generate_ts_init();
 
         parse_perp_instrument(&resp, maker_fee, taker_fee, ts_init, ts_init)
+    }
+
+    /// Requests account state from Architect and parses to a Nautilus [`AccountState`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or parsing fails.
+    pub async fn request_account_state(
+        &self,
+        account_id: AccountId,
+    ) -> anyhow::Result<AccountState> {
+        let response = self
+            .inner
+            .get_balances()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        parse_account_state(&response, account_id, ts_init, ts_init)
+    }
+
+    /// Requests funding rates from Architect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails.
+    pub async fn request_funding_rates(
+        &self,
+        symbol: &str,
+        start_timestamp_ns: i64,
+        end_timestamp_ns: i64,
+    ) -> Result<ArchitectFundingRatesResponse, ArchitectHttpError> {
+        self.inner
+            .get_funding_rates(symbol, start_timestamp_ns, end_timestamp_ns)
+            .await
+    }
+
+    /// Requests historical bars from Architect and parses them to Nautilus Bar types.
+    ///
+    /// Requires the instrument to be cached (call `request_instruments` first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The instrument is not found in the cache.
+    /// - The HTTP request fails.
+    /// - Bar parsing fails.
+    pub async fn request_bars(
+        &self,
+        symbol: &str,
+        start_timestamp_ns: i64,
+        end_timestamp_ns: i64,
+        width: ArchitectCandleWidth,
+    ) -> anyhow::Result<Vec<Bar>> {
+        let symbol_ustr = ustr::Ustr::from(symbol);
+        let instrument = self
+            .get_instrument(&symbol_ustr)
+            .ok_or_else(|| anyhow::anyhow!("Instrument {symbol} not found in cache"))?;
+
+        let resp = self
+            .inner
+            .get_candles(symbol, start_timestamp_ns, end_timestamp_ns, width)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let ts_init = self.generate_ts_init();
+        let mut bars = Vec::with_capacity(resp.candles.len());
+
+        for candle in &resp.candles {
+            match parse_bar(candle, &instrument, ts_init) {
+                Ok(bar) => bars.push(bar),
+                Err(e) => {
+                    tracing::warn!("Failed to parse bar for {symbol}: {e}");
+                }
+            }
+        }
+
+        Ok(bars)
     }
 }

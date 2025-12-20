@@ -18,16 +18,19 @@
 use std::str::FromStr;
 
 use anyhow::Context;
-use nautilus_core::nanos::UnixNanos;
+use nautilus_core::{UUID4, nanos::UnixNanos};
 use nautilus_model::{
-    identifiers::{InstrumentId, Symbol},
-    instruments::{CryptoPerpetual, any::InstrumentAny},
-    types::{Currency, Price, Quantity},
+    data::{Bar, BarSpecification, BarType},
+    enums::{AccountType, AggregationSource, BarAggregation, PriceType},
+    events::AccountState,
+    identifiers::{AccountId, InstrumentId, Symbol},
+    instruments::{CryptoPerpetual, Instrument, any::InstrumentAny},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
 
-use super::models::ArchitectInstrument;
-use crate::common::{consts::ARCHITECT_VENUE, parse::parse_decimal};
+use super::models::{ArchitectBalancesResponse, ArchitectCandle, ArchitectInstrument};
+use crate::common::{consts::ARCHITECT_VENUE, enums::ArchitectCandleWidth, parse::parse_decimal};
 
 /// Parses a Price from a string field.
 ///
@@ -51,10 +54,78 @@ fn parse_quantity(value: &str, field_name: &str) -> anyhow::Result<Quantity> {
     Quantity::from_decimal(decimal).context("Failed to convert decimal to Quantity")
 }
 
+/// Parses a Price with specific precision.
+fn parse_price_with_precision(value: &str, precision: u8, field: &str) -> anyhow::Result<Price> {
+    let parsed = value
+        .parse::<f64>()
+        .with_context(|| format!("Failed to parse {field}='{value}' as f64"))?;
+    Price::new_checked(parsed, precision).with_context(|| {
+        format!("Failed to construct Price for {field} with precision {precision}")
+    })
+}
+
 /// Gets or creates a Currency from a currency code string.
 #[must_use]
 fn get_currency(code: &str) -> Currency {
     Currency::from(code)
+}
+
+/// Converts an Architect candle width to a Nautilus bar specification.
+#[must_use]
+pub fn candle_width_to_bar_spec(width: ArchitectCandleWidth) -> BarSpecification {
+    match width {
+        ArchitectCandleWidth::Seconds1 => {
+            BarSpecification::new(1, BarAggregation::Second, PriceType::Last)
+        }
+        ArchitectCandleWidth::Seconds5 => {
+            BarSpecification::new(5, BarAggregation::Second, PriceType::Last)
+        }
+        ArchitectCandleWidth::Minutes1 => {
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last)
+        }
+        ArchitectCandleWidth::Minutes5 => {
+            BarSpecification::new(5, BarAggregation::Minute, PriceType::Last)
+        }
+        ArchitectCandleWidth::Minutes15 => {
+            BarSpecification::new(15, BarAggregation::Minute, PriceType::Last)
+        }
+        ArchitectCandleWidth::Hours1 => {
+            BarSpecification::new(1, BarAggregation::Hour, PriceType::Last)
+        }
+        ArchitectCandleWidth::Days1 => {
+            BarSpecification::new(1, BarAggregation::Day, PriceType::Last)
+        }
+    }
+}
+
+/// Parses an Architect candle into a Nautilus Bar.
+///
+/// # Errors
+///
+/// Returns an error if any OHLCV field cannot be parsed.
+pub fn parse_bar(
+    candle: &ArchitectCandle,
+    instrument: &InstrumentAny,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Bar> {
+    let price_precision = instrument.price_precision();
+    let size_precision = instrument.size_precision();
+
+    let open = parse_price_with_precision(&candle.open, price_precision, "candle.open")?;
+    let high = parse_price_with_precision(&candle.high, price_precision, "candle.high")?;
+    let low = parse_price_with_precision(&candle.low, price_precision, "candle.low")?;
+    let close = parse_price_with_precision(&candle.close, price_precision, "candle.close")?;
+
+    // Architect provides volume as i64 contracts
+    let volume = Quantity::new(candle.volume as f64, size_precision);
+
+    let ts_event = UnixNanos::from(candle.tn.timestamp_nanos_opt().unwrap_or(0) as u64);
+
+    let bar_spec = candle_width_to_bar_spec(candle.width);
+    let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::External);
+
+    Bar::new_checked(bar_type, open, high, low, close, volume, ts_event, ts_init)
+        .context("Failed to construct Bar from Architect candle")
 }
 
 /// Parses an Architect perpetual futures instrument into a Nautilus CryptoPerpetual.
@@ -124,6 +195,62 @@ pub fn parse_perp_instrument(
     Ok(InstrumentAny::CryptoPerpetual(instrument))
 }
 
+/// Parses an Architect balances response into a Nautilus [`AccountState`].
+///
+/// Architect provides a simple balance structure with symbol and amount.
+/// The amount is treated as both total and free balance (no locked funds tracking).
+///
+/// # Errors
+///
+/// Returns an error if balance amount parsing fails.
+pub fn parse_account_state(
+    response: &ArchitectBalancesResponse,
+    account_id: AccountId,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<AccountState> {
+    let mut balances = Vec::new();
+
+    for balance in &response.balances {
+        let symbol_str = balance.symbol.as_str().trim();
+        if symbol_str.is_empty() {
+            tracing::debug!("Skipping balance with empty symbol");
+            continue;
+        }
+
+        let currency = Currency::from(symbol_str);
+
+        let amount = balance
+            .amount
+            .parse::<f64>()
+            .with_context(|| format!("Failed to parse balance amount for {symbol_str}"))?;
+
+        let total = Money::new(amount, currency);
+        let locked = Money::new(0.0, currency);
+        let free = total;
+
+        balances.push(AccountBalance::new(total, locked, free));
+    }
+
+    if balances.is_empty() {
+        let zero_currency = Currency::USD();
+        let zero_money = Money::new(0.0, zero_currency);
+        balances.push(AccountBalance::new(zero_money, zero_money, zero_money));
+    }
+
+    Ok(AccountState::new(
+        account_id,
+        AccountType::Margin,
+        balances,
+        vec![],
+        true,
+        UUID4::new(),
+        ts_event,
+        ts_init,
+        None,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::nanos::UnixNanos;
@@ -131,7 +258,9 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
-    use crate::common::enums::ArchitectInstrumentState;
+    use crate::{
+        common::enums::ArchitectInstrumentState, http::models::ArchitectInstrumentsResponse,
+    };
 
     fn create_test_instrument() -> ArchitectInstrument {
         ArchitectInstrument {
@@ -203,7 +332,7 @@ mod tests {
     #[rstest]
     fn test_deserialize_instruments_from_test_data() {
         let test_data = include_str!("../../test_data/http_get_instruments.json");
-        let response: super::super::models::ArchitectInstrumentsResponse =
+        let response: ArchitectInstrumentsResponse =
             serde_json::from_str(test_data).expect("Failed to deserialize test data");
 
         assert_eq!(response.instruments.len(), 3);
@@ -230,7 +359,7 @@ mod tests {
     #[rstest]
     fn test_parse_all_instruments_from_test_data() {
         let test_data = include_str!("../../test_data/http_get_instruments.json");
-        let response: super::super::models::ArchitectInstrumentsResponse =
+        let response: ArchitectInstrumentsResponse =
             serde_json::from_str(test_data).expect("Failed to deserialize test data");
 
         let maker_fee = Decimal::new(2, 4);

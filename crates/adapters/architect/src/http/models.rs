@@ -553,7 +553,7 @@ pub struct AuthenticateApiKeyRequest {
     /// API key.
     pub api_key: String,
     /// API secret.
-    pub secret: String,
+    pub api_secret: String,
     /// Token expiration in seconds.
     pub expiration_seconds: i32,
     /// Optional 2FA code.
@@ -566,12 +566,12 @@ impl AuthenticateApiKeyRequest {
     #[must_use]
     pub fn new(
         api_key: impl Into<String>,
-        secret: impl Into<String>,
+        api_secret: impl Into<String>,
         expiration_seconds: i32,
     ) -> Self {
         Self {
             api_key: api_key.into(),
-            secret: secret.into(),
+            api_secret: api_secret.into(),
             expiration_seconds,
             totp: None,
         }
