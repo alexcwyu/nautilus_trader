@@ -1070,7 +1070,7 @@ cdef class DataEngine(Component):
 
         Condition.not_none(client, "client")
 
-        if self._is_backtest_client(client) and not command.params.get("force_aggregated_quotes", False):
+        if command.params.get("aggregate_spread_quotes", False):
             instrument = self._cache.instrument(command.instrument_id)
             if instrument and instrument.is_spread() and len(instrument.legs()) > 1:
                 self._start_spread_quote_aggregator(client, command)
@@ -1314,7 +1314,7 @@ cdef class DataEngine(Component):
     cpdef void _handle_unsubscribe_quote_ticks(self, MarketDataClient client, UnsubscribeQuoteTicks command):
         Condition.not_none(command.instrument_id, "instrument_id")
 
-        if self._is_backtest_client(client) and not command.params.get("force_aggregated_quotes", False):
+        if command.params.get("aggregate_spread_quotes", False):
             instrument = self._cache.instrument(command.instrument_id)
             if instrument and instrument.is_spread() and len(instrument.legs()) > 1:
                 self._stop_spread_quote_aggregator(client, command)
@@ -1446,9 +1446,8 @@ cdef class DataEngine(Component):
         request.end = time_object_to_dt(request.end)
 
         # A request involving a spread aggregator will be converted to a request join first
-        # "force_aggregated_quotes" allows to request actual quotes instead of aggregated ones,
-        # this can be useful if quotes have been saved before or an exchange provides actual quotes
-        if isinstance(request, RequestQuoteTicks) and not request.params.get("force_aggregated_quotes", False):
+        # "aggregate_spread_quotes" allows to aggregate spread quotes from component quotes
+        if isinstance(request, RequestQuoteTicks) and request.params.get("aggregate_spread_quotes", False):
             instrument = self._cache.instrument(request.instrument_id)
             if instrument and instrument.is_spread() and len(instrument.legs()) > 1:
                 if self._should_request_spread_quote_ticks(request):

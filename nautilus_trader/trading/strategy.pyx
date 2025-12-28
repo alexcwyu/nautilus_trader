@@ -179,6 +179,8 @@ cdef class Strategy(Actor):
         self.register_warning_event(OrderCancelRejected)
         self.register_warning_event(OrderModifyRejected)
 
+        self.default_execution_params = {}
+
     def _parse_external_order_claims(
         self,
         config_claims: list[str] | None,
@@ -809,6 +811,11 @@ cdef class Strategy(Actor):
 
         self.cache.add_order(order, position_id, client_id)
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef SubmitOrder command = SubmitOrder(
             trader_id=self.trader_id,
             strategy_id=self.id,
@@ -817,7 +824,7 @@ cdef class Strategy(Actor):
             ts_init=self.clock.timestamp_ns(),
             position_id=position_id,
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
 
         if self.manage_gtd_expiry and order.time_in_force == TimeInForce.GTD:
@@ -908,6 +915,11 @@ cdef class Strategy(Actor):
         for order in order_list.orders:
             self.cache.add_order(order, position_id, client_id)
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef SubmitOrderList command = SubmitOrderList(
             trader_id=self.trader_id,
             strategy_id=self.id,
@@ -916,7 +928,7 @@ cdef class Strategy(Actor):
             command_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
 
         if self.manage_gtd_expiry:
@@ -990,13 +1002,18 @@ cdef class Strategy(Actor):
         Condition.is_true(self.trader_id is not None, "The strategy has not been registered")
         Condition.not_none(order, "order")
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef ModifyOrder command = self._create_modify_order(
             order=order,
             quantity=quantity,
             price=price,
             trigger_price=trigger_price,
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
         if command is None:
             return
@@ -1027,10 +1044,15 @@ cdef class Strategy(Actor):
         Condition.is_true(self.trader_id is not None, "The strategy has not been registered")
         Condition.not_none(order, "order")
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef CancelOrder command = self._create_cancel_order(
             order=order,
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
         if command is None:
             return
@@ -1111,6 +1133,11 @@ cdef class Strategy(Actor):
             self._log.warning("Cannot send `BatchCancelOrders`, no valid cancel commands")
             return
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef command = BatchCancelOrders(
             trader_id=self.trader_id,
             strategy_id=self.id,
@@ -1119,7 +1146,7 @@ cdef class Strategy(Actor):
             command_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
 
         self._manager.send_exec_command(command)
@@ -1214,6 +1241,11 @@ cdef class Strategy(Actor):
                 if order.strategy_id == self.id and not order.is_closed_c():
                     self.cancel_order(order)
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef CancelAllOrders command
 
         if open_count > 0:
@@ -1225,7 +1257,7 @@ cdef class Strategy(Actor):
                 command_id=UUID4(),
                 ts_init=self.clock.timestamp_ns(),
                 client_id=client_id,
-                params=params,
+                params=used_params,
             )
             self._manager.send_exec_command(command)
 
@@ -1238,7 +1270,7 @@ cdef class Strategy(Actor):
                 command_id=UUID4(),
                 ts_init=self.clock.timestamp_ns(),
                 client_id=client_id,
-                params=params,
+                params=used_params,
             )
             self._manager.send_emulator_command(command)
 
@@ -1303,7 +1335,12 @@ cdef class Strategy(Actor):
             tags=tags,
         )
 
-        self.submit_order(order, position_id=position.id, client_id=client_id, params=params)
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
+        self.submit_order(order, position_id=position.id, client_id=client_id, params=used_params)
 
     cpdef void close_all_positions(
         self,
@@ -1363,6 +1400,11 @@ cdef class Strategy(Actor):
             f"Closing {count} open{position_side_str} position{'' if count == 1 else 's'}",
         )
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef Position position
         for position in positions_open:
             self.close_position(
@@ -1372,7 +1414,7 @@ cdef class Strategy(Actor):
                 time_in_force,
                 reduce_only,
                 quote_quantity,
-                params,
+                used_params,
             )
 
     cpdef void query_account(self, AccountId account_id, ClientId client_id = None, dict[str, object] params = None):
@@ -1395,13 +1437,18 @@ cdef class Strategy(Actor):
         """
         Condition.is_true(self.trader_id is not None, "The strategy has not been registered")
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef QueryAccount command = QueryAccount(
             trader_id=self.trader_id,
             account_id=account_id,
             command_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
 
         self._manager.send_exec_command(command)
@@ -1429,6 +1476,11 @@ cdef class Strategy(Actor):
         Condition.is_true(self.trader_id is not None, "The strategy has not been registered")
         Condition.not_none(order, "order")
 
+        cdef dict[str, object] used_params = {}
+        used_params.update(self.default_execution_params)
+        if params:
+            used_params.update(params)
+
         cdef QueryOrder command = QueryOrder(
             trader_id=self.trader_id,
             strategy_id=self.id,
@@ -1438,7 +1490,7 @@ cdef class Strategy(Actor):
             command_id=UUID4(),
             ts_init=self.clock.timestamp_ns(),
             client_id=client_id,
-            params=params,
+            params=used_params,
         )
 
         self._manager.send_exec_command(command)
