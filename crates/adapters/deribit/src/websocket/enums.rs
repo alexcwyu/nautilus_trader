@@ -42,7 +42,12 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object
+    )
 )]
 pub enum DeribitUpdateInterval {
     /// Raw updates - immediate delivery of each event.
@@ -101,7 +106,12 @@ impl Display for DeribitUpdateInterval {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object
+    )
 )]
 pub enum DeribitWsChannel {
     // Public Market Data Channels

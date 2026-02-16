@@ -40,7 +40,12 @@ use strum::{AsRefStr, Display as StrumDisplay, EnumIter, EnumString};
 #[strum(serialize_all = "snake_case")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object
+    )
 )]
 pub enum DeribitProductType {
     /// Future contract
@@ -65,7 +70,12 @@ pub enum DeribitProductType {
 #[strum(serialize_all = "UPPERCASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.deribit")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object
+    )
 )]
 pub enum DeribitCurrency {
     /// Bitcoin

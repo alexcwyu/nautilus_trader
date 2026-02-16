@@ -54,7 +54,8 @@ use super::consts::{
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect"
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object,
     )
 )]
 pub enum AxEnvironment {
@@ -125,7 +126,12 @@ impl AxEnvironment {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxInstrumentState {
     /// Instrument is in pre-open state.
@@ -160,7 +166,12 @@ pub enum AxInstrumentState {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxOrderSide {
     /// Buy order.
@@ -234,7 +245,12 @@ impl TryFrom<OrderSide> for AxOrderSide {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxOrderStatus {
     /// Order is pending submission.
@@ -310,7 +326,12 @@ impl From<AxOrderStatus> for OrderStatus {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxTimeInForce {
     /// Good-Till-Canceled: order remains active until filled or canceled.
@@ -381,7 +402,12 @@ impl TryFrom<TimeInForce> for AxTimeInForce {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxOrderType {
     /// Market order; execute immediately at best available price.
@@ -446,7 +472,8 @@ impl TryFrom<OrderType> for AxOrderType {
         eq_int,
         frozen,
         hash,
-        module = "nautilus_trader.core.nautilus_pyo3.architect"
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object,
     )
 )]
 pub enum AxMarketDataLevel {
@@ -624,7 +651,12 @@ pub enum AxOrderRequestType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxMdWsMessageType {
     /// Heartbeat event.
@@ -677,7 +709,12 @@ pub enum AxMdWsMessageType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxOrderWsMessageType {
     /// Heartbeat event.
@@ -744,7 +781,12 @@ pub enum AxOrderWsMessageType {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxCancelReason {
     /// User requested cancellation.
@@ -776,7 +818,12 @@ pub enum AxCancelReason {
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(eq, eq_int, module = "nautilus_trader.core.nautilus_pyo3.architect")
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.architect",
+        from_py_object
+    )
 )]
 pub enum AxCancelRejectionReason {
     /// Order not found or already canceled.

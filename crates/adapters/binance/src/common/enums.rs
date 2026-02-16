@@ -28,7 +28,11 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", eq)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        eq,
+        from_py_object
+    )
 )]
 pub enum BinanceProductType {
     /// Spot trading (api.binance.com).
@@ -110,7 +114,11 @@ impl Display for BinanceProductType {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", eq)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        eq,
+        from_py_object
+    )
 )]
 pub enum BinanceEnvironment {
     /// Production/mainnet environment.
@@ -172,7 +180,11 @@ impl From<BinanceSide> for OrderSide {
 #[serde(rename_all = "UPPERCASE")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", eq)
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.binance",
+        eq,
+        from_py_object
+    )
 )]
 pub enum BinancePositionSide {
     /// Single position mode (both).
