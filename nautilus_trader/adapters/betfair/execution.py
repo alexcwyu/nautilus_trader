@@ -174,6 +174,7 @@ class BetfairExecutionClient(LiveExecutionClient):
         self._log.info(f"{config.reconcile_market_ids_only=}", LogColor.BLUE)
         self._log.info(f"{config.stream_market_ids_filter=}", LogColor.BLUE)
         self._log.info(f"{config.ignore_external_orders=}", LogColor.BLUE)
+        self._log.info(f"{config.submit_rejection_delay_secs=}", LogColor.BLUE)
 
         # Include filter for order stream updates (None = process all markets)
         self._stream_market_ids_filter: set[str] | None = (
@@ -219,6 +220,10 @@ class BetfairExecutionClient(LiveExecutionClient):
         # Tracks venue_order_ids that have been replaced via modify price operations
         # to ignore late stream updates for the old (replaced) order
         self._replaced_venue_order_ids: FifoCache = FifoCache()
+
+        # Tracks deferred rejection tasks for orders where the HTTP response failed
+        # but the order may have been placed (network errors, timeouts)
+        self._pending_submit_rejections: dict[ClientOrderId, asyncio.Task] = {}
 
     @property
     def instrument_provider(self) -> BetfairInstrumentProvider:
@@ -292,6 +297,10 @@ class BetfairExecutionClient(LiveExecutionClient):
             self._log.debug("Canceling task 'update_account_task'")
             self._update_account_task.cancel()
             self._update_account_task = None
+
+        for task in self._pending_submit_rejections.values():
+            task.cancel()
+        self._pending_submit_rejections.clear()
 
         self._log.info("Closing streaming socket")
         await self._stream.disconnect()
@@ -759,19 +768,7 @@ class BetfairExecutionClient(LiveExecutionClient):
         try:
             result: PlaceExecutionReport = await self._client.place_orders(place_orders)
         except Exception as e:
-            if isinstance(e, BetfairError):
-                await self.on_api_exception(error=e)
-
-            self._customer_order_ref_remove_for_client_id(client_order_id)
-            self._try_mark_terminal_order(client_order_id)
-
-            self.generate_order_rejected(
-                command.strategy_id,
-                command.instrument_id,
-                client_order_id,
-                str(e),
-                self._clock.timestamp_ns(),
-            )
+            await self._handle_submit_error(command, client_order_id, e)
             return
 
         self._log.debug(f"{result=}")
@@ -835,6 +832,93 @@ class BetfairExecutionClient(LiveExecutionClient):
                     self._clock.timestamp_ns(),
                 )
                 self._log.debug("Generated order accepted")
+
+    async def _handle_submit_error(
+        self,
+        command: SubmitOrder,
+        client_order_id: ClientOrderId,
+        error: Exception,
+    ) -> None:
+        if isinstance(error, BetfairError):
+            # Betfair responded with an explicit error - order was not placed
+            await self.on_api_exception(error=error)
+            self._customer_order_ref_remove_for_client_id(client_order_id)
+            self._try_mark_terminal_order(client_order_id)
+            self.generate_order_rejected(
+                command.strategy_id,
+                command.instrument_id,
+                client_order_id,
+                str(error),
+                self._clock.timestamp_ns(),
+            )
+        elif self.config.submit_rejection_delay_secs > 0:
+            # Network error (timeout, connection reset, etc.) - the order may
+            # have been placed on the venue. Keep the rfo registered so the
+            # stream can confirm the order during the grace period.
+            self._log.warning(
+                f"HTTP error placing {client_order_id!r}, deferring rejection "
+                f"for {self.config.submit_rejection_delay_secs}s "
+                f"to allow stream confirmation: {error}",
+            )
+            task = self.create_task(
+                self._deferred_submit_rejection(command, str(error)),
+            )
+            self._pending_submit_rejections[client_order_id] = task
+        else:
+            self._customer_order_ref_remove_for_client_id(client_order_id)
+            self._try_mark_terminal_order(client_order_id)
+            self.generate_order_rejected(
+                command.strategy_id,
+                command.instrument_id,
+                client_order_id,
+                str(error),
+                self._clock.timestamp_ns(),
+            )
+
+    async def _deferred_submit_rejection(
+        self,
+        command: SubmitOrder,
+        reason: str,
+    ) -> None:
+        client_order_id = command.order.client_order_id
+
+        try:
+            await asyncio.sleep(self.config.submit_rejection_delay_secs)
+        except asyncio.CancelledError:
+            self._log.debug(f"Deferred rejection canceled for {client_order_id!r}")
+            return
+        finally:
+            self._pending_submit_rejections.pop(client_order_id, None)
+
+        order = self._cache.order(client_order_id)
+        if order is None:
+            self._log.warning(
+                f"Deferred rejection: order {client_order_id!r} not found in cache",
+            )
+            return
+
+        if order.status != OrderStatus.SUBMITTED:
+            # Stream confirmed the order during the grace period
+            self._log.info(
+                f"Deferred rejection skipped for {client_order_id!r}: "
+                f"order status is {order.status_string()} (stream confirmed)",
+            )
+            return
+
+        # Order still SUBMITTED after grace period - reject
+        self._log.warning(
+            f"Rejecting {client_order_id!r} after "
+            f"{self.config.submit_rejection_delay_secs}s grace period: {reason}",
+        )
+        self._customer_order_ref_remove_for_client_id(client_order_id)
+        self._try_mark_terminal_order(client_order_id)
+        self.generate_order_rejected(
+            command.strategy_id,
+            command.instrument_id,
+            client_order_id,
+            reason,
+            self._clock.timestamp_ns(),
+        )
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         existing_order: Order | None = self._cache.order(client_order_id=command.client_order_id)
@@ -1294,6 +1378,29 @@ class BetfairExecutionClient(LiveExecutionClient):
         if client_order_id is None:
             self._log_skipped_external_order(unmatched_order, instrument.id)
             return
+
+        # Cancel deferred rejection if one is pending
+        pending_task = self._pending_submit_rejections.pop(client_order_id, None)
+        if pending_task is not None:
+            pending_task.cancel()
+            self._log.info(
+                f"Stream confirmed {client_order_id!r}, canceled deferred rejection",
+            )
+
+        # Any stream update for a SUBMITTED order confirms it exists on venue.
+        # This handles both: (a) stream arriving after deferred rejection is
+        # registered, and (b) stream arriving before the HTTP timeout fires.
+        order = self._cache.order(client_order_id)
+        if order is not None and order.status == OrderStatus.SUBMITTED:
+            venue_order_id = VenueOrderId(str(unmatched_order.id))
+            self._cache.add_venue_order_id(client_order_id, venue_order_id)
+            self.generate_order_accepted(
+                order.strategy_id,
+                instrument.id,
+                client_order_id,
+                venue_order_id,
+                self._clock.timestamp_ns(),
+            )
 
         if unmatched_order.status == BETFAIR_ORDER_STATUS_EXECUTABLE:
             self._handle_stream_executable_order_update(

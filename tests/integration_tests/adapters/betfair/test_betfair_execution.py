@@ -51,6 +51,7 @@ from nautilus_trader.adapters.betfair.orderbook import betfair_float_to_price
 from nautilus_trader.adapters.betfair.orderbook import betfair_float_to_quantity
 from nautilus_trader.adapters.betfair.parsing import requests as parsing_requests
 from nautilus_trader.adapters.betfair.parsing.common import betfair_instrument_id
+from nautilus_trader.adapters.betfair.parsing.requests import make_customer_order_ref
 from nautilus_trader.core.rust.model import OrderSide
 from nautilus_trader.core.rust.model import OrderStatus
 from nautilus_trader.core.rust.model import TimeInForce
@@ -4815,3 +4816,372 @@ def test_check_cache_against_order_image_filters_markets(
 
     # Act - should complete without checking the filtered market
     exec_client.check_cache_against_order_image(ocm)
+
+
+@pytest.mark.asyncio
+async def test_submit_order_network_error_defers_rejection(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+):
+    # Arrange - make place_orders raise a network error (not BetfairError)
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=10,
+    )
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=TimeoutError("Connection timed out"),
+    ):
+        # Act
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    # Assert - order should still be SUBMITTED (not rejected yet)
+    assert test_order.status == OrderStatus.SUBMITTED
+    assert test_order.client_order_id in exec_client._pending_submit_rejections
+
+    # The rfo should still be registered
+    rfo = make_customer_order_ref(test_order.client_order_id)
+    assert rfo in exec_client._customer_order_refs
+
+
+@pytest.mark.asyncio
+async def test_submit_order_network_error_rejects_after_grace_period(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+):
+    # Arrange - use a very short grace period for testing
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=1,
+    )
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=TimeoutError("Connection timed out"),
+    ):
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    # Assert - order should be SUBMITTED during grace period
+    assert test_order.status == OrderStatus.SUBMITTED
+
+    # Act - wait for grace period to expire
+    await eventually(lambda: test_order.status == OrderStatus.REJECTED, timeout=3.0)
+
+    # Assert - order should now be rejected
+    rejected_events = [e for e in test_order.events if isinstance(e, OrderRejected)]
+    assert len(rejected_events) == 1
+    assert "Connection timed out" in rejected_events[0].reason
+
+    # RFO should be cleaned up
+    rfo = make_customer_order_ref(test_order.client_order_id)
+    assert rfo not in exec_client._customer_order_refs
+    assert test_order.client_order_id not in exec_client._pending_submit_rejections
+
+
+@pytest.mark.asyncio
+async def test_submit_order_network_error_stream_confirms_cancels_rejection(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+    instrument,
+    cache,
+):
+    # Arrange - use a long grace period so we can confirm via stream before it expires
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=30,
+    )
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=TimeoutError("Connection timed out"),
+    ):
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    assert test_order.status == OrderStatus.SUBMITTED
+    assert test_order.client_order_id in exec_client._pending_submit_rejections
+
+    # Act - simulate a stream fill arriving (order was placed on venue)
+    rfo = make_customer_order_ref(test_order.client_order_id)
+    venue_order_id = "999888777"
+
+    ocm = OCM(
+        oc=[
+            OrderMarketChange(
+                id=instrument.market_id,
+                orc=[
+                    OrderRunnerChange(
+                        id=int(instrument.selection_id),
+                        hc=None,
+                        uo=[
+                            BFOrder(
+                                id=int(venue_order_id),
+                                p=2.0,
+                                s=100.0,
+                                side="B",
+                                status="E",
+                                sm=100.0,
+                                avp=2.0,
+                                rfo=rfo,
+                                pd=0,
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    exec_client.handle_order_stream_update(msgspec.json.encode(ocm))
+    await asyncio.sleep(0)
+
+    # Assert - deferred rejection should have been canceled
+    assert test_order.client_order_id not in exec_client._pending_submit_rejections
+
+    # Order should have been accepted then filled (not rejected)
+    accepted_events = [e for e in test_order.events if isinstance(e, OrderAccepted)]
+    assert len(accepted_events) == 1
+    assert accepted_events[0].venue_order_id == VenueOrderId(venue_order_id)
+    fills = [e for e in test_order.events if isinstance(e, OrderFilled)]
+    assert len(fills) == 1
+    assert fills[0].venue_order_id == VenueOrderId(venue_order_id)
+    rejected_events = [e for e in test_order.events if isinstance(e, OrderRejected)]
+    assert len(rejected_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_order_network_error_executable_no_fill_generates_acceptance(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+    instrument,
+    cache,
+):
+    # Arrange - HTTP times out but order was placed on venue (no fill yet)
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=30,
+    )
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=TimeoutError("Connection timed out"),
+    ):
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    assert test_order.status == OrderStatus.SUBMITTED
+    assert test_order.client_order_id in exec_client._pending_submit_rejections
+
+    # Act - simulate EXECUTABLE stream update with no fill (sm=0)
+    rfo = make_customer_order_ref(test_order.client_order_id)
+    venue_order_id = "999888777"
+
+    ocm = OCM(
+        oc=[
+            OrderMarketChange(
+                id=instrument.market_id,
+                orc=[
+                    OrderRunnerChange(
+                        id=int(instrument.selection_id),
+                        hc=None,
+                        uo=[
+                            BFOrder(
+                                id=int(venue_order_id),
+                                p=2.0,
+                                s=100.0,
+                                side="B",
+                                status="E",
+                                sm=0,
+                                rfo=rfo,
+                                pd=0,
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+        ],
+    )
+    exec_client.handle_order_stream_update(msgspec.json.encode(ocm))
+    await asyncio.sleep(0)
+
+    # Assert - deferred rejection canceled, order accepted (not rejected)
+    assert test_order.client_order_id not in exec_client._pending_submit_rejections
+    assert test_order.status == OrderStatus.ACCEPTED
+    accepted_events = [e for e in test_order.events if isinstance(e, OrderAccepted)]
+    assert len(accepted_events) == 1
+    assert accepted_events[0].venue_order_id == VenueOrderId(venue_order_id)
+    rejected_events = [e for e in test_order.events if isinstance(e, OrderRejected)]
+    assert len(rejected_events) == 0
+
+
+@pytest.mark.asyncio
+async def test_submit_order_stream_confirms_before_timeout_prevents_rejection(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+    instrument,
+    cache,
+):
+    # Arrange - stream confirmation arrives before the HTTP timeout exception.
+    # This tests the race where _pending_submit_rejections is still empty when
+    # the stream update is processed (HTTP call hasn't failed yet).
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=1,
+    )
+
+    rfo = make_customer_order_ref(test_order.client_order_id)
+    venue_order_id = "999888777"
+
+    async def slow_timeout_with_stream_confirm(*args, **kwargs):
+        # Simulate the stream confirming the order DURING the HTTP await
+        ocm = OCM(
+            oc=[
+                OrderMarketChange(
+                    id=instrument.market_id,
+                    orc=[
+                        OrderRunnerChange(
+                            id=int(instrument.selection_id),
+                            hc=None,
+                            uo=[
+                                BFOrder(
+                                    id=int(venue_order_id),
+                                    p=2.0,
+                                    s=100.0,
+                                    side="B",
+                                    status="E",
+                                    sm=0,
+                                    rfo=rfo,
+                                    pd=0,
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+        )
+        exec_client.handle_order_stream_update(msgspec.json.encode(ocm))
+        raise TimeoutError("Connection timed out")
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=slow_timeout_with_stream_confirm,
+    ):
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    # Assert - stream confirmed before timeout, deferred rejection should
+    # either not be created or should be harmless (order already ACCEPTED)
+    assert test_order.status == OrderStatus.ACCEPTED
+    accepted_events = [e for e in test_order.events if isinstance(e, OrderAccepted)]
+    assert len(accepted_events) == 1
+    assert accepted_events[0].venue_order_id == VenueOrderId(venue_order_id)
+
+    # If a deferred rejection was created, wait for it to fire and verify it skips
+    if test_order.client_order_id in exec_client._pending_submit_rejections:
+        await eventually(
+            lambda: test_order.client_order_id not in exec_client._pending_submit_rejections,
+            timeout=3.0,
+        )
+
+    rejected_events = [e for e in test_order.events if isinstance(e, OrderRejected)]
+    assert len(rejected_events) == 0
+    assert test_order.status == OrderStatus.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_submit_order_network_error_immediate_rejection_when_delay_zero(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+):
+    # Arrange - disable grace period
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=0,
+    )
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=TimeoutError("Connection timed out"),
+    ):
+        # Act
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    # Assert - should be rejected immediately (legacy behavior)
+    assert test_order.status == OrderStatus.REJECTED
+    assert test_order.client_order_id not in exec_client._pending_submit_rejections
+
+
+@pytest.mark.asyncio
+async def test_submit_order_betfair_error_rejects_immediately(
+    exec_client: BetfairExecutionClient,
+    strategy,
+    test_order,
+    events,
+):
+    # Arrange - BetfairError should always reject immediately regardless of delay
+    exec_client.config = BetfairExecClientConfig(
+        username="username",
+        password="password",
+        app_key="app_key",
+        account_currency="GBP",
+        submit_rejection_delay_secs=30,
+    )
+
+    with patch.object(
+        exec_client._client,
+        "place_orders",
+        new_callable=AsyncMock,
+        side_effect=BetfairError("PERMISSION_DENIED"),
+    ):
+        # Act
+        strategy.submit_order(test_order)
+        await asyncio.sleep(0)
+
+    # Assert - BetfairError means venue explicitly rejected, no grace period
+    assert test_order.status == OrderStatus.REJECTED
+    assert test_order.client_order_id not in exec_client._pending_submit_rejections
