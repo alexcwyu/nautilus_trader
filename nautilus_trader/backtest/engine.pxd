@@ -127,6 +127,7 @@ cdef class BacktestEngine:
     cdef dict[str, uint64_t] _last_subscription_ts
     cdef list[Data] _response_data
 
+    cdef void _set_exchange_clocks(self, uint64_t ts)
     cdef CVec _advance_time(self, uint64_t ts_now)
     cdef bint _process_next_timer(self)
     cdef void _process_and_settle_venues(self, uint64_t ts_now)
@@ -283,6 +284,7 @@ cdef class SimulatedExchange:
     cdef object _message_queue
     cdef list[tuple[tuple[uint64_t, uint64_t], TradingCommand]] _inflight_queue
     cdef dict[uint64_t, uint64_t] _inflight_counter
+    cdef bint _orders_submitted_this_drain
 
 # -- REGISTRATION ---------------------------------------------------------------------------------
 
@@ -422,6 +424,13 @@ cdef class OrderMatchingEngine:
     cdef int _order_count
     cdef int _execution_count
 
+    cdef bint _bar_iterated
+    cdef bint _needs_trade_cleanup
+    cdef AggressorSide _deferred_aggressor_side
+    cdef PriceRaw _deferred_trade_price_raw
+    cdef PriceRaw _deferred_original_bid
+    cdef PriceRaw _deferred_original_ask
+
     cpdef void reset(self)
     cpdef void set_fill_model(self, FillModel fill_model)
     cpdef void update_instrument(self, Instrument instrument)
@@ -508,6 +517,7 @@ cdef class OrderMatchingEngine:
     cdef Quantity determine_trade_fill_qty(self, Order order)
     cpdef void fill_market_order(self, Order order)
     cpdef void fill_limit_order(self, Order order)
+    cpdef void _fill_unmatched_limit_order(self, Order order)
     cdef void _trail_stop_order(self, Order order)
 
     cdef void _snapshot_queue_position(self, Order order, Price price)

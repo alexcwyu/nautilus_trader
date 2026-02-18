@@ -1562,6 +1562,8 @@ cdef class BacktestEngine:
         else:
             self._last_ns = start_ns
 
+        self._set_exchange_clocks(self._last_ns)
+
         try:
             while True:
                 if data is None:
@@ -1685,6 +1687,12 @@ cdef class BacktestEngine:
                 break
 
             ts_event = handler.event.ts_event
+
+            # Settle venues for the previous timestamp batch before processing new timestamp
+            if ts_event != ts_last and ts_last != 0:
+                self._process_and_settle_venues(ts_last)
+
+            ts_last = ts_event
             set_logging_clock_static_time(ts_event)
 
             if LOGGING_PYO3:
@@ -1693,15 +1701,14 @@ cdef class BacktestEngine:
             for clock in clocks:
                 clock.set_time(ts_event)
 
+            self._set_exchange_clocks(ts_event)
+
             event = TimeEvent.from_mem_c(handler.event)
+
             raw_callback = <PyObject *>handler.callback_ptr
             callback = <object>raw_callback
             callback(event)
             time_event_handler_drop(handler)
-
-            if ts_event != ts_last:
-                ts_last = ts_event
-                self._process_and_settle_venues(ts_event)
 
             # Re-advance to capture timers scheduled by callback
             for clock in clocks:
@@ -1712,6 +1719,10 @@ cdef class BacktestEngine:
                     False,
                 )
 
+        # Settle venues for the last timestamp batch
+        if ts_last != 0:
+            self._process_and_settle_venues(ts_last)
+
         set_logging_clock_static_time(ts_now)
 
         if LOGGING_PYO3:
@@ -1719,6 +1730,8 @@ cdef class BacktestEngine:
 
         for clock in clocks:
             clock.set_time(ts_now)
+
+        self._set_exchange_clocks(ts_now)
 
         cdef CVec empty_vec
         empty_vec.ptr = NULL
@@ -1764,24 +1777,6 @@ cdef class BacktestEngine:
 
         return False
 
-    cdef void _process_and_settle_venues(self, uint64_t ts_now):
-        cdef SimulatedExchange exchange
-        cdef SimulationModule module
-
-        # Settle all cascading commands (without running modules)
-        while True:
-            for exchange in self._venues.values():
-                exchange._drain_commands(ts_now)
-
-            if not any(ex.has_pending_commands(ts_now) for ex in self._venues.values()):
-                break
-
-        # Run modules and expirations once after all commands are settled
-        for exchange in self._venues.values():
-            for module in exchange.modules:
-                module.process(ts_now)
-            exchange._process_instrument_expirations(ts_now)
-
     cdef void _flush_accumulator_events(self, uint64_t ts_now):
         cdef list[TestClock] clocks = get_component_clocks(self._instance_id)
         cdef:
@@ -1801,6 +1796,8 @@ cdef class BacktestEngine:
                 False,
             )
 
+        # Process events <= ts_now, settling venues when the timestamp changes
+        # (for the previous batch) and after the loop ends (for the last batch).
         while True:
             if FORCE_STOP:
                 break
@@ -1813,6 +1810,12 @@ cdef class BacktestEngine:
                 break
 
             ts_event = handler.event.ts_event
+
+            # Settle venues for the previous timestamp batch before processing new timestamp
+            if ts_event != ts_last and ts_last != 0:
+                self._process_and_settle_venues(ts_last)
+
+            ts_last = ts_event
             set_logging_clock_static_time(ts_event)
 
             if LOGGING_PYO3:
@@ -1821,15 +1824,13 @@ cdef class BacktestEngine:
             for clock in clocks:
                 clock.set_time(ts_event)
 
+            self._set_exchange_clocks(ts_event)
+
             event = TimeEvent.from_mem_c(handler.event)
             raw_callback = <PyObject *>handler.callback_ptr
             callback = <object>raw_callback
             callback(event)
             time_event_handler_drop(handler)
-
-            if ts_event != ts_last:
-                ts_last = ts_event
-                self._process_and_settle_venues(ts_event)
 
             # Re-advance clocks to capture chained alerts scheduled by callback
             for clock in clocks:
@@ -1839,6 +1840,10 @@ cdef class BacktestEngine:
                     ts_now,
                     False,
                 )
+
+        # Settle venues for the last timestamp batch
+        if ts_last != 0:
+            self._process_and_settle_venues(ts_last)
 
     cdef void _process_raw_time_event_handlers(
         self,
@@ -1860,6 +1865,8 @@ cdef class BacktestEngine:
         if not only_now:
             return
 
+        # Process events <= ts_now, settling venues when the timestamp changes
+        # (for the previous batch) and after the loop ends (for the last batch).
         while True:
             if FORCE_STOP:
                 break
@@ -1875,6 +1882,11 @@ cdef class BacktestEngine:
             if as_of_now and ts_event > ts_now:
                 break
 
+            # Settle venues for the previous timestamp batch before processing new timestamp
+            if ts_event != ts_last and ts_last != 0:
+                self._process_and_settle_venues(ts_last)
+
+            ts_last = ts_event
             set_logging_clock_static_time(ts_event)
 
             if LOGGING_PYO3:
@@ -1883,15 +1895,13 @@ cdef class BacktestEngine:
             for clock in clocks:
                 clock.set_time(ts_event)
 
+            self._set_exchange_clocks(ts_event)
+
             event = TimeEvent.from_mem_c(handler.event)
             raw_callback = <PyObject *>handler.callback_ptr
             callback = <object>raw_callback
             callback(event)
             time_event_handler_drop(handler)
-
-            if ts_event != ts_last:
-                ts_last = ts_event
-                self._process_and_settle_venues(ts_event)
 
             # Re-advance to capture timers scheduled by callback
             for clock in clocks:
@@ -1901,6 +1911,34 @@ cdef class BacktestEngine:
                     ts_now,
                     False,
                 )
+
+        # Settle venues for the last timestamp batch
+        if ts_last != 0:
+            self._process_and_settle_venues(ts_last)
+
+    cdef void _set_exchange_clocks(self, uint64_t ts):
+        cdef SimulatedExchange exchange
+        for exchange in self._venues.values():
+            exchange._clock.set_time(ts)
+
+    cdef void _process_and_settle_venues(self, uint64_t ts_now):
+        cdef SimulatedExchange exchange
+        cdef SimulationModule module
+
+        # Settle all cascading commands (without running modules)
+        while True:
+            for exchange in self._venues.values():
+                exchange._drain_commands(ts_now)
+
+            if not any(ex.has_pending_commands(ts_now) for ex in self._venues.values()):
+                break
+
+        # Run modules and expirations once after all commands are settled
+        for exchange in self._venues.values():
+            for module in exchange.modules:
+                module.process(ts_now)
+
+            exchange._process_instrument_expirations(ts_now)
 
     def _get_log_color_code(self):
         return "\033[36m" if logging_is_colored() else ""
@@ -2770,9 +2808,9 @@ cdef class SimulatedExchange:
         self._inflight_counter: dict[uint64_t, uint64_t] = {}
 
         # For direct communication from SpreadQuoteAggregator
-        spread_quote_endpoint = f"SimulatedExchange.spread_quote.{venue}"
-        if spread_quote_endpoint not in self.msgbus._endpoints:
-            self.msgbus.register(endpoint=spread_quote_endpoint, handler=self.process_quote_tick)
+        new_quote_endpoint = f"SimulatedExchange.process_new_quote.{venue}"
+        if new_quote_endpoint not in self.msgbus._endpoints:
+            self.msgbus.register(endpoint=new_quote_endpoint, handler=self.process_quote_tick)
 
     def __repr__(self) -> str:
         return (
@@ -3562,16 +3600,29 @@ cdef class SimulatedExchange:
         cdef Instrument instrument
         cdef OrderMatchingEngine matching_engine = self._matching_engines.get(command.instrument_id)
         if matching_engine is None:
-            raise RuntimeError(f"Cannot process command: no matching engine for {command.instrument_id}")
+            # Try to get instrument from cache and add it to the exchange
+            instrument = self.cache.instrument(command.instrument_id)
+            if instrument is not None:
+                self._log.info(f"Auto-adding instrument {command.instrument_id} to exchange (no matching engine found)")
+                self.add_instrument(instrument)
+                matching_engine = self._matching_engines.get(command.instrument_id)
+
+            if matching_engine is None:
+                raise RuntimeError(f"Cannot process command: no matching engine for {command.instrument_id}")
 
         cdef:
             Order order
             list[Order] orders
+            bint matching_engine_touched = False
+            uint64_t ts
         if isinstance(command, SubmitOrder):
             matching_engine.process_order(command.order, self.exec_client.account_id)
+            matching_engine_touched = True
         elif isinstance(command, SubmitOrderList):
             for order in command.order_list.orders:
                 matching_engine.process_order(order, self.exec_client.account_id)
+
+            matching_engine_touched = True
         elif isinstance(command, ModifyOrder):
             # Check if order is in SUBMITTED status or PENDING_UPDATE with previous SUBMITTED status
             # (bracket orders not yet at matching engine)
@@ -3583,12 +3634,20 @@ cdef class SimulatedExchange:
                 self._process_modify_submitted_order(command)
             else:
                 matching_engine.process_modify(command, self.exec_client.account_id)
+                matching_engine_touched = True
         elif isinstance(command, CancelOrder):
             matching_engine.process_cancel(command, self.exec_client.account_id)
+            matching_engine_touched = True
         elif isinstance(command, CancelAllOrders):
             matching_engine.process_cancel_all(command, self.exec_client.account_id)
+            matching_engine_touched = True
         elif isinstance(command, BatchCancelOrders):
             matching_engine.process_batch_cancel(command, self.exec_client.account_id)
+            matching_engine_touched = True
+
+        if matching_engine_touched:
+            ts = self._clock.timestamp_ns()
+            matching_engine._core.iterate(ts)
 
     cdef void _process_modify_submitted_order(self, ModifyOrder command):
         cdef Order order = self.cache.order(command.client_order_id)
@@ -3843,6 +3902,9 @@ cdef class OrderMatchingEngine:
             fill_market_order=self.fill_market_order,
             fill_limit_order=self.fill_limit_order,
         )
+        if self._fill_model is not None:
+            self._core.set_fill_limit_order_unmatched(self._fill_unmatched_limit_order)
+
         self._price_prec = instrument.price_precision
         self._size_prec = instrument.size_precision
 
@@ -3916,6 +3978,7 @@ cdef class OrderMatchingEngine:
         Condition.not_none(fill_model, "fill_model")
 
         self._fill_model = fill_model
+        self._core.set_fill_limit_order_unmatched(self._fill_unmatched_limit_order)
 
         self._log.debug(f"Changed `FillModel` to {self._fill_model}")
 
@@ -6070,6 +6133,13 @@ cdef class OrderMatchingEngine:
             venue_position_id=venue_position_id,
             position=position,
         )
+
+    cpdef void _fill_unmatched_limit_order(self, Order order):
+        # Callback for limit orders not matched by standard price comparison.
+        # Delegates to the fill model for potential off-market matching
+        # (e.g. orders inside the bid-ask spread).
+        order.liquidity_side = LiquiditySide.MAKER
+        self.fill_limit_order(order)
 
     cdef list[tuple[Price, Quantity]] determine_limit_fills_with_simulation(self, Order order):
         """

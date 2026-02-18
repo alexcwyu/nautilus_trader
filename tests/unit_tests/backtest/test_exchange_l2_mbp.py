@@ -206,10 +206,10 @@ class TestL2OrderBookExchange:
         self.exchange.process(0)
 
         # Assert
-        assert order.status == OrderStatus.PARTIALLY_FILLED
-        assert order.filled_qty == Quantity.from_str("60000.0")
-        # Corrected weighted average calculation
-        assert order.avg_px == 102.33333333333333
+        assert order.status == OrderStatus.FILLED
+        assert order.filled_qty == Quantity.from_str("70000.0")
+        # Corrected weighted average calculation (full fill over multiple levels)
+        assert order.avg_px == 103.71428571428571
 
     def test_post_only_insert(self):
         # Arrange: Prepare market

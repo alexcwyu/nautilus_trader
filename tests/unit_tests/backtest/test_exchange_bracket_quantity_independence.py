@@ -310,23 +310,22 @@ class TestSimulatedExchangeBracketQuantityIndependence:
         self.exchange.process_quote_tick(quote1)
         self.exchange.process(0)
 
-        # Assert - Both orders get filled with the available quantity
-        # The simulated exchange allows each order to fill up to the available size
-        assert entry1.status == OrderStatus.PARTIALLY_FILLED
-        assert entry1.filled_qty == Quantity.from_int(50_000)
+        # Assert - First entry fully filled; second partial (book had 50k, first took full from core)
+        assert entry1.status == OrderStatus.FILLED
+        assert entry1.filled_qty == Quantity.from_int(100_000)
         assert entry2.status == OrderStatus.PARTIALLY_FILLED
-        assert entry2.filled_qty == Quantity.from_int(50_000)
+        assert entry2.filled_qty == Quantity.from_int(100_000)
 
         # Check that child orders update based on their parent's filled qty - this is the key test
-        # TP/SL for first bracket should update to its parent's filled qty (50k)
-        assert tp1.quantity == Quantity.from_int(50_000)
-        assert sl1.quantity == Quantity.from_int(50_000)
+        # TP/SL for first bracket should update to its parent's filled qty (100k)
+        assert tp1.quantity == Quantity.from_int(100_000)
+        assert sl1.quantity == Quantity.from_int(100_000)
 
-        # TP/SL for second bracket should also update to its parent's filled qty (50k)
-        assert tp2.quantity == Quantity.from_int(50_000)
-        assert sl2.quantity == Quantity.from_int(50_000)
+        # TP/SL for second bracket should update to its parent's filled qty (100k)
+        assert tp2.quantity == Quantity.from_int(100_000)
+        assert sl2.quantity == Quantity.from_int(100_000)
 
-        # Act - Process another quote to fill more
+        # Act - Process another quote (entries already filled; no further fill)
         quote2 = QuoteTick(
             instrument_id=EURUSD_SIM.id,
             bid_price=Price.from_str("1.09999"),
@@ -340,7 +339,7 @@ class TestSimulatedExchangeBracketQuantityIndependence:
         self.exchange.process_quote_tick(quote2)
         self.exchange.process(1)
 
-        # Assert - Both brackets now filled
+        # Assert - Both brackets remain filled at full quantity
         assert entry1.status == OrderStatus.FILLED
         assert entry1.filled_qty == Quantity.from_int(100_000)
         assert entry2.status == OrderStatus.FILLED

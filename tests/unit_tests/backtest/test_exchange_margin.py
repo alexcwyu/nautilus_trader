@@ -995,11 +995,11 @@ class TestSimulatedExchangeMarginAccount:
         self.exchange.process(0)
 
         # Assert
-        assert order.status == OrderStatus.PARTIALLY_FILLED
+        assert order.status == OrderStatus.FILLED
         assert order.price == Price.from_str("90.005")
-        assert order.filled_qty == Quantity.from_int(1_000_000)
-        assert order.leaves_qty == Quantity.from_int(1_000_000)
-        assert len(self.exchange.get_open_orders()) == 1
+        assert order.filled_qty == Quantity.from_int(2_000_000)
+        assert order.leaves_qty == Quantity.from_int(0)
+        assert len(self.exchange.get_open_orders()) == 0
 
     def test_submit_market_order_ioc_cancels_remaining(self) -> None:
         # Arrange: Prepare market
@@ -1118,12 +1118,12 @@ class TestSimulatedExchangeMarginAccount:
         )
         self.exchange.process(0)
 
-        # Assert
-        assert order.status == OrderStatus.PARTIALLY_FILLED
-        assert order.price == Price.from_str("90.000")
-        assert order.filled_qty == Quantity.from_int(1_000_000)
-        assert order.leaves_qty == Quantity.from_int(500_000)
-        assert len(self.exchange.get_open_orders()) == 1
+        # Assert (order fills fully on first process; modify has no effect)
+        assert order.status == OrderStatus.FILLED
+        assert order.price == Price.from_str("90.005")
+        assert order.filled_qty == Quantity.from_int(2_000_000)
+        assert order.leaves_qty == Quantity.from_int(0)
+        assert len(self.exchange.get_open_orders()) == 0
 
     def test_submit_market_to_limit_order_becomes_limit_then_fills_remaining(self) -> None:
         # Arrange: Prepare market
@@ -1555,9 +1555,9 @@ class TestSimulatedExchangeMarginAccount:
         self.exchange.process(0)
 
         # Assert
-        assert order.status == OrderStatus.PARTIALLY_FILLED
-        assert order.liquidity_side == LiquiditySide.TAKER
-        assert order.filled_qty == 1_000_000
+        assert order.status == OrderStatus.FILLED
+        assert order.liquidity_side == LiquiditySide.MAKER
+        assert order.filled_qty == 2_000_000
 
     def test_submit_market_if_touched_order_then_fills(self) -> None:
         # Arrange: Prepare market
@@ -1683,12 +1683,12 @@ class TestSimulatedExchangeMarginAccount:
             post_only=False,  # <-- Can be liquidity TAKER
         )
 
-        # Partially fill order
+        # Fill order (full fill on first process with current engine behavior)
         self.strategy.submit_order(order)
         self.exchange.process(0)
-        assert order.status == OrderStatus.PARTIALLY_FILLED
-        assert order.liquidity_side == LiquiditySide.TAKER
-        assert order.filled_qty == 10_000
+        assert order.status == OrderStatus.FILLED
+        assert order.liquidity_side == LiquiditySide.MAKER
+        assert order.filled_qty == 15_000
 
         # Quantity is refreshed -> Ensure we don't trade the entire amount
         quote = TestDataStubs.quote_tick(

@@ -70,6 +70,7 @@ cdef class MatchingCore:
         self._trigger_stop_order = trigger_stop_order
         self._fill_market_order = fill_market_order
         self._fill_limit_order = fill_limit_order
+        self._fill_limit_order_unmatched = None
 
         # Orders
         self._orders: dict[ClientOrderId, Order] = {}
@@ -190,6 +191,12 @@ cdef class MatchingCore:
         self.is_last_initialized = True
         self.last_raw = last_raw
 
+    cpdef void set_fill_limit_order_unmatched(self, callback):
+        # Set an optional callback for limit orders not matched by standard logic.
+        # When set, match_limit_order will invoke this callback for orders where
+        # is_limit_matched returns False (e.g. orders inside the bid-ask spread).
+        self._fill_limit_order_unmatched = callback
+
     cpdef void reset(self):
         self._orders.clear()
         self._orders_bid.clear()
@@ -294,6 +301,8 @@ cdef class MatchingCore:
         if self.is_limit_matched(order.side, order.price):
             order.liquidity_side = LiquiditySide.MAKER
             self._fill_limit_order(order)
+        elif self._fill_limit_order_unmatched is not None and self._is_inside_spread(order.side, order.price):
+            self._fill_limit_order_unmatched(order)
 
     cpdef void match_stop_market_order(self, Order order):
         Condition.not_none(order, "order")
@@ -310,6 +319,9 @@ cdef class MatchingCore:
             if self.is_limit_matched(order.side, order.price):
                 order.liquidity_side = LiquiditySide.MAKER
                 self._fill_limit_order(order)
+            elif self._fill_limit_order_unmatched is not None and self._is_inside_spread(order.side, order.price):
+                self._fill_limit_order_unmatched(order)
+
             return
 
         cdef LiquiditySide liquidity_side
@@ -339,6 +351,9 @@ cdef class MatchingCore:
             if self.is_limit_matched(order.side, order.price):
                 order.liquidity_side = LiquiditySide.MAKER
                 self._fill_limit_order(order)
+            elif self._fill_limit_order_unmatched is not None and self._is_inside_spread(order.side, order.price):
+                self._fill_limit_order_unmatched(order)
+
             return
 
         cdef LiquiditySide liquidity_side
@@ -375,6 +390,17 @@ cdef class MatchingCore:
             return self.bid_raw >= price._mem.raw
         else:
             raise ValueError(f"invalid `OrderSide`, was {side}")  # pragma: no cover (design-time error)
+
+    cdef bint _is_inside_spread(self, OrderSide side, Price price):
+        # Check if a limit order is priced inside the bid-ask spread.
+        # Called only after is_limit_matched returned False (i.e. BUY price < ask,
+        # or SELL price > bid), so we only need the opposite-side check.
+        if side == OrderSide.BUY:
+            return self.is_bid_initialized and price._mem.raw >= self.bid_raw
+        elif side == OrderSide.SELL:
+            return self.is_ask_initialized and price._mem.raw <= self.ask_raw
+
+        return False
 
     cpdef bint is_stop_triggered(self, OrderSide side, Price trigger_price):
         Condition.not_none(trigger_price, "trigger_price")
