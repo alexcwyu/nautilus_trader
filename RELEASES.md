@@ -1,3 +1,26 @@
+# NautilusTrader 1.226.0 Beta
+
+Released on TBD (UTC).
+
+### Enhancements
+- Added Polymarket game_id and fee_schedule to instrument info (#3811), thanks @Javdu10
+
+### Breaking Changes
+
+### Security
+
+### Fixes
+- Fixed `OrderTriggered` ValueError on market-style stop orders (#3812), thanks for reporting @jindrichsirucek
+- Fixed OKX option greeks not forwarded due to inaccessible Cython `cdef` subscription attribute
+
+### Internal Improvements
+
+### Documentation Updates
+
+### Deprecations
+
+---
+
 # NautilusTrader 1.225.0 Beta
 
 Released on 6th April 2026 (UTC).
