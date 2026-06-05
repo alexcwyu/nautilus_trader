@@ -220,6 +220,10 @@ class InteractiveBrokersClient(
 
         while not self._is_ib_connected.is_set():
             try:
+                if self.state in _SHUTDOWN_STATES:
+                    break
+
+                self._is_shutting_down = False
                 self._connection_attempts += 1
 
                 if (
@@ -256,9 +260,46 @@ class InteractiveBrokersClient(
 
             except TimeoutError:
                 self._log.error("Client failed to initialize; connection timeout")
+                await self._cleanup_failed_startup_attempt()
             except Exception as e:
                 self._log.exception("Unhandled exception in client startup", e)
-                self._stop()
+                await self._cleanup_failed_startup_attempt()
+
+    async def _cleanup_failed_startup_attempt(self) -> None:
+        # A failed handshake is not a user shutdown; clean up this socket attempt
+        # without leaving `_is_shutting_down` set for the next reconnect loop.
+        if self._is_client_ready.is_set():
+            self._is_client_ready.clear()
+            self._log.debug(
+                "`_is_client_ready` unset by `_cleanup_failed_startup_attempt`",
+                LogColor.BLUE,
+            )
+
+        if self._is_ib_connected.is_set():
+            self._is_ib_connected.clear()
+            self._log.debug(
+                "`_is_ib_connected` unset by `_cleanup_failed_startup_attempt`",
+                LogColor.BLUE,
+            )
+
+        tasks = [
+            self._connection_watchdog_task,
+            self._tws_incoming_msg_reader_task,
+            self._internal_msg_queue_processor_task,
+            self._msg_handler_processor_task,
+        ]
+
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+
+        tasks = [task for task in tasks if task is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await self._clear_bar_tracking_state()
+        self._eclient.disconnect()
+        self._is_shutting_down = False
 
     def _start_tws_incoming_msg_reader(self) -> None:
         """
