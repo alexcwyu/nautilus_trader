@@ -94,6 +94,7 @@ Released on TBD (UTC).
 - Fixed `OrderMatchingEngine` panicking on `PriceType::Mark` bars during bar execution, now logs a warning and skips the bar (Rust)
 - Fixed `PRICE_RAW_MAX`/`MIN`, `QUANTITY_RAW_MAX`, and `MONEY_RAW_MAX`/`MIN` computed with lossy `f64` scaling, which rounded the bound below the representable maximum and could panic `from_raw` at the limits (Rust)
 - Fixed unbounded Cache `VecDeque` memory leak (Rust) (#4107), thanks @filipmacek
+- Fixed `Throttler` silently dropping buffered messages in buffer mode (Python v1) (#4221), thanks @santatic
 - Fixed `Cache.reset` clearing FX rate lookup for retained instruments (#4159), thanks for reporting @dfjmax
 - Fixed `BacktestEngine` option positions remaining open when data stops before expiry
 - Fixed `BacktestEngine` losing latency-deferred commands at shutdown (Rust) (#4062), thanks for reporting @zhanghaoda
@@ -114,6 +115,7 @@ Released on TBD (UTC).
 - Fixed `LiveNode` signal handling during startup connection wait (#4102), thanks @filipmacek
 - Fixed `NautilusKernelConfig.timeout_connection` default at 60 seconds (#4179), thanks for reporting @triyys
 - Fixed Python `ShutdownSystem` dict serialization to round-trip `correlation_id` (was previously dropped)
+- Fixed Python v2 live trading deadlocks from timer callbacks and kept Polymarket instrument refreshes Rust-only
 - Fixed Python v2 order-book wranglers writing raw fixed-point bytes in big-endian (needed little-endian) (#4111), thanks for reporting @fabz1
 - Fixed Python v2 type stub generation failing to locate `libpython` under uv-managed interpreters
 - Fixed Betfair adapter snapshot book deltas emitting zero-volume `Add` entries (Rust)
@@ -125,6 +127,7 @@ Released on TBD (UTC).
 - Fixed Binance Futures full-depth book startup after snapshot retries
 - Fixed Binance Spot full-depth book startup after snapshot retries (#4181), thanks for reporting @graceyangfan
 - Fixed Binance Spot full-depth books to seed diffs from REST snapshots
+- Fixed Binance Spot JSON full-depth books to use REST-synced diff streams (#4181), thanks @graceyangfan
 - Fixed Binance Spot SBE numeric parsing to reject invalid price and quantity values
 - Fixed BitMEX startup handling for crypto futures spreads, duplicate subscriptions, `USYC` margins, and account ID discovery
 - Fixed BitMEX order submission to deny unsupported GTD time-in-force locally

@@ -911,6 +911,11 @@ impl DataEngine {
 
     /// Executes a `DataCommand` by delegating to subscribe, unsubscribe, or request handlers.
     ///
+    /// This is the final synchronous dispatch point for data commands. Runtime command producers
+    /// should send to `DataEngine.queue_execute`, which lets the runner sequence command execution
+    /// before this method runs. The engine also calls this method for child commands generated while
+    /// processing a parent command, where immediate in-engine ordering matters.
+    ///
     /// Errors during execution are logged.
     pub fn execute(&mut self, cmd: DataCommand) {
         match &cmd {
@@ -3113,7 +3118,10 @@ impl DataEngine {
                 "SimulatedExchange.process_new_quote.{}",
                 quote.instrument_id.venue
             );
-            msgbus::send_quote(exchange_endpoint.into(), &quote);
+            let exchange_endpoint = exchange_endpoint.into();
+            if msgbus::has_quote_endpoint(exchange_endpoint) {
+                msgbus::send_quote(exchange_endpoint, &quote);
+            }
 
             if let Err(e) = cache.borrow_mut().add_quote(quote) {
                 log_error_on_cache_insert(&e);
