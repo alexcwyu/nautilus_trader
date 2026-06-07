@@ -29,7 +29,7 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderUpdated {
     /// Creates a new `OrderUpdated` instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
     #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, quantity, event_id, ts_event, ts_init, reconciliation, venue_order_id=None, account_id=None, price=None, trigger_price=None, protection_price=None, is_quote_quantity=false))]
     fn py_new(
@@ -171,7 +171,7 @@ impl OrderUpdated {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[pyo3(name = "to_dict")]
@@ -191,19 +191,26 @@ impl OrderUpdated {
             Some(venue_order_id) => dict.set_item("venue_order_id", venue_order_id.to_string())?,
             None => dict.set_item("venue_order_id", py.None())?,
         }
+
         match self.account_id {
             Some(account_id) => dict.set_item("account_id", account_id.to_string())?,
             None => dict.set_item("account_id", py.None())?,
         }
+
         match self.price {
             Some(price) => dict.set_item("price", price.to_string())?,
             None => dict.set_item("price", py.None())?,
         }
+
         match self.trigger_price {
             Some(trigger_price) => dict.set_item("trigger_price", trigger_price.to_string())?,
             None => dict.set_item("trigger_price", py.None())?,
         }
         dict.set_item("is_quote_quantity", self.is_quote_quantity)?;
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
+        }
         Ok(dict.into())
     }
 }

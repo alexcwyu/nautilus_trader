@@ -16,8 +16,8 @@
 //! Enumerations mapping OKX concepts onto idiomatic Nautilus variants.
 
 use nautilus_model::enums::{
-    AggressorSide, LiquiditySide, OptionKind, OrderSide, OrderSideSpecified, OrderStatus,
-    OrderType, PositionSide, TriggerType,
+    AggressorSide, GreeksConvention, LiquiditySide, OptionKind, OrderSide, OrderSideSpecified,
+    OrderStatus, OrderType, PositionSide, TriggerType,
 };
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumIter, EnumString};
@@ -171,26 +171,31 @@ pub enum OKXOrderType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXOrderStatus {
     Canceled,
     Live,
-    Effective,
     PartiallyFilled,
     Filled,
     MmpCanceled,
-    OrderPlaced,
 }
 
-impl From<OrderStatus> for OKXOrderStatus {
-    fn from(value: OrderStatus) -> Self {
+impl TryFrom<OrderStatus> for OKXOrderStatus {
+    type Error = OrderStatus;
+
+    /// Converts a Nautilus [`OrderStatus`] into the matching [`OKXOrderStatus`].
+    ///
+    /// Returns the original [`OrderStatus`] in the error case for any variant
+    /// that has no representable OKX equivalent (e.g. `Submitted`, `PendingNew`,
+    /// `Triggered`, `PendingCancel`, `Expired`, `Rejected`).
+    fn try_from(value: OrderStatus) -> Result<Self, Self::Error> {
         match value {
-            OrderStatus::Canceled => Self::Canceled,
-            OrderStatus::Accepted => Self::Live,
-            OrderStatus::PartiallyFilled => Self::PartiallyFilled,
-            OrderStatus::Filled => Self::Filled,
-            _ => panic!("Invalid `OrderStatus` for OKX: {value:?}"),
+            OrderStatus::Canceled => Ok(Self::Canceled),
+            OrderStatus::Accepted => Ok(Self::Live),
+            OrderStatus::PartiallyFilled => Ok(Self::PartiallyFilled),
+            OrderStatus::Filled => Ok(Self::Filled),
+            other => Err(other),
         }
     }
 }
@@ -260,10 +265,11 @@ impl From<LiquiditySide> for OKXExecType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXInstrumentType {
     #[default]
+    /// Any product type.
     Any,
     /// Spot products.
     Spot,
@@ -275,6 +281,57 @@ pub enum OKXInstrumentType {
     Futures,
     /// Option products.
     Option,
+    /// Event contract products.
+    Events,
+}
+
+/// Represents an OKX instrument category code (the `instCategory` field).
+///
+/// OKX also returns a deprecated `category` field that is effectively always
+/// `"1"`; `instCategory` is the meaningful value that drives asset-class
+/// mapping. Unknown or future codes fall back to
+/// [`OKXInstrumentCategory::Unknown`] rather than failing to parse.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+pub enum OKXInstrumentCategory {
+    /// Cryptocurrency (`"1"`).
+    #[serde(rename = "1")]
+    #[strum(serialize = "1")]
+    Crypto,
+    /// Equity-linked (`"3"`).
+    #[serde(rename = "3")]
+    #[strum(serialize = "3")]
+    Equity,
+    /// Commodity-linked (`"4"`).
+    #[serde(rename = "4")]
+    #[strum(serialize = "4")]
+    Commodity,
+    /// FX-linked (`"5"`).
+    #[serde(rename = "5")]
+    #[strum(serialize = "5")]
+    Fx,
+    /// Debt-linked (`"6"`).
+    #[serde(rename = "6")]
+    #[strum(serialize = "6")]
+    Debt,
+    /// Unknown or future category code.
+    #[default]
+    #[serde(other)]
+    #[strum(serialize = "")]
+    Unknown,
 }
 
 /// Represents an instrument status on OKX.
@@ -298,6 +355,62 @@ pub enum OKXInstrumentStatus {
     Suspend,
     Preopen,
     Test,
+    PostOnly,
+    Rebase,
+    Settling,
+    /// Unknown or future status.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Represents a spread type on OKX.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSpreadType {
+    Linear,
+    Inverse,
+    Hybrid,
+    /// Unknown or future spread type.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Represents a spread status on OKX.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OKXSpreadState {
+    Live,
+    Suspend,
+    Expired,
+    /// Unknown or future status.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Represents an instrument contract type on OKX.
@@ -329,7 +442,7 @@ pub enum OKXInstrumentStatus {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXContractType {
     #[serde(rename = "")]
@@ -363,12 +476,95 @@ pub enum OKXOptionType {
     Put,
 }
 
-impl From<OKXOptionType> for OptionKind {
-    fn from(option_type: OKXOptionType) -> Self {
+impl TryFrom<OKXOptionType> for OptionKind {
+    type Error = OKXOptionType;
+
+    /// Converts an OKX option type into the matching Nautilus [`OptionKind`].
+    ///
+    /// Returns the source variant in the error case for [`OKXOptionType::None`]
+    /// (sent by OKX as an empty `optType` for non-option instruments and the
+    /// occasional malformed payload). Callers should skip such instruments
+    /// rather than treating the unknown variant as a default option kind.
+    fn try_from(option_type: OKXOptionType) -> Result<Self, Self::Error> {
         match option_type {
-            OKXOptionType::Call => Self::Call,
-            OKXOptionType::Put => Self::Put,
-            _ => panic!("Invalid `OKXOptionType` for OptionKind: {option_type:?}"),
+            OKXOptionType::Call => Ok(Self::Call),
+            OKXOptionType::Put => Ok(Self::Put),
+            other => Err(other),
+        }
+    }
+}
+
+/// Represents the convention used for option greeks on OKX.
+///
+/// OKX publishes two parallel greek sets on `opt-summary` and related endpoints:
+/// Black-Scholes greeks denominated in USD, and price-adjusted greeks denominated
+/// in the underlying/coin units.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "UPPERCASE")]
+#[strum(serialize_all = "UPPERCASE", ascii_case_insensitive)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
+pub enum OKXGreeksType {
+    /// Black-Scholes greeks in USD.
+    #[default]
+    Bs = 0,
+    /// Price-adjusted greeks in the underlying/coin units.
+    Pa = 1,
+}
+
+impl From<u8> for OKXGreeksType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Bs,
+            1 => Self::Pa,
+            _ => {
+                log::warn!("Invalid OKXGreeksType {value}, defaulting to Bs");
+                Self::Bs
+            }
+        }
+    }
+}
+
+impl From<GreeksConvention> for OKXGreeksType {
+    fn from(convention: GreeksConvention) -> Self {
+        match convention {
+            GreeksConvention::BlackScholes => Self::Bs,
+            GreeksConvention::PriceAdjusted => Self::Pa,
+        }
+    }
+}
+
+impl From<OKXGreeksType> for GreeksConvention {
+    fn from(greeks_type: OKXGreeksType) -> Self {
+        match greeks_type {
+            OKXGreeksType::Bs => Self::BlackScholes,
+            OKXGreeksType::Pa => Self::PriceAdjusted,
         }
     }
 }
@@ -403,7 +599,7 @@ impl From<OKXOptionType> for OptionKind {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXTradeMode {
     #[default]
@@ -479,7 +675,7 @@ pub enum OKXAccountMode {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXMarginMode {
     #[serde(rename = "")]
@@ -521,7 +717,7 @@ pub enum OKXMarginMode {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXPositionMode {
     #[default]
@@ -642,9 +838,10 @@ impl From<TriggerType> for OKXTriggerType {
 mod tests {
     use std::str::FromStr;
 
+    use nautilus_model::enums::{GreeksConvention, OptionKind, OrderStatus};
     use rstest::rstest;
 
-    use super::{OKXOrderType, OKXTriggerType};
+    use super::{OKXGreeksType, OKXOptionType, OKXOrderStatus, OKXOrderType, OKXTriggerType};
 
     #[rstest]
     fn test_okx_trigger_type_from_str_accepts_snake_case_values() {
@@ -660,6 +857,41 @@ mod tests {
             OKXTriggerType::from_str("index").unwrap(),
             OKXTriggerType::Index
         );
+    }
+
+    #[rstest]
+    #[case(OKXGreeksType::Bs, "\"BS\"")]
+    #[case(OKXGreeksType::Pa, "\"PA\"")]
+    fn test_greeks_type_serde_roundtrip(#[case] input: OKXGreeksType, #[case] expected: &str) {
+        let json = serde_json::to_string(&input).unwrap();
+        assert_eq!(json, expected);
+        let parsed: OKXGreeksType = serde_json::from_str(expected).unwrap();
+        assert_eq!(parsed, input);
+    }
+
+    #[rstest]
+    fn test_greeks_type_default_is_bs() {
+        assert_eq!(OKXGreeksType::default(), OKXGreeksType::Bs);
+    }
+
+    #[rstest]
+    fn test_greeks_type_from_u8() {
+        assert_eq!(OKXGreeksType::from(0_u8), OKXGreeksType::Bs);
+        assert_eq!(OKXGreeksType::from(1_u8), OKXGreeksType::Pa);
+        assert_eq!(OKXGreeksType::from(99_u8), OKXGreeksType::Bs);
+    }
+
+    #[rstest]
+    #[case(GreeksConvention::BlackScholes, OKXGreeksType::Bs)]
+    #[case(GreeksConvention::PriceAdjusted, OKXGreeksType::Pa)]
+    fn test_greeks_type_convention_roundtrip(
+        #[case] convention: GreeksConvention,
+        #[case] expected: OKXGreeksType,
+    ) {
+        let mapped: OKXGreeksType = convention.into();
+        assert_eq!(mapped, expected);
+        let back: GreeksConvention = mapped.into();
+        assert_eq!(back, convention);
     }
 
     #[rstest]
@@ -679,6 +911,37 @@ mod tests {
         use nautilus_model::enums::OrderType;
         let order_type: OrderType = OKXOrderType::OpFok.into();
         assert_eq!(order_type, OrderType::Limit);
+    }
+
+    #[rstest]
+    #[case::call(OKXOptionType::Call, Ok(OptionKind::Call))]
+    #[case::put(OKXOptionType::Put, Ok(OptionKind::Put))]
+    #[case::none(OKXOptionType::None, Err(OKXOptionType::None))]
+    fn test_try_from_okx_option_type(
+        #[case] input: OKXOptionType,
+        #[case] expected: Result<OptionKind, OKXOptionType>,
+    ) {
+        let actual: Result<OptionKind, OKXOptionType> = input.try_into();
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case::canceled(OrderStatus::Canceled, Ok(OKXOrderStatus::Canceled))]
+    #[case::accepted(OrderStatus::Accepted, Ok(OKXOrderStatus::Live))]
+    #[case::partially_filled(OrderStatus::PartiallyFilled, Ok(OKXOrderStatus::PartiallyFilled))]
+    #[case::filled(OrderStatus::Filled, Ok(OKXOrderStatus::Filled))]
+    #[case::submitted(OrderStatus::Submitted, Err(OrderStatus::Submitted))]
+    #[case::pending_update(OrderStatus::PendingUpdate, Err(OrderStatus::PendingUpdate))]
+    #[case::pending_cancel(OrderStatus::PendingCancel, Err(OrderStatus::PendingCancel))]
+    #[case::triggered(OrderStatus::Triggered, Err(OrderStatus::Triggered))]
+    #[case::expired(OrderStatus::Expired, Err(OrderStatus::Expired))]
+    #[case::rejected(OrderStatus::Rejected, Err(OrderStatus::Rejected))]
+    fn test_try_from_order_status(
+        #[case] input: OrderStatus,
+        #[case] expected: Result<OKXOrderStatus, OrderStatus>,
+    ) {
+        let actual: Result<OKXOrderStatus, OrderStatus> = input.try_into();
+        assert_eq!(actual, expected);
     }
 }
 
@@ -756,7 +1019,7 @@ pub enum OKXBookChannel {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.okx")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
 )]
 pub enum OKXVipLevel {
     /// VIP level 0 (default tier).
@@ -855,11 +1118,23 @@ impl From<OKXOrderStatus> for OrderStatus {
     fn from(status: OKXOrderStatus) -> Self {
         match status {
             OKXOrderStatus::Live => Self::Accepted,
-            OKXOrderStatus::Effective => Self::Triggered,
             OKXOrderStatus::PartiallyFilled => Self::PartiallyFilled,
             OKXOrderStatus::Filled => Self::Filled,
             OKXOrderStatus::Canceled | OKXOrderStatus::MmpCanceled => Self::Canceled,
-            OKXOrderStatus::OrderPlaced => Self::Triggered,
+        }
+    }
+}
+
+impl From<OKXAlgoOrderStatus> for OrderStatus {
+    fn from(status: OKXAlgoOrderStatus) -> Self {
+        match status {
+            OKXAlgoOrderStatus::Live | OKXAlgoOrderStatus::Pause => Self::Accepted,
+            OKXAlgoOrderStatus::Effective
+            | OKXAlgoOrderStatus::OrderPlaced
+            | OKXAlgoOrderStatus::PartiallyEffective => Self::Triggered,
+            OKXAlgoOrderStatus::Filled => Self::Filled,
+            OKXAlgoOrderStatus::Canceled => Self::Canceled,
+            OKXAlgoOrderStatus::OrderFailed | OKXAlgoOrderStatus::PartiallyFailed => Self::Rejected,
         }
     }
 }
@@ -960,6 +1235,7 @@ pub fn conditional_order_to_algo_type(order_type: OrderType) -> anyhow::Result<O
     }
 }
 
+/// Represents the state of an algo (trigger/OCO/conditional) order on OKX.
 #[derive(
     Copy,
     Clone,
@@ -978,100 +1254,13 @@ pub fn conditional_order_to_algo_type(order_type: OrderType) -> anyhow::Result<O
 pub enum OKXAlgoOrderStatus {
     Live,
     Pause,
-    PartiallyEffective,
     Effective,
+    OrderPlaced,
+    PartiallyEffective,
     Canceled,
+    Filled,
     OrderFailed,
     PartiallyFailed,
-}
-
-#[derive(
-    Copy,
-    Clone,
-    Debug,
-    Display,
-    PartialEq,
-    Eq,
-    Hash,
-    AsRefStr,
-    EnumIter,
-    EnumString,
-    Serialize,
-    Deserialize,
-)]
-pub enum OKXTransactionType {
-    #[serde(rename = "1")]
-    Buy,
-    #[serde(rename = "2")]
-    Sell,
-    #[serde(rename = "3")]
-    OpenLong,
-    #[serde(rename = "4")]
-    OpenShort,
-    #[serde(rename = "5")]
-    CloseLong,
-    #[serde(rename = "6")]
-    CloseShort,
-    #[serde(rename = "100")]
-    PartialLiquidationCloseLong,
-    #[serde(rename = "101")]
-    PartialLiquidationCloseShort,
-    #[serde(rename = "102")]
-    PartialLiquidationBuy,
-    #[serde(rename = "103")]
-    PartialLiquidationSell,
-    #[serde(rename = "104")]
-    LiquidationLong,
-    #[serde(rename = "105")]
-    LiquidationShort,
-    #[serde(rename = "106")]
-    LiquidationBuy,
-    #[serde(rename = "107")]
-    LiquidationSell,
-    #[serde(rename = "110")]
-    LiquidationTransferIn,
-    #[serde(rename = "111")]
-    LiquidationTransferOut,
-    #[serde(rename = "118")]
-    SystemTokenConversionTransferIn,
-    #[serde(rename = "119")]
-    SystemTokenConversionTransferOut,
-    #[serde(rename = "125")]
-    AdlCloseLong,
-    #[serde(rename = "126")]
-    AdlCloseShort,
-    #[serde(rename = "127")]
-    AdlBuy,
-    #[serde(rename = "128")]
-    AdlSell,
-    #[serde(rename = "212")]
-    AutoBorrowOfQuickMargin,
-    #[serde(rename = "213")]
-    AutoRepayOfQuickMargin,
-    #[serde(rename = "204")]
-    BlockTradeBuy,
-    #[serde(rename = "205")]
-    BlockTradeSell,
-    #[serde(rename = "206")]
-    BlockTradeOpenLong,
-    #[serde(rename = "207")]
-    BlockTradeOpenShort,
-    #[serde(rename = "208")]
-    BlockTradeCloseOpen,
-    #[serde(rename = "209")]
-    BlockTradeCloseShort,
-    #[serde(rename = "270")]
-    SpreadTradingBuy,
-    #[serde(rename = "271")]
-    SpreadTradingSell,
-    #[serde(rename = "272")]
-    SpreadTradingOpenLong,
-    #[serde(rename = "273")]
-    SpreadTradingOpenShort,
-    #[serde(rename = "274")]
-    SpreadTradingCloseLong,
-    #[serde(rename = "275")]
-    SpreadTradingCloseShort,
 }
 
 /// Represents the category of an order on OKX.
@@ -1119,6 +1308,8 @@ pub enum OKXOrderCategory {
     MoveOrderStop,
     /// Delivery and exercise (for futures/options settlement).
     Ddh,
+    /// Event contract settlement fill.
+    Delivery,
     /// Unknown or future category (graceful fallback).
     #[serde(other)]
     Other,
@@ -1263,4 +1454,44 @@ pub enum OKXQuickMarginType {
     AutoBorrow,
     /// Auto repay margin.
     AutoRepay,
+}
+
+/// OKX API environment.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.okx",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.okx")
+)]
+pub enum OKXEnvironment {
+    /// Live trading environment.
+    #[default]
+    Live,
+    /// Demo trading environment.
+    Demo,
 }

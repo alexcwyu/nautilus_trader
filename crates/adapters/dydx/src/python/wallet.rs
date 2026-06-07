@@ -15,8 +15,6 @@
 
 //! Python bindings for dYdX wallet.
 
-#![allow(clippy::missing_errors_doc)]
-
 use std::sync::Arc;
 
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
@@ -26,7 +24,7 @@ use crate::execution::wallet::Wallet;
 
 /// Python wrapper for the Wallet.
 #[pyclass(name = "DydxWallet", from_py_object)]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.dydx")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.dydx")]
 #[derive(Debug, Clone)]
 pub struct PyDydxWallet {
     pub(crate) inner: Arc<Wallet>,

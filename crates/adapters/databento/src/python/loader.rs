@@ -18,17 +18,14 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use databento::dbn;
-use nautilus_core::{
-    ffi::cvec::CVec,
-    python::{IntoPyObjectNautilusExt, to_pyvalue_err},
-};
+use nautilus_core::python::{IntoPyObjectNautilusExt, to_pyvalue_err};
 use nautilus_model::{
     data::{
         Bar, Data, DataFFI, InstrumentStatus, OrderBookDelta, OrderBookDepth10, QuoteTick,
         TradeTick,
     },
-    identifiers::{InstrumentId, Venue},
-    python::instruments::instrument_any_to_pyobject,
+    identifiers::{InstrumentId, Symbol, Venue},
+    python::{data::DataFfiCVec, instruments::instrument_any_to_pyobject},
 };
 use pyo3::{
     prelude::*,
@@ -41,7 +38,7 @@ use crate::{
     types::{DatabentoImbalance, DatabentoPublisher, DatabentoStatistics, PublisherId},
 };
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DatabentoDataLoader {
@@ -120,6 +117,26 @@ impl DatabentoDataLoader {
             .map(ToString::to_string)
     }
 
+    /// Caches a `price_precision` for the given `symbol`.
+    ///
+    /// When market data is read without an explicit `price_precision` argument,
+    /// the loader resolves precision per record from this cache. Definitions
+    /// loaded via `Self.load_instruments` are inserted automatically.
+    #[pyo3(name = "set_price_precision")]
+    fn py_set_price_precision(&mut self, symbol: &str, price_precision: u8) {
+        self.set_price_precision(Symbol::from(symbol), price_precision);
+    }
+
+    /// Returns the cached price precisions keyed by symbol.
+    #[must_use]
+    #[pyo3(name = "get_price_precisions")]
+    fn py_get_price_precisions(&self) -> HashMap<String, u8> {
+        self.get_price_precisions()
+            .iter()
+            .map(|(symbol, precision)| (symbol.to_string(), *precision))
+            .collect()
+    }
+
     #[pyo3(name = "schema_for_file")]
     fn py_schema_for_file(&self, filepath: PathBuf) -> PyResult<Option<String>> {
         self.schema_from_file(&filepath).map_err(to_pyvalue_err)
@@ -143,6 +160,7 @@ impl DatabentoDataLoader {
             .map_err(to_pyvalue_err)?;
 
         let mut data = Vec::new();
+
         for instrument in iter {
             let py_object = instrument_any_to_pyobject(py, instrument)?;
             data.push(py_object);
@@ -492,6 +510,7 @@ impl DatabentoDataLoader {
             .map_err(to_pyvalue_err)?;
 
         let mut data = Vec::new();
+
         for result in iter {
             match result {
                 Ok(item) => data.push(item),
@@ -515,6 +534,7 @@ impl DatabentoDataLoader {
             .map_err(to_pyvalue_err)?;
 
         let mut data = Vec::new();
+
         for result in iter {
             match result {
                 Ok(item) => data.push(item),
@@ -538,6 +558,7 @@ impl DatabentoDataLoader {
             .map_err(to_pyvalue_err)?;
 
         let mut data = Vec::new();
+
         for result in iter {
             match result {
                 Ok(item) => data.push(item),
@@ -554,6 +575,7 @@ fn exhaust_data_iter_to_pycapsule(
     iter: impl Iterator<Item = anyhow::Result<(Option<Data>, Option<Data>)>>,
 ) -> anyhow::Result<Py<PyAny>> {
     let mut data = Vec::new();
+
     for result in iter {
         match result {
             Ok((Some(item1), None)) => data.push(item1),
@@ -572,9 +594,14 @@ fn exhaust_data_iter_to_pycapsule(
         .map(DataFFI::try_from)
         .collect::<Result<Vec<_>, _>>()
         .map_err(to_pyvalue_err)?;
-    let cvec: CVec = ffi_data.into();
+    let cvec: DataFfiCVec = ffi_data.into();
     // No destructor: Python must call drop_cvec_pycapsule to take ownership and free.
-    let capsule = PyCapsule::new_with_destructor::<CVec, _>(py, cvec, None, |_, _| {})?;
+    let capsule = PyCapsule::new_with_destructor::<DataFfiCVec, _>(
+        py,
+        cvec,
+        Some(DataFfiCVec::capsule_name()),
+        |_, _| {},
+    )?;
 
     // TODO: Improve error domain. Replace anyhow errors with nautilus
     // errors to unify pyo3 and anyhow errors.

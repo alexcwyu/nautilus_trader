@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.binance")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.binance")
 )]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BinanceBar {
@@ -65,7 +65,7 @@ pub struct BinanceBar {
 
 impl BinanceBar {
     /// Creates a new [`BinanceBar`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[must_use]
     pub fn new(
         bar_type: BarType,

@@ -122,9 +122,9 @@ impl BinanceFuturesWsTradingHandler {
                         BinanceFuturesWsTradingCommand::PlaceOrder { id, params } => {
                             if let Err(e) = self.handle_place_order(id.clone(), params).await {
                                 log::error!("Failed to handle place order command: {e}");
-                                self.emit(BinanceFuturesWsTradingMessage::OrderRejected {
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
                                     request_id: id,
-                                    code: -1,
                                     msg: e.to_string(),
                                 });
                             }
@@ -132,9 +132,9 @@ impl BinanceFuturesWsTradingHandler {
                         BinanceFuturesWsTradingCommand::CancelOrder { id, params } => {
                             if let Err(e) = self.handle_cancel_order(id.clone(), params).await {
                                 log::error!("Failed to handle cancel order command: {e}");
-                                self.emit(BinanceFuturesWsTradingMessage::CancelRejected {
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
                                     request_id: id,
-                                    code: -1,
                                     msg: e.to_string(),
                                 });
                             }
@@ -142,19 +142,9 @@ impl BinanceFuturesWsTradingHandler {
                         BinanceFuturesWsTradingCommand::ModifyOrder { id, params } => {
                             if let Err(e) = self.handle_modify_order(id.clone(), params).await {
                                 log::error!("Failed to handle modify order command: {e}");
-                                self.emit(BinanceFuturesWsTradingMessage::ModifyRejected {
+                                self.pending_requests.remove(&id);
+                                self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
                                     request_id: id,
-                                    code: -1,
-                                    msg: e.to_string(),
-                                });
-                            }
-                        }
-                        BinanceFuturesWsTradingCommand::CancelAllOrders { id, symbol } => {
-                            if let Err(e) = self.handle_cancel_all_orders(id.clone(), symbol).await {
-                                log::error!("Failed to handle cancel all command: {e}");
-                                self.emit(BinanceFuturesWsTradingMessage::CancelRejected {
-                                    request_id: id,
-                                    code: -1,
                                     msg: e.to_string(),
                                 });
                             }
@@ -195,14 +185,11 @@ impl BinanceFuturesWsTradingHandler {
         log::warn!("Failing {count} pending requests after reconnection");
 
         let pending = std::mem::take(&mut self.pending_requests);
-        for (request_id, meta) in pending {
-            let msg = self.create_rejection(
+        for (request_id, _meta) in pending {
+            self.emit(BinanceFuturesWsTradingMessage::RequestFailed {
                 request_id,
-                -1,
-                "Connection lost before response received".to_string(),
-                meta,
-            );
-            self.emit(msg);
+                msg: "Connection lost before response received".to_string(),
+            });
         }
     }
 
@@ -248,23 +235,6 @@ impl BinanceFuturesWsTradingHandler {
         let request = BinanceFuturesWsTradingRequest::new(&id, method::ORDER_MODIFY, signed_params);
         self.pending_requests
             .insert(id.clone(), BinanceFuturesWsTradingRequestMeta::ModifyOrder);
-        self.send_request(request).await
-    }
-
-    async fn handle_cancel_all_orders(
-        &mut self,
-        id: String,
-        symbol: String,
-    ) -> BinanceFuturesWsApiResult<()> {
-        let params_json = serde_json::json!({ "symbol": symbol });
-        let signed_params = self.sign_params(params_json)?;
-
-        let request =
-            BinanceFuturesWsTradingRequest::new(&id, method::OPEN_ORDERS_CANCEL_ALL, signed_params);
-        self.pending_requests.insert(
-            id.clone(),
-            BinanceFuturesWsTradingRequestMeta::CancelAllOrders,
-        );
         self.send_request(request).await
     }
 
@@ -362,19 +332,10 @@ impl BinanceFuturesWsTradingHandler {
         }
 
         let Some(result) = response.result else {
-            match meta {
-                BinanceFuturesWsTradingRequestMeta::CancelAllOrders => {
-                    self.emit(BinanceFuturesWsTradingMessage::AllOrdersCanceled {
-                        request_id: response.id,
-                    });
-                }
-                _ => {
-                    log::warn!(
-                        "Missing result in success response for request {}",
-                        response.id
-                    );
-                }
-            }
+            log::warn!(
+                "Missing result in success response for request {}",
+                response.id
+            );
             return;
         };
 
@@ -419,11 +380,6 @@ impl BinanceFuturesWsTradingHandler {
                     self.emit(BinanceFuturesWsTradingMessage::Error(e.to_string()));
                 }
             },
-            BinanceFuturesWsTradingRequestMeta::CancelAllOrders => {
-                self.emit(BinanceFuturesWsTradingMessage::AllOrdersCanceled {
-                    request_id: response.id,
-                });
-            }
         }
     }
 
@@ -442,8 +398,7 @@ impl BinanceFuturesWsTradingHandler {
                     msg,
                 }
             }
-            BinanceFuturesWsTradingRequestMeta::CancelOrder
-            | BinanceFuturesWsTradingRequestMeta::CancelAllOrders => {
+            BinanceFuturesWsTradingRequestMeta::CancelOrder => {
                 BinanceFuturesWsTradingMessage::CancelRejected {
                     request_id,
                     code,

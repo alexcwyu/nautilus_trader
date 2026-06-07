@@ -29,7 +29,7 @@ use strum::{AsRefStr, Display, EnumIter, EnumString};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.coinbase")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.coinbase")
 )]
 pub enum CoinbaseEnvironment {
     /// Production environment.
@@ -56,7 +56,8 @@ impl CoinbaseEnvironment {
 pub enum CoinbaseProductType {
     Spot,
     Future,
-    #[serde(other)]
+    #[serde(rename = "UNKNOWN_PRODUCT_TYPE")]
+    #[strum(serialize = "UNKNOWN_PRODUCT_TYPE")]
     Unknown,
 }
 
@@ -72,7 +73,7 @@ pub enum CoinbaseOrderSide {
     Unknown,
 }
 
-/// Coinbase order type used in create order requests.
+/// Coinbase REST order type values.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString, AsRefStr,
 )]
@@ -82,11 +83,23 @@ pub enum CoinbaseOrderType {
     #[serde(rename = "UNKNOWN_ORDER_TYPE")]
     #[strum(serialize = "UNKNOWN_ORDER_TYPE")]
     Unknown,
+    #[serde(alias = "Market")]
     Market,
+    #[serde(alias = "Limit")]
     Limit,
+    #[serde(alias = "Stop")]
     Stop,
+    #[serde(alias = "StopLimit", alias = "Stop Limit")]
     StopLimit,
+    #[serde(alias = "Bracket")]
     Bracket,
+    Twap,
+    #[serde(alias = "Roll Open")]
+    RollOpen,
+    #[serde(alias = "Roll Close")]
+    RollClose,
+    Liquidation,
+    Scaled,
 }
 
 /// Coinbase order status.
@@ -107,6 +120,19 @@ pub enum CoinbaseOrderStatus {
     Unknown,
     Queued,
     CancelQueued,
+    EditQueued,
+}
+
+impl CoinbaseOrderStatus {
+    /// Returns true when the status represents a terminal lifecycle state
+    /// (no further updates expected from the venue).
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Cancelled | Self::Expired | Self::Failed
+        )
+    }
 }
 
 /// Coinbase time in force.
@@ -117,10 +143,61 @@ pub enum CoinbaseTimeInForce {
     #[serde(rename = "UNKNOWN_TIME_IN_FORCE")]
     #[strum(serialize = "UNKNOWN_TIME_IN_FORCE")]
     Unknown,
-    GoodUntilDate,
+    GoodUntilDateTime,
     GoodUntilCancelled,
     ImmediateOrCancel,
     FillOrKill,
+}
+
+/// Coinbase trigger status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum CoinbaseTriggerStatus {
+    #[serde(rename = "UNKNOWN_TRIGGER_STATUS")]
+    #[strum(serialize = "UNKNOWN_TRIGGER_STATUS")]
+    Unknown,
+    InvalidOrderType,
+    StopPending,
+    StopTriggered,
+}
+
+/// Coinbase order placement source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum CoinbaseOrderPlacementSource {
+    #[serde(rename = "UNKNOWN_PLACEMENT_SOURCE")]
+    #[strum(serialize = "UNKNOWN_PLACEMENT_SOURCE")]
+    Unknown,
+    RetailSimple,
+    RetailAdvanced,
+}
+
+/// Coinbase order margin type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.core.nautilus_pyo3.coinbase",
+        eq,
+        eq_int,
+        frozen,
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.coinbase")
+)]
+pub enum CoinbaseMarginType {
+    #[serde(alias = "Cross")]
+    Cross,
+    #[serde(alias = "Isolated")]
+    Isolated,
 }
 
 /// Coinbase product status.
@@ -130,10 +207,13 @@ pub enum CoinbaseTimeInForce {
 pub enum CoinbaseProductStatus {
     Online,
     Offline,
-    /// Futures products return an empty status string
+    Delisted,
+    /// Futures products return an empty status string.
     #[serde(rename = "")]
     #[strum(serialize = "")]
     Unset,
+    /// A status value not modeled by this enum.
+    Unknown,
 }
 
 /// Coinbase product venue.
@@ -147,11 +227,114 @@ pub enum CoinbaseProductVenue {
     Fcm,
 }
 
+/// Coinbase FCM trading session state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseFcmTradingSessionState {
+    #[serde(rename = "FCM_TRADING_SESSION_STATE_UNDEFINED")]
+    #[strum(serialize = "FCM_TRADING_SESSION_STATE_UNDEFINED")]
+    Undefined,
+    #[serde(rename = "FCM_TRADING_SESSION_STATE_OPEN")]
+    #[strum(serialize = "FCM_TRADING_SESSION_STATE_OPEN")]
+    Open,
+}
+
+/// Coinbase FCM trading session closed reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseFcmTradingSessionClosedReason {
+    #[serde(rename = "FCM_TRADING_SESSION_CLOSED_REASON_UNDEFINED")]
+    #[strum(serialize = "FCM_TRADING_SESSION_CLOSED_REASON_UNDEFINED")]
+    Undefined,
+    #[serde(rename = "FCM_TRADING_SESSION_CLOSED_REASON_EXCHANGE_MAINTENANCE")]
+    #[strum(serialize = "FCM_TRADING_SESSION_CLOSED_REASON_EXCHANGE_MAINTENANCE")]
+    ExchangeMaintenance,
+}
+
+/// Coinbase risk management owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseRiskManagedBy {
+    #[serde(rename = "UNKNOWN_RISK_MANAGEMENT_TYPE")]
+    #[strum(serialize = "UNKNOWN_RISK_MANAGEMENT_TYPE")]
+    Unknown,
+    #[serde(rename = "MANAGED_BY_FCM")]
+    #[strum(serialize = "MANAGED_BY_FCM")]
+    ManagedByFcm,
+    #[serde(rename = "MANAGED_BY_VENUE")]
+    #[strum(serialize = "MANAGED_BY_VENUE")]
+    ManagedByVenue,
+}
+
+/// Coinbase account type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub enum CoinbaseAccountType {
+    // Production currently returns the fully qualified wire names
+    // (`ACCOUNT_TYPE_CRYPTO`, `ACCOUNT_TYPE_FIAT`); older documented
+    // examples use the short forms. Accept both on deserialize / parse
+    // but keep the short form as the canonical Display value.
+    #[serde(alias = "ACCOUNT_TYPE_CRYPTO")]
+    #[strum(to_string = "CRYPTO", serialize = "ACCOUNT_TYPE_CRYPTO")]
+    Crypto,
+    #[serde(alias = "ACCOUNT_TYPE_FIAT")]
+    #[strum(to_string = "FIAT", serialize = "ACCOUNT_TYPE_FIAT")]
+    Fiat,
+}
+
+/// Coinbase fill trade type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseFillTradeType {
+    #[serde(rename = "FILL")]
+    #[strum(serialize = "FILL")]
+    Fill,
+}
+
+/// Coinbase FCM position side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseFcmPositionSide {
+    #[serde(rename = "FUTURES_POSITION_SIDE_UNSPECIFIED")]
+    #[strum(serialize = "FUTURES_POSITION_SIDE_UNSPECIFIED")]
+    Unspecified,
+    #[serde(rename = "LONG")]
+    #[strum(serialize = "LONG")]
+    Long,
+    #[serde(rename = "SHORT")]
+    #[strum(serialize = "SHORT")]
+    Short,
+}
+
+/// Coinbase futures margin window type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseMarginWindowType {
+    #[serde(rename = "FCM_MARGIN_WINDOW_TYPE_INTRADAY")]
+    #[strum(serialize = "FCM_MARGIN_WINDOW_TYPE_INTRADAY")]
+    Intraday,
+    #[serde(rename = "FCM_MARGIN_WINDOW_TYPE_OVERNIGHT")]
+    #[strum(serialize = "FCM_MARGIN_WINDOW_TYPE_OVERNIGHT")]
+    Overnight,
+}
+
+/// Coinbase margin level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
+pub enum CoinbaseMarginLevel {
+    #[serde(rename = "MARGIN_LEVEL_TYPE_BASE")]
+    #[strum(serialize = "MARGIN_LEVEL_TYPE_BASE")]
+    Base,
+}
+
 /// Coinbase contract expiry type for futures products.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Display, EnumString)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub enum CoinbaseContractExpiryType {
+    #[serde(
+        rename = "UNKNOWN_CONTRACT_EXPIRY_TYPE",
+        alias = "UNKNOWN_CONTRACT_EXPIRY"
+    )]
+    #[strum(
+        serialize = "UNKNOWN_CONTRACT_EXPIRY_TYPE",
+        serialize = "UNKNOWN_CONTRACT_EXPIRY"
+    )]
+    Unknown,
     Expiring,
     /// Non-expiring (perpetual)
     #[serde(rename = "PERPETUAL")]
@@ -263,6 +446,21 @@ mod tests {
     }
 
     #[rstest]
+    #[case(CoinbaseOrderStatus::Filled, true)]
+    #[case(CoinbaseOrderStatus::Cancelled, true)]
+    #[case(CoinbaseOrderStatus::Expired, true)]
+    #[case(CoinbaseOrderStatus::Failed, true)]
+    #[case(CoinbaseOrderStatus::Open, false)]
+    #[case(CoinbaseOrderStatus::Pending, false)]
+    #[case(CoinbaseOrderStatus::Queued, false)]
+    #[case(CoinbaseOrderStatus::CancelQueued, false)]
+    #[case(CoinbaseOrderStatus::EditQueued, false)]
+    #[case(CoinbaseOrderStatus::Unknown, false)]
+    fn test_order_status_is_terminal(#[case] status: CoinbaseOrderStatus, #[case] expected: bool) {
+        assert_eq!(status.is_terminal(), expected);
+    }
+
+    #[rstest]
     fn test_ws_channel_requires_auth() {
         assert!(CoinbaseWsChannel::User.requires_auth());
         assert!(CoinbaseWsChannel::FuturesBalanceSummary.requires_auth());
@@ -289,11 +487,87 @@ mod tests {
         let json = serde_json::to_string(&CoinbaseOrderStatus::CancelQueued).unwrap();
         assert_eq!(json, "\"CANCEL_QUEUED\"");
 
-        let json = serde_json::to_string(&CoinbaseTimeInForce::GoodUntilDate).unwrap();
-        assert_eq!(json, "\"GOOD_UNTIL_DATE\"");
+        let json = serde_json::to_string(&CoinbaseTimeInForce::GoodUntilDateTime).unwrap();
+        assert_eq!(json, "\"GOOD_UNTIL_DATE_TIME\"");
 
         let json = serde_json::to_string(&CoinbaseGranularity::FifteenMinute).unwrap();
         assert_eq!(json, "\"FIFTEEN_MINUTE\"");
+    }
+
+    #[rstest]
+    fn test_order_type_accepts_title_case_aliases() {
+        let order_type: CoinbaseOrderType = serde_json::from_str("\"Limit\"").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::Limit);
+
+        let order_type: CoinbaseOrderType = serde_json::from_str("\"StopLimit\"").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::StopLimit);
+
+        let order_type: CoinbaseOrderType = serde_json::from_str("\"Stop Limit\"").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::StopLimit);
+
+        let order_type = CoinbaseOrderType::from_str("STOP_LIMIT").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::StopLimit);
+
+        let order_type = CoinbaseOrderType::from_str("TWAP").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::Twap);
+
+        let order_type = CoinbaseOrderType::from_str("LIQUIDATION").unwrap();
+        assert_eq!(order_type, CoinbaseOrderType::Liquidation);
+    }
+
+    #[rstest]
+    fn test_account_type_accepts_current_wire_values() {
+        let account_type: CoinbaseAccountType = serde_json::from_str("\"FIAT\"").unwrap();
+        assert_eq!(account_type, CoinbaseAccountType::Fiat);
+
+        let account_type = CoinbaseAccountType::from_str("CRYPTO").unwrap();
+        assert_eq!(account_type, CoinbaseAccountType::Crypto);
+    }
+
+    // Production `/accounts` currently returns the fully qualified wire
+    // names (`ACCOUNT_TYPE_CRYPTO` / `ACCOUNT_TYPE_FIAT`). Both shapes
+    // must parse so account-state bootstrap doesn't fail with
+    // "unknown variant".
+    #[rstest]
+    fn test_account_type_accepts_qualified_wire_values() {
+        let account_type: CoinbaseAccountType =
+            serde_json::from_str("\"ACCOUNT_TYPE_CRYPTO\"").unwrap();
+        assert_eq!(account_type, CoinbaseAccountType::Crypto);
+
+        let account_type: CoinbaseAccountType =
+            serde_json::from_str("\"ACCOUNT_TYPE_FIAT\"").unwrap();
+        assert_eq!(account_type, CoinbaseAccountType::Fiat);
+
+        let account_type = CoinbaseAccountType::from_str("ACCOUNT_TYPE_CRYPTO").unwrap();
+        assert_eq!(account_type, CoinbaseAccountType::Crypto);
+    }
+
+    // Display must keep emitting the short form regardless of input
+    // wire shape; the qualified form is an input-only alias.
+    #[rstest]
+    fn test_account_type_display_uses_short_form() {
+        assert_eq!(CoinbaseAccountType::Crypto.to_string(), "CRYPTO");
+        assert_eq!(CoinbaseAccountType::Fiat.to_string(), "FIAT");
+        assert_eq!(
+            serde_json::to_string(&CoinbaseAccountType::Crypto).unwrap(),
+            "\"CRYPTO\""
+        );
+    }
+
+    #[rstest]
+    fn test_margin_type_accepts_request_and_ws_spellings() {
+        let margin_type: CoinbaseMarginType = serde_json::from_str("\"CROSS\"").unwrap();
+        assert_eq!(margin_type, CoinbaseMarginType::Cross);
+
+        let margin_type: CoinbaseMarginType = serde_json::from_str("\"Cross\"").unwrap();
+        assert_eq!(margin_type, CoinbaseMarginType::Cross);
+    }
+
+    #[rstest]
+    fn test_contract_expiry_type_accepts_websocket_alias() {
+        let expiry_type: CoinbaseContractExpiryType =
+            serde_json::from_str("\"UNKNOWN_CONTRACT_EXPIRY\"").unwrap();
+        assert_eq!(expiry_type, CoinbaseContractExpiryType::Unknown);
     }
 
     #[rstest]
@@ -310,6 +584,9 @@ mod tests {
 
     #[rstest]
     fn test_unknown_variants_have_qualified_names() {
+        let json = serde_json::to_string(&CoinbaseProductType::Unknown).unwrap();
+        assert_eq!(json, "\"UNKNOWN_PRODUCT_TYPE\"");
+
         let json = serde_json::to_string(&CoinbaseOrderSide::Unknown).unwrap();
         assert_eq!(json, "\"UNKNOWN_ORDER_SIDE\"");
 
@@ -321,5 +598,17 @@ mod tests {
 
         let json = serde_json::to_string(&CoinbaseTimeInForce::Unknown).unwrap();
         assert_eq!(json, "\"UNKNOWN_TIME_IN_FORCE\"");
+
+        let json = serde_json::to_string(&CoinbaseTriggerStatus::Unknown).unwrap();
+        assert_eq!(json, "\"UNKNOWN_TRIGGER_STATUS\"");
+
+        let json = serde_json::to_string(&CoinbaseOrderPlacementSource::Unknown).unwrap();
+        assert_eq!(json, "\"UNKNOWN_PLACEMENT_SOURCE\"");
+
+        let json = serde_json::to_string(&CoinbaseContractExpiryType::Unknown).unwrap();
+        assert_eq!(json, "\"UNKNOWN_CONTRACT_EXPIRY_TYPE\"");
+
+        let json = serde_json::to_string(&CoinbaseRiskManagedBy::Unknown).unwrap();
+        assert_eq!(json, "\"UNKNOWN_RISK_MANAGEMENT_TYPE\"");
     }
 }

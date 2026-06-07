@@ -29,8 +29,8 @@ use crate::{
         Chain, Dex,
         chain::Blockchain,
         data::{
-            Block, PoolFeeCollect, PoolFlash, PoolLiquidityUpdate, PoolLiquidityUpdateType,
-            PoolSwap, Transaction,
+            Block, DefiData, PoolFeeCollect, PoolFlash, PoolLiquidityUpdate,
+            PoolLiquidityUpdateType, PoolSwap, Transaction,
         },
     },
     identifiers::InstrumentId,
@@ -39,6 +39,31 @@ use crate::{
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl Block {
+    /// Represents an Ethereum-compatible blockchain block with essential metadata.
+    #[new]
+    #[expect(clippy::too_many_arguments)]
+    fn py_new(
+        chain: Blockchain,
+        hash: String,
+        parent_hash: String,
+        number: u64,
+        miner: String,
+        gas_limit: u64,
+        gas_used: u64,
+        timestamp: u64,
+    ) -> Self {
+        Self::new(
+            hash,
+            parent_hash,
+            number,
+            miner.into(),
+            gas_limit,
+            gas_used,
+            timestamp.into(),
+            Some(chain),
+        )
+    }
+
     /// Returns the blockchain for this block.
     #[getter]
     #[pyo3(name = "chain")]
@@ -124,6 +149,18 @@ impl Block {
         self.timestamp.as_u64()
     }
 
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.timestamp.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.timestamp.as_u64()
+    }
+
     fn __str__(&self) -> String {
         self.to_string()
     }
@@ -141,6 +178,58 @@ impl Block {
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl DefiData {
+    /// Returns the block number associated with this DeFi data.
+    #[getter]
+    #[pyo3(name = "block_number")]
+    fn py_block_number(&self) -> u64 {
+        self.block_number()
+    }
+
+    /// Returns the transaction index associated with this DeFi data.
+    #[getter]
+    #[pyo3(name = "transaction_index")]
+    fn py_transaction_index(&self) -> u32 {
+        self.transaction_index()
+    }
+
+    /// Returns the log index associated with this DeFi data.
+    #[getter]
+    #[pyo3(name = "log_index")]
+    fn py_log_index(&self) -> u32 {
+        self.log_index()
+    }
+
+    /// Returns the event timestamp associated with this DeFi data.
+    #[getter]
+    #[pyo3(name = "timestamp")]
+    fn py_timestamp(&self) -> u64 {
+        self.timestamp().as_u64()
+    }
+
+    /// Returns the event timestamp associated with this DeFi data.
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event().as_u64()
+    }
+
+    /// Returns the initialization timestamp associated with this DeFi data.
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init().as_u64()
+    }
+
+    /// Returns the block position associated with this DeFi data.
+    #[pyo3(name = "block_position")]
+    fn py_block_position(&self) -> (u64, u32, u32) {
+        self.block_position()
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PoolSwap {
     /// Represents a token swap transaction on a decentralized exchange (DEX).
     ///
@@ -148,7 +237,7 @@ impl PoolSwap {
     /// optionally includes computed market-oriented trade information. It serves as
     /// the primary data structure for tracking and analyzing DEX swap activity.
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         dex: Dex,
@@ -182,7 +271,8 @@ impl PoolSwap {
             transaction_hash,
             transaction_index,
             log_index,
-            Some(timestamp.into()),
+            timestamp.into(), // ts_event
+            timestamp.into(), // ts_init (single Python timestamp)
             sender,
             receiver,
             amount0,
@@ -273,14 +363,20 @@ impl PoolSwap {
 
     #[getter]
     #[pyo3(name = "timestamp")]
-    fn py_timestamp(&self) -> Option<u64> {
-        self.timestamp.map(|x| x.as_u64())
+    fn py_timestamp(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
     }
 
     #[getter]
     #[pyo3(name = "ts_init")]
-    fn py_ts_init(&self) -> Option<u64> {
-        self.ts_init.map(|x| x.as_u64())
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
     }
 }
 
@@ -289,7 +385,7 @@ impl PoolSwap {
 impl PoolLiquidityUpdate {
     /// Represents a liquidity update event in a decentralized exchange (DEX) pool.
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         dex: Dex,
@@ -335,7 +431,8 @@ impl PoolLiquidityUpdate {
             amount1,
             tick_lower,
             tick_upper,
-            Some(timestamp.into()),
+            timestamp.into(), // ts_event
+            timestamp.into(), // ts_init (single Python timestamp)
         ))
     }
 
@@ -461,14 +558,20 @@ impl PoolLiquidityUpdate {
 
     #[getter]
     #[pyo3(name = "timestamp")]
-    fn py_timestamp(&self) -> Option<u64> {
-        self.timestamp.map(|x| x.as_u64())
+    fn py_timestamp(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
     }
 
     #[getter]
     #[pyo3(name = "ts_init")]
-    fn py_ts_init(&self) -> Option<u64> {
-        self.ts_init.map(|x| x.as_u64())
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
     }
 }
 
@@ -477,7 +580,7 @@ impl PoolLiquidityUpdate {
 impl PoolFeeCollect {
     /// Represents a fee collection event in a decentralized exchange (DEX) pool.
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         dex: Dex,
@@ -512,7 +615,8 @@ impl PoolFeeCollect {
             amount1,
             tick_lower,
             tick_upper,
-            Some(timestamp.into()),
+            timestamp.into(), // ts_event
+            timestamp.into(), // ts_init (single Python timestamp)
         ))
     }
 
@@ -620,14 +724,20 @@ impl PoolFeeCollect {
 
     #[getter]
     #[pyo3(name = "timestamp")]
-    fn py_timestamp(&self) -> Option<u64> {
-        self.timestamp.map(|x| x.as_u64())
+    fn py_timestamp(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
     }
 
     #[getter]
     #[pyo3(name = "ts_init")]
-    fn py_ts_init(&self) -> Option<u64> {
-        self.ts_init.map(|x| x.as_u64())
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
     }
 }
 
@@ -640,7 +750,7 @@ impl PoolFlash {
     /// within the same transaction. Fees are paid on the borrowed amount, which are added to
     /// the pool's fee growth accumulators.
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         dex: Dex,
@@ -674,7 +784,8 @@ impl PoolFlash {
             transaction_hash,
             transaction_index,
             log_index,
-            Some(timestamp.into()),
+            timestamp.into(), // ts_event
+            timestamp.into(), // ts_init (single Python timestamp)
             sender,
             recipient,
             amount0,
@@ -794,8 +905,20 @@ impl PoolFlash {
 
     #[getter]
     #[pyo3(name = "timestamp")]
-    fn py_timestamp(&self) -> Option<u64> {
-        self.ts_event.map(|x| x.as_u64())
+    fn py_timestamp(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_event")]
+    fn py_ts_event(&self) -> u64 {
+        self.ts_event.as_u64()
+    }
+
+    #[getter]
+    #[pyo3(name = "ts_init")]
+    fn py_ts_init(&self) -> u64 {
+        self.ts_init.as_u64()
     }
 }
 
@@ -804,7 +927,7 @@ impl PoolFlash {
 impl Transaction {
     /// Represents a transaction on an EVM based blockchain.
     #[new]
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     fn py_new(
         chain: Chain,
         hash: String,

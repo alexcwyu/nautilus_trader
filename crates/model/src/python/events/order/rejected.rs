@@ -30,7 +30,7 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl OrderRejected {
     /// Represents an event where an order has been rejected by the trading venue.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[new]
     fn py_new(
         trader_id: TraderId,
@@ -139,13 +139,13 @@ impl OrderRejected {
     #[getter]
     #[pyo3(name = "reconciliation")]
     fn py_reconciliation(&self) -> bool {
-        self.reconciliation != 0
+        self.reconciliation
     }
 
     #[getter]
     #[pyo3(name = "due_post_only")]
     fn py_due_post_only(&self) -> bool {
-        self.due_post_only != 0
+        self.due_post_only
     }
 
     #[pyo3(name = "to_dict")]
@@ -163,6 +163,10 @@ impl OrderRejected {
         dict.set_item("ts_init", self.ts_init.as_u64())?;
         dict.set_item("reconciliation", self.reconciliation)?;
         dict.set_item("due_post_only", self.due_post_only)?;
+        match self.causation_id {
+            Some(causation_id) => dict.set_item("causation_id", causation_id.to_string())?,
+            None => dict.set_item("causation_id", py.None())?,
+        }
         Ok(dict.into())
     }
 }

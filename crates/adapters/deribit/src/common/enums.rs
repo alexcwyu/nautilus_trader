@@ -50,7 +50,7 @@ use strum::{AsRefStr, Display as StrumDisplay, EnumIter, EnumString};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.deribit")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.deribit")
 )]
 pub enum DeribitProductType {
     /// Future contract
@@ -85,7 +85,7 @@ pub enum DeribitProductType {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.deribit")
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.deribit")
 )]
 pub enum DeribitCurrency {
     /// Bitcoin
@@ -236,6 +236,46 @@ impl TryFrom<TimeInForce> for DeribitTimeInForce {
             )),
         }
     }
+}
+
+/// Deribit API environment.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    StrumDisplay,
+    PartialEq,
+    Eq,
+    Hash,
+    AsRefStr,
+    EnumIter,
+    EnumString,
+    Serialize,
+    Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+#[strum(ascii_case_insensitive, serialize_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        eq,
+        eq_int,
+        module = "nautilus_trader.core.nautilus_pyo3.deribit",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.deribit")
+)]
+pub enum DeribitEnvironment {
+    /// Live trading environment.
+    #[default]
+    Mainnet,
+    /// Testnet environment.
+    Testnet,
 }
 
 /// Resolves an optional Nautilus trigger type to a Deribit trigger string.

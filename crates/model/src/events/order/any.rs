@@ -31,7 +31,10 @@ use crate::{
 };
 
 /// Wraps an `OrderEvent` allowing polymorphism.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "lint fires only with high-precision feature"
+)]
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum OrderEventAny {
     Initialized(OrderInitialized),
@@ -139,6 +142,30 @@ impl OrderEventAny {
             Self::Updated(event) => event.client_order_id,
             Self::Filled(event) => event.client_order_id,
         }
+    }
+
+    #[must_use]
+    pub fn with_client_order_id(mut self, client_order_id: ClientOrderId) -> Self {
+        match &mut self {
+            Self::Initialized(event) => event.client_order_id = client_order_id,
+            Self::Denied(event) => event.client_order_id = client_order_id,
+            Self::Emulated(event) => event.client_order_id = client_order_id,
+            Self::Released(event) => event.client_order_id = client_order_id,
+            Self::Submitted(event) => event.client_order_id = client_order_id,
+            Self::Accepted(event) => event.client_order_id = client_order_id,
+            Self::Rejected(event) => event.client_order_id = client_order_id,
+            Self::Canceled(event) => event.client_order_id = client_order_id,
+            Self::Expired(event) => event.client_order_id = client_order_id,
+            Self::Triggered(event) => event.client_order_id = client_order_id,
+            Self::PendingUpdate(event) => event.client_order_id = client_order_id,
+            Self::PendingCancel(event) => event.client_order_id = client_order_id,
+            Self::ModifyRejected(event) => event.client_order_id = client_order_id,
+            Self::CancelRejected(event) => event.client_order_id = client_order_id,
+            Self::Updated(event) => event.client_order_id = client_order_id,
+            Self::Filled(event) => event.client_order_id = client_order_id,
+        }
+
+        self
     }
 
     #[must_use]
@@ -328,7 +355,7 @@ mod tests {
     }
 
     #[rstest]
-    #[should_panic]
+    #[should_panic(expected = "Invalid `OrderEventAny` not `OrderFilled`")]
     fn test_from_order_event_any_to_filled_panics_on_wrong_variant(order_accepted: OrderAccepted) {
         let event = OrderEventAny::Accepted(order_accepted);
         let _filled: OrderFilled = event.into();

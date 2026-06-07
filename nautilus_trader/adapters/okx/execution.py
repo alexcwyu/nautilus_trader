@@ -14,13 +14,14 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
-from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 from typing import Any
 
 from nautilus_trader.adapters.okx.config import OKXExecClientConfig
 from nautilus_trader.adapters.okx.constants import OKX_VENUE
 from nautilus_trader.adapters.okx.providers import OKXInstrumentProvider
+from nautilus_trader.adapters.okx.types import OKXAttachedOcoBinding
 from nautilus_trader.adapters.okx.types import OkxInstrument
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
@@ -31,6 +32,7 @@ from nautilus_trader.common.secure import mask_api_key
 from nautilus_trader.core import nautilus_pyo3
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.datetime import ensure_pydatetime_utc
+from nautilus_trader.core.nautilus_pyo3 import OKXEnvironment
 from nautilus_trader.core.nautilus_pyo3 import OKXInstrumentType
 from nautilus_trader.core.nautilus_pyo3 import OKXMarginMode
 from nautilus_trader.core.nautilus_pyo3 import OKXTradeMode
@@ -76,35 +78,24 @@ from nautilus_trader.model.identifiers import AccountId
 from nautilus_trader.model.identifiers import ClientId
 from nautilus_trader.model.identifiers import ClientOrderId
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.instruments import CryptoFuturesSpread
 from nautilus_trader.model.instruments import CryptoOption
+from nautilus_trader.model.instruments import CryptoOptionSpread
 from nautilus_trader.model.instruments import CurrencyPair
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orders import Order
 
 
-@dataclass(frozen=True)
-class _OKXAttachedOcoBinding:
-    parent_client_order_id: ClientOrderId
-    attach_client_order_id: ClientOrderId
-    instrument_id: InstrumentId
-    sl_client_order_id: ClientOrderId | None
-    tp_client_order_id: ClientOrderId | None
+class _OKXOrderCommandRoute(Enum):
+    REGULAR_WS = "regular_ws"
+    ALGO_HTTP = "algo_http"
+    SPREAD_HTTP = "spread_http"
 
-    def child_client_order_ids(self) -> list[ClientOrderId]:
-        child_ids: list[ClientOrderId] = []
 
-        if self.sl_client_order_id is not None:
-            child_ids.append(self.sl_client_order_id)
-        if self.tp_client_order_id is not None and self.tp_client_order_id not in child_ids:
-            child_ids.append(self.tp_client_order_id)
-        return child_ids
-
-    def all_client_order_ids(self) -> list[ClientOrderId]:
-        ids = [self.parent_client_order_id, self.attach_client_order_id]
-        for child_id in self.child_client_order_ids():
-            if child_id not in ids:
-                ids.append(child_id)
-        return ids
+class _OKXCancelAllOrdersRoute(Enum):
+    BATCH_WS = "batch_ws"
+    MASS_CANCEL_HTTP = "mass_cancel_http"
+    SPREAD_HTTP = "spread_http"
 
 
 class OKXExecutionClient(LiveExecutionClient):
@@ -169,12 +160,14 @@ class OKXExecutionClient(LiveExecutionClient):
         )
         margin_mode = str(config.margin_mode) if config.margin_mode else None
 
+        self._environment = config.environment or OKXEnvironment.LIVE
+
         # Configuration
         self._config = config
         self._log.info(f"config.instrument_types={instrument_types}", LogColor.BLUE)
         self._log.info(f"{config.instrument_families=}", LogColor.BLUE)
         self._log.info(f"config.contract_types={contract_types}", LogColor.BLUE)
-        self._log.info(f"{config.is_demo=}", LogColor.BLUE)
+        self._log.info(f"environment={self._environment}", LogColor.BLUE)
         self._log.info(f"config.margin_mode={margin_mode}", LogColor.BLUE)
         self._log.info(f"{config.use_spot_margin=}", LogColor.BLUE)
         self._log.info(f"{config.http_timeout_secs=}", LogColor.BLUE)
@@ -184,8 +177,7 @@ class OKXExecutionClient(LiveExecutionClient):
         self._log.info(f"{config.use_fills_channel=}", LogColor.BLUE)
         self._log.info(f"{config.use_mm_mass_cancel=}", LogColor.BLUE)
         self._log.info(f"{config.use_spot_cash_position_reports=}", LogColor.BLUE)
-        self._log.info(f"{config.http_proxy_url=}", LogColor.BLUE)
-        self._log.info(f"{config.ws_proxy_url=}", LogColor.BLUE)
+        self._log.info(f"{config.proxy_url=}", LogColor.BLUE)
 
         if config.use_spot_cash_position_reports:
             self._log.warning(
@@ -213,23 +205,31 @@ class OKXExecutionClient(LiveExecutionClient):
         self._algo_order_instruments: dict[ClientOrderId, InstrumentId] = {}
         self._client_id_aliases: dict[ClientOrderId, ClientOrderId] = {}
         self._client_id_children: dict[ClientOrderId, ClientOrderId] = {}
-        self._attached_oco_bindings: dict[ClientOrderId, _OKXAttachedOcoBinding] = {}
+        self._attached_oco_bindings: dict[ClientOrderId, OKXAttachedOcoBinding] = {}
 
         # WebSocket API
-        _private_url = config.base_url_ws or nautilus_pyo3.get_okx_ws_url_private(config.is_demo)
+        _private_url = config.base_url_ws or nautilus_pyo3.get_okx_ws_url_private(self._environment)
         self._ws_client = nautilus_pyo3.OKXWebSocketClient.with_credentials(
             url=_private_url,
+            api_key=config.api_key,
+            api_secret=config.api_secret,
+            api_passphrase=config.api_passphrase,
             account_id=self.pyo3_account_id,
             heartbeat=20,
             auth_timeout_secs=config.ws_auth_timeout_secs,
+            proxy_url=config.proxy_url,
         )
         self._ws_client_futures: set[asyncio.Future] = set()
 
         self._ws_business_client = nautilus_pyo3.OKXWebSocketClient.with_credentials(
             url=nautilus_pyo3.derive_okx_ws_url(_private_url, "business"),
+            api_key=config.api_key,
+            api_secret=config.api_secret,
+            api_passphrase=config.api_passphrase,
             account_id=self.pyo3_account_id,
             heartbeat=20,
             auth_timeout_secs=config.ws_auth_timeout_secs,
+            proxy_url=config.proxy_url,
         )
         self._ws_business_client_futures: set[asyncio.Future] = set()
 
@@ -341,8 +341,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 await self._ws_client.subscribe_orders(OKXInstrumentType.MARGIN)
                 subscribed_order_channels.add(OKXInstrumentType.MARGIN)
 
-            # OKX doesn't support algo orders channel for OPTIONS
-            if instrument_type != OKXInstrumentType.OPTION:
+            if _supports_algo_orders(instrument_type):
                 await self._ws_business_client.subscribe_orders_algo(instrument_type)
                 await self._ws_business_client.subscribe_algo_advance(instrument_type)
 
@@ -376,6 +375,10 @@ class OKXExecutionClient(LiveExecutionClient):
                 )
 
         await self._ws_client.subscribe_account()
+
+        if self._config.load_spreads:
+            self._log.info("Subscribing to Nitro spread orders channel", LogColor.BLUE)
+            await self._ws_business_client.subscribe_spread_orders()
 
     async def _disconnect(self) -> None:
         # Shutdown websocket
@@ -482,6 +485,15 @@ class OKXExecutionClient(LiveExecutionClient):
                     )
                     pyo3_reports.extend(response)
 
+                if self._config.load_spreads:
+                    response = await self._http_client.request_order_status_reports(
+                        account_id=self.pyo3_account_id,
+                        start=ensure_pydatetime_utc(command.start),
+                        end=ensure_pydatetime_utc(command.end),
+                        open_only=command.open_only,
+                    )
+                    pyo3_reports.extend(response)
+
             for pyo3_report in pyo3_reports:
                 report = OrderStatusReport.from_pyo3(pyo3_report)
                 self._apply_client_order_alias(report)
@@ -521,7 +533,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
         pyo3_instrument_id = nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value)
 
-        canonical_requested_id: ClientOrderId | None = None
+        canonical_requested_id = self._canonical_client_order_id(command.client_order_id)
 
         try:
             pyo3_reports: list[
@@ -535,7 +547,6 @@ class OKXExecutionClient(LiveExecutionClient):
                 return None
 
             # Filter for the specific order we're looking for
-            canonical_requested_id = self._canonical_client_order_id(command.client_order_id)
             self._log.warning(
                 f"Resolving order status lookup for requested {command.client_order_id!r} -> canonical {canonical_requested_id!r}",
             )
@@ -571,6 +582,7 @@ class OKXExecutionClient(LiveExecutionClient):
         pyo3_instrument_id: nautilus_pyo3.InstrumentId,
     ) -> OrderStatusReport | None:
         fallback_ids: list[ClientOrderId] = []
+
         for candidate in (
             canonical_requested_id,
             self._exchange_client_order_id(command.client_order_id),
@@ -580,6 +592,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 fallback_ids.append(candidate)
 
         algo_ids: set[str] = set()
+
         for candidate in fallback_ids:
             candidate_report = await self._fetch_algo_order_status_report(
                 candidate,
@@ -659,6 +672,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 instrument_id=pyo3_instrument_id,
                 algo_id=algo_id,
             )
+
             for algo_report in algo_reports:
                 algo_report = self._hydrate_zero_quantity_algo_report(algo_report)
                 report = OrderStatusReport.from_pyo3(algo_report)
@@ -720,6 +734,14 @@ class OKXExecutionClient(LiveExecutionClient):
                     response = await self._http_client.request_fill_reports(
                         account_id=self.pyo3_account_id,
                         instrument_type=instrument_type,
+                        start=ensure_pydatetime_utc(command.start),
+                        end=ensure_pydatetime_utc(command.end),
+                    )
+                    pyo3_reports.extend(response)
+
+                if self._config.load_spreads:
+                    response = await self._http_client.request_fill_reports(
+                        account_id=self.pyo3_account_id,
                         start=ensure_pydatetime_utc(command.start),
                         end=ensure_pydatetime_utc(command.end),
                     )
@@ -1063,17 +1085,19 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             return
 
-        # Check if this is a conditional order that needs to go via REST API
-        is_conditional = order.order_type in (
-            OrderType.STOP_MARKET,
-            OrderType.STOP_LIMIT,
-            OrderType.MARKET_IF_TOUCHED,
-            OrderType.LIMIT_IF_TOUCHED,
-            OrderType.TRAILING_STOP_MARKET,
-        )
+        route = self._submit_order_route(order, instrument)
 
-        # OKX trigger/algo orders are not supported for options
-        if is_conditional and is_option:
+        if route is _OKXOrderCommandRoute.SPREAD_HTTP and self._is_conditional_order(order):
+            self.generate_order_denied(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=f"Trigger/conditional orders ({order.order_type}) are not supported for OKX spreads",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        if route is _OKXOrderCommandRoute.ALGO_HTTP and is_option:
             self.generate_order_denied(
                 strategy_id=order.strategy_id,
                 instrument_id=order.instrument_id,
@@ -1083,7 +1107,9 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             return
 
-        if is_conditional:
+        if route is _OKXOrderCommandRoute.SPREAD_HTTP:
+            await self._submit_order_http(command)
+        elif route is _OKXOrderCommandRoute.ALGO_HTTP:
             await self._submit_algo_order_http(command)
         else:
             await self._submit_order_websocket(command)
@@ -1094,11 +1120,29 @@ class OKXExecutionClient(LiveExecutionClient):
             self._log.warning("Received SubmitOrderList with empty order list")
             return
 
+        spread_orders = [
+            order
+            for order in order_list.orders
+            if self._is_spread_instrument_id(order.instrument_id)
+        ]
+
+        if spread_orders:
+            for order in spread_orders:
+                self.generate_order_denied(
+                    strategy_id=order.strategy_id,
+                    instrument_id=order.instrument_id,
+                    client_order_id=order.client_order_id,
+                    reason="OKX spread order lists are not supported",
+                    ts_event=self._clock.timestamp_ns(),
+                )
+            return
+
         try:
             parent_order, sl_order, tp_order = self._extract_attached_bracket_orders(
                 order_list.orders,
             )
             attach_algo_ords = self._build_attach_algo_ords(sl_order, tp_order)
+            attach_algo_ords = self._merge_attach_algo_ords(attach_algo_ords, command.params)
             self._register_attached_oco_binding(parent_order, sl_order, tp_order)
 
             for order in order_list.orders:
@@ -1109,7 +1153,7 @@ class OKXExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
 
-            await self._submit_regular_order_http(
+            await self._place_order_http(
                 order=parent_order,
                 params=command.params,
                 attach_algo_ords=attach_algo_ords,
@@ -1118,6 +1162,7 @@ class OKXExecutionClient(LiveExecutionClient):
             self._clear_attached_oco_binding(
                 parent_order.client_order_id if "parent_order" in locals() else None,
             )
+
             for order in order_list.orders:
                 self.generate_order_rejected(
                     strategy_id=order.strategy_id,
@@ -1127,7 +1172,40 @@ class OKXExecutionClient(LiveExecutionClient):
                     ts_event=self._clock.timestamp_ns(),
                 )
 
-    async def _submit_regular_order_http(
+    @staticmethod
+    def _merge_attach_algo_ords(
+        bracket_attach_algo_ords: list[dict[str, str]],
+        params: dict[str, Any] | None,
+    ) -> list[dict[str, str]]:
+        param_attach_algo_ords = OKXExecutionClient._attach_algo_ords_from_params(params)
+        if bracket_attach_algo_ords and param_attach_algo_ords:
+            raise ValueError(
+                "OKX attach_algo_ords param cannot be combined with bracket order TP/SL legs",
+            )
+
+        return bracket_attach_algo_ords or param_attach_algo_ords
+
+    async def _submit_order_http(self, command: SubmitOrder) -> None:
+        order = command.order
+
+        try:
+            self.generate_order_submitted(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                ts_event=self._clock.timestamp_ns(),
+            )
+            await self._place_order_http(order, command.params)
+        except Exception as e:
+            self.generate_order_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                reason=str(e),
+                ts_event=self._clock.timestamp_ns(),
+            )
+
+    async def _place_order_http(
         self,
         order: Order,
         params: dict[str, Any] | None,
@@ -1149,6 +1227,9 @@ class OKXExecutionClient(LiveExecutionClient):
 
         px_usd = params.get("px_usd") if params else None
         px_vol = params.get("px_vol") if params else None
+        speed_bump = params.get("speed_bump") if params else None
+        outcome = params.get("outcome") if params else None
+        slippage_pct = params.get("slippage_pct") if params else None
 
         response = await self._http_client.place_order(
             trader_id=pyo3_trader_id,
@@ -1167,6 +1248,9 @@ class OKXExecutionClient(LiveExecutionClient):
             attach_algo_ords=attach_algo_ords,
             px_usd=str(px_usd) if px_usd is not None else None,
             px_vol=str(px_vol) if px_vol is not None else None,
+            speed_bump=str(speed_bump) if speed_bump is not None else None,
+            outcome=str(outcome) if outcome is not None else None,
+            slippage_pct=str(slippage_pct) if slippage_pct is not None else None,
         )
 
         if response.get("s_code") and response["s_code"] != "0":
@@ -1200,6 +1284,9 @@ class OKXExecutionClient(LiveExecutionClient):
 
         px_usd = params.get("px_usd") if params else None
         px_vol = params.get("px_vol") if params else None
+        speed_bump = params.get("speed_bump") if params else None
+        outcome = params.get("outcome") if params else None
+        slippage_pct = params.get("slippage_pct") if params else None
 
         await self._ws_client.submit_order(
             trader_id=pyo3_trader_id,
@@ -1219,6 +1306,9 @@ class OKXExecutionClient(LiveExecutionClient):
             attach_algo_ords=attach_algo_ords,
             px_usd=str(px_usd) if px_usd is not None else None,
             px_vol=str(px_vol) if px_vol is not None else None,
+            speed_bump=str(speed_bump) if speed_bump is not None else None,
+            outcome=str(outcome) if outcome is not None else None,
+            slippage_pct=str(slippage_pct) if slippage_pct is not None else None,
         )
 
     async def _submit_order_websocket(self, command: SubmitOrder) -> None:
@@ -1236,6 +1326,7 @@ class OKXExecutionClient(LiveExecutionClient):
             await self._submit_regular_order_websocket(
                 order=order,
                 params=command.params,
+                attach_algo_ords=self._attach_algo_ords_from_params(command.params) or None,
             )
         except Exception as e:
             self.generate_order_rejected(
@@ -1276,6 +1367,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
         sl_order: Order | None = None
         tp_order: Order | None = None
+
         for child_order in child_orders:
             self._validate_attached_bracket_child(
                 parent_order=parent_order,
@@ -1365,7 +1457,7 @@ class OKXExecutionClient(LiveExecutionClient):
         if attach_client_order_id is None:
             return
 
-        binding = _OKXAttachedOcoBinding(
+        binding = OKXAttachedOcoBinding(
             parent_client_order_id=parent_order.client_order_id,
             attach_client_order_id=attach_client_order_id,
             instrument_id=parent_order.instrument_id,
@@ -1418,7 +1510,7 @@ class OKXExecutionClient(LiveExecutionClient):
     def _rebuild_attached_oco_binding(
         self,
         client_order_id: ClientOrderId,
-    ) -> _OKXAttachedOcoBinding | None:
+    ) -> OKXAttachedOcoBinding | None:
         order = self._cache.order(client_order_id)
         if order is None:
             return None
@@ -1438,7 +1530,7 @@ class OKXExecutionClient(LiveExecutionClient):
     def _attached_oco_binding(
         self,
         client_order_id: ClientOrderId | None,
-    ) -> _OKXAttachedOcoBinding | None:
+    ) -> OKXAttachedOcoBinding | None:
         if client_order_id is None:
             return None
         binding = self._attached_oco_bindings.get(client_order_id)
@@ -1472,6 +1564,24 @@ class OKXExecutionClient(LiveExecutionClient):
             attach_algo_ord["tp_trigger_px_type"] = self._okx_trigger_type_str(tp_order)
 
         return [attach_algo_ord] if attach_algo_ord else []
+
+    @staticmethod
+    def _attach_algo_ords_from_params(params: dict[str, Any] | None) -> list[dict[str, str]]:
+        raw_attach_algo_ords = params.get("attach_algo_ords") if params else None
+        if raw_attach_algo_ords is None:
+            return []
+        if not isinstance(raw_attach_algo_ords, list | tuple):
+            raise ValueError("OKX attach_algo_ords param must be a list of dicts")
+
+        attach_algo_ords: list[dict[str, str]] = []
+        for raw_item in raw_attach_algo_ords:
+            if not isinstance(raw_item, dict):
+                raise ValueError("OKX attach_algo_ords entries must be dicts")
+            attach_algo_ords.append(
+                {str(key): str(value) for key, value in raw_item.items() if value is not None},
+            )
+
+        return attach_algo_ords
 
     async def _submit_algo_order_http(self, command: SubmitOrder) -> None:
         order = command.order
@@ -1577,7 +1687,9 @@ class OKXExecutionClient(LiveExecutionClient):
             )
 
     async def _batch_cancel_orders(self, command) -> None:
-        regular_orders, algo_orders = self._categorize_orders_for_batch_cancel(command.cancels)
+        regular_orders, algo_orders, http_cancels = self._categorize_orders_for_batch_cancel(
+            command.cancels,
+        )
 
         if regular_orders:
             await self._batch_cancel_regular_orders(regular_orders)
@@ -1585,12 +1697,16 @@ class OKXExecutionClient(LiveExecutionClient):
         if algo_orders:
             await self._batch_cancel_algo_orders(algo_orders)
 
-        if not regular_orders and not algo_orders:
+        if http_cancels:
+            await self._batch_cancel_http_orders(http_cancels)
+
+        if not regular_orders and not algo_orders and not http_cancels:
             self._log.warning("No valid orders to cancel in batch")
 
     def _categorize_orders_for_batch_cancel(self, cancels):
         regular_orders = []
         algo_orders: list[tuple[ClientOrderId, InstrumentId, str]] = []
+        http_cancels = []
 
         for cancel in cancels:
             order = self._cache.order(cancel.client_order_id)
@@ -1604,12 +1720,13 @@ class OKXExecutionClient(LiveExecutionClient):
                 )
                 continue
 
-            # Pending conditional orders must use HTTP algo cancel
-            is_pending_algo = self._is_conditional_order(order) and not self._is_order_triggered(
-                order,
-            )
+            route = self._order_command_route(cancel.instrument_id, order)
 
-            if is_pending_algo:
+            if route is _OKXOrderCommandRoute.SPREAD_HTTP:
+                http_cancels.append((cancel, order))
+                continue
+
+            if route is _OKXOrderCommandRoute.ALGO_HTTP:
                 algo_id = self._resolve_algo_id(order)
                 if algo_id:
                     algo_orders.append((order.client_order_id, cancel.instrument_id, algo_id))
@@ -1633,7 +1750,7 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             regular_orders.append((pyo3_inst_id, pyo3_client_order_id, pyo3_venue_order_id))
 
-        return regular_orders, algo_orders
+        return regular_orders, algo_orders, http_cancels
 
     async def _batch_cancel_regular_orders(self, orders_to_cancel) -> None:
         try:
@@ -1641,6 +1758,10 @@ class OKXExecutionClient(LiveExecutionClient):
             self._log.info(f"Submitted batch cancel for {len(orders_to_cancel)} regular orders")
         except Exception as e:
             self._log.error(f"Failed to batch cancel regular orders: {e}")
+
+    async def _batch_cancel_http_orders(self, http_cancels) -> None:
+        for cancel, order in http_cancels:
+            await self._cancel_order_http(cancel, order)
 
     async def _batch_cancel_algo_orders(
         self,
@@ -1710,13 +1831,20 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             return
 
-        # Pending conditional orders use HTTP algo amend,
-        # triggered conditional orders become regular on OKX
-        is_pending_algo = self._is_conditional_order(order) and not self._is_order_triggered(
-            order,
-        )
+        route = self._order_command_route(order.instrument_id, order)
 
-        if is_pending_algo:
+        if route is _OKXOrderCommandRoute.SPREAD_HTTP:
+            self.generate_order_modify_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                reason="OKX spread orders do not support modify requests",
+                ts_event=self._clock.timestamp_ns(),
+            )
+            return
+
+        if route is _OKXOrderCommandRoute.ALGO_HTTP:
             await self._modify_algo_order_http(command, order)
         else:
             await self._modify_order_websocket(command, order)
@@ -1819,6 +1947,7 @@ class OKXExecutionClient(LiveExecutionClient):
 
         new_px_usd = command.params.get("px_usd") if command.params else None
         new_px_vol = command.params.get("px_vol") if command.params else None
+        speed_bump = command.params.get("speed_bump") if command.params else None
 
         try:
             await self._ws_client.modify_order(
@@ -1831,6 +1960,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 venue_order_id=pyo3_venue_order_id,
                 new_px_usd=str(new_px_usd) if new_px_usd is not None else None,
                 new_px_vol=str(new_px_vol) if new_px_vol is not None else None,
+                speed_bump=str(speed_bump) if speed_bump is not None else None,
             )
         except Exception as e:
             self.generate_order_modify_rejected(
@@ -1842,7 +1972,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
             )
 
-    async def _cancel_order(self, command: CancelOrder) -> None:
+    async def _cancel_order(self, command: CancelOrder) -> None:  # noqa: C901 (too complex)
         order: Order | None = self._cache.order(command.client_order_id)
         if order is None:
             self._log.error(f"{command.client_order_id!r} not found in cache")
@@ -1855,20 +1985,23 @@ class OKXExecutionClient(LiveExecutionClient):
             )
             return
 
+        route = self._order_command_route(command.instrument_id, order)
+
+        if route is _OKXOrderCommandRoute.SPREAD_HTTP:
+            await self._cancel_order_http(command, order)
+            return
+
         try:
             canonical_client_order_id = self._canonical_client_order_id(
                 command.client_order_id,
             )
             alias_lookup_key = canonical_client_order_id or command.client_order_id
 
-            # Pending conditional orders use HTTP algo cancel,
-            # triggered conditional orders become regular on OKX
-            is_pending_algo = self._is_conditional_order(order) and not self._is_order_triggered(
-                order,
+            algo_id = (
+                self._resolve_algo_id(order) if route is _OKXOrderCommandRoute.ALGO_HTTP else None
             )
-            algo_id = self._resolve_algo_id(order) if is_pending_algo else None
 
-            if is_pending_algo and not algo_id:
+            if route is _OKXOrderCommandRoute.ALGO_HTTP and not algo_id:
                 self._log.error(
                     f"Cannot cancel pending algo order {command.client_order_id!r}: "
                     "no algo_id resolved from mapping or venue_order_id",
@@ -1980,6 +2113,47 @@ class OKXExecutionClient(LiveExecutionClient):
                 ts_event=self._clock.timestamp_ns(),
             )
 
+    async def _cancel_order_http(self, command: CancelOrder, order: Order) -> None:
+        try:
+            canonical_client_order_id = self._canonical_client_order_id(
+                command.client_order_id,
+            )
+            resolved_client_order_id = self._exchange_client_order_id(command.client_order_id)
+            client_order_id = resolved_client_order_id or command.client_order_id
+            venue_order_id = command.venue_order_id or order.venue_order_id
+
+            self._log.debug(
+                "Cancelling OKX order over HTTP using exchange id "
+                f"{client_order_id!r} (canonical {canonical_client_order_id!r}, "
+                f"requested {command.client_order_id!r})",
+            )
+
+            response = await self._http_client.cancel_order(
+                instrument_id=nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value),
+                client_order_id=(
+                    nautilus_pyo3.ClientOrderId(client_order_id.value)
+                    if client_order_id is not None
+                    else None
+                ),
+                venue_order_id=(
+                    nautilus_pyo3.VenueOrderId(venue_order_id.value)
+                    if venue_order_id is not None
+                    else None
+                ),
+            )
+
+            if response.get("s_code") and response["s_code"] != "0":
+                raise ValueError(f"OKX API error: {response.get('s_msg', 'Unknown error')}")
+        except Exception as e:
+            self.generate_order_cancel_rejected(
+                strategy_id=order.strategy_id,
+                instrument_id=order.instrument_id,
+                client_order_id=order.client_order_id,
+                venue_order_id=order.venue_order_id,
+                reason=str(e),
+                ts_event=self._clock.timestamp_ns(),
+            )
+
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         if command.order_side != OrderSide.NO_ORDER_SIDE:
             self._log.warning(
@@ -1987,10 +2161,32 @@ class OKXExecutionClient(LiveExecutionClient):
                 f"ignoring order_side={order_side_to_str(command.order_side)} and canceling all orders",
             )
 
-        if self._config.use_mm_mass_cancel:
+        route = self._cancel_all_orders_route(command.instrument_id)
+
+        if route is _OKXCancelAllOrdersRoute.SPREAD_HTTP:
+            await self._cancel_all_orders_http(command)
+        elif route is _OKXCancelAllOrdersRoute.MASS_CANCEL_HTTP:
             await self._cancel_all_orders_mass_cancel(command)
         else:
             await self._cancel_all_orders_individually(command)
+
+    async def _cancel_all_orders_http(self, command: CancelAllOrders) -> None:
+        try:
+            await self._http_client.cancel_all_orders(
+                instrument_id=nautilus_pyo3.InstrumentId.from_str(command.instrument_id.value),
+            )
+        except Exception as e:
+            orders_open = self._cache.orders_open(instrument_id=command.instrument_id)
+            for order in orders_open:
+                if not order.is_closed:
+                    self.generate_order_cancel_rejected(
+                        strategy_id=order.strategy_id,
+                        instrument_id=order.instrument_id,
+                        client_order_id=order.client_order_id,
+                        venue_order_id=order.venue_order_id,
+                        reason=str(e),
+                        ts_event=self._clock.timestamp_ns(),
+                    )
 
     async def _cancel_algo_order_fallback(
         self,
@@ -2069,12 +2265,9 @@ class OKXExecutionClient(LiveExecutionClient):
             if order.is_closed:
                 continue
 
-            # Pending conditional orders must use HTTP algo cancel
-            is_pending_algo = self._is_conditional_order(order) and not self._is_order_triggered(
-                order,
-            )
+            route = self._order_command_route(order.instrument_id, order)
 
-            if is_pending_algo:
+            if route is _OKXOrderCommandRoute.ALGO_HTTP:
                 algo_id = self._resolve_algo_id(order)
                 if algo_id:
                     algo_cancels.append((order.client_order_id, order.instrument_id, algo_id))
@@ -2082,7 +2275,7 @@ class OKXExecutionClient(LiveExecutionClient):
                     self._log.warning(
                         f"No algo_id for conditional order {order.client_order_id!r}, skipping",
                     )
-            else:
+            elif route is _OKXOrderCommandRoute.REGULAR_WS:
                 regular_cancels.append(
                     CancelOrder(
                         trader_id=command.trader_id,
@@ -2094,6 +2287,8 @@ class OKXExecutionClient(LiveExecutionClient):
                         ts_init=command.ts_init,
                     ),
                 )
+            else:
+                continue
 
         self._log.debug(
             f"Canceling {len(regular_cancels)} regular orders and "
@@ -2137,6 +2332,35 @@ class OKXExecutionClient(LiveExecutionClient):
     def _is_conditional_order(self, order: Order) -> bool:
         return order.order_type in self._OKX_CONDITIONAL_ORDER_TYPES
 
+    def _submit_order_route(
+        self,
+        order: Order,
+        instrument: object | None,
+    ) -> _OKXOrderCommandRoute:
+        if self._is_spread_instrument(instrument, order.instrument_id):
+            return _OKXOrderCommandRoute.SPREAD_HTTP
+        if self._is_conditional_order(order):
+            return _OKXOrderCommandRoute.ALGO_HTTP
+        return _OKXOrderCommandRoute.REGULAR_WS
+
+    def _order_command_route(
+        self,
+        instrument_id: InstrumentId,
+        order: Order,
+    ) -> _OKXOrderCommandRoute:
+        if self._is_spread_instrument_id(instrument_id):
+            return _OKXOrderCommandRoute.SPREAD_HTTP
+        if self._is_conditional_order(order) and not self._is_order_triggered(order):
+            return _OKXOrderCommandRoute.ALGO_HTTP
+        return _OKXOrderCommandRoute.REGULAR_WS
+
+    def _cancel_all_orders_route(self, instrument_id: InstrumentId) -> _OKXCancelAllOrdersRoute:
+        if self._is_spread_instrument_id(instrument_id):
+            return _OKXCancelAllOrdersRoute.SPREAD_HTTP
+        if self._config.use_mm_mass_cancel:
+            return _OKXCancelAllOrdersRoute.MASS_CANCEL_HTTP
+        return _OKXCancelAllOrdersRoute.BATCH_WS
+
     @staticmethod
     def _is_order_triggered(order: Order) -> bool:
         # Prefer the sticky is_triggered flag (StopLimit, LimitIfTouched,
@@ -2145,6 +2369,15 @@ class OKXExecutionClient(LiveExecutionClient):
         if hasattr(order, "is_triggered"):
             return order.is_triggered
         return order.filled_qty > 0 or order.status == OrderStatus.TRIGGERED
+
+    @staticmethod
+    def _is_spread_instrument_id(instrument_id: InstrumentId) -> bool:
+        return instrument_id.venue == OKX_VENUE and "_" in instrument_id.symbol.value
+
+    def _is_spread_instrument(self, instrument: object | None, instrument_id: InstrumentId) -> bool:
+        return isinstance(instrument, (CryptoFuturesSpread, CryptoOptionSpread)) or (
+            instrument is None and self._is_spread_instrument_id(instrument_id)
+        )
 
     def _resolve_algo_id(self, order: Order) -> str | None:
         """
@@ -2262,6 +2495,7 @@ class OKXExecutionClient(LiveExecutionClient):
             return [venue_report]
 
         reports: list[OrderStatusReport] = []
+
         for child_client_order_id in child_client_order_ids:
             child_order = self._cache.order(child_client_order_id)
             if child_order is None or not self._is_conditional_order(child_order):
@@ -2936,3 +3170,7 @@ class OKXExecutionClient(LiveExecutionClient):
                 self._client_id_aliases.pop(key, None)
 
         self._client_id_children.pop(canonical, None)
+
+
+def _supports_algo_orders(instrument_type: OKXInstrumentType) -> bool:
+    return instrument_type not in (OKXInstrumentType.OPTION, OKXInstrumentType.EVENTS)

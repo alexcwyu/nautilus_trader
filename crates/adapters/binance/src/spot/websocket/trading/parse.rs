@@ -24,14 +24,19 @@ use nautilus_model::{
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     reports::{FillReport, OrderStatusReport},
-    types::{AccountBalance, Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price},
 };
+use rust_decimal::Decimal;
 
 use super::user_data::{BinanceSpotAccountPositionMsg, BinanceSpotExecutionReport};
 use crate::common::{
     consts::BINANCE_NAUTILUS_SPOT_BROKER_ID,
     encoder::decode_broker_id,
     enums::{BinanceOrderStatus, BinanceSide, BinanceTimeInForce},
+    parse::{
+        parse_required_decimal, parse_required_price_at_precision,
+        parse_required_quantity_at_precision,
+    },
 };
 
 /// Converts a Binance Spot execution report to a Nautilus order status report.
@@ -63,13 +68,27 @@ pub fn parse_spot_exec_report_to_order_status(
     let order_type = parse_spot_order_type(&msg.order_type);
     let time_in_force = parse_time_in_force(msg.time_in_force);
 
-    let quantity: f64 = msg.original_qty.parse().unwrap_or(0.0);
-    let filled_qty: f64 = msg.cumulative_filled_qty.parse().unwrap_or(0.0);
-    let price: f64 = msg.price.parse().unwrap_or(0.0);
+    let quantity =
+        parse_required_quantity_at_precision(&msg.original_qty, size_precision, "original_qty")?;
+    let filled_qty = parse_required_quantity_at_precision(
+        &msg.cumulative_filled_qty,
+        size_precision,
+        "cumulative_filled_qty",
+    )?;
+    let price = parse_required_price_at_precision(&msg.price, price_precision, "price")?;
 
-    let avg_px = if filled_qty > 0.0 {
-        let cum_quote: f64 = msg.cumulative_quote_qty.parse().unwrap_or(0.0);
-        Some(Price::new(cum_quote / filled_qty, price_precision))
+    let filled_qty_decimal =
+        parse_required_decimal(&msg.cumulative_filled_qty, "cumulative_filled_qty")?;
+    let avg_px = if filled_qty_decimal > Decimal::ZERO {
+        let cum_quote = parse_required_decimal(&msg.cumulative_quote_qty, "cumulative_quote_qty")?;
+        let avg_px = cum_quote.checked_div(filled_qty_decimal).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid cumulative_quote_qty='{}' for cumulative_filled_qty='{}': division overflow",
+                msg.cumulative_quote_qty,
+                msg.cumulative_filled_qty,
+            )
+        })?;
+        Some(Price::from_decimal_dp(avg_px, price_precision)?)
     } else {
         None
     };
@@ -83,20 +102,24 @@ pub fn parse_spot_exec_report_to_order_status(
         order_type,
         time_in_force,
         order_status,
-        Quantity::new(quantity, size_precision),
-        Quantity::new(filled_qty, size_precision),
+        quantity,
+        filled_qty,
         ts_event,
         ts_event,
         ts_init,
         None, // report_id
     );
 
-    report.price = Some(Price::new(price, price_precision));
+    report.price = Some(price);
     report.post_only = msg.order_type == "LIMIT_MAKER";
 
-    let stop_price: f64 = msg.stop_price.parse().unwrap_or(0.0);
-    if stop_price > 0.0 {
-        report.trigger_price = Some(Price::new(stop_price, price_precision));
+    let stop_price = parse_required_decimal(&msg.stop_price, "stop_price")?;
+    if stop_price > Decimal::ZERO {
+        report.trigger_price = Some(parse_required_price_at_precision(
+            &msg.stop_price,
+            price_precision,
+            "stop_price",
+        )?);
     }
 
     if let Some(avg) = avg_px {
@@ -138,9 +161,17 @@ pub fn parse_spot_exec_report_to_fill(
         LiquiditySide::Taker
     };
 
-    let last_qty: f64 = msg.last_filled_qty.parse().unwrap_or(0.0);
-    let last_px: f64 = msg.last_filled_price.parse().unwrap_or(0.0);
-    let commission: f64 = msg.commission.parse().unwrap_or(0.0);
+    let last_qty = parse_required_quantity_at_precision(
+        &msg.last_filled_qty,
+        size_precision,
+        "last_filled_qty",
+    )?;
+    let last_px = parse_required_price_at_precision(
+        &msg.last_filled_price,
+        price_precision,
+        "last_filled_price",
+    )?;
+    let commission = parse_required_decimal(&msg.commission, "commission")?;
     let commission_currency = msg
         .commission_asset
         .as_ref()
@@ -154,9 +185,9 @@ pub fn parse_spot_exec_report_to_fill(
         venue_order_id,
         trade_id,
         order_side,
-        Quantity::new(last_qty, size_precision),
-        Price::new(last_px, price_precision),
-        Money::new(commission, commission_currency),
+        last_qty,
+        last_px,
+        Money::from_decimal(commission, commission_currency)?,
         liquidity_side,
         Some(client_order_id),
         None, // venue_position_id
@@ -177,17 +208,10 @@ pub fn parse_spot_account_position(
     let balances: Vec<AccountBalance> = msg
         .balances
         .iter()
-        .map(|b| {
-            let free: f64 = b.free.parse().unwrap_or(0.0);
-            let locked: f64 = b.locked.parse().unwrap_or(0.0);
-            let total = free + locked;
-
+        .filter_map(|b| {
+            let total = b.free + b.locked;
             let currency = Currency::get_or_create_crypto(b.asset.as_str());
-            AccountBalance::new(
-                Money::new(total, currency),
-                Money::new(locked, currency),
-                Money::new(free, currency),
-            )
+            AccountBalance::from_total_and_locked(total, b.locked, currency).ok()
         })
         .collect();
 
@@ -242,6 +266,7 @@ fn parse_time_in_force(tif: BinanceTimeInForce) -> TimeInForce {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::types::Quantity;
     use rstest::rstest;
 
     use super::*;
@@ -279,12 +304,133 @@ mod tests {
         assert_eq!(report.order_side, OrderSide::Buy);
         assert_eq!(report.order_status, OrderStatus::Accepted);
         assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.time_in_force, TimeInForce::Gtc);
         assert_eq!(report.venue_order_id, VenueOrderId::new("12345678"));
         assert_eq!(
             report.client_order_id,
             Some(ClientOrderId::from("O-20200101-000000-000-000-0")),
         );
+        assert_eq!(report.quantity, Quantity::new(1.0, SIZE_PRECISION));
+        assert_eq!(report.filled_qty, Quantity::new(0.0, SIZE_PRECISION));
+        assert_eq!(report.price, Some(Price::new(2500.0, PRICE_PRECISION)));
+        assert!(report.avg_px.is_none());
+        assert!(!report.post_only);
         assert!(report.trigger_price.is_none());
+        assert_eq!(
+            report.ts_accepted,
+            UnixNanos::from(1_709_654_400_000_000_000u64)
+        );
+        assert_eq!(
+            report.ts_last,
+            UnixNanos::from(1_709_654_400_000_000_000u64)
+        );
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_execution_report_to_order_status_rejects_invalid_quantity() {
+        let json = load_fixture_string("spot/user_data_json/execution_report_new.json");
+        let mut msg: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
+        msg.original_qty = "not-a-number".to_string();
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = parse_spot_exec_report_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id,
+            ts_init,
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("original_qty"));
+    }
+
+    #[rstest]
+    fn test_parse_execution_report_limit_maker_sets_post_only() {
+        let json = r#"{
+            "e":"executionReport","E":1709654400000,"s":"ETHUSDT",
+            "c":"x-TD67BGP9-T0000000000000","S":"SELL","o":"LIMIT_MAKER",
+            "f":"GTC","q":"0.5","p":"2600.00","P":"0",
+            "x":"NEW","X":"NEW","r":"NONE","i":12345679,
+            "l":"0","z":"0","L":"0","n":"0","N":null,
+            "T":1709654400000,"t":-1,"w":true,"m":false,
+            "O":1709654400000,"Z":"0","C":""
+        }"#;
+        let msg: BinanceSpotExecutionReport = serde_json::from_str(json).unwrap();
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_spot_exec_report_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert!(report.post_only, "LIMIT_MAKER must set post_only");
+    }
+
+    #[rstest]
+    fn test_parse_execution_report_partial_fill_computes_avg_px() {
+        let json = r#"{
+            "e":"executionReport","E":1709654400000,"s":"ETHUSDT",
+            "c":"x-TD67BGP9-T0000000000000","S":"BUY","o":"LIMIT",
+            "f":"GTC","q":"2.0","p":"2500.00","P":"0",
+            "x":"TRADE","X":"PARTIALLY_FILLED","r":"NONE","i":12345678,
+            "l":"0.5","z":"0.5","L":"2499.00","n":"0.00100000","N":"ETH",
+            "T":1709654400000,"t":98765432,"w":true,"m":false,
+            "O":1709654400000,"Z":"1249.50","C":""
+        }"#;
+        let msg: BinanceSpotExecutionReport = serde_json::from_str(json).unwrap();
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let report = parse_spot_exec_report_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.quantity, Quantity::new(2.0, SIZE_PRECISION));
+        assert_eq!(report.filled_qty, Quantity::new(0.5, SIZE_PRECISION));
+
+        // avg_px = cum_quote / filled_qty = 1249.50 / 0.5 = 2499.00
+        assert_eq!(report.avg_px.unwrap().to_string(), "2499.00");
+    }
+
+    #[rstest]
+    fn test_parse_execution_report_rejects_overflowing_avg_px() {
+        let json = load_fixture_string("spot/user_data_json/execution_report_trade.json");
+        let mut msg: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
+        msg.cumulative_quote_qty = Decimal::MAX.to_string();
+        msg.cumulative_filled_qty = "0.00000001".to_string();
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = parse_spot_exec_report_to_order_status(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id,
+            ts_init,
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("cumulative_quote_qty"));
+        assert!(error.contains("division overflow"));
     }
 
     #[rstest]
@@ -346,6 +492,27 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_execution_report_to_fill_rejects_invalid_commission() {
+        let json = load_fixture_string("spot/user_data_json/execution_report_trade.json");
+        let mut msg: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
+        msg.commission = "not-a-number".to_string();
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let result = parse_spot_exec_report_to_fill(
+            &msg,
+            instrument_id(),
+            PRICE_PRECISION,
+            SIZE_PRECISION,
+            account_id,
+            ts_init,
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("commission"));
+    }
+
+    #[rstest]
     fn test_parse_account_position() {
         let json = load_fixture_string("spot/user_data_json/account_position.json");
         let msg: BinanceSpotAccountPositionMsg = serde_json::from_str(&json).unwrap();
@@ -358,5 +525,31 @@ mod tests {
         assert_eq!(state.account_type, AccountType::Cash);
         assert!(state.is_reported);
         assert_eq!(state.balances.len(), 2);
+    }
+
+    // Regression for the #3867 bug class: WS `free` and `locked` with more decimal places
+    // than the asset's currency precision used to trip the invariant when Money::new rounded
+    // each side independently.
+    #[rstest]
+    fn test_parse_account_position_precision_drift() {
+        let json = r#"{
+            "e": "outboundAccountPosition",
+            "E": 1700000000000,
+            "u": 1700000000000,
+            "B": [{
+                "a": "ETH",
+                "f": "9.999999994999",
+                "l": "0.000000040000"
+            }]
+        }"#;
+        let msg: BinanceSpotAccountPositionMsg = serde_json::from_str(json).unwrap();
+        let account_id = AccountId::from("BINANCE-001");
+        let ts_init = UnixNanos::from(1_000_000_000u64);
+
+        let state = parse_spot_account_position(&msg, account_id, ts_init);
+
+        assert_eq!(state.balances.len(), 1);
+        let balance = &state.balances[0];
+        assert_eq!(balance.total.raw, balance.locked.raw + balance.free.raw);
     }
 }

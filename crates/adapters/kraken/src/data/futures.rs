@@ -52,7 +52,7 @@ use nautilus_core::{
 use nautilus_model::{
     data::{Data, OrderBookDeltas, OrderBookDeltas_API, QuoteTick},
     enums::BookType,
-    identifiers::{ClientId, InstrumentId, Symbol, Venue},
+    identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
 };
@@ -60,7 +60,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    common::consts::KRAKEN_VENUE,
+    common::{consts::KRAKEN_VENUE, lookup_instrument_in_snapshot},
     config::KrakenDataClientConfig,
     http::{
         KrakenFuturesHttpClient, futures::client::KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND,
@@ -108,15 +108,18 @@ impl KrakenFuturesDataClient {
             None,
             None,
             None,
-            config.http_proxy.clone(),
+            config.proxy_url.clone(),
             config
                 .max_requests_per_second
                 .unwrap_or(KRAKEN_FUTURES_DEFAULT_RATE_LIMIT_PER_SECOND),
         )?;
 
-        let ws = KrakenFuturesWebSocketClient::new(
+        let ws = KrakenFuturesWebSocketClient::with_credentials(
             config.ws_public_url(),
             config.heartbeat_interval_secs,
+            None,
+            config.transport_backend,
+            config.proxy_url.clone(),
         );
 
         Ok(Self {
@@ -234,15 +237,7 @@ impl KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn lookup_instrument(
-        instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-        product_id: &str,
-    ) -> Option<InstrumentAny> {
-        let instrument_id = InstrumentId::new(Symbol::new(product_id), *KRAKEN_VENUE);
-        instruments.load().get(&instrument_id).cloned()
-    }
-
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn handle_ws_message(
         msg: KrakenFuturesWsMessage,
         sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -258,39 +253,42 @@ impl KrakenFuturesDataClient {
 
         match msg {
             KrakenFuturesWsMessage::Ticker(ticker) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, ticker.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, ticker.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", ticker.product_id);
                     return;
                 };
 
-                if let Some(mark) = parse_futures_ws_mark_price(&ticker, &instrument, ts_init)
+                if let Some(mark) = parse_futures_ws_mark_price(&ticker, instrument, ts_init)
                     && let Err(e) = sender.send(DataEvent::Data(Data::MarkPriceUpdate(mark)))
                 {
                     log::error!("Failed to send mark price: {e}");
                 }
 
-                if let Some(index) = parse_futures_ws_index_price(&ticker, &instrument, ts_init)
+                if let Some(index) = parse_futures_ws_index_price(&ticker, instrument, ts_init)
                     && let Err(e) = sender.send(DataEvent::Data(Data::IndexPriceUpdate(index)))
                 {
                     log::error!("Failed to send index price: {e}");
                 }
 
-                if let Some(funding) = parse_futures_ws_funding_rate(&ticker, &instrument, ts_init)
+                if let Some(funding) = parse_futures_ws_funding_rate(&ticker, instrument, ts_init)
                     && let Err(e) = sender.send(DataEvent::FundingRate(funding))
                 {
                     log::error!("Failed to send funding rate: {e}");
                 }
             }
             KrakenFuturesWsMessage::Trade(trade) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, trade.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, trade.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", trade.product_id);
                     return;
                 };
-                match parse_futures_ws_trade_tick(&trade, &instrument, ts_init) {
+
+                match parse_futures_ws_trade_tick(&trade, instrument, ts_init) {
                     Ok(tick) => {
                         if let Err(e) = sender.send(DataEvent::Data(Data::Trade(tick))) {
                             log::error!("Failed to send trade: {e}");
@@ -300,19 +298,18 @@ impl KrakenFuturesDataClient {
                 }
             }
             KrakenFuturesWsMessage::BookSnapshot(snapshot) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, snapshot.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, snapshot.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", snapshot.product_id);
                     return;
                 };
                 let instrument_id = instrument.id();
                 let sequence = book_sequence.load(Ordering::Relaxed);
+
                 match parse_futures_ws_book_snapshot_deltas(
-                    &snapshot,
-                    &instrument,
-                    sequence,
-                    ts_init,
+                    &snapshot, instrument, sequence, ts_init,
                 ) {
                     Ok(delta_vec) => {
                         if delta_vec.is_empty() {
@@ -354,15 +351,16 @@ impl KrakenFuturesDataClient {
                 }
             }
             KrakenFuturesWsMessage::BookDelta(delta) => {
+                let instruments = instruments.load();
                 let Some(instrument) =
-                    Self::lookup_instrument(instruments, delta.product_id.as_str())
+                    lookup_instrument_in_snapshot(&instruments, delta.product_id.as_str())
                 else {
                     log::warn!("No instrument for product_id: {}", delta.product_id);
                     return;
                 };
                 let instrument_id = instrument.id();
                 let sequence = book_sequence.fetch_add(1, Ordering::Relaxed);
-                match parse_futures_ws_book_delta(&delta, &instrument, sequence, ts_init) {
+                match parse_futures_ws_book_delta(&delta, instrument, sequence, ts_init) {
                     Ok(book_delta) => {
                         let deltas = OrderBookDeltas::new(instrument_id, vec![book_delta]);
 
@@ -564,17 +562,17 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_instruments(&mut self, _cmd: &SubscribeInstruments) -> anyhow::Result<()> {
+    fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
         log::debug!("subscribe_instruments: Kraken instruments are fetched via HTTP on connect");
         Ok(())
     }
 
-    fn subscribe_instrument(&mut self, _cmd: &SubscribeInstrument) -> anyhow::Result<()> {
+    fn subscribe_instrument(&mut self, _cmd: SubscribeInstrument) -> anyhow::Result<()> {
         log::debug!("subscribe_instrument: Kraken instruments are fetched via HTTP on connect");
         Ok(())
     }
 
-    fn subscribe_book_deltas(&mut self, cmd: &SubscribeBookDeltas) -> anyhow::Result<()> {
+    fn subscribe_book_deltas(&mut self, cmd: SubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let depth = cmd.depth;
 
@@ -602,7 +600,7 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_quotes(&mut self, cmd: &SubscribeQuotes) -> anyhow::Result<()> {
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -621,7 +619,7 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_trades(&mut self, cmd: &SubscribeTrades) -> anyhow::Result<()> {
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -638,7 +636,7 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_mark_prices(&mut self, cmd: &SubscribeMarkPrices) -> anyhow::Result<()> {
+    fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -655,7 +653,7 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_index_prices(&mut self, cmd: &SubscribeIndexPrices) -> anyhow::Result<()> {
+    fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -672,7 +670,7 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_funding_rates(&mut self, cmd: &SubscribeFundingRates) -> anyhow::Result<()> {
+    fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         let ws = self.ws.clone();
 
@@ -689,7 +687,7 @@ impl DataClient for KrakenFuturesDataClient {
         Ok(())
     }
 
-    fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
+    fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
         log::warn!(
             "Cannot subscribe to {} bars: Kraken Futures does not support EXTERNAL bar streaming",
             cmd.bar_type
@@ -699,7 +697,7 @@ impl DataClient for KrakenFuturesDataClient {
 
     fn subscribe_instrument_status(
         &mut self,
-        cmd: &SubscribeInstrumentStatus,
+        cmd: SubscribeInstrumentStatus,
     ) -> anyhow::Result<()> {
         log::info!(
             "subscribe_instrument_status: {} (status changes detected via periodic instrument polling)",
@@ -1098,11 +1096,13 @@ impl DataClient for KrakenFuturesDataClient {
 #[cfg(test)]
 mod tests {
     use nautilus_common::{live::runner::set_data_event_sender, messages::DataEvent};
-    use nautilus_model::identifiers::ClientId;
     use rstest::rstest;
 
     use super::*;
-    use crate::{common::enums::KrakenProductType, config::KrakenDataClientConfig};
+    use crate::{
+        common::{consts::KRAKEN_CLIENT_ID, enums::KrakenProductType},
+        config::KrakenDataClientConfig,
+    };
 
     fn setup_test_env() {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
@@ -1116,11 +1116,11 @@ mod tests {
             product_type: KrakenProductType::Futures,
             ..Default::default()
         };
-        let client = KrakenFuturesDataClient::new(ClientId::from("KRAKEN"), config);
+        let client = KrakenFuturesDataClient::new(*KRAKEN_CLIENT_ID, config);
         assert!(client.is_ok());
 
         let client = client.unwrap();
-        assert_eq!(client.client_id(), ClientId::from("KRAKEN"));
+        assert_eq!(client.client_id(), *KRAKEN_CLIENT_ID);
         assert_eq!(client.venue(), Some(*KRAKEN_VENUE));
         assert!(!client.is_connected());
         assert!(client.is_disconnected());
@@ -1134,7 +1134,7 @@ mod tests {
             product_type: KrakenProductType::Futures,
             ..Default::default()
         };
-        let mut client = KrakenFuturesDataClient::new(ClientId::from("KRAKEN"), config).unwrap();
+        let mut client = KrakenFuturesDataClient::new(*KRAKEN_CLIENT_ID, config).unwrap();
 
         assert!(client.start().is_ok());
         assert!(client.stop().is_ok());

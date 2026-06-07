@@ -15,7 +15,7 @@
 
 //! Python bindings from [PyO3](https://pyo3.rs).
 
-#![allow(
+#![expect(
     clippy::missing_errors_doc,
     reason = "errors documented on underlying Rust methods"
 )]
@@ -121,11 +121,14 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::AggressorSide>()?;
     m.add_class::<crate::enums::AssetClass>()?;
     m.add_class::<crate::enums::BarAggregation>()?;
+    m.add_class::<crate::enums::BarIntervalType>()?;
     m.add_class::<crate::enums::BetSide>()?;
     m.add_class::<crate::enums::BookAction>()?;
     m.add_class::<crate::enums::BookType>()?;
     m.add_class::<crate::enums::ContingencyType>()?;
+    m.add_class::<crate::enums::ContinuousFutureAdjustmentType>()?;
     m.add_class::<crate::enums::CurrencyType>()?;
+    m.add_class::<crate::enums::GreeksConvention>()?;
     m.add_class::<crate::enums::InstrumentClass>()?;
     m.add_class::<crate::enums::InstrumentCloseType>()?;
     m.add_class::<crate::enums::LiquiditySide>()?;
@@ -178,13 +181,19 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::reports::mass_status::ExecutionMassStatus>()?;
     // Position
     m.add_class::<crate::position::Position>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::position::py_fold_net_position,
+        m
+    )?)?;
     // Instruments
     m.add_class::<crate::instruments::BettingInstrument>()?;
     m.add_class::<crate::instruments::BinaryOption>()?;
     m.add_class::<crate::instruments::Cfd>()?;
     m.add_class::<crate::instruments::Commodity>()?;
     m.add_class::<crate::instruments::CryptoFuture>()?;
+    m.add_class::<crate::instruments::CryptoFuturesSpread>()?;
     m.add_class::<crate::instruments::CryptoOption>()?;
+    m.add_class::<crate::instruments::CryptoOptionSpread>()?;
     m.add_class::<crate::instruments::CryptoPerpetual>()?;
     m.add_class::<crate::instruments::CurrencyPair>()?;
     m.add_class::<crate::instruments::Equity>()?;
@@ -233,6 +242,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::events::PositionClosed>()?;
     m.add_class::<crate::events::PositionAdjusted>()?;
     m.add_class::<crate::events::PositionSnapshot>()?;
+    m.add_class::<crate::events::PortfolioSnapshot>()?;
     // Accounts
     m.add_class::<crate::accounts::BettingAccount>()?;
     m.add_class::<crate::accounts::CashAccount>()?;
@@ -279,7 +289,9 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<crate::defi::data::PoolFlash>()?;
         m.add_class::<crate::defi::data::Transaction>()?;
         m.add_class::<crate::defi::data::Block>()?;
+        m.add_class::<crate::defi::data::DefiData>()?;
         m.add_class::<crate::defi::dex::DexType>()?;
+        m.add_class::<crate::defi::pool_analysis::PoolSnapshot>()?;
         m.add_class::<crate::defi::pool_analysis::PoolProfiler>()?;
     }
     Ok(())

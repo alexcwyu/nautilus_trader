@@ -206,7 +206,7 @@ impl WsDispatchState {
 }
 
 /// Top-level dispatch for all BitMEX WebSocket messages on the execution stream.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub fn dispatch_ws_message(
     ts_init: UnixNanos,
     message: BitmexWsMessage,
@@ -238,6 +238,7 @@ pub fn dispatch_ws_message(
                     state,
                     instruments_by_symbol,
                     order_symbol_cache,
+                    account_id,
                     ts_init,
                 );
             }
@@ -251,22 +252,26 @@ pub fn dispatch_ws_message(
                         );
                         continue;
                     };
-                    let report = parse_position_msg(&pos_msg, instrument, ts_init);
+                    let mut report = parse_position_msg(&pos_msg, instrument, ts_init);
+                    report.account_id = account_id;
                     emitter.send_position_report(report);
                 }
             }
             BitmexTableMessage::Wallet { data, .. } => {
                 if !state.margin_subscribed.load(Ordering::Relaxed) {
                     for wallet_msg in data {
-                        let acct_state = parse_wallet_msg(&wallet_msg, ts_init);
+                        let mut acct_state = parse_wallet_msg(&wallet_msg, ts_init);
+                        acct_state.account_id = account_id;
                         emitter.send_account_state(acct_state);
                     }
                 }
             }
             BitmexTableMessage::Margin { data, .. } => {
                 state.margin_subscribed.store(true, Ordering::Relaxed);
+
                 for margin_msg in data {
-                    let acct_state = parse_margin_account_state(&margin_msg, ts_init);
+                    let mut acct_state = parse_margin_account_state(&margin_msg, ts_init);
+                    acct_state.account_id = account_id;
                     emitter.send_account_state(acct_state);
                 }
             }
@@ -322,7 +327,7 @@ pub fn dispatch_ws_message(
 
 /// Dispatches order messages, routing tracked orders to events and untracked
 /// orders to reports.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn dispatch_order_messages(
     data: Vec<OrderData>,
     emitter: &ExecutionEventEmitter,
@@ -409,13 +414,14 @@ fn dispatch_order_messages(
                 } else {
                     // Untracked order: fall back to report
                     match parse_order_msg(&order_msg, instrument, order_type_cache, ts_init) {
-                        Ok(report) => {
+                        Ok(mut report) => {
                             if report.order_status.is_closed()
                                 && let Some(cid) = report.client_order_id
                             {
                                 order_type_cache.remove(&cid);
                                 order_symbol_cache.remove(&cid);
                             }
+                            report.account_id = account_id;
                             emitter.send_order_status_report(report);
                         }
                         Err(e) => {
@@ -509,6 +515,7 @@ fn dispatch_execution_messages(
     state: &WsDispatchState,
     instruments_by_symbol: &AHashMap<Ustr, InstrumentAny>,
     order_symbol_cache: &AHashMap<ClientOrderId, Ustr>,
+    account_id: AccountId,
     ts_init: UnixNanos,
 ) {
     for exec_msg in data {
@@ -565,9 +572,10 @@ fn dispatch_execution_messages(
             continue;
         };
 
-        let Some(fill) = parse_execution_msg(exec_msg, instrument, ts_init) else {
+        let Some(mut fill) = parse_execution_msg(exec_msg, instrument, ts_init) else {
             continue;
         };
+        fill.account_id = account_id;
 
         let identity = fill
             .client_order_id
@@ -605,7 +613,7 @@ fn dispatch_execution_messages(
 ///
 /// Guarantees the `Submitted -> Accepted -> ...` lifecycle by synthesizing
 /// `OrderAccepted` before any other event when one has not yet been emitted.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn dispatch_parsed_order_event(
     event: ParsedOrderEvent,
     client_order_id: ClientOrderId,

@@ -23,23 +23,23 @@ use anyhow::Context;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Duration, NaiveDate};
 use futures_util::{StreamExt, pin_mut};
-use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, formatting::Separable};
+use nautilus_core::{UnixNanos, datetime::unix_nanos_to_iso8601, string::formatting::Separable};
 use nautilus_model::{
     data::{
-        Bar, BarType, Data, OrderBookDelta, OrderBookDeltas_API, OrderBookDepth10, QuoteTick,
-        TradeTick,
+        Bar, BarType, CatalogPathPrefix, Data, OptionGreeks, OrderBookDelta, OrderBookDeltas_API,
+        OrderBookDepth10, QuoteTick, TradeTick,
     },
     identifiers::InstrumentId,
 };
 use nautilus_serialization::arrow::{
     bars_to_arrow_record_batch_bytes, book_deltas_to_arrow_record_batch_bytes,
-    book_depth10_to_arrow_record_batch_bytes, quotes_to_arrow_record_batch_bytes,
-    trades_to_arrow_record_batch_bytes,
+    book_depth10_to_arrow_record_batch_bytes, option_greeks_to_arrow_record_batch_bytes,
+    quotes_to_arrow_record_batch_bytes, trades_to_arrow_record_batch_bytes,
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 
 use crate::{
-    config::{BookSnapshotOutput, TardisReplayConfig},
+    config::{BookSnapshotOutput, ParquetCompression, TardisReplayConfig},
     http::TardisHttpClient,
     machine::TardisMachineClient,
 };
@@ -109,12 +109,29 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
         .unwrap_or(BookSnapshotOutput::Deltas);
     log::info!("book_snapshot_output={book_snapshot_output:?}");
 
-    let http_client = TardisHttpClient::new(None, None, None, normalize_symbols)?;
+    let extract_bbo_as_quotes = config.extract_bbo_as_quotes.unwrap_or(false);
+    log::info!("extract_bbo_as_quotes={extract_bbo_as_quotes}");
+
+    let compression = config
+        .compression
+        .clone()
+        .unwrap_or(ParquetCompression::Zstd);
+    log::info!("compression={compression:?}");
+    let compression = compression.as_parquet_compression();
+
+    let http_client = TardisHttpClient::new(
+        None,
+        None,
+        None,
+        normalize_symbols,
+        config.proxy_url.clone(),
+    )?;
     let mut machine_client = TardisMachineClient::new(
         config.tardis_ws_url.as_deref(),
         normalize_symbols,
         book_snapshot_output,
     )?;
+    machine_client.extract_bbo_as_quotes = extract_bbo_as_quotes;
 
     let exchanges: AHashSet<_> = config.options.iter().map(|opt| opt.exchange).collect();
     let (instrument_map, _instruments) = http_client
@@ -136,6 +153,7 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
     let mut quotes_cursors: AHashMap<InstrumentId, DateCursor> = AHashMap::new();
     let mut trades_cursors: AHashMap<InstrumentId, DateCursor> = AHashMap::new();
     let mut bars_cursors: AHashMap<BarType, DateCursor> = AHashMap::new();
+    let mut greeks_cursors: AHashMap<InstrumentId, DateCursor> = AHashMap::new();
 
     // Initialize date collection maps
     let mut deltas_map: AHashMap<InstrumentId, Vec<OrderBookDelta>> = AHashMap::new();
@@ -143,6 +161,7 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
     let mut quotes_map: AHashMap<InstrumentId, Vec<QuoteTick>> = AHashMap::new();
     let mut trades_map: AHashMap<InstrumentId, Vec<TradeTick>> = AHashMap::new();
     let mut bars_map: AHashMap<BarType, Vec<Bar>> = AHashMap::new();
+    let mut greeks_map: AHashMap<InstrumentId, Vec<OptionGreeks>> = AHashMap::new();
 
     let mut msg_count = 0;
 
@@ -151,32 +170,73 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
             Ok(msg) => {
                 match msg {
                     Data::Deltas(msg) => {
-                        handle_deltas_msg(&msg, &mut deltas_map, &mut deltas_cursors, &path);
+                        handle_deltas_msg(
+                            &msg,
+                            &mut deltas_map,
+                            &mut deltas_cursors,
+                            &path,
+                            compression,
+                        );
                     }
                     Data::Depth10(msg) => {
-                        handle_depth10_msg(*msg, &mut depths_map, &mut depths_cursors, &path);
+                        handle_depth10_msg(
+                            *msg,
+                            &mut depths_map,
+                            &mut depths_cursors,
+                            &path,
+                            compression,
+                        );
                     }
                     Data::Quote(msg) => {
-                        handle_quote_msg(msg, &mut quotes_map, &mut quotes_cursors, &path);
+                        handle_quote_msg(
+                            msg,
+                            &mut quotes_map,
+                            &mut quotes_cursors,
+                            &path,
+                            compression,
+                        );
                     }
                     Data::Trade(msg) => {
-                        handle_trade_msg(msg, &mut trades_map, &mut trades_cursors, &path);
+                        handle_trade_msg(
+                            msg,
+                            &mut trades_map,
+                            &mut trades_cursors,
+                            &path,
+                            compression,
+                        );
                     }
-                    Data::Bar(msg) => handle_bar_msg(msg, &mut bars_map, &mut bars_cursors, &path),
+                    Data::Bar(msg) => {
+                        handle_bar_msg(msg, &mut bars_map, &mut bars_cursors, &path, compression);
+                    }
                     Data::Delta(delta) => {
                         log::warn!(
                             "Skipping individual delta message for {} (use Deltas batch instead)",
                             delta.instrument_id
                         );
                     }
+                    Data::OptionGreeks(msg) => {
+                        handle_option_greeks_msg(
+                            msg,
+                            &mut greeks_map,
+                            &mut greeks_cursors,
+                            &path,
+                            compression,
+                        );
+                    }
                     Data::MarkPriceUpdate(_)
                     | Data::IndexPriceUpdate(_)
+                    | Data::FundingRateUpdate(_)
+                    | Data::InstrumentStatus(_)
                     | Data::InstrumentClose(_)
                     | Data::Custom(_) => {
                         log::debug!(
                             "Skipping unsupported data type for instrument {}",
                             msg.instrument_id()
                         );
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        log::debug!("Skipping unsupported data type");
                     }
                 }
 
@@ -196,27 +256,32 @@ pub async fn run_tardis_machine_replay_from_config(config_filepath: &Path) -> an
 
     for (instrument_id, deltas) in &deltas_map {
         let cursor = deltas_cursors.get(instrument_id).expect("Expected cursor");
-        batch_and_write_deltas(deltas, instrument_id, cursor.date_utc, &path);
+        batch_and_write_deltas(deltas, instrument_id, cursor.date_utc, &path, compression);
     }
 
     for (instrument_id, depths) in &depths_map {
         let cursor = depths_cursors.get(instrument_id).expect("Expected cursor");
-        batch_and_write_depths(depths, instrument_id, cursor.date_utc, &path);
+        batch_and_write_depths(depths, instrument_id, cursor.date_utc, &path, compression);
     }
 
     for (instrument_id, quotes) in &quotes_map {
         let cursor = quotes_cursors.get(instrument_id).expect("Expected cursor");
-        batch_and_write_quotes(quotes, instrument_id, cursor.date_utc, &path);
+        batch_and_write_quotes(quotes, instrument_id, cursor.date_utc, &path, compression);
     }
 
     for (instrument_id, trades) in &trades_map {
         let cursor = trades_cursors.get(instrument_id).expect("Expected cursor");
-        batch_and_write_trades(trades, instrument_id, cursor.date_utc, &path);
+        batch_and_write_trades(trades, instrument_id, cursor.date_utc, &path, compression);
     }
 
     for (bar_type, bars) in &bars_map {
         let cursor = bars_cursors.get(bar_type).expect("Expected cursor");
-        batch_and_write_bars(bars, bar_type, cursor.date_utc, &path);
+        batch_and_write_bars(bars, bar_type, cursor.date_utc, &path, compression);
+    }
+
+    for (instrument_id, greeks) in &greeks_map {
+        let cursor = greeks_cursors.get(instrument_id).expect("Expected cursor");
+        batch_and_write_greeks(greeks, instrument_id, cursor.date_utc, &path, compression);
     }
 
     log::info!(
@@ -231,6 +296,7 @@ fn handle_deltas_msg(
     map: &mut AHashMap<InstrumentId, Vec<OrderBookDelta>>,
     cursors: &mut AHashMap<InstrumentId, DateCursor>,
     path: &Path,
+    compression: Compression,
 ) {
     let cursor = cursors
         .entry(deltas.instrument_id)
@@ -238,7 +304,13 @@ fn handle_deltas_msg(
 
     if deltas.ts_init > cursor.end_ns {
         if let Some(deltas_vec) = map.remove(&deltas.instrument_id) {
-            batch_and_write_deltas(&deltas_vec, &deltas.instrument_id, cursor.date_utc, path);
+            batch_and_write_deltas(
+                &deltas_vec,
+                &deltas.instrument_id,
+                cursor.date_utc,
+                path,
+                compression,
+            );
         }
         // Update cursor
         *cursor = DateCursor::new(deltas.ts_init);
@@ -254,6 +326,7 @@ fn handle_depth10_msg(
     map: &mut AHashMap<InstrumentId, Vec<OrderBookDepth10>>,
     cursors: &mut AHashMap<InstrumentId, DateCursor>,
     path: &Path,
+    compression: Compression,
 ) {
     let cursor = cursors
         .entry(depth10.instrument_id)
@@ -261,7 +334,13 @@ fn handle_depth10_msg(
 
     if depth10.ts_init > cursor.end_ns {
         if let Some(depths_vec) = map.remove(&depth10.instrument_id) {
-            batch_and_write_depths(&depths_vec, &depth10.instrument_id, cursor.date_utc, path);
+            batch_and_write_depths(
+                &depths_vec,
+                &depth10.instrument_id,
+                cursor.date_utc,
+                path,
+                compression,
+            );
         }
         // Update cursor
         *cursor = DateCursor::new(depth10.ts_init);
@@ -277,6 +356,7 @@ fn handle_quote_msg(
     map: &mut AHashMap<InstrumentId, Vec<QuoteTick>>,
     cursors: &mut AHashMap<InstrumentId, DateCursor>,
     path: &Path,
+    compression: Compression,
 ) {
     let cursor = cursors
         .entry(quote.instrument_id)
@@ -284,7 +364,13 @@ fn handle_quote_msg(
 
     if quote.ts_init > cursor.end_ns {
         if let Some(quotes_vec) = map.remove(&quote.instrument_id) {
-            batch_and_write_quotes(&quotes_vec, &quote.instrument_id, cursor.date_utc, path);
+            batch_and_write_quotes(
+                &quotes_vec,
+                &quote.instrument_id,
+                cursor.date_utc,
+                path,
+                compression,
+            );
         }
         // Update cursor
         *cursor = DateCursor::new(quote.ts_init);
@@ -300,6 +386,7 @@ fn handle_trade_msg(
     map: &mut AHashMap<InstrumentId, Vec<TradeTick>>,
     cursors: &mut AHashMap<InstrumentId, DateCursor>,
     path: &Path,
+    compression: Compression,
 ) {
     let cursor = cursors
         .entry(trade.instrument_id)
@@ -307,7 +394,13 @@ fn handle_trade_msg(
 
     if trade.ts_init > cursor.end_ns {
         if let Some(trades_vec) = map.remove(&trade.instrument_id) {
-            batch_and_write_trades(&trades_vec, &trade.instrument_id, cursor.date_utc, path);
+            batch_and_write_trades(
+                &trades_vec,
+                &trade.instrument_id,
+                cursor.date_utc,
+                path,
+                compression,
+            );
         }
         // Update cursor
         *cursor = DateCursor::new(trade.ts_init);
@@ -323,6 +416,7 @@ fn handle_bar_msg(
     map: &mut AHashMap<BarType, Vec<Bar>>,
     cursors: &mut AHashMap<BarType, DateCursor>,
     path: &Path,
+    compression: Compression,
 ) {
     let cursor = cursors
         .entry(bar.bar_type)
@@ -330,7 +424,7 @@ fn handle_bar_msg(
 
     if bar.ts_init > cursor.end_ns {
         if let Some(bars_vec) = map.remove(&bar.bar_type) {
-            batch_and_write_bars(&bars_vec, &bar.bar_type, cursor.date_utc, path);
+            batch_and_write_bars(&bars_vec, &bar.bar_type, cursor.date_utc, path, compression);
         }
         // Update cursor
         *cursor = DateCursor::new(bar.ts_init);
@@ -341,14 +435,52 @@ fn handle_bar_msg(
         .push(bar);
 }
 
+fn handle_option_greeks_msg(
+    greeks: OptionGreeks,
+    map: &mut AHashMap<InstrumentId, Vec<OptionGreeks>>,
+    cursors: &mut AHashMap<InstrumentId, DateCursor>,
+    path: &Path,
+    compression: Compression,
+) {
+    let cursor = cursors
+        .entry(greeks.instrument_id)
+        .or_insert_with(|| DateCursor::new(greeks.ts_init));
+
+    if greeks.ts_init > cursor.end_ns {
+        if let Some(greeks_vec) = map.remove(&greeks.instrument_id) {
+            batch_and_write_greeks(
+                &greeks_vec,
+                &greeks.instrument_id,
+                cursor.date_utc,
+                path,
+                compression,
+            );
+        }
+        // Update cursor
+        *cursor = DateCursor::new(greeks.ts_init);
+    }
+
+    map.entry(greeks.instrument_id)
+        .or_insert_with(|| Vec::with_capacity(100_000))
+        .push(greeks);
+}
+
 fn batch_and_write_deltas(
     deltas: &[OrderBookDelta],
     instrument_id: &InstrumentId,
     date: NaiveDate,
     path: &Path,
+    compression: Compression,
 ) {
     match book_deltas_to_arrow_record_batch_bytes(deltas) {
-        Ok(batch) => write_batch(&batch, "order_book_deltas", instrument_id, date, path),
+        Ok(batch) => write_batch(
+            &batch,
+            "order_book_deltas",
+            instrument_id,
+            date,
+            path,
+            compression,
+        ),
         Err(e) => {
             log::error!("Error converting OrderBookDeltas to Arrow: {e:?}");
         }
@@ -360,9 +492,17 @@ fn batch_and_write_depths(
     instrument_id: &InstrumentId,
     date: NaiveDate,
     path: &Path,
+    compression: Compression,
 ) {
     match book_depth10_to_arrow_record_batch_bytes(depths) {
-        Ok(batch) => write_batch(&batch, "order_book_depths", instrument_id, date, path),
+        Ok(batch) => write_batch(
+            &batch,
+            "order_book_depths",
+            instrument_id,
+            date,
+            path,
+            compression,
+        ),
         Err(e) => {
             log::error!("Error converting OrderBookDepth10 to Arrow: {e:?}");
         }
@@ -374,9 +514,17 @@ fn batch_and_write_quotes(
     instrument_id: &InstrumentId,
     date: NaiveDate,
     path: &Path,
+    compression: Compression,
 ) {
     match quotes_to_arrow_record_batch_bytes(quotes) {
-        Ok(batch) => write_batch(&batch, "quote_tick", instrument_id, date, path),
+        Ok(batch) => write_batch(
+            &batch,
+            QuoteTick::path_prefix(),
+            instrument_id,
+            date,
+            path,
+            compression,
+        ),
         Err(e) => {
             log::error!("Error converting QuoteTick to Arrow: {e:?}");
         }
@@ -388,16 +536,23 @@ fn batch_and_write_trades(
     instrument_id: &InstrumentId,
     date: NaiveDate,
     path: &Path,
+    compression: Compression,
 ) {
     match trades_to_arrow_record_batch_bytes(trades) {
-        Ok(batch) => write_batch(&batch, "trade_tick", instrument_id, date, path),
+        Ok(batch) => write_batch(&batch, "trade_tick", instrument_id, date, path, compression),
         Err(e) => {
             log::error!("Error converting TradeTick to Arrow: {e:?}");
         }
     }
 }
 
-fn batch_and_write_bars(bars: &[Bar], bar_type: &BarType, date: NaiveDate, path: &Path) {
+fn batch_and_write_bars(
+    bars: &[Bar],
+    bar_type: &BarType,
+    date: NaiveDate,
+    path: &Path,
+    compression: Compression,
+) {
     let batch = match bars_to_arrow_record_batch_bytes(bars) {
         Ok(batch) => batch,
         Err(e) => {
@@ -407,10 +562,32 @@ fn batch_and_write_bars(bars: &[Bar], bar_type: &BarType, date: NaiveDate, path:
     };
 
     let filepath = path.join(parquet_filepath_bars(bar_type, date));
-    if let Err(e) = write_parquet_local(&batch, &filepath) {
+    if let Err(e) = write_parquet_local(&batch, &filepath, compression) {
         log::error!("Error writing {}: {e}", filepath.display());
     } else {
         log::info!("File written: {}", filepath.display());
+    }
+}
+
+fn batch_and_write_greeks(
+    greeks: &[OptionGreeks],
+    instrument_id: &InstrumentId,
+    date: NaiveDate,
+    path: &Path,
+    compression: Compression,
+) {
+    match option_greeks_to_arrow_record_batch_bytes(greeks) {
+        Ok(batch) => write_batch(
+            &batch,
+            OptionGreeks::path_prefix(),
+            instrument_id,
+            date,
+            path,
+            compression,
+        ),
+        Err(e) => {
+            log::error!("Error converting OptionGreeks to Arrow: {e:?}");
+        }
     }
 }
 
@@ -503,23 +680,28 @@ fn write_batch(
     instrument_id: &InstrumentId,
     date: NaiveDate,
     path: &Path,
+    compression: Compression,
 ) {
     let filepath = path.join(parquet_filepath(typename, instrument_id, date));
-    if let Err(e) = write_parquet_local(batch, &filepath) {
+    if let Err(e) = write_parquet_local(batch, &filepath, compression) {
         log::error!("Error writing {}: {e}", filepath.display());
     } else {
         log::info!("File written: {}", filepath.display());
     }
 }
 
-fn write_parquet_local(batch: &RecordBatch, file_path: &Path) -> anyhow::Result<()> {
+fn write_parquet_local(
+    batch: &RecordBatch,
+    file_path: &Path,
+    compression: Compression,
+) -> anyhow::Result<()> {
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let file = std::fs::File::create(file_path)?;
     let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(compression)
         .build();
 
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))?;
@@ -530,10 +712,22 @@ fn write_parquet_local(batch: &RecordBatch, file_path: &Path) -> anyhow::Result<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use chrono::{TimeZone, Utc};
+    use nautilus_persistence::backend::catalog::ParquetDataCatalog;
     use rstest::rstest;
 
     use super::*;
+    use crate::{
+        common::{enums::TardisExchange, testing::load_test_json},
+        config::BookSnapshotOutput,
+        machine::{
+            message::{BookSnapshotMsg, OptionSummaryMsg, WsMessage},
+            parse::parse_tardis_ws_message,
+            types::TardisInstrumentMiniInfo,
+        },
+    };
 
     #[rstest]
     #[case(
@@ -570,5 +764,103 @@ mod tests {
 
         assert_eq!(cursor.date_utc, expected_date);
         assert_eq!(cursor.end_ns, UnixNanos::from(expected_end_ns));
+    }
+
+    #[rstest]
+    fn test_option_greeks_replay_catalog_round_trip() {
+        let instrument_id = InstrumentId::from("BTC-28JUN24-70000-C.DERIBIT");
+        let compression = ParquetCompression::Zstd.as_parquet_compression();
+        let info = Arc::new(TardisInstrumentMiniInfo::new(
+            instrument_id,
+            None,
+            TardisExchange::Deribit,
+            4,
+            1,
+        ));
+
+        let option_summary: OptionSummaryMsg =
+            serde_json::from_str(&load_test_json("option_summary.json")).unwrap();
+        let Some(Data::OptionGreeks(greeks_1)) = parse_tardis_ws_message(
+            WsMessage::OptionSummary(option_summary),
+            &info,
+            &BookSnapshotOutput::Deltas,
+        ) else {
+            panic!("Expected option_summary to route to Data::OptionGreeks");
+        };
+
+        let mut greeks_2 = greeks_1;
+        greeks_2.ts_event = greeks_1.ts_event + 1_000_000_000;
+        greeks_2.ts_init = greeks_1.ts_init + 1_000_000_000;
+        greeks_2.greeks.delta = 0.26;
+
+        let option_quote: BookSnapshotMsg =
+            serde_json::from_str(&load_test_json("option_book_snapshot.json")).unwrap();
+        let Some(Data::Quote(quote_1)) = parse_tardis_ws_message(
+            WsMessage::BookSnapshot(option_quote),
+            &info,
+            &BookSnapshotOutput::Deltas,
+        ) else {
+            panic!("Expected depth-1 option book snapshot to route to Data::Quote");
+        };
+
+        let mut quote_2 = quote_1;
+        quote_2.ts_event = quote_1.ts_event + 1_000_000_000;
+        quote_2.ts_init = quote_1.ts_init + 1_000_000_000;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let data_path = temp_dir.path().join("data");
+
+        let mut quotes_map: AHashMap<InstrumentId, Vec<QuoteTick>> = AHashMap::new();
+        let mut quotes_cursors: AHashMap<InstrumentId, DateCursor> = AHashMap::new();
+        let mut greeks_map: AHashMap<InstrumentId, Vec<OptionGreeks>> = AHashMap::new();
+        let mut greeks_cursors: AHashMap<InstrumentId, DateCursor> = AHashMap::new();
+
+        for quote in [quote_1, quote_2] {
+            handle_quote_msg(
+                quote,
+                &mut quotes_map,
+                &mut quotes_cursors,
+                &data_path,
+                compression,
+            );
+        }
+
+        for greeks in [greeks_1, greeks_2] {
+            handle_option_greeks_msg(
+                greeks,
+                &mut greeks_map,
+                &mut greeks_cursors,
+                &data_path,
+                compression,
+            );
+        }
+
+        for (id, quotes) in &quotes_map {
+            let cursor = quotes_cursors.get(id).expect("Expected cursor");
+            batch_and_write_quotes(quotes, id, cursor.date_utc, &data_path, compression);
+        }
+
+        for (id, greeks) in &greeks_map {
+            let cursor = greeks_cursors.get(id).expect("Expected cursor");
+            batch_and_write_greeks(greeks, id, cursor.date_utc, &data_path, compression);
+        }
+
+        let mut catalog = ParquetDataCatalog::new(temp_dir.path(), None, None, None, None);
+        let identifiers = Some(vec![instrument_id.to_string()]);
+
+        let quotes_out = catalog
+            .quote_ticks(identifiers.clone(), None, None)
+            .unwrap();
+        let greeks_out = catalog.option_greeks(identifiers, None, None).unwrap();
+
+        assert_eq!(greeks_out, vec![greeks_1, greeks_2]);
+        assert_eq!(greeks_out[0].instrument_id, instrument_id);
+        assert_eq!(greeks_out[0].mark_iv, Some(0.565));
+        assert_eq!(greeks_out[0].underlying_price, Some(63_500.0));
+        assert!(greeks_out[0].ts_init < greeks_out[1].ts_init);
+
+        assert_eq!(quotes_out, vec![quote_1, quote_2]);
+        assert_eq!(quotes_out[0].instrument_id, instrument_id);
+        assert!(quotes_out[0].ts_init < quotes_out[1].ts_init);
     }
 }

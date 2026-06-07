@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// The base model for all trading strategy configurations.
 #[derive(Clone, Debug, Deserialize, Serialize, bon::Builder)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -54,7 +55,8 @@ pub struct StrategyConfig {
     /// how the `ExecutionEngine` handles position IDs.
     pub oms_type: Option<OmsType>,
     /// The external order claim instrument IDs.
-    /// External orders for matching instrument IDs will be associated with (claimed by) the strategy.
+    /// External orders, fills, and materialized reconciliation activity for matching instrument IDs
+    /// will be associated with the strategy.
     pub external_order_claims: Option<Vec<InstrumentId>>,
     /// If OTO, OCO, and OUO **open** contingent orders should be managed automatically by the strategy.
     /// Any emulated orders which are active local will be managed by the `OrderEmulator` instead.
@@ -119,7 +121,8 @@ const fn default_market_exit_time_in_force() -> TimeInForce {
 }
 
 /// Configuration for creating strategies from importable paths.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.trading", from_py_object)

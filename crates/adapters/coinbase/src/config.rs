@@ -15,17 +15,25 @@
 
 //! Configuration structures for the Coinbase adapter.
 
-use crate::common::{enums::CoinbaseEnvironment, urls};
+use nautilus_model::enums::AccountType;
+use nautilus_network::websocket::TransportBackend;
+use serde::{Deserialize, Serialize};
+
+use crate::common::{
+    enums::{CoinbaseEnvironment, CoinbaseMarginType},
+    urls,
+};
 
 /// Configuration for the Coinbase data client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.coinbase")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.coinbase")
 )]
 pub struct CoinbaseDataClientConfig {
     /// CDP API key name (falls back to `COINBASE_API_KEY` env var).
@@ -36,10 +44,8 @@ pub struct CoinbaseDataClientConfig {
     pub base_url_rest: Option<String>,
     /// Override for the WebSocket market data URL.
     pub base_url_ws: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The Coinbase environment to connect to.
     #[builder(default)]
     pub environment: CoinbaseEnvironment,
@@ -52,6 +58,15 @@ pub struct CoinbaseDataClientConfig {
     /// Interval for refreshing instruments in minutes.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// Seconds between REST polls for derivatives-only data streams
+    /// (`IndexPriceUpdate`, `FundingRateUpdate`). Coinbase Advanced Trade
+    /// does not publish these on a WebSocket channel, so they are sourced
+    /// from periodic `/products/{id}` fetches.
+    #[builder(default = 15)]
+    pub derivatives_poll_interval_secs: u64,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for CoinbaseDataClientConfig {
@@ -97,14 +112,15 @@ impl CoinbaseDataClientConfig {
 }
 
 /// Configuration for the Coinbase execution client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.coinbase")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.coinbase")
 )]
 pub struct CoinbaseExecClientConfig {
     /// CDP API key name (falls back to `COINBASE_API_KEY` env var).
@@ -115,10 +131,8 @@ pub struct CoinbaseExecClientConfig {
     pub base_url_rest: Option<String>,
     /// Override for the WebSocket user data URL.
     pub base_url_ws: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    pub ws_proxy_url: Option<String>,
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
     /// The Coinbase environment to connect to.
     #[builder(default)]
     pub environment: CoinbaseEnvironment,
@@ -134,6 +148,24 @@ pub struct CoinbaseExecClientConfig {
     /// Maximum retry delay in milliseconds.
     #[builder(default = 5000)]
     pub retry_delay_max_ms: u64,
+    /// Selects the execution scope: `Cash` for spot, `Margin` for CFM
+    /// derivatives. `CoinbaseExecutionClientFactory` rejects other values.
+    #[builder(default = AccountType::Cash)]
+    pub account_type: AccountType,
+    /// Optional default margin type applied to derivatives orders. Ignored on
+    /// Cash accounts.
+    pub default_margin_type: Option<CoinbaseMarginType>,
+    /// Optional default leverage applied to derivatives orders. Ignored on
+    /// Cash accounts.
+    pub default_leverage: Option<rust_decimal::Decimal>,
+    /// CDP retail portfolio UUID required when the API key is bound to a
+    /// non-default portfolio. When unset, the venue uses the key's default
+    /// portfolio. Coinbase rejects orders with `"account is not available"`
+    /// if the portfolio is non-default and this field is omitted.
+    pub retail_portfolio_id: Option<String>,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for CoinbaseExecClientConfig {
@@ -243,5 +275,35 @@ mod tests {
     fn test_exec_config_ws_url_uses_user_endpoint() {
         let config = CoinbaseExecClientConfig::default();
         assert!(config.ws_url().contains("user"));
+    }
+
+    #[rstest]
+    fn test_data_config_toml_minimal() {
+        let config: CoinbaseDataClientConfig = toml::from_str(
+            r#"
+environment = "Sandbox"
+http_timeout_secs = 5
+update_instruments_interval_mins = 30
+derivatives_poll_interval_secs = 60
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.environment, CoinbaseEnvironment::Sandbox);
+        assert_eq!(config.http_timeout_secs, 5);
+        assert_eq!(config.update_instruments_interval_mins, 30);
+        assert_eq!(config.derivatives_poll_interval_secs, 60);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_empty_uses_defaults() {
+        let config: CoinbaseExecClientConfig = toml::from_str("").unwrap();
+        let expected = CoinbaseExecClientConfig::default();
+
+        assert_eq!(config.environment, expected.environment);
+        assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
+        assert_eq!(config.max_retries, expected.max_retries);
+        assert_eq!(config.account_type, expected.account_type);
+        assert_eq!(config.transport_backend, expected.transport_backend);
     }
 }

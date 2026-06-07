@@ -15,7 +15,7 @@
 
 //! Example demonstrating live execution testing with the Kraken adapter.
 //!
-//! Run with: `cargo run -p nautilus-kraken --example kraken-exec-tester`
+//! Run with: `cargo run -p nautilus-kraken --example kraken-exec-tester --features examples`
 //!
 //! Environment variables (for Spot):
 //! - KRAKEN_SPOT_API_KEY: Your Kraken Spot API key
@@ -23,13 +23,13 @@
 
 use nautilus_common::enums::Environment;
 use nautilus_kraken::{
-    common::{credential::KrakenCredential, enums::KrakenProductType},
+    common::{consts::KRAKEN_CLIENT_ID, credential::KrakenCredential, enums::KrakenProductType},
     config::{KrakenDataClientConfig, KrakenExecClientConfig},
     factories::{KrakenDataClientFactory, KrakenExecutionClientFactory},
 };
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{AccountId, ClientId, InstrumentId, StrategyId, TraderId},
+    identifiers::{AccountId, InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("KRAKEN-001");
     let node_name = "KRAKEN-EXEC-TESTER-001".to_string();
-    let client_id = ClientId::new("KRAKEN");
+    let client_id = *KRAKEN_CLIENT_ID;
 
     let credential = match product_type {
         KrakenProductType::Spot => KrakenCredential::resolve_spot(None, None),
@@ -98,9 +98,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data_factory = KrakenDataClientFactory::new();
     let exec_factory = KrakenExecutionClientFactory::new();
+    let exec_engine_config = LiveExecEngineConfig {
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
         .with_name(node_name)
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_delay_post_stop_secs(5)

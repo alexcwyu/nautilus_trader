@@ -51,10 +51,11 @@
 use std::{
     hint::black_box,
     sync::{Arc, Barrier, RwLock},
+    time::Duration,
 };
 
 use ahash::AHashMap;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use dashmap::DashMap;
 use nautilus_core::AtomicMap;
 
@@ -62,6 +63,8 @@ const MAP_SIZES: [usize; 2] = [100, 1_000];
 const THREAD_COUNTS: [usize; 4] = [1, 4, 8, 16];
 const READS_PER_THREAD: usize = 10_000;
 const WRITES_PER_CYCLE: usize = 10;
+const ATOMIC_MAP_LOOKUPS_PER_ITER: usize = 256;
+const CONCURRENT_MEASUREMENT_TIME: Duration = Duration::from_secs(10);
 
 fn make_keys(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("BTCUSDT.BINANCE-{i:04}")).collect()
@@ -137,6 +140,7 @@ fn bench_single_thread_read(c: &mut Criterion) {
 
 fn bench_concurrent_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("concurrent_reads");
+    group.measurement_time(CONCURRENT_MEASUREMENT_TIME);
 
     for &size in &MAP_SIZES {
         let keys = make_keys(size);
@@ -156,6 +160,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for i in 0..READS_PER_THREAD {
                                     let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                     black_box(map.get(key).map(|r| *r.value()));
@@ -181,6 +186,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                                 let bar = Arc::clone(&barrier);
                                 s.spawn(move || {
                                     bar.wait();
+
                                     for i in 0..READS_PER_THREAD {
                                         let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                         let guard = map.read().unwrap();
@@ -206,6 +212,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for i in 0..READS_PER_THREAD {
                                     let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                     let guard = map.load();
@@ -223,6 +230,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
 
 fn bench_read_heavy_mixed(c: &mut Criterion) {
     let mut group = c.benchmark_group("read_heavy_mixed");
+    group.measurement_time(CONCURRENT_MEASUREMENT_TIME);
 
     for &size in &MAP_SIZES {
         let keys = make_keys(size);
@@ -249,9 +257,11 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
                         let bar = Arc::clone(&barrier);
                         s.spawn(move || {
                             bar.wait();
+
                             for (i, key) in wk.iter().enumerate() {
                                 map.insert(key.clone(), (size + i) as u64);
                             }
+
                             for key in wk.iter() {
                                 map.remove(key);
                             }
@@ -263,6 +273,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for i in 0..READS_PER_THREAD {
                                     let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                     black_box(map.get(key).map(|r| *r.value()));
@@ -288,11 +299,13 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for (i, key) in wk.iter().enumerate() {
                                     let mut guard = map.write().unwrap();
                                     guard.insert(key.clone(), (size + i) as u64);
                                     drop(guard);
                                 }
+
                                 for key in wk.iter() {
                                     let mut guard = map.write().unwrap();
                                     guard.remove(key);
@@ -306,6 +319,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
                                 let bar = Arc::clone(&barrier);
                                 s.spawn(move || {
                                     bar.wait();
+
                                     for i in 0..READS_PER_THREAD {
                                         let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                         let guard = map.read().unwrap();
@@ -349,6 +363,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for i in 0..READS_PER_THREAD {
                                     let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                     let guard = map.load();
@@ -366,6 +381,7 @@ fn bench_read_heavy_mixed(c: &mut Criterion) {
 
 fn bench_write_once_read_many(c: &mut Criterion) {
     let mut group = c.benchmark_group("write_once_read_many");
+    group.measurement_time(CONCURRENT_MEASUREMENT_TIME);
 
     for &size in &MAP_SIZES {
         let keys = make_keys(size);
@@ -385,6 +401,7 @@ fn bench_write_once_read_many(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for i in 0..READS_PER_THREAD {
                                     let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                     black_box(map.get(key).map(|r| *r.value()));
@@ -410,6 +427,7 @@ fn bench_write_once_read_many(c: &mut Criterion) {
                                 let bar = Arc::clone(&barrier);
                                 s.spawn(move || {
                                     bar.wait();
+
                                     for i in 0..READS_PER_THREAD {
                                         let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                         let guard = map.read().unwrap();
@@ -435,6 +453,7 @@ fn bench_write_once_read_many(c: &mut Criterion) {
                             let bar = Arc::clone(&barrier);
                             s.spawn(move || {
                                 bar.wait();
+
                                 for i in 0..READS_PER_THREAD {
                                     let key = &ks[(t * READS_PER_THREAD + i) % ks.len()];
                                     let guard = map.load();
@@ -450,11 +469,66 @@ fn bench_write_once_read_many(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_atomic_map_read_patterns(c: &mut Criterion) {
+    let mut group = c.benchmark_group("atomic_map_read_patterns");
+    let keys = make_keys(1_000);
+    let atomic = populated_atomic_map(&keys);
+
+    group.throughput(Throughput::Elements(ATOMIC_MAP_LOOKUPS_PER_ITER as u64));
+
+    group.bench_function("get_cloned_each_lookup", |b| {
+        let mut idx = 0usize;
+        b.iter(|| {
+            let mut sum = 0u64;
+
+            for _ in 0..ATOMIC_MAP_LOOKUPS_PER_ITER {
+                let key = &keys[idx % keys.len()];
+                sum = sum.wrapping_add(atomic.get_cloned(key).unwrap_or_default());
+                idx = idx.wrapping_add(1);
+            }
+            black_box(sum)
+        });
+    });
+
+    group.bench_function("load_each_lookup", |b| {
+        let mut idx = 0usize;
+        b.iter(|| {
+            let mut sum = 0u64;
+
+            for _ in 0..ATOMIC_MAP_LOOKUPS_PER_ITER {
+                let key = &keys[idx % keys.len()];
+                let guard = atomic.load();
+                sum = sum.wrapping_add(guard.get(key).copied().unwrap_or_default());
+                idx = idx.wrapping_add(1);
+            }
+            black_box(sum)
+        });
+    });
+
+    group.bench_function("load_once_guard", |b| {
+        let mut idx = 0usize;
+        b.iter(|| {
+            let guard = atomic.load();
+            let mut sum = 0u64;
+
+            for _ in 0..ATOMIC_MAP_LOOKUPS_PER_ITER {
+                let key = &keys[idx % keys.len()];
+                sum = sum.wrapping_add(guard.get(key).copied().unwrap_or_default());
+                idx = idx.wrapping_add(1);
+            }
+            black_box(sum)
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_thread_read,
     bench_concurrent_reads,
     bench_read_heavy_mixed,
     bench_write_once_read_many,
+    bench_atomic_map_read_patterns,
 );
 criterion_main!(benches);

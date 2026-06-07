@@ -20,7 +20,7 @@ use aws_lc_rs::{
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
 };
 use base64::prelude::*;
-use nautilus_core::env::get_or_env_var;
+use nautilus_core::env::resolve_env_var_pair;
 use serde_json::json;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -29,8 +29,11 @@ use crate::{
     http::error::{Error, Result},
 };
 
-pub const COINBASE_API_KEY_ENV: &str = "COINBASE_API_KEY";
-pub const COINBASE_API_SECRET_ENV: &str = "COINBASE_API_SECRET";
+/// Returns the `(api_key, api_secret)` environment variable names.
+#[must_use]
+pub fn credential_env_vars() -> (&'static str, &'static str) {
+    ("COINBASE_API_KEY", "COINBASE_API_SECRET")
+}
 
 fn base64url_encode(data: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(data)
@@ -52,36 +55,34 @@ impl CoinbaseCredential {
         }
     }
 
-    /// Resolves credentials from provided values or environment variables.
-    pub fn resolve(api_key: Option<&str>, api_secret: Option<&str>) -> Result<Self> {
-        let key = get_or_env_var(
+    /// Resolves credentials from provided values or [`credential_env_vars`],
+    /// returning `None` when neither yields a complete pair.
+    #[must_use]
+    pub fn resolve(api_key: Option<&str>, api_secret: Option<&str>) -> Option<Self> {
+        let (key_var, secret_var) = credential_env_vars();
+        let (key, secret) = resolve_env_var_pair(
             api_key.filter(|s| !s.trim().is_empty()).map(String::from),
-            COINBASE_API_KEY_ENV,
-        )
-        .map_err(|_| {
-            Error::auth(format!(
-                "{COINBASE_API_KEY_ENV} environment variable is not set"
-            ))
-        })?;
-
-        let secret = get_or_env_var(
             api_secret
                 .filter(|s| !s.trim().is_empty())
                 .map(String::from),
-            COINBASE_API_SECRET_ENV,
-        )
-        .map_err(|_| {
-            Error::auth(format!(
-                "{COINBASE_API_SECRET_ENV} environment variable is not set"
-            ))
-        })?;
-
-        Ok(Self::new(key, secret))
+            key_var,
+            secret_var,
+        )?;
+        Some(Self::new(key, secret))
     }
 
     /// Loads credentials from environment variables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Auth`] if the environment variables are unset or empty.
     pub fn from_env() -> Result<Self> {
-        Self::resolve(None, None)
+        let (key_var, secret_var) = credential_env_vars();
+        Self::resolve(None, None).ok_or_else(|| {
+            Error::auth(format!(
+                "{key_var} and {secret_var} environment variables are required"
+            ))
+        })
     }
 
     /// Returns the API key name.
@@ -143,7 +144,11 @@ impl CoinbaseCredential {
         let payload_b64 = base64url_encode(payload.to_string().as_bytes());
         let signing_input = format!("{header_b64}.{payload_b64}");
 
-        let pem_obj = pem::parse(self.api_secret.trim())
+        // Env vars and .env files often store PEM keys with literal `\n`
+        // instead of real newlines. Normalize before parsing.
+        let pem_str = self.api_secret.trim().replace("\\n", "\n");
+
+        let pem_obj = pem::parse(&pem_str)
             .map_err(|e| Error::auth(format!("Failed to parse PEM key: {e}")))?;
 
         // Coinbase issues SEC1 (EC PRIVATE KEY) PEMs; from_private_key_der
@@ -291,10 +296,46 @@ mod tests {
     }
 
     #[rstest]
+    fn test_build_jwt_with_escaped_newline_pem() {
+        let pem_key = test_sec1_pem_key();
+
+        // Simulate the common env-var / .env-file pattern where real newlines
+        // are stored as literal two-char `\n` sequences.
+        let escaped = pem_key.replace('\n', "\\n");
+        assert!(
+            escaped.contains("\\n"),
+            "test setup: must have literal backslash-n"
+        );
+
+        let cred = CoinbaseCredential::new(TEST_API_KEY.to_string(), escaped);
+        let result = cred.build_rest_jwt("GET api.coinbase.com/api/v3/brokerage/accounts");
+        assert!(
+            result.is_ok(),
+            "escaped-newline PEM must parse after normalization"
+        );
+    }
+
+    #[rstest]
     fn test_base64url_encode() {
         let encoded = base64url_encode(b"hello world");
         assert!(!encoded.contains('='));
         assert!(!encoded.contains('+'));
         assert!(!encoded.contains('/'));
+    }
+
+    #[rstest]
+    fn test_credential_env_vars_returns_canonical_pair() {
+        assert_eq!(
+            credential_env_vars(),
+            ("COINBASE_API_KEY", "COINBASE_API_SECRET"),
+        );
+    }
+
+    #[rstest]
+    fn test_credential_resolve_with_explicit_values() {
+        let cred = CoinbaseCredential::resolve(Some("explicit-key"), Some("explicit-secret"))
+            .expect("both explicit values must resolve");
+        assert_eq!(cred.api_key(), "explicit-key");
+        assert_eq!(cred.api_secret(), "explicit-secret");
     }
 }

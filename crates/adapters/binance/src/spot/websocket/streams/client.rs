@@ -34,12 +34,13 @@ use std::{
 
 use futures_util::Stream;
 use nautilus_common::live::get_runtime;
-use nautilus_core::{AtomicMap, string::REDACTED};
+use nautilus_core::{AtomicMap, string::secret::REDACTED};
 use nautilus_model::instruments::{Instrument, InstrumentAny};
 use nautilus_network::{
     mode::ConnectionMode,
     websocket::{
-        PingHandler, SubscriptionState, WebSocketClient, WebSocketConfig, channel_message_handler,
+        PingHandler, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
+        channel_message_handler,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -86,6 +87,7 @@ pub struct BinanceSpotWebSocketClient {
     out_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BinanceSpotWsMessage>>>>,
     request_id_counter: Arc<AtomicU64>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
+    transport_backend: TransportBackend,
 }
 
 impl Debug for BinanceSpotWebSocketClient {
@@ -100,7 +102,7 @@ impl Debug for BinanceSpotWebSocketClient {
 
 impl Default for BinanceSpotWebSocketClient {
     fn default() -> Self {
-        Self::new(None, None, None, None).unwrap()
+        Self::new(None, None, None, None, TransportBackend::default()).unwrap()
     }
 }
 
@@ -115,11 +117,20 @@ impl BinanceSpotWebSocketClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         heartbeat: Option<u64>,
+        transport_backend: TransportBackend,
     ) -> anyhow::Result<Self> {
         let url = url.unwrap_or(BINANCE_SPOT_SBE_WS_URL.to_string());
 
         let credential = match (api_key, api_secret) {
-            (Some(key), Some(secret)) => Some(Arc::new(Ed25519Credential::new(key, &secret)?)),
+            (Some(key), Some(secret)) => {
+                let credential = Ed25519Credential::new(key, &secret).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Binance Spot SBE market-data streams require an Ed25519 API key \
+                         (HMAC keys are not supported): {e}"
+                    )
+                })?;
+                Some(Arc::new(credential))
+            }
             _ => None,
         };
 
@@ -133,12 +144,19 @@ impl BinanceSpotWebSocketClient {
             out_rx: Arc::new(Mutex::new(None)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             instruments_cache: Arc::new(AtomicMap::new()),
+            transport_backend,
         })
+    }
+
+    /// Returns whether API credentials are configured.
+    #[must_use]
+    pub fn has_credentials(&self) -> bool {
+        self.credential.is_some()
     }
 
     /// Returns whether any connection in the pool is active.
     #[must_use]
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub fn is_active(&self) -> bool {
         let slots = self.slots.lock().expect("slots lock poisoned");
         slots
@@ -148,7 +166,7 @@ impl BinanceSpotWebSocketClient {
 
     /// Returns whether all connections in the pool are closed.
     #[must_use]
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub fn is_closed(&self) -> bool {
         let slots = self.slots.lock().expect("slots lock poisoned");
         slots.is_empty()
@@ -159,7 +177,7 @@ impl BinanceSpotWebSocketClient {
 
     /// Returns the total number of confirmed subscriptions across all connections.
     #[must_use]
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub fn subscription_count(&self) -> usize {
         let slots = self.slots.lock().expect("slots lock poisoned");
         slots.iter().map(|s| s.subscriptions_state.len()).sum()
@@ -170,7 +188,7 @@ impl BinanceSpotWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if connection fails.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn connect(&mut self) -> BinanceWsResult<()> {
         self.signal.store(false, Ordering::Relaxed);
 
@@ -193,7 +211,7 @@ impl BinanceSpotWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if disconnect fails.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn close(&mut self) -> BinanceWsResult<()> {
         self.signal.store(true, Ordering::Relaxed);
 
@@ -204,8 +222,8 @@ impl BinanceSpotWebSocketClient {
 
         for slot in slots {
             slot.cancellation_token.cancel();
-            let _ = slot.cmd_tx.send(BinanceSpotWsStreamsCommand::Disconnect);
-            let _ = slot.task_handle.await;
+            let _result = slot.cmd_tx.send(BinanceSpotWsStreamsCommand::Disconnect);
+            let _result = slot.task_handle.await;
         }
 
         *self.out_tx.lock().expect("out_tx lock poisoned") = None;
@@ -224,7 +242,7 @@ impl BinanceSpotWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if the pool is exhausted or command delivery fails.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn subscribe(&self, streams: Vec<String>) -> BinanceWsResult<()> {
         // Phase 1: filter already-subscribed streams (brief lock)
         let new_streams: Vec<String> = {
@@ -313,7 +331,7 @@ impl BinanceSpotWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if command delivery fails.
-    #[allow(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
+    #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn unsubscribe(&self, streams: Vec<String>) -> BinanceWsResult<()> {
         let mut slots = self.slots.lock().expect("slots lock poisoned");
         let mut slot_batches: Vec<(usize, Vec<String>)> = Vec::new();
@@ -340,6 +358,7 @@ impl BinanceSpotWebSocketClient {
                         "Handler not available for pool slot {slot_idx}: {e}"
                     ))
                 })?;
+
             for stream in batch {
                 slots[*slot_idx].streams.retain(|s| s != stream);
             }
@@ -428,6 +447,8 @@ impl BinanceSpotWebSocketClient {
             reconnect_jitter_ms: Some(250),
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
+            backend: self.transport_backend,
+            proxy_url: None,
         };
 
         let keyed_quotas = vec![(
@@ -528,5 +549,40 @@ impl BinanceSpotWebSocketClient {
             cancellation_token,
             connection_mode,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_new_rejects_hmac_secret_with_actionable_error() {
+        // An all-zero 48-byte buffer base64-encodes to a non-Ed25519 secret
+        // (no PKCS#8 OID), standing in for an HMAC key. SBE market-data streams
+        // require Ed25519, so construction must fail with guidance that names
+        // HMAC, not the raw OID error.
+        let secret = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 48]);
+
+        let result = BinanceSpotWebSocketClient::new(
+            None,
+            Some("test_key".to_string()),
+            Some(secret),
+            None,
+            TransportBackend::default(),
+        );
+
+        let err = result.expect_err("HMAC secret must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Ed25519"),
+            "error should mention Ed25519, was: {msg}"
+        );
+        assert!(
+            msg.contains("HMAC"),
+            "error should mention HMAC, was: {msg}"
+        );
     }
 }

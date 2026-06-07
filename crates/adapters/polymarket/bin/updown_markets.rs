@@ -57,6 +57,7 @@ fn build_updown_slugs() -> Vec<String> {
     let period_start = (now / PERIOD_SECS) * PERIOD_SECS;
 
     let mut slugs = Vec::new();
+
     for i in 0..NUM_PERIODS {
         let timestamp = period_start + i * PERIOD_SECS;
         for asset in ASSETS {
@@ -72,7 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let http_client = PolymarketGammaHttpClient::new(None, 60, RetryConfig::default())?;
     let filter = MarketSlugFilter::new(build_updown_slugs);
-    let mut provider = PolymarketInstrumentProvider::with_filter(http_client, Arc::new(filter));
+    let mut provider =
+        PolymarketInstrumentProvider::with_filter(http_client, None, Arc::new(filter));
     provider.load_all(None).await?;
 
     let instruments = provider.store().list_all();

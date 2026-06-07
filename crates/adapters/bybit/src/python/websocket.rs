@@ -40,14 +40,15 @@ use nautilus_model::{
     python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
     types::{Price, Quantity},
 };
+use nautilus_network::websocket::TransportBackend;
 use pyo3::{IntoPyObjectExt, prelude::*};
 use ustr::Ustr;
 
 use crate::{
     common::{
         consts::BYBIT_VENUE,
-        enums::{BybitEnvironment, BybitProductType},
-        parse::make_bybit_symbol,
+        enums::{BybitEnvironment, BybitPositionIdx, BybitProductType},
+        parse::{make_bybit_symbol, parse_bbo_level, parse_bbo_side_type},
     },
     python::params::{BybitWsAmendOrderParams, BybitWsCancelOrderParams, BybitWsPlaceOrderParams},
     websocket::{
@@ -60,8 +61,8 @@ use crate::{
             parse_ticker_linear_mark_price, parse_ticker_linear_quote, parse_ticker_option_greeks,
             parse_ticker_option_index_price, parse_ticker_option_mark_price,
             parse_ticker_option_quote, parse_ws_account_state, parse_ws_fill_report,
-            parse_ws_kline_bar, parse_ws_order_status_report, parse_ws_position_status_report,
-            parse_ws_trade_tick,
+            parse_ws_fill_report_fast, parse_ws_kline_bar, parse_ws_order_status_report,
+            parse_ws_position_status_report, parse_ws_trade_tick,
         },
     },
 };
@@ -134,14 +135,22 @@ impl BybitWebSocketClient {
     /// Creates a new Bybit public WebSocket client.
     #[staticmethod]
     #[pyo3(name = "new_public")]
-    #[pyo3(signature = (product_type, environment, url=None, heartbeat=20))]
+    #[pyo3(signature = (product_type, environment, url=None, heartbeat=20, proxy_url=None))]
     fn py_new_public(
         product_type: BybitProductType,
         environment: BybitEnvironment,
         url: Option<String>,
         heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
-        Self::new_public_with(product_type, environment, url, heartbeat)
+        Self::new_public_with(
+            product_type,
+            environment,
+            url,
+            heartbeat,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     /// Creates a new Bybit private WebSocket client.
@@ -153,15 +162,24 @@ impl BybitWebSocketClient {
     /// - Mainnet: `BYBIT_API_KEY`, `BYBIT_API_SECRET`
     #[staticmethod]
     #[pyo3(name = "new_private")]
-    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20))]
+    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20, proxy_url=None))]
     fn py_new_private(
         environment: BybitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
         url: Option<String>,
         heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
-        Self::new_private(environment, api_key, api_secret, url, heartbeat)
+        Self::new_private(
+            environment,
+            api_key,
+            api_secret,
+            url,
+            heartbeat,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     /// Creates a new Bybit trade WebSocket client for order operations.
@@ -173,15 +191,24 @@ impl BybitWebSocketClient {
     /// - Mainnet: `BYBIT_API_KEY`, `BYBIT_API_SECRET`
     #[staticmethod]
     #[pyo3(name = "new_trade")]
-    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20))]
+    #[pyo3(signature = (environment, api_key=None, api_secret=None, url=None, heartbeat=20, proxy_url=None))]
     fn py_new_trade(
         environment: BybitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
         url: Option<String>,
         heartbeat: u64,
+        proxy_url: Option<String>,
     ) -> Self {
-        Self::new_trade(environment, api_key, api_secret, url, heartbeat)
+        Self::new_trade(
+            environment,
+            api_key,
+            api_secret,
+            url,
+            heartbeat,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     #[getter]
@@ -248,7 +275,7 @@ impl BybitWebSocketClient {
 
     /// Disconnects the WebSocket client and stops the background task.
     #[pyo3(name = "connect")]
-    #[allow(clippy::needless_pass_by_value)] // PyO3 extracted parameter
+    #[expect(clippy::needless_pass_by_value)] // PyO3 extracted parameter
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -277,11 +304,6 @@ impl BybitWebSocketClient {
                 let mut funding_cache: AHashMap<Ustr, (Option<String>, Option<String>)> =
                     AHashMap::new();
                 let _client = client;
-                let _resolve = |raw_symbol: &Ustr| -> Option<InstrumentAny> {
-                    let key =
-                        product_type.map_or(*raw_symbol, |pt| make_bybit_symbol(raw_symbol, pt));
-                    instruments.get_cloned(&key)
-                };
 
                 tokio::pin!(stream);
 
@@ -357,6 +379,16 @@ impl BybitWebSocketClient {
                         }
                         BybitWsMessage::AccountExecution(ref msg) => {
                             handle_account_execution(
+                                msg,
+                                &instruments,
+                                account_id,
+                                clock,
+                                &call_soon,
+                                &callback,
+                            );
+                        }
+                        BybitWsMessage::AccountExecutionFast(ref msg) => {
+                            handle_account_execution_fast(
                                 msg,
                                 &instruments,
                                 account_id,
@@ -824,8 +856,11 @@ impl BybitWebSocketClient {
         post_only=None,
         reduce_only=None,
         is_leverage=false,
+        position_idx=None,
+        bbo_side_type=None,
+        bbo_level=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_submit_order<'py>(
         &self,
         py: Python<'py>,
@@ -845,9 +880,25 @@ impl BybitWebSocketClient {
         post_only: Option<bool>,
         reduce_only: Option<bool>,
         is_leverage: bool,
+        position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<String>,
+        bbo_level: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
         let pending_py_requests = Arc::clone(self.pending_py_requests());
+        let bbo_side_type = bbo_side_type
+            .map(|value| parse_bbo_side_type(&value))
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+        let bbo_level = bbo_level
+            .map(parse_bbo_level)
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+        if bbo_side_type.is_some() != bbo_level.is_some() {
+            return Err(to_pyvalue_err(anyhow::anyhow!(
+                "'bbo_side_type' and 'bbo_level' must be provided together"
+            )));
+        }
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let req_id = client
@@ -866,6 +917,9 @@ impl BybitWebSocketClient {
                     post_only,
                     reduce_only,
                     is_leverage,
+                    position_idx,
+                    bbo_side_type,
+                    bbo_level,
                 )
                 .await
                 .map_err(to_pyruntime_err)?;
@@ -896,7 +950,7 @@ impl BybitWebSocketClient {
         quantity=None,
         price=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
         &self,
         py: Python<'py>,
@@ -949,7 +1003,7 @@ impl BybitWebSocketClient {
         client_order_id,
         venue_order_id=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_cancel_order<'py>(
         &self,
         py: Python<'py>,
@@ -1002,8 +1056,11 @@ impl BybitWebSocketClient {
         is_leverage=false,
         take_profit=None,
         stop_loss=None,
+        position_idx=None,
+        bbo_side_type=None,
+        bbo_level=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_build_place_order_params(
         &self,
         product_type: BybitProductType,
@@ -1022,7 +1079,24 @@ impl BybitWebSocketClient {
         is_leverage: bool,
         take_profit: Option<Price>,
         stop_loss: Option<Price>,
+        position_idx: Option<BybitPositionIdx>,
+        bbo_side_type: Option<String>,
+        bbo_level: Option<String>,
     ) -> PyResult<BybitWsPlaceOrderParams> {
+        let bbo_side_type = bbo_side_type
+            .map(|value| parse_bbo_side_type(&value))
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+        let bbo_level = bbo_level
+            .map(parse_bbo_level)
+            .transpose()
+            .map_err(to_pyvalue_err)?;
+        if bbo_side_type.is_some() != bbo_level.is_some() {
+            return Err(to_pyvalue_err(anyhow::anyhow!(
+                "'bbo_side_type' and 'bbo_level' must be provided together"
+            )));
+        }
+
         let params = self
             .build_place_order_params(
                 product_type,
@@ -1041,6 +1115,9 @@ impl BybitWebSocketClient {
                 is_leverage,
                 take_profit,
                 stop_loss,
+                position_idx,
+                bbo_side_type,
+                bbo_level,
             )
             .map_err(to_pyruntime_err)?;
         Ok(params.into())
@@ -1084,7 +1161,6 @@ impl BybitWebSocketClient {
 
     /// Builds order params for amending an order.
     #[pyo3(name = "build_amend_order_params")]
-    #[allow(clippy::too_many_arguments)]
     fn py_build_amend_order_params(
         &self,
         product_type: BybitProductType,
@@ -1284,13 +1360,13 @@ fn register_batch_pending(
     }
 }
 
-fn resolve_instrument(
+fn resolve_instrument_from_snapshot<'a>(
     raw_symbol: &Ustr,
     product_type: Option<BybitProductType>,
-    instruments: &AtomicMap<Ustr, InstrumentAny>,
-) -> Option<InstrumentAny> {
+    instruments: &'a AHashMap<Ustr, InstrumentAny>,
+) -> Option<&'a InstrumentAny> {
     let key = product_type.map_or(*raw_symbol, |pt| make_bybit_symbol(raw_symbol, pt));
-    instruments.get_cloned(&key)
+    instruments.get(&key)
 }
 
 fn send_data_to_python(data: Data, call_soon: &Py<PyAny>, callback: &Py<PyAny>) {
@@ -1321,12 +1397,15 @@ fn handle_orderbook(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = resolve_instrument(&msg.data.s, product_type, instruments) else {
+    let instruments_snapshot = instruments.load();
+    let Some(instrument) =
+        resolve_instrument_from_snapshot(&msg.data.s, product_type, &instruments_snapshot)
+    else {
         return;
     };
     let ts_init = clock.get_time_ns();
 
-    match parse_orderbook_deltas(msg, &instrument, ts_init) {
+    match parse_orderbook_deltas(msg, instrument, ts_init) {
         Ok(deltas) => {
             send_data_to_python(
                 Data::Deltas(OrderBookDeltas_API::new(deltas)),
@@ -1340,7 +1419,7 @@ fn handle_orderbook(
     let instrument_id = instrument.id();
     let last_quote = quote_cache.get(&instrument_id);
 
-    match parse_orderbook_quote(msg, &instrument, last_quote, ts_init) {
+    match parse_orderbook_quote(msg, instrument, last_quote, ts_init) {
         Ok(quote) => {
             quote_cache.insert(instrument_id, quote);
             send_data_to_python(Data::Quote(quote), call_soon, callback);
@@ -1359,8 +1438,12 @@ fn handle_trade(
     callback: &Py<PyAny>,
 ) {
     let ts_init = clock.get_time_ns();
+    let instruments_snapshot = instruments.load();
+
     for trade in &msg.data {
-        let Some(instrument) = resolve_instrument(&trade.s, product_type, instruments) else {
+        let Some(instrument) =
+            resolve_instrument_from_snapshot(&trade.s, product_type, &instruments_snapshot)
+        else {
             continue;
         };
 
@@ -1371,14 +1454,14 @@ fn handle_trade(
             continue;
         }
 
-        match parse_ws_trade_tick(trade, &instrument, ts_init) {
+        match parse_ws_trade_tick(trade, instrument, ts_init) {
             Ok(tick) => send_data_to_python(Data::Trade(tick), call_soon, callback),
             Err(e) => log::error!("Failed to parse trade tick: {e}"),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_kline(
     msg: &crate::websocket::messages::BybitWsKlineMsg,
     product_type: Option<BybitProductType>,
@@ -1393,7 +1476,10 @@ fn handle_kline(
         return;
     };
     let ustr_symbol = Ustr::from(raw_symbol);
-    let Some(instrument) = resolve_instrument(&ustr_symbol, product_type, instruments) else {
+    let instruments_snapshot = instruments.load();
+    let Some(instrument) =
+        resolve_instrument_from_snapshot(&ustr_symbol, product_type, &instruments_snapshot)
+    else {
         return;
     };
     let Some(bar_type) = bar_types_cache.load().get(msg.topic.as_str()).copied() else {
@@ -1401,6 +1487,7 @@ fn handle_kline(
     };
 
     let ts_init = clock.get_time_ns();
+
     for kline in &msg.data {
         if !kline.confirm {
             continue;
@@ -1408,7 +1495,7 @@ fn handle_kline(
 
         match parse_ws_kline_bar(
             kline,
-            &instrument,
+            instrument,
             bar_type,
             bars_timestamp_on_close,
             ts_init,
@@ -1419,7 +1506,7 @@ fn handle_kline(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_ticker_linear(
     msg: &crate::websocket::messages::BybitWsTickerLinearMsg,
     product_type: Option<BybitProductType>,
@@ -1430,14 +1517,17 @@ fn handle_ticker_linear(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = resolve_instrument(&msg.data.symbol, product_type, instruments) else {
+    let instruments_snapshot = instruments.load();
+    let Some(instrument) =
+        resolve_instrument_from_snapshot(&msg.data.symbol, product_type, &instruments_snapshot)
+    else {
         return;
     };
     let instrument_id = instrument.id();
     let ts_init = clock.get_time_ns();
 
     if msg.data.bid1_price.is_some() {
-        match parse_ticker_linear_quote(msg, &instrument, ts_init) {
+        match parse_ticker_linear_quote(msg, instrument, ts_init) {
             Ok(quote) => {
                 let last = quote_cache.get(&instrument_id);
 
@@ -1483,21 +1573,21 @@ fn handle_ticker_linear(
     }
 
     if msg.data.mark_price.is_some() {
-        match parse_ticker_linear_mark_price(&msg.data, &instrument, ts_event, ts_init) {
+        match parse_ticker_linear_mark_price(&msg.data, instrument, ts_event, ts_init) {
             Ok(update) => send_to_python(update, call_soon, callback),
             Err(e) => log::debug!("Skipping mark price update: {e}"),
         }
     }
 
     if msg.data.index_price.is_some() {
-        match parse_ticker_linear_index_price(&msg.data, &instrument, ts_event, ts_init) {
+        match parse_ticker_linear_index_price(&msg.data, instrument, ts_event, ts_init) {
             Ok(update) => send_to_python(update, call_soon, callback),
             Err(e) => log::debug!("Skipping index price update: {e}"),
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_ticker_option(
     msg: &crate::websocket::messages::BybitWsTickerOptionMsg,
     product_type: Option<BybitProductType>,
@@ -1508,13 +1598,16 @@ fn handle_ticker_option(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = resolve_instrument(&msg.data.symbol, product_type, instruments) else {
+    let instruments_snapshot = instruments.load();
+    let Some(instrument) =
+        resolve_instrument_from_snapshot(&msg.data.symbol, product_type, &instruments_snapshot)
+    else {
         return;
     };
     let instrument_id = instrument.id();
     let ts_init = clock.get_time_ns();
 
-    match parse_ticker_option_quote(msg, &instrument, ts_init) {
+    match parse_ticker_option_quote(msg, instrument, ts_init) {
         Ok(quote) => {
             let last = quote_cache.get(&instrument_id);
 
@@ -1526,18 +1619,18 @@ fn handle_ticker_option(
         Err(e) => log::error!("Failed to parse ticker option quote: {e}"),
     }
 
-    match parse_ticker_option_mark_price(msg, &instrument, ts_init) {
+    match parse_ticker_option_mark_price(msg, instrument, ts_init) {
         Ok(update) => send_to_python(update, call_soon, callback),
         Err(e) => log::error!("Failed to parse ticker option mark price: {e}"),
     }
 
-    match parse_ticker_option_index_price(msg, &instrument, ts_init) {
+    match parse_ticker_option_index_price(msg, instrument, ts_init) {
         Ok(update) => send_to_python(update, call_soon, callback),
         Err(e) => log::error!("Failed to parse ticker option index price: {e}"),
     }
 
     if option_greeks_subs.contains(&instrument_id) {
-        match parse_ticker_option_greeks(msg, &instrument, ts_init) {
+        match parse_ticker_option_greeks(msg, instrument, ts_init) {
             Ok(greeks) => send_to_python(greeks, call_soon, callback),
             Err(e) => log::error!("Failed to parse option greeks: {e}"),
         }
@@ -1553,9 +1646,11 @@ fn handle_account_order(
     callback: &Py<PyAny>,
 ) {
     let ts_init = clock.get_time_ns();
+    let instruments_snapshot = instruments.load();
+
     for order in &msg.data {
         let symbol = make_bybit_symbol(order.symbol, order.category);
-        let Some(instrument) = instruments.get_cloned(&symbol) else {
+        let Some(instrument) = instruments_snapshot.get(&symbol) else {
             log::warn!("No instrument for order update: {symbol}");
             continue;
         };
@@ -1563,7 +1658,7 @@ fn handle_account_order(
             continue;
         };
 
-        match parse_ws_order_status_report(order, &instrument, account_id, ts_init) {
+        match parse_ws_order_status_report(order, instrument, account_id, ts_init) {
             Ok(report) => send_to_python(report, call_soon, callback),
             Err(e) => log::error!("Failed to parse order status report: {e}"),
         }
@@ -1579,9 +1674,11 @@ fn handle_account_execution(
     callback: &Py<PyAny>,
 ) {
     let ts_init = clock.get_time_ns();
+    let instruments_snapshot = instruments.load();
+
     for exec in &msg.data {
         let symbol = make_bybit_symbol(exec.symbol, exec.category);
-        let Some(instrument) = instruments.get_cloned(&symbol) else {
+        let Some(instrument) = instruments_snapshot.get(&symbol) else {
             log::warn!("No instrument for execution update: {symbol}");
             continue;
         };
@@ -1589,9 +1686,37 @@ fn handle_account_execution(
             continue;
         };
 
-        match parse_ws_fill_report(exec, account_id, &instrument, ts_init) {
+        match parse_ws_fill_report(exec, account_id, instrument, ts_init) {
             Ok(report) => send_to_python(report, call_soon, callback),
             Err(e) => log::error!("Failed to parse fill report: {e}"),
+        }
+    }
+}
+
+fn handle_account_execution_fast(
+    msg: &crate::websocket::messages::BybitWsAccountExecutionFastMsg,
+    instruments: &AtomicMap<Ustr, InstrumentAny>,
+    account_id: Option<AccountId>,
+    clock: &AtomicTime,
+    call_soon: &Py<PyAny>,
+    callback: &Py<PyAny>,
+) {
+    let ts_init = clock.get_time_ns();
+    let instruments_snapshot = instruments.load();
+
+    for exec in &msg.data {
+        let symbol = make_bybit_symbol(exec.symbol, exec.category);
+        let Some(instrument) = instruments_snapshot.get(&symbol) else {
+            log::warn!("No instrument for fast-execution update: {symbol}");
+            continue;
+        };
+        let Some(account_id) = account_id else {
+            continue;
+        };
+
+        match parse_ws_fill_report_fast(exec, account_id, instrument, None, ts_init) {
+            Ok(report) => send_to_python(report, call_soon, callback),
+            Err(e) => log::error!("Failed to parse fast fill report: {e}"),
         }
     }
 }
@@ -1626,9 +1751,11 @@ fn handle_account_position(
     callback: &Py<PyAny>,
 ) {
     let ts_init = clock.get_time_ns();
+    let instruments_snapshot = instruments.load();
+
     for position in &msg.data {
         let symbol = make_bybit_symbol(position.symbol, position.category);
-        let Some(instrument) = instruments.get_cloned(&symbol) else {
+        let Some(instrument) = instruments_snapshot.get(&symbol) else {
             log::warn!("No instrument for position update: {symbol}");
             continue;
         };
@@ -1636,7 +1763,7 @@ fn handle_account_position(
             continue;
         };
 
-        match parse_ws_position_status_report(position, account_id, &instrument, ts_init) {
+        match parse_ws_position_status_report(position, account_id, instrument, ts_init) {
             Ok(report) => send_to_python(report, call_soon, callback),
             Err(e) => log::error!("Failed to parse position status report: {e}"),
         }

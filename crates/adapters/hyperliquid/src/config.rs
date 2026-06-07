@@ -15,10 +15,17 @@
 
 //! Configuration structures for the Hyperliquid adapter.
 
-use crate::common::consts::{info_url, ws_url};
+use nautilus_network::websocket::TransportBackend;
+use serde::{Deserialize, Serialize};
+
+use crate::common::{
+    consts::{info_url, ws_url},
+    enums::HyperliquidEnvironment,
+};
 
 /// Configuration for the Hyperliquid data client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -28,7 +35,7 @@ use crate::common::consts::{info_url, ws_url};
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidDataClientConfig {
     /// Optional private key for authenticated endpoints.
@@ -37,16 +44,11 @@ pub struct HyperliquidDataClientConfig {
     pub base_url_ws: Option<String>,
     /// Override for the HTTP info URL.
     pub base_url_http: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
-    pub ws_proxy_url: Option<String>,
-    /// When true the client will use Hyperliquid testnet endpoints.
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
+    /// The target environment (mainnet or testnet).
     #[builder(default)]
-    pub is_testnet: bool,
+    pub environment: HyperliquidEnvironment,
     /// HTTP timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -56,6 +58,9 @@ pub struct HyperliquidDataClientConfig {
     /// Interval for refreshing instruments in minutes.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
 }
 
 impl Default for HyperliquidDataClientConfig {
@@ -79,25 +84,26 @@ impl HyperliquidDataClientConfig {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Returns the WebSocket URL, respecting the testnet flag and overrides.
+    /// Returns the WebSocket URL, respecting the environment and overrides.
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.base_url_ws
             .clone()
-            .unwrap_or_else(|| ws_url(self.is_testnet).to_string())
+            .unwrap_or_else(|| ws_url(self.environment).to_string())
     }
 
-    /// Returns the HTTP info URL, respecting the testnet flag and overrides.
+    /// Returns the HTTP info URL, respecting the environment and overrides.
     #[must_use]
     pub fn http_url(&self) -> String {
         self.base_url_http
             .clone()
-            .unwrap_or_else(|| info_url(self.is_testnet).to_string())
+            .unwrap_or_else(|| info_url(self.environment).to_string())
     }
 }
 
 /// Configuration for the Hyperliquid execution client.
-#[derive(Clone, Debug, bon::Builder)]
+#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
@@ -107,7 +113,7 @@ impl HyperliquidDataClientConfig {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.hyperliquid")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
 )]
 pub struct HyperliquidExecClientConfig {
     /// Private key for signing transactions.
@@ -117,10 +123,17 @@ pub struct HyperliquidExecClientConfig {
     /// - Testnet: `HYPERLIQUID_TESTNET_PK`
     pub private_key: Option<String>,
     /// Optional vault address for vault operations.
+    ///
+    /// If not provided, falls back to environment variable:
+    /// - Mainnet: `HYPERLIQUID_VAULT`
+    /// - Testnet: `HYPERLIQUID_TESTNET_VAULT`
     pub vault_address: Option<String>,
     /// Optional main account address when using an agent wallet (API sub-key).
     /// When set, used for balance queries, position reports, and WS subscriptions
     /// instead of the address derived from the private key.
+    ///
+    /// If not provided and no explicit vault address is set, falls back to
+    /// the `HYPERLIQUID_ACCOUNT_ADDRESS` environment variable.
     pub account_address: Option<String>,
     /// Override for the WebSocket URL.
     pub base_url_ws: Option<String>,
@@ -128,16 +141,11 @@ pub struct HyperliquidExecClientConfig {
     pub base_url_http: Option<String>,
     /// Override for the exchange API URL.
     pub base_url_exchange: Option<String>,
-    /// Optional HTTP proxy URL.
-    pub http_proxy_url: Option<String>,
-    /// Optional WebSocket proxy URL.
-    ///
-    /// Note: WebSocket proxy support is not yet implemented. This field is reserved
-    /// for future functionality. Use `http_proxy_url` for REST API proxy support.
-    pub ws_proxy_url: Option<String>,
-    /// When true the client will use Hyperliquid testnet endpoints.
+    /// Optional proxy URL for HTTP and WebSocket transports.
+    pub proxy_url: Option<String>,
+    /// The target environment (mainnet or testnet).
     #[builder(default)]
-    pub is_testnet: bool,
+    pub environment: HyperliquidEnvironment,
     /// HTTP timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
@@ -154,6 +162,23 @@ pub struct HyperliquidExecClientConfig {
     /// before submission (Hyperliquid requirement).
     #[builder(default = true)]
     pub normalize_prices: bool,
+    /// Slippage buffer in basis points applied to MARKET orders and
+    /// stop-to-limit trigger derivations. Can be overridden per-order via
+    /// `SubmitOrder.params["market_order_slippage_bps"]`.
+    #[builder(default = 50)]
+    pub market_order_slippage_bps: u32,
+    /// WebSocket transport backend (defaults to `Tungstenite`).
+    #[builder(default)]
+    pub transport_backend: TransportBackend,
+    /// Timeout in seconds for WebSocket post trading requests.
+    #[builder(default = 10)]
+    pub ws_post_timeout_secs: u64,
+    /// Poll interval in seconds for `outcomeMeta` settlement detection.
+    /// Disabled by default; venue `Settlement` fills drive HIP-4 settlement
+    /// through the standard user-fills stream. Set to a non-zero value only
+    /// when the venue fill stream is unavailable.
+    #[builder(default = 0)]
+    pub outcome_settlement_poll_secs: u64,
 }
 
 impl Default for HyperliquidExecClientConfig {
@@ -163,15 +188,6 @@ impl Default for HyperliquidExecClientConfig {
 }
 
 impl HyperliquidExecClientConfig {
-    /// Creates a new configuration with the provided private key.
-    #[must_use]
-    pub fn new(private_key: Option<String>) -> Self {
-        Self {
-            private_key,
-            ..Self::default()
-        }
-    }
-
     /// Returns `true` when private key is populated and non-empty.
     #[must_use]
     pub fn has_credentials(&self) -> bool {
@@ -180,20 +196,20 @@ impl HyperliquidExecClientConfig {
             .is_some_and(|s| !s.trim().is_empty())
     }
 
-    /// Returns the WebSocket URL, respecting the testnet flag and overrides.
+    /// Returns the WebSocket URL, respecting the environment and overrides.
     #[must_use]
     pub fn ws_url(&self) -> String {
         self.base_url_ws
             .clone()
-            .unwrap_or_else(|| ws_url(self.is_testnet).to_string())
+            .unwrap_or_else(|| ws_url(self.environment).to_string())
     }
 
-    /// Returns the HTTP info URL, respecting the testnet flag and overrides.
+    /// Returns the HTTP info URL, respecting the environment and overrides.
     #[must_use]
     pub fn http_url(&self) -> String {
         self.base_url_http
             .clone()
-            .unwrap_or_else(|| info_url(self.is_testnet).to_string())
+            .unwrap_or_else(|| info_url(self.environment).to_string())
     }
 }
 
@@ -216,5 +232,44 @@ mod tests {
             ..HyperliquidExecClientConfig::default()
         };
         assert_eq!(config.account_address.as_deref(), Some("0x1234"));
+    }
+
+    #[rstest]
+    fn test_data_config_toml_minimal() {
+        let config: HyperliquidDataClientConfig = toml::from_str(
+            r#"
+environment = "testnet"
+http_timeout_secs = 30
+update_instruments_interval_mins = 10
+transport_backend = "tungstenite"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.environment, HyperliquidEnvironment::Testnet);
+        assert_eq!(config.http_timeout_secs, 30);
+        assert_eq!(config.update_instruments_interval_mins, 10);
+        assert_eq!(config.transport_backend, TransportBackend::Tungstenite);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_empty_uses_defaults() {
+        let config: HyperliquidExecClientConfig = toml::from_str("").unwrap();
+        let expected = HyperliquidExecClientConfig::default();
+
+        assert_eq!(config.environment, expected.environment);
+        assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
+        assert_eq!(config.max_retries, expected.max_retries);
+        assert_eq!(config.normalize_prices, expected.normalize_prices);
+        assert_eq!(
+            config.market_order_slippage_bps,
+            expected.market_order_slippage_bps,
+        );
+        assert_eq!(config.transport_backend, expected.transport_backend);
+        assert_eq!(config.ws_post_timeout_secs, expected.ws_post_timeout_secs);
+        assert_eq!(
+            config.outcome_settlement_poll_secs,
+            expected.outcome_settlement_poll_secs,
+        );
     }
 }

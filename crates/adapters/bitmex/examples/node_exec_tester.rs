@@ -20,16 +20,18 @@
 //! - Testnet: `BITMEX_TESTNET_API_KEY` / `BITMEX_TESTNET_API_SECRET`
 //! - Mainnet: `BITMEX_API_KEY` / `BITMEX_API_SECRET`
 //!
-//! Run with: `cargo run --example bitmex-exec-tester --package nautilus-bitmex`
+//! Run with: `cargo run --example bitmex-exec-tester --package nautilus-bitmex --features examples`
 
 use nautilus_bitmex::{
+    common::{consts::BITMEX_CLIENT_ID, enums::BitmexEnvironment},
     config::{BitmexDataClientConfig, BitmexExecClientConfig},
     factories::{BitmexDataClientFactory, BitmexExecFactoryConfig, BitmexExecutionClientFactory},
 };
 use nautilus_common::enums::Environment;
-use nautilus_live::node::LiveNode;
+use nautilus_live::{config::LiveExecEngineConfig, node::LiveNode};
 use nautilus_model::{
-    identifiers::{ClientId, InstrumentId, StrategyId, TraderId},
+    enums::TimeInForce,
+    identifiers::{InstrumentId, StrategyId, TraderId},
     types::Quantity,
 };
 use nautilus_testkit::testers::{ExecTester, ExecTesterConfig};
@@ -39,35 +41,43 @@ use nautilus_trading::strategy::StrategyConfig;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
-    let use_testnet = true;
-
     let environment = Environment::Live;
     let trader_id = TraderId::from("TESTER-001");
     let instrument_id = InstrumentId::from("XBTUSD.BITMEX");
 
     let data_config = BitmexDataClientConfig {
-        use_testnet,
+        environment: BitmexEnvironment::Testnet,
         ..Default::default()
     };
 
     let exec_config = BitmexExecFactoryConfig::new(
         trader_id,
         BitmexExecClientConfig {
-            use_testnet,
+            environment: BitmexEnvironment::Testnet,
             ..Default::default()
         },
     );
 
     let data_factory = BitmexDataClientFactory::new();
     let exec_factory = BitmexExecutionClientFactory::new();
+    let exec_engine_config = LiveExecEngineConfig {
+        reconciliation_instrument_ids: Some(vec![instrument_id.to_string()]),
+        filter_unclaimed_external_orders: true,
+        open_check_interval_secs: Some(10.0),
+        position_check_interval_secs: Some(30.0),
+        ..Default::default()
+    };
 
     let mut node = LiveNode::builder(trader_id, environment)?
+        .with_exec_engine_config(exec_engine_config)
         .add_data_client(None, Box::new(data_factory), Box::new(data_config))?
         .add_exec_client(None, Box::new(exec_factory), Box::new(exec_config))?
         .with_reconciliation(true)
         .with_reconciliation_lookback_mins(2880)
         .with_delay_post_stop_secs(5)
         .build()?;
+
+    let order_qty = Quantity::from("100");
 
     let tester_config = ExecTesterConfig::builder()
         .base(StrategyConfig {
@@ -76,9 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ..Default::default()
         })
         .instrument_id(instrument_id)
-        .client_id(ClientId::new("BITMEX"))
-        .order_qty(Quantity::from("100"))
+        .client_id(*BITMEX_CLIENT_ID)
+        .order_qty(order_qty)
         .use_post_only(true)
+        .open_position_on_start_qty(order_qty.as_decimal())
+        .open_position_time_in_force(TimeInForce::Ioc)
+        .close_positions_time_in_force(TimeInForce::Ioc)
         .log_data(false)
         .build();
 

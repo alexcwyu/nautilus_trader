@@ -68,9 +68,11 @@ class TardisDataClientConfig:
         self,
         api_key: str | None = None,
         tardis_ws_url: str | None = None,
+        proxy_url: str | None = None,
         normalize_symbols: bool | None = None,
         options: typing.Sequence[ReplayNormalizedRequestOptions] | None = None,
         stream_options: typing.Sequence[StreamNormalizedRequestOptions] | None = None,
+        extract_bbo_as_quotes: bool | None = None,
     ) -> None: ...
 
 @typing.final
@@ -101,6 +103,7 @@ class TardisHttpClient:
         base_url: str | None = None,
         timeout_secs: int | None = None,
         normalize_symbols: bool = True,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def api_key(self) -> str | None: ...
@@ -109,17 +112,17 @@ class TardisHttpClient:
     def instruments(
         self,
         exchange: str,
-        symbol: str | None = ...,
-        base_currency: typing.Sequence[str] | None = ...,
-        quote_currency: typing.Sequence[str] | None = ...,
-        instrument_type: typing.Sequence[str] | None = ...,
-        contract_type: typing.Sequence[str] | None = ...,
-        active: bool | None = ...,
-        start: int | None = ...,
-        end: int | None = ...,
-        available_offset: int | None = ...,
-        effective: int | None = ...,
-        ts_init: int | None = ...,
+        symbol: str | None = None,
+        base_currency: typing.Sequence[str] | None = None,
+        quote_currency: typing.Sequence[str] | None = None,
+        instrument_type: typing.Sequence[str] | None = None,
+        contract_type: typing.Sequence[str] | None = None,
+        active: bool | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        available_offset: int | None = None,
+        effective: int | None = None,
+        ts_init: int | None = None,
     ) -> typing.Any: ...
 
 @typing.final
@@ -153,6 +156,7 @@ class TardisMachineClient:
         base_url: str | None = None,
         normalize_symbols: bool = True,
         book_snapshot_output: str = "deltas",
+        extract_bbo_as_quotes: bool = False,
     ) -> None: ...
     def is_closed(self) -> bool: ...
     def close(self) -> None: ...

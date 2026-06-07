@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import sys
 from pathlib import Path
@@ -21,6 +22,67 @@ def _load_generate_stubs_module():
 
 
 generate_stubs = _load_generate_stubs_module()
+
+
+@pytest.mark.parametrize(
+    ("platform", "shared", "libdir", "existing", "expected_var", "expected_value"),
+    [
+        ("linux", 1, "/uv/lib", None, "LD_LIBRARY_PATH", "/uv/lib"),
+        ("linux", 1, "/uv/lib", "/existing", "LD_LIBRARY_PATH", f"/uv/lib{os.pathsep}/existing"),
+        ("darwin", 1, "/uv/lib", None, "DYLD_LIBRARY_PATH", "/uv/lib"),
+        ("win32", 1, "/uv/lib", None, None, None),
+        ("linux", 0, "/uv/lib", None, None, None),
+        ("linux", 1, None, None, None, None),
+    ],
+)
+def test_python_libdir_env_sets_loader_path(
+    monkeypatch,
+    platform,
+    shared,
+    libdir,
+    existing,
+    expected_var,
+    expected_value,
+):
+    # Arrange
+    monkeypatch.setattr(generate_stubs.sys, "platform", platform)
+    monkeypatch.setattr(
+        generate_stubs.sysconfig,
+        "get_config_var",
+        {"Py_ENABLE_SHARED": shared, "LIBDIR": libdir}.get,
+    )
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    monkeypatch.delenv("DYLD_LIBRARY_PATH", raising=False)
+    if existing is not None:
+        monkeypatch.setenv(expected_var, existing)
+
+    # Act
+    env = generate_stubs.python_libdir_env()
+
+    # Assert
+    if expected_var is None:
+        assert "LD_LIBRARY_PATH" not in env
+        assert "DYLD_LIBRARY_PATH" not in env
+    else:
+        assert env[expected_var] == expected_value
+
+
+def test_python_libdir_env_does_not_mutate_os_environ(monkeypatch):
+    # Arrange
+    monkeypatch.setattr(generate_stubs.sys, "platform", "linux")
+    monkeypatch.setattr(
+        generate_stubs.sysconfig,
+        "get_config_var",
+        {"Py_ENABLE_SHARED": 1, "LIBDIR": "/uv/lib"}.get,
+    )
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+
+    # Act
+    env = generate_stubs.python_libdir_env()
+
+    # Assert
+    assert env["LD_LIBRARY_PATH"] == "/uv/lib"
+    assert "LD_LIBRARY_PATH" not in os.environ
 
 
 def test_collect_rust_class_fixups_reads_pymethods_and_identifier_macros(tmp_path):
@@ -127,6 +189,132 @@ impl PriceType {
     # Assert
     assert fixups["PriceType"].classmethods == {"variants", "from_str"}
     assert fixups["PriceType"].staticmethods == set()
+
+
+def test_signature_defaults_handle_lifetime_generic_methods(tmp_path):
+    # Arrange
+    rust_file = tmp_path / "crates" / "adapters" / "hyperliquid" / "src" / "python" / "http.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl HyperliquidHttpClient {
+    #[pyo3(name = "load_instrument_definitions", signature = (include_spot=true, include_perps=true, include_perps_hip3=false, include_outcomes=false))]
+    fn py_load_instrument_definitions<'py>(
+        &self,
+        py: Python<'py>,
+        include_spot: bool,
+        include_perps: bool,
+        include_perps_hip3: bool,
+        include_outcomes: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        todo!()
+    }
+}
+""".strip(),
+    )
+    content = """
+class HyperliquidHttpClient:
+    def load_instrument_definitions(
+        self,
+        include_spot: bool,
+        include_perps: bool,
+        include_perps_hip3: bool,
+        include_outcomes: bool,
+    ) -> typing.Any: ...
+""".strip()
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+    updated = generate_stubs.apply_signature_defaults(content, fixups)
+
+    # Assert
+    assert "include_spot: bool = True" in updated
+    assert "include_perps: bool = True" in updated
+    assert "include_perps_hip3: bool = False" in updated
+    assert "include_outcomes: bool = False" in updated
+
+
+def test_collect_rust_class_fixups_reads_custom_data_stub_module(tmp_path):
+    # Arrange
+    rust_file = tmp_path / "crates" / "adapters" / "hyperliquid" / "src" / "data_types.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.hyperliquid")]
+pub struct HyperliquidAllMids {
+    #[custom_data_field(json)]
+    pub mids: HashMap<InstrumentId, Price>,
+    pub ts_event: UnixNanos,
+    pub ts_init: UnixNanos,
+}
+""".strip(),
+    )
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+
+    # Assert
+    assert fixups["HyperliquidAllMids"].getters == {"mids", "ts_event", "ts_init"}
+    assert fixups["HyperliquidAllMids"].classmethods == {"from_json"}
+
+
+def test_collect_rust_class_fixups_detects_cfg_attr_wrapped_custom_data(tmp_path):
+    # Arrange: mirrors the multi-line cfg_attr form used in
+    # crates/adapters/hyperliquid/src/data_types.rs
+    rust_file = tmp_path / "crates" / "adapters" / "hyperliquid" / "src" / "data_types.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[cfg_attr(
+    feature = "arrow",
+    custom_data(pyo3, stub_module = "nautilus_trader.adapters.hyperliquid")
+)]
+#[cfg_attr(
+    not(feature = "arrow"),
+    custom_data(pyo3, no_arrow, stub_module = "nautilus_trader.adapters.hyperliquid")
+)]
+pub struct HyperliquidAllMids {
+    #[custom_data_field(json)]
+    pub mids: HashMap<InstrumentId, Price>,
+    pub ts_event: UnixNanos,
+    pub ts_init: UnixNanos,
+}
+""".strip(),
+    )
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+
+    # Assert
+    assert fixups["HyperliquidAllMids"].getters == {"mids", "ts_event", "ts_init"}
+    assert fixups["HyperliquidAllMids"].classmethods == {"from_json"}
+
+
+def test_collect_rust_class_fixups_ignores_custom_data_without_stub_module(tmp_path):
+    # Arrange: DeribitVolatilityIndex pattern, cfg_attr-wrapped custom_data
+    # with no stub_module must not register stub fixups.
+    rust_file = tmp_path / "crates" / "adapters" / "deribit" / "src" / "data_types.rs"
+    rust_file.parent.mkdir(parents=True)
+    rust_file.write_text(
+        """
+#[cfg_attr(feature = "arrow", custom_data(pyo3))]
+#[cfg_attr(not(feature = "arrow"), custom_data(pyo3, no_arrow))]
+pub struct DeribitVolatilityIndex {
+    pub index_name: String,
+    pub volatility: f64,
+    pub ts_event: UnixNanos,
+    pub ts_init: UnixNanos,
+}
+""".strip(),
+    )
+
+    # Act
+    fixups = generate_stubs.collect_rust_class_fixups(tmp_path)
+
+    # Assert
+    assert "DeribitVolatilityIndex" not in fixups
 
 
 def test_collect_rust_class_fixups_preserves_attrs_across_doc_comments(tmp_path):
@@ -302,6 +490,27 @@ class PriceType(Enum):
     assert "    @classmethod\n    def from_str(cls, data: str) -> PriceType: ..." in updated
     assert "def variants(self)" not in updated
     assert "def from_str(self," not in updated
+
+
+def test_apply_rust_class_fixups_drops_extra_classmethod_cls_param():
+    # Arrange
+    content = """
+@typing.final
+class HyperliquidAllMids:
+    def from_json(self, _cls: type, data: typing.Any) -> typing.Any: ...
+""".strip()
+    fixups = {
+        "HyperliquidAllMids": generate_stubs.ClassMethodFixup(
+            classmethods={"from_json"},
+        ),
+    }
+
+    # Act
+    updated = generate_stubs.apply_rust_class_fixups(content, fixups)
+
+    # Assert
+    assert "    @classmethod\n    def from_json(cls, data: typing.Any)" in updated
+    assert "_cls" not in updated
 
 
 def test_apply_rust_class_fixups_renames_methods():
@@ -489,6 +698,30 @@ class DexType(Enum):
     assert "    CLAM_ENHANCED = ..." in updated
 
 
+def test_rename_enum_variants_uses_source_variants_for_digit_boundaries():
+    # Arrange
+    content = """
+class Blockchain(Enum):
+    HarmonySharD0 = ...
+    MetalL2 = ...
+""".strip()
+    renamed_enums = {"Blockchain"}
+    renamed_enum_variants = {"Blockchain": ["HarmonyShard0", "Metall2"]}
+
+    # Act
+    updated = generate_stubs.rename_enum_variants(
+        content,
+        renamed_enums,
+        renamed_enum_variants,
+    )
+
+    # Assert
+    assert "    HARMONY_SHARD0 = ..." in updated
+    assert "    METALL2 = ..." in updated
+    assert "    HARMONY_SHAR_D0" not in updated
+    assert "    METAL_L2" not in updated
+
+
 def test_collect_renamed_enums_detects_rename_all(tmp_path):
     # Arrange
     rust_file = tmp_path / "crates" / "model" / "src" / "enums.rs"
@@ -571,6 +804,79 @@ pub const MY_CONSTANT: u64 = 42;
     assert consts[names.index("MY_CONSTANT")].python_type == "int"
 
 
+def test_collect_module_constants_uses_adapter_package_path(tmp_path):
+    # Arrange
+    mod_rs = tmp_path / "crates" / "adapters" / "polymarket" / "src" / "python" / "mod.rs"
+    mod_rs.parent.mkdir(parents=True)
+    mod_rs.write_text(
+        """
+#[pymodule]
+pub fn polymarket(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add(stringify!(POLYMARKET), POLYMARKET)?;
+    Ok(())
+}
+""".strip(),
+    )
+
+    const_rs = tmp_path / "crates" / "adapters" / "polymarket" / "src" / "common" / "consts.rs"
+    const_rs.parent.mkdir(parents=True, exist_ok=True)
+    const_rs.write_text(
+        """
+pub const POLYMARKET: &str = "POLYMARKET";
+""".strip(),
+    )
+
+    # Act
+    result = generate_stubs.collect_module_constants(tmp_path)
+
+    # Assert
+    assert "adapters.polymarket" in result
+    assert "polymarket" not in result
+
+
+def test_remove_stale_top_level_adapter_stubs_deletes_generated_aliases(tmp_path):
+    # Arrange
+    root = tmp_path / "nautilus_trader"
+    adapters_dir = root / "adapters"
+    (adapters_dir / "polymarket").mkdir(parents=True)
+    (adapters_dir / "polymarket" / "__init__.pyi").write_text("class Polymarket: ...\n")
+
+    stale_dir = root / "polymarket"
+    stale_dir.mkdir()
+    stale_init = stale_dir / "__init__.pyi"
+    stale_init.write_text("class Polymarket: ...\n")
+
+    (adapters_dir / "bybit").mkdir()
+    (adapters_dir / "bybit" / "__init__.pyi").write_text("class Bybit: ...\n")
+    non_stale_dir = root / "bybit"
+    non_stale_dir.mkdir()
+    (non_stale_dir / "__init__.pyi").write_text("class Bybit: ...\n")
+    (non_stale_dir / "extra.pyi").write_text("class Extra: ...\n")
+
+    # Act
+    generate_stubs.remove_stale_top_level_adapter_stubs(root)
+
+    # Assert
+    assert not stale_dir.exists()
+    assert non_stale_dir.exists()
+
+
+def test_generated_stubs_do_not_expose_top_level_adapter_packages():
+    # Arrange
+    adapters_dir = STUB_ROOT / "adapters"
+
+    # Act
+    adapter_names = sorted(path.parent.name for path in adapters_dir.glob("*/__init__.pyi"))
+    exposed = [
+        adapter_name
+        for adapter_name in adapter_names
+        if (STUB_ROOT / adapter_name / "__init__.pyi").exists()
+    ]
+
+    # Assert
+    assert not exposed
+
+
 def test_add_names_to_all_inserts_sorted():
     # Arrange
     content = """
@@ -650,6 +956,50 @@ class Strategy:
     assert "Standard = ..." in updated
 
 
+def test_elide_forward_class_defaults_in_signatures():
+    content = """
+class Client:
+    def __init__(self, network: DydxNetwork = DydxNetwork.MAINNET) -> None: ...
+
+    @staticmethod
+    def from_env(
+        environment: HyperliquidEnvironment = HyperliquidEnvironment.MAINNET,
+        book_type: model.BookType = model.BookType.L1_MBP,
+    ) -> Client: ...
+
+class DydxNetwork(Enum):
+    MAINNET = ...
+
+class HyperliquidEnvironment(Enum):
+    MAINNET = ...
+""".strip()
+
+    updated = generate_stubs.elide_forward_class_defaults_in_signatures(content)
+
+    assert "network: DydxNetwork = ..." in updated
+    assert "environment: HyperliquidEnvironment = ..." in updated
+    assert "book_type: model.BookType = model.BookType.L1_MBP" in updated
+    assert "DydxNetwork.MAINNET" not in updated
+    assert "HyperliquidEnvironment.MAINNET" not in updated
+
+
+def test_elide_forward_class_defaults_in_signatures_keeps_earlier_local_defaults():
+    content = """
+class BitmexEnvironment(Enum):
+    MAINNET = ...
+
+class Client:
+    def __init__(
+        self,
+        environment: BitmexEnvironment = BitmexEnvironment.MAINNET,
+    ) -> None: ...
+""".strip()
+
+    updated = generate_stubs.elide_forward_class_defaults_in_signatures(content)
+
+    assert "environment: BitmexEnvironment = BitmexEnvironment.MAINNET" in updated
+
+
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 STUB_ROOT = WORKSPACE_ROOT / "python" / "nautilus_trader"
 
@@ -665,6 +1015,7 @@ def _parse_stub_enum_variants(stub_root: Path) -> dict[str, list[str]]:
 
     for pyi in sorted(stub_root.rglob("*.pyi")):
         current_enum: str | None = None
+
         for line in pyi.read_text().splitlines():
             class_match = STUB_ENUM_CLASS_RE.match(line)
             if class_match:
@@ -683,6 +1034,49 @@ def _parse_stub_enum_variants(stub_root: Path) -> dict[str, list[str]]:
 
 
 SCREAMING_SNAKE_RE = re.compile(r"^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*_?$")
+
+
+def test_live_stub_exposes_native_live_node_config_signature():
+    live_stub = (STUB_ROOT / "live" / "__init__.pyi").read_text()
+
+    assert "@typing.final\nclass LiveNodeConfig:" in live_stub
+    assert re.search(
+        r"portfolio:\s+(?:portfolio\.)?PortfolioConfig \| None = None",
+        live_stub,
+    )
+    assert '"PortfolioConfig"' in live_stub
+
+
+def test_live_stub_exposes_builder_engine_config_methods():
+    live_stub = (STUB_ROOT / "live" / "__init__.pyi").read_text()
+
+    assert (
+        "def with_cache_config(self, config: common.CacheConfig) -> LiveNodeBuilder: ..."
+        in live_stub
+    )
+    assert (
+        "def with_portfolio_config(self, config: portfolio.PortfolioConfig) -> LiveNodeBuilder: ..."
+        in live_stub
+    )
+    assert (
+        "def with_data_engine_config(self, config: LiveDataEngineConfig) -> LiveNodeBuilder: ..."
+        in live_stub
+    )
+    assert (
+        "def with_risk_engine_config(self, config: LiveRiskEngineConfig) -> LiveNodeBuilder: ..."
+        in live_stub
+    )
+    assert (
+        "def with_exec_engine_config(self, config: LiveExecEngineConfig) -> LiveNodeBuilder: ..."
+        in live_stub
+    )
+
+
+def test_package_stub_exports_portfolio_module():
+    package_stub = (STUB_ROOT / "__init__.pyi").read_text()
+
+    assert "from . import portfolio" in package_stub
+    assert '"portfolio"' in package_stub
 
 
 def test_stub_enum_variants_match_screaming_snake_case():
@@ -717,6 +1111,7 @@ def test_stub_enum_variants_match_runtime():
     runtime_enums = _collect_runtime_enum_variants(STUB_ROOT)
 
     mismatches: list[str] = []
+
     for name, runtime_members in sorted(runtime_enums.items()):
         expected_runtime_members = runtime_members
 

@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{FAILED, check_equal_u8},
+    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,7 @@ use ustr::Ustr;
 
 use super::{Instrument, any::InstrumentAny};
 use crate::{
-    enums::{AssetClass, InstrumentClass, OptionKind},
+    enums::{AssetClass, CurrencyType, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
     types::{
         currency::Currency,
@@ -106,7 +106,7 @@ impl CurrencyPair {
     /// # Errors
     ///
     /// Returns an error if any input validation fails.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -131,7 +131,7 @@ impl CurrencyPair {
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> anyhow::Result<Self> {
+    ) -> CorrectnessResult<Self> {
         check_equal_u8(
             price_precision,
             price_increment.precision,
@@ -179,7 +179,8 @@ impl CurrencyPair {
     /// # Panics
     ///
     /// Panics if any input parameter is invalid (see `new_checked`).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
@@ -230,7 +231,7 @@ impl CurrencyPair {
             ts_event,
             ts_init,
         )
-        .expect(FAILED)
+        .expect_display(FAILED)
     }
 }
 
@@ -262,7 +263,13 @@ impl Instrument for CurrencyPair {
     }
 
     fn asset_class(&self) -> AssetClass {
-        AssetClass::FX
+        if self.base_currency.currency_type == CurrencyType::Crypto
+            || self.quote_currency.currency_type == CurrencyType::Crypto
+        {
+            AssetClass::Cryptocurrency
+        } else {
+            AssetClass::FX
+        }
     }
 
     fn instrument_class(&self) -> InstrumentClass {
@@ -402,7 +409,10 @@ mod tests {
             currency_pair_btcusdt.id(),
             InstrumentId::from("BTCUSDT.BINANCE")
         );
-        assert_eq!(currency_pair_btcusdt.asset_class(), AssetClass::FX);
+        assert_eq!(
+            currency_pair_btcusdt.asset_class(),
+            AssetClass::Cryptocurrency
+        );
         assert_eq!(
             currency_pair_btcusdt.instrument_class(),
             InstrumentClass::Spot

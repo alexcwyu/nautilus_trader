@@ -22,9 +22,16 @@ crate-type = ["rlib", "staticlib"]
 
 [features]
 default = []
+simulation = ["madsim"]
 extension-module = ["python", "pyo3/extension-module"]
 ffi = ["cbindgen"]
 python = ["pyo3", "pyo3-stub-gen", "strum"]
+
+[package.metadata.cargo-machete]
+ignored = [
+  "cbindgen", # Used by build.rs when the `ffi` feature is enabled
+  "toml", # Used by build.rs to read pyproject.toml version metadata
+]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -43,9 +50,11 @@ rmp-serde = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 ustr = { workspace = true }
 uuid = { workspace = true }
 
+madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 strum = { workspace = true, optional = true }
@@ -70,6 +79,11 @@ harness = false
 [[bench]]
 name = "time"
 path = "benches/time.rs"
+harness = false
+
+[[bench]]
+name = "datetime"
+path = "benches/datetime.rs"
 harness = false
 
 [[bench]]
@@ -103,6 +117,11 @@ path = "benches/concurrent_map.rs"
 harness = false
 
 [[bench]]
+name = "hash_map"
+path = "benches/hash_map.rs"
+harness = false
+
+[[bench]]
 name = "hex"
 path = "benches/hex.rs"
 harness = false
@@ -110,4 +129,9 @@ harness = false
 [[bench]]
 name = "to_snake_case"
 path = "benches/to_snake_case.rs"
+harness = false
+
+[[bench]]
+name = "urlencoding"
+path = "benches/urlencoding.rs"
 harness = false

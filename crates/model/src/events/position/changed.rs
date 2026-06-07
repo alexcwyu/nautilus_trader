@@ -14,6 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use nautilus_core::{UUID4, UnixNanos};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     enums::{OrderSide, PositionSide},
@@ -25,7 +26,7 @@ use crate::{
 
 /// Represents an event where a position has changed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -84,6 +85,7 @@ pub struct PositionChanged {
 }
 
 impl PositionChanged {
+    #[must_use]
     pub fn create(
         position: &Position,
         fill: &OrderFilled,
@@ -125,8 +127,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
-        events::OrderFilled,
+        enums::{OrderSide, PositionSide},
+        events::{OrderFilled, order::spec::OrderFilledSpec},
         identifiers::{
             AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
             VenueOrderId,
@@ -165,53 +167,37 @@ mod tests {
     }
 
     fn create_test_order_filled() -> OrderFilled {
-        OrderFilled::new(
-            TraderId::from("TRADER-001"),
-            StrategyId::from("EMA-CROSS"),
-            InstrumentId::from("AUD/USD.SIM"),
-            ClientOrderId::from("O-19700101-000000-001-001-2"),
-            VenueOrderId::from("2"),
-            AccountId::from("SIM-001"),
-            TradeId::from("T-002"),
-            OrderSide::Buy,
-            OrderType::Market,
-            Quantity::from("50"),
-            Price::from("0.8050"),
-            Currency::USD(),
-            LiquiditySide::Taker,
-            UUID4::default(),
-            UnixNanos::from(1_500_000_000),
-            UnixNanos::from(2_500_000_000),
-            false,
-            Some(PositionId::from("P-001")),
-            Some(Money::new(1.0, Currency::USD())),
-        )
+        OrderFilledSpec::builder()
+            .strategy_id(StrategyId::from("EMA-CROSS"))
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-2"))
+            .venue_order_id(VenueOrderId::from("2"))
+            .trade_id(TradeId::from("T-002"))
+            .last_qty(Quantity::from("50"))
+            .last_px(Price::from("0.8050"))
+            .ts_event(UnixNanos::from(1_500_000_000))
+            .ts_init(UnixNanos::from(2_500_000_000))
+            .position_id(PositionId::from("P-001"))
+            .commission(Money::new(1.0, Currency::USD()))
+            .build()
     }
 
     #[rstest]
     fn test_position_changed_create() {
         let instrument = audusd_sim();
-        let initial_fill = OrderFilled::new(
-            TraderId::from("TRADER-001"),
-            StrategyId::from("EMA-CROSS"),
-            InstrumentId::from("AUD/USD.SIM"),
-            ClientOrderId::from("O-19700101-000000-001-001-1"),
-            VenueOrderId::from("1"),
-            AccountId::from("SIM-001"),
-            TradeId::from("T-001"),
-            OrderSide::Buy,
-            OrderType::Market,
-            Quantity::from("100"),
-            Price::from("0.8000"),
-            Currency::USD(),
-            LiquiditySide::Taker,
-            UUID4::default(),
-            UnixNanos::from(1_000_000_000),
-            UnixNanos::from(2_000_000_000),
-            false,
-            Some(PositionId::from("P-001")),
-            Some(Money::new(2.0, Currency::USD())),
-        );
+        let initial_fill = OrderFilledSpec::builder()
+            .strategy_id(StrategyId::from("EMA-CROSS"))
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .client_order_id(ClientOrderId::from("O-19700101-000000-001-001-1"))
+            .venue_order_id(VenueOrderId::from("1"))
+            .trade_id(TradeId::from("T-001"))
+            .last_qty(Quantity::from("100"))
+            .last_px(Price::from("0.8000"))
+            .ts_event(UnixNanos::from(1_000_000_000))
+            .ts_init(UnixNanos::from(2_000_000_000))
+            .position_id(PositionId::from("P-001"))
+            .commission(Money::new(2.0, Currency::USD()))
+            .build();
 
         let position = Position::new(&InstrumentAny::CurrencyPair(instrument), initial_fill);
         let change_fill = create_test_order_filled();

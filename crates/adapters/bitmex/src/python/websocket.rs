@@ -47,12 +47,16 @@ use nautilus_model::{
     },
     types::Price,
 };
+use nautilus_network::websocket::TransportBackend;
 use pyo3::{conversion::IntoPyObjectExt, prelude::*};
 use ustr::Ustr;
 
 use crate::{
     common::{
-        enums::{BitmexExecType, BitmexInstrumentState, BitmexOrderType, BitmexPegPriceType},
+        enums::{
+            BitmexEnvironment, BitmexExecType, BitmexInstrumentState, BitmexOrderType,
+            BitmexPegPriceType,
+        },
         parse::{
             parse_contracts_quantity, parse_instrument_id, parse_optional_datetime_to_unix_nanos,
         },
@@ -81,7 +85,7 @@ use crate::{
     name = "BitmexWebSocketClient",
     module = "nautilus_trader.core.nautilus_pyo3.bitmex"
 )]
-#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bitmex")]
+#[pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")]
 pub struct PyBitmexWebSocketClient {
     inner: BitmexWebSocketClient,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -100,17 +104,25 @@ impl Debug for PyBitmexWebSocketClient {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyBitmexWebSocketClient {
     #[new]
-    #[pyo3(signature = (url=None, api_key=None, api_secret=None, account_id=None, heartbeat=5, testnet=false))]
+    #[pyo3(signature = (url=None, api_key=None, api_secret=None, account_id=None, heartbeat=5, environment=BitmexEnvironment::Mainnet, proxy_url=None))]
     fn py_new(
         url: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: u64,
-        testnet: bool,
+        environment: BitmexEnvironment,
+        proxy_url: Option<String>,
     ) -> PyResult<Self> {
         let inner = BitmexWebSocketClient::new_with_env(
-            url, api_key, api_secret, account_id, heartbeat, testnet,
+            url,
+            api_key,
+            api_secret,
+            account_id,
+            heartbeat,
+            environment,
+            TransportBackend::default(),
+            proxy_url,
         )
         .map_err(to_pyvalue_err)?;
         Ok(Self {
@@ -209,7 +221,7 @@ impl PyBitmexWebSocketClient {
 
     #[pyo3(name = "connect")]
     #[pyo3(signature = (loop_, instruments, callback, trader_id=None))]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -223,6 +235,7 @@ impl PyBitmexWebSocketClient {
         let cache = Arc::clone(&self.instruments_cache);
         {
             let mut initial: AHashMap<Ustr, InstrumentAny> = AHashMap::new();
+
             for inst_py in instruments {
                 let inst = pyobject_to_instrument_any(py, inst_py)?;
                 initial.insert(inst.symbol().inner(), inst);
@@ -779,7 +792,7 @@ impl PyBitmexWebSocketClient {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_table_message(
     table_msg: BitmexTableMessage,
     instruments_cache: &Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -902,6 +915,7 @@ fn handle_table_message(
                 order_symbol_cache,
                 dispatch_state,
                 trader_id,
+                account_id,
                 ts_init,
                 call_soon,
                 callback,
@@ -914,16 +928,16 @@ fn handle_table_message(
                     continue;
                 };
 
-                send_to_python(
-                    parse_position_msg(&msg, instrument, ts_init),
-                    call_soon,
-                    callback,
-                );
+                let mut report = parse_position_msg(&msg, instrument, ts_init);
+                report.account_id = account_id;
+                send_to_python(report, call_soon, callback);
             }
         }
         BitmexTableMessage::Wallet { data, .. } => {
             for msg in data {
-                send_to_python(parse_wallet_msg(&msg, ts_init), call_soon, callback);
+                let mut account_state = parse_wallet_msg(&msg, ts_init);
+                account_state.account_id = account_id;
+                send_to_python(account_state, call_soon, callback);
             }
         }
         BitmexTableMessage::Margin { .. } => {}
@@ -1068,7 +1082,7 @@ fn handle_instrument_messages(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_order_messages(
     data: Vec<OrderData>,
     instruments: &AHashMap<Ustr, InstrumentAny>,
@@ -1149,13 +1163,14 @@ fn handle_order_messages(
                     }
                 } else {
                     match parse_order_msg(&order_msg, instrument, order_type_cache, ts_init) {
-                        Ok(report) => {
+                        Ok(mut report) => {
                             if report.order_status.is_closed()
                                 && let Some(cid) = report.client_order_id
                             {
                                 order_type_cache.remove(&cid);
                                 order_symbol_cache.remove(&cid);
                             }
+                            report.account_id = account_id;
                             send_to_python(report, call_soon, callback);
                         }
                         Err(e) => log::error!("Failed to parse order message: {e}"),
@@ -1232,13 +1247,14 @@ fn handle_order_messages(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_execution_messages(
     data: Vec<BitmexExecutionMsg>,
     instruments: &AHashMap<Ustr, InstrumentAny>,
     order_symbol_cache: &AHashMap<ClientOrderId, Ustr>,
     dispatch_state: &WsDispatchState,
     trader_id: TraderId,
+    account_id: AccountId,
     ts_init: UnixNanos,
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
@@ -1289,9 +1305,10 @@ fn handle_execution_messages(
             continue;
         };
 
-        let Some(fill) = parse_execution_msg(exec_msg, instrument, ts_init) else {
+        let Some(mut fill) = parse_execution_msg(exec_msg, instrument, ts_init) else {
             continue;
         };
+        fill.account_id = account_id;
 
         let identity = fill.client_order_id.and_then(|cid| {
             dispatch_state
@@ -1325,7 +1342,7 @@ fn handle_execution_messages(
 }
 
 /// Dispatches a parsed order event to Python with lifecycle synthesis and deduplication.
-#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+#[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 fn dispatch_order_event_to_python(
     event: ParsedOrderEvent,
     client_order_id: ClientOrderId,
@@ -1422,7 +1439,7 @@ fn dispatch_order_event_to_python(
 }
 
 /// Synthesizes and sends `OrderAccepted` to Python if one has not yet been emitted.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn ensure_accepted_to_python(
     client_order_id: ClientOrderId,
     account_id: AccountId,

@@ -169,6 +169,20 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "cython-compat")]
     re_export_module_attributes(m, n)?;
 
+    let n = "portfolio";
+    let submodule = pyo3::wrap_pymodule!(nautilus_portfolio::python::portfolio);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
+    let n = "risk";
+    let submodule = pyo3::wrap_pymodule!(nautilus_risk::python::risk);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
     let n = "serialization";
     let submodule = pyo3::wrap_pymodule!(nautilus_serialization::python::serialization);
     m.add_wrapped(submodule)?;
@@ -201,12 +215,22 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Adapters
     ////////////////////////////////////////////////////////////////////////////////
 
-    let n = "architect";
-    let submodule = pyo3::wrap_pymodule!(nautilus_architect_ax::python::architect);
+    let n = "architect_ax";
+    let submodule = pyo3::wrap_pymodule!(nautilus_architect_ax::python::architect_ax);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     #[cfg(feature = "cython-compat")]
     re_export_module_attributes(m, n)?;
+
+    #[cfg(feature = "betfair")]
+    {
+        let n = "betfair";
+        let submodule = pyo3::wrap_pymodule!(nautilus_betfair::python::betfair);
+        m.add_wrapped(submodule)?;
+        sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+        #[cfg(feature = "cython-compat")]
+        re_export_module_attributes(m, n)?;
+    }
 
     let n = "binance";
     let submodule = pyo3::wrap_pymodule!(nautilus_binance::python::binance);
@@ -229,6 +253,13 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "cython-compat")]
     re_export_module_attributes(m, n)?;
 
+    let n = "coinbase";
+    let submodule = pyo3::wrap_pymodule!(nautilus_coinbase::python::coinbase);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
     let n = "databento";
     let submodule = pyo3::wrap_pymodule!(nautilus_databento::python::databento);
     m.add_wrapped(submodule)?;
@@ -238,6 +269,13 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let n = "deribit";
     let submodule = pyo3::wrap_pymodule!(nautilus_deribit::python::deribit);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
+    let n = "derive";
+    let submodule = pyo3::wrap_pymodule!(nautilus_derive::python::derive);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     #[cfg(feature = "cython-compat")]
@@ -259,6 +297,20 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let n = "kraken";
     let submodule = pyo3::wrap_pymodule!(nautilus_kraken::python::kraken);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
+    let n = "lighter";
+    let submodule = pyo3::wrap_pymodule!(nautilus_lighter::python::lighter);
+    m.add_wrapped(submodule)?;
+    sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    #[cfg(feature = "cython-compat")]
+    re_export_module_attributes(m, n)?;
+
+    let n = "interactive_brokers";
+    let submodule = pyo3::wrap_pymodule!(nautilus_interactive_brokers::python::interactive_brokers);
     m.add_wrapped(submodule)?;
     sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     #[cfg(feature = "cython-compat")]

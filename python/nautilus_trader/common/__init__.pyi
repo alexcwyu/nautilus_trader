@@ -2,6 +2,7 @@
 # ruff: noqa: F401
 
 import datetime
+import decimal
 import enum
 import typing
 
@@ -48,6 +49,7 @@ __all__ = [
     "logging_clock_set_realtime_mode",
     "logging_clock_set_static_mode",
     "logging_clock_set_static_time",
+    "logging_sync_to_disk",
     "tracing_is_initialized",
 ]
 
@@ -62,17 +64,18 @@ class BusMessage:
 class CacheConfig:
     def __init__(
         self,
-        encoding: SerializationEncoding | None = ...,
-        timestamps_as_iso8601: bool | None = ...,
-        buffer_interval_ms: int | None = ...,
-        bulk_read_batch_size: int | None = ...,
-        use_trader_prefix: bool | None = ...,
-        use_instance_id: bool | None = ...,
-        flush_on_start: bool | None = ...,
-        drop_instruments_on_reset: bool | None = ...,
-        tick_capacity: int | None = ...,
-        bar_capacity: int | None = ...,
-        save_market_data: bool | None = ...,
+        encoding: SerializationEncoding | None = None,
+        timestamps_as_iso8601: bool | None = None,
+        buffer_interval_ms: int | None = None,
+        bulk_read_batch_size: int | None = None,
+        use_trader_prefix: bool | None = None,
+        use_instance_id: bool | None = None,
+        flush_on_start: bool | None = None,
+        drop_instruments_on_reset: bool | None = None,
+        tick_capacity: int | None = None,
+        bar_capacity: int | None = None,
+        save_market_data: bool | None = None,
+        persist_account_events: bool | None = None,
     ) -> None: ...
     @property
     def encoding(self) -> SerializationEncoding: ...
@@ -94,6 +97,8 @@ class CacheConfig:
     def tick_capacity(self) -> int: ...
     @property
     def bar_capacity(self) -> int: ...
+    @property
+    def persist_account_events(self) -> bool: ...
     @property
     def save_market_data(self) -> bool: ...
 
@@ -187,6 +192,20 @@ class LogGuard: ...
 
 @typing.final
 class LoggerConfig:
+    def __init__(
+        self,
+        stdout_level: LogLevel | None = None,
+        fileout_level: LogLevel | None = None,
+        component_levels: typing.Mapping[str, str] | None = None,
+        is_colored: bool | None = None,
+        print_config: bool | None = None,
+        bypass_logging: bool | None = None,
+        log_components_only: bool | None = None,
+        file_config: FileWriterConfig | None = None,
+        clear_log_file: bool | None = None,
+        fileout_sync_on_flush: bool | None = None,
+        buffered_stdout: bool | None = None,
+    ) -> None: ...
     @staticmethod
     def from_spec(spec: str) -> LoggerConfig: ...
 
@@ -276,6 +295,12 @@ class Cache:
         self, instrument_id: model.InstrumentId
     ) -> list[model.IndexPriceUpdate] | None: ...
     def funding_rate(self, instrument_id: model.InstrumentId) -> model.FundingRateUpdate | None: ...
+    def instrument_status(
+        self, instrument_id: model.InstrumentId
+    ) -> model.InstrumentStatus | None: ...
+    def instrument_statuses(
+        self, instrument_id: model.InstrumentId
+    ) -> list[model.InstrumentStatus] | None: ...
     def price(
         self, instrument_id: model.InstrumentId, price_type: model.PriceType
     ) -> model.Price | None: ...
@@ -545,7 +570,11 @@ class Cache:
     def strategy_id_for_position(
         self, position_id: model.PositionId
     ) -> model.StrategyId | None: ...
-    def position_snapshot_bytes(self, position_id: model.PositionId) -> list[int] | None: ...
+    def position_snapshot_bytes(self, position_id: model.PositionId) -> list[list[int]] | None: ...
+    def snapshot_position(self, position: typing.Any) -> None: ...
+    def position_snapshots(
+        self, position_id: model.PositionId | None = None, account_id: model.AccountId | None = None
+    ) -> list[typing.Any]: ...
     def pool(self, instrument_id: model.InstrumentId) -> model.Pool | None: ...
     def pool_profiler(self, instrument_id: model.InstrumentId) -> model.PoolProfiler | None: ...
 
@@ -561,6 +590,8 @@ class Clock:
     def timer_names(self) -> list[str]: ...
     def timer_count(self) -> int: ...
     def register_default_handler(self, callback: typing.Any) -> None: ...
+    def cancel_default_handler(self) -> None: ...
+    def cancel_callbacks(self) -> None: ...
     def set_time_alert(
         self,
         name: str,
@@ -627,6 +658,10 @@ class DataActor:
     def degrade(self) -> None: ...
     def fault(self) -> None: ...
     def shutdown_system(self, reason: str | None = None) -> None: ...
+    def publish_data(self, data_type: model.DataType, data: model.CustomData) -> None: ...
+    def publish_signal(self, name: str, value: typing.Any, ts_event: int = 0) -> None: ...
+    def add_synthetic(self, synthetic: model.SyntheticInstrument) -> None: ...
+    def update_synthetic(self, synthetic: model.SyntheticInstrument) -> None: ...
     def on_start(self) -> None: ...
     def on_stop(self) -> None: ...
     def on_resume(self) -> None: ...
@@ -656,6 +691,7 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def subscribe_signal(self, name: str = "", priority: int | None = None) -> None: ...
     def subscribe_instruments(
         self,
         venue: model.Venue,
@@ -722,6 +758,12 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def subscribe_option_greeks(
+        self,
+        instrument_id: model.InstrumentId,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> None: ...
     def subscribe_instrument_status(
         self,
         instrument_id: model.InstrumentId,
@@ -734,73 +776,23 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def subscribe_option_chain(
+        self,
+        series_id: model.OptionSeriesId,
+        strike_range: model.StrikeRange,
+        snapshot_interval_ms: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> None: ...
     def subscribe_order_fills(self, instrument_id: model.InstrumentId) -> None: ...
     def subscribe_order_cancels(self, instrument_id: model.InstrumentId) -> None: ...
-    def request_data(
-        self,
-        data_type: model.DataType,
-        client_id: model.ClientId,
-        start: int | None = None,
-        end: int | None = None,
-        limit: int | None = None,
-        params: dict | None = None,
-    ) -> str: ...
-    def request_instrument(
-        self,
-        instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
-        client_id: model.ClientId | None = None,
-        params: dict | None = None,
-    ) -> str: ...
-    def request_instruments(
-        self,
-        venue: model.Venue | None = None,
-        start: int | None = None,
-        end: int | None = None,
-        client_id: model.ClientId | None = None,
-        params: dict | None = None,
-    ) -> str: ...
-    def request_book_snapshot(
-        self,
-        instrument_id: model.InstrumentId,
-        depth: int | None = None,
-        client_id: model.ClientId | None = None,
-        params: dict | None = None,
-    ) -> str: ...
-    def request_quotes(
-        self,
-        instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
-        limit: int | None = None,
-        client_id: model.ClientId | None = None,
-        params: dict | None = None,
-    ) -> str: ...
-    def request_trades(
-        self,
-        instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
-        limit: int | None = None,
-        client_id: model.ClientId | None = None,
-        params: dict | None = None,
-    ) -> str: ...
-    def request_bars(
-        self,
-        bar_type: model.BarType,
-        start: int | None = None,
-        end: int | None = None,
-        limit: int | None = None,
-        client_id: model.ClientId | None = None,
-        params: dict | None = None,
-    ) -> str: ...
     def unsubscribe_data(
         self,
         data_type: model.DataType,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def unsubscribe_signal(self, name: str = "") -> None: ...
     def unsubscribe_instruments(
         self,
         venue: model.Venue,
@@ -856,6 +848,18 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def unsubscribe_funding_rates(
+        self,
+        instrument_id: model.InstrumentId,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> None: ...
+    def unsubscribe_option_greeks(
+        self,
+        instrument_id: model.InstrumentId,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> None: ...
     def unsubscribe_instrument_status(
         self,
         instrument_id: model.InstrumentId,
@@ -868,11 +872,85 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
+    def unsubscribe_option_chain(
+        self, series_id: model.OptionSeriesId, client_id: model.ClientId | None = None
+    ) -> None: ...
     def unsubscribe_order_fills(self, instrument_id: model.InstrumentId) -> None: ...
     def unsubscribe_order_cancels(self, instrument_id: model.InstrumentId) -> None: ...
+    def request_data(
+        self,
+        data_type: model.DataType,
+        client_id: model.ClientId,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_instrument(
+        self,
+        instrument_id: model.InstrumentId,
+        start: int | None = None,
+        end: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_instruments(
+        self,
+        venue: model.Venue | None = None,
+        start: int | None = None,
+        end: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_book_snapshot(
+        self,
+        instrument_id: model.InstrumentId,
+        depth: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_quotes(
+        self,
+        instrument_id: model.InstrumentId,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_trades(
+        self,
+        instrument_id: model.InstrumentId,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_funding_rates(
+        self,
+        instrument_id: model.InstrumentId,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_bars(
+        self,
+        bar_type: model.BarType,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
     def on_historical_data(self, data: typing.Any) -> None: ...
     def on_historical_quotes(self, quotes: typing.Sequence[model.QuoteTick]) -> None: ...
     def on_historical_trades(self, trades: typing.Sequence[model.TradeTick]) -> None: ...
+    def on_historical_funding_rates(
+        self, funding_rates: typing.Sequence[model.FundingRateUpdate]
+    ) -> None: ...
     def on_historical_bars(self, bars: typing.Sequence[model.Bar]) -> None: ...
     def on_historical_mark_prices(
         self, mark_prices: typing.Sequence[model.MarkPriceUpdate]
@@ -984,6 +1062,8 @@ class GreeksCalculator:
         index_instrument_id: model.InstrumentId | None = None,
         beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
         vega_time_weight_base: int | None = None,
+        vol_index_instrument_id: model.InstrumentId | None = None,
+        vol_beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
     ) -> model.GreeksData: ...
     def modify_greeks(
         self,
@@ -999,6 +1079,11 @@ class GreeksCalculator:
         vol: float = 0.0,
         expiry_in_days: int = 0,
         vega_time_weight_base: int | None = None,
+        unshocked_vol: float = 0.0,
+        vol_index_instrument_id: model.InstrumentId | None = None,
+        vol_beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
+        index_price: float | None = None,
+        vol_index_price: float | None = None,
     ) -> tuple[float, float, float]: ...
     def portfolio_greeks(
         self,
@@ -1020,6 +1105,8 @@ class GreeksCalculator:
         beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
         greeks_filter: typing.Any | None = None,
         vega_time_weight_base: int | None = None,
+        vol_index_instrument_id: model.InstrumentId | None = None,
+        vol_beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
     ) -> model.PortfolioGreeks: ...
     def cache_futures_spread(
         self,
@@ -1036,14 +1123,14 @@ class Logger:
     def __init__(self, name: str = "Python") -> None: ...
     @property
     def name(self) -> str: ...
-    def trace(self, message: str, color: LogColor | None = ...) -> None: ...
-    def debug(self, message: str, color: LogColor | None = ...) -> None: ...
-    def info(self, message: str, color: LogColor | None = ...) -> None: ...
-    def warning(self, message: str, color: LogColor | None = ...) -> None: ...
-    def error(self, message: str, color: LogColor | None = ...) -> None: ...
+    def trace(self, message: str, color: LogColor | None = None) -> None: ...
+    def debug(self, message: str, color: LogColor | None = None) -> None: ...
+    def info(self, message: str, color: LogColor | None = None) -> None: ...
+    def warning(self, message: str, color: LogColor | None = None) -> None: ...
+    def error(self, message: str, color: LogColor | None = None) -> None: ...
     def exception(self, message: str = "", color: LogColor | None = None) -> None: ...
     def flush(self) -> None: ...
-    def _log(self, level: LogLevel, color: LogColor | None, message: str) -> None: ...
+    def _log(self, level: LogLevel, color: LogColor | None = None, message: str = "") -> None: ...
 
 @typing.final
 class MessageBus:
@@ -1239,7 +1326,7 @@ def get_exchange_rate(
     price_type: model.PriceType,
     quotes_bid: typing.Mapping[str, float],
     quotes_ask: typing.Mapping[str, float],
-) -> float | None: ...
+) -> decimal.Decimal | None: ...
 def init_logging(
     trader_id: model.TraderId,
     instance_id: core.UUID4,
@@ -1254,6 +1341,8 @@ def init_logging(
     is_bypassed: bool | None = None,
     print_config: bool | None = None,
     log_components_only: bool | None = None,
+    fileout_sync_on_flush: bool | None = None,
+    buffered_stdout: bool | None = None,
 ) -> LogGuard: ...
 def init_tracing() -> None: ...
 def log_header(
@@ -1265,4 +1354,5 @@ def logger_log(level: LogLevel, color: LogColor, component: str, message: str) -
 def logging_clock_set_realtime_mode() -> None: ...
 def logging_clock_set_static_mode() -> None: ...
 def logging_clock_set_static_time(time_ns: int) -> None: ...
+def logging_sync_to_disk() -> bool: ...
 def tracing_is_initialized() -> bool: ...

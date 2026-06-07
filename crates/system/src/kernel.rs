@@ -14,7 +14,7 @@
 // -------------------------------------------------------------------------------------------------
 
 use std::{
-    cell::{Ref, RefCell},
+    cell::{Cell, Ref, RefCell},
     rc::Rc,
     time::Duration,
 };
@@ -25,11 +25,15 @@ use nautilus_common::{
     component::Component,
     enums::Environment,
     logging::{
-        headers, init_logging,
+        arm_shutdown_on_error, disarm_shutdown_on_error, headers, init_logging,
         logger::{LogGuard, LoggerConfig},
-        writer::FileWriterConfig,
+        try_drain_shutdown_on_error_trigger,
     },
-    msgbus::{MessageBus, get_message_bus, set_message_bus},
+    messages::system::ShutdownSystem,
+    msgbus::{
+        self, MessageBus, MessagingSwitchboard, ShareableMessageHandler, get_message_bus,
+        set_message_bus,
+    },
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_data::engine::DataEngine;
@@ -39,7 +43,12 @@ use nautilus_portfolio::portfolio::Portfolio;
 use nautilus_risk::engine::RiskEngine;
 use ustr::Ustr;
 
-use crate::{builder::NautilusKernelBuilder, config::NautilusKernelConfig, trader::Trader};
+use crate::{
+    builder::NautilusKernelBuilder,
+    config::NautilusKernelConfig,
+    event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents},
+    trader::Trader,
+};
 
 /// Core Nautilus system kernel.
 ///
@@ -78,6 +87,9 @@ pub struct NautilusKernel {
     pub ts_started: Option<UnixNanos>,
     /// The UNIX timestamp (nanoseconds) when the kernel was last shutdown.
     pub ts_shutdown: Option<UnixNanos>,
+    shutdown_requested: Rc<Cell<bool>>,
+    event_store: Option<Box<dyn KernelEventStore>>,
+    event_store_replay: bool,
 }
 
 impl NautilusKernel {
@@ -97,6 +109,44 @@ impl NautilusKernel {
     ///
     /// Returns an error if the kernel fails to initialize.
     pub fn new<T: NautilusKernelConfig + 'static>(name: String, config: T) -> anyhow::Result<Self> {
+        Self::new_with(name, config, None, None)
+    }
+
+    /// Create a new [`NautilusKernel`] instance with an injected cache database adapter.
+    ///
+    /// The adapter is passed straight to [`Cache::new`] so the kernel can restore
+    /// generic cache state (including snapshot blobs anchored by the event store) from
+    /// the durable backing store on startup, without an external caller pre-seeding the
+    /// in-memory cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel fails to initialize.
+    pub fn new_with_cache_database<T: NautilusKernelConfig + 'static>(
+        name: String,
+        config: T,
+        cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with(name, config, cache_database, None)
+    }
+
+    /// Create a new [`NautilusKernel`] instance with optional cache database and event store
+    /// injections.
+    ///
+    /// The cache adapter is passed to [`Cache::new`]; the event-store factory is invoked
+    /// with the kernel's clock so the resulting [`KernelEventStore`] implementation shares
+    /// the same time source the kernel uses to stamp `RunStarted`/`RunEnded` and any
+    /// drop-seal fallback timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel fails to initialize or the event-store factory fails.
+    pub fn new_with<T: NautilusKernelConfig + 'static>(
+        name: String,
+        config: T,
+        cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
+        event_store_factory: Option<EventStoreFactory>,
+    ) -> anyhow::Result<Self> {
         let instance_id = config.instance_id().unwrap_or_default();
         let machine_id = Self::determine_machine_id()?;
 
@@ -106,13 +156,17 @@ impl NautilusKernel {
             config.trader_id(),
             &machine_id,
             instance_id,
-            Ustr::from(stringify!(LiveNode)),
+            Ustr::from(&name),
         );
 
         log::info!("Building system kernel");
 
         let clock = Self::initialize_clock(&config.environment());
-        let cache = Self::initialize_cache(config.cache());
+        let event_store = match event_store_factory {
+            Some(factory) => Some(factory(instance_id, clock.clone())?),
+            None => None,
+        };
+        let cache = Self::initialize_cache(config.cache(), cache_database);
 
         let msgbus = Rc::new(RefCell::new(MessageBus::new(
             config.trader_id(),
@@ -149,6 +203,9 @@ impl NautilusKernel {
         RiskEngine::register_msgbus_handlers(&risk_engine);
         ExecutionEngine::register_msgbus_handlers(&exec_engine);
 
+        let shutdown_requested = Rc::new(Cell::new(false));
+        Self::register_shutdown_handler(config.trader_id(), shutdown_requested.clone());
+
         let trader = Rc::new(RefCell::new(Trader::new(
             config.trader_id(),
             instance_id,
@@ -164,6 +221,7 @@ impl NautilusKernel {
             name,
             instance_id,
             machine_id,
+            event_store,
             config: Box::new(config),
             cache,
             clock,
@@ -177,7 +235,28 @@ impl NautilusKernel {
             ts_created,
             ts_started: None,
             ts_shutdown: None,
+            shutdown_requested,
+            event_store_replay: false,
         })
+    }
+
+    fn register_shutdown_handler(trader_id: TraderId, shutdown_requested: Rc<Cell<bool>>) {
+        let handler = ShareableMessageHandler::from_typed(move |cmd: &ShutdownSystem| {
+            if cmd.trader_id != trader_id {
+                log::warn!("Received {cmd} not for this trader {trader_id}, ignoring",);
+                return;
+            }
+
+            if shutdown_requested.get() {
+                log::debug!("Shutdown already requested, ignoring {cmd}");
+                return;
+            }
+
+            log::info!("Received {cmd}, requesting shutdown");
+            shutdown_requested.set(true);
+        });
+        let topic = MessagingSwitchboard::shutdown_system_topic();
+        msgbus::subscribe_any(topic.into(), handler, None);
     }
 
     fn determine_machine_id() -> anyhow::Result<String> {
@@ -192,12 +271,8 @@ impl NautilusKernel {
         #[cfg(feature = "tracing-bridge")]
         let use_tracing = config.use_tracing;
 
-        let log_guard = match init_logging(
-            trader_id,
-            instance_id,
-            config,
-            FileWriterConfig::default(), // TODO: Properly incorporate file writer config
-        ) {
+        let file_config = config.file_config.clone().unwrap_or_default();
+        let log_guard = match init_logging(trader_id, instance_id, config, file_config) {
             Ok(guard) => guard,
             Err(e) => {
                 // Only recover from SetLoggerError (logger already registered).
@@ -249,11 +324,11 @@ impl NautilusKernel {
         }
     }
 
-    fn initialize_cache(cache_config: Option<CacheConfig>) -> Rc<RefCell<Cache>> {
+    fn initialize_cache(
+        cache_config: Option<CacheConfig>,
+        cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
+    ) -> Rc<RefCell<Cache>> {
         let cache_config = cache_config.unwrap_or_default();
-
-        // TODO: Placeholder: persistent database adapter can be initialized here (e.g., Redis)
-        let cache_database: Option<Box<dyn CacheDatabaseAdapter>> = None;
         let cache = Cache::new(Some(cache_config), cache_database);
 
         Rc::new(RefCell::new(cache))
@@ -322,6 +397,51 @@ impl NautilusKernel {
         self.ts_shutdown
     }
 
+    /// Returns `true` if shutdown has been requested.
+    ///
+    /// Drains pending shutdown-on-error logs before checking the kernel flag.
+    #[must_use]
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.drain_shutdown_on_error_trigger();
+        self.shutdown_requested.get()
+    }
+
+    /// Clears the shutdown flag.
+    ///
+    /// Call this before starting a fresh run so a prior `ShutdownSystem`
+    /// command does not abort it.
+    pub fn reset_shutdown_flag(&self) {
+        self.shutdown_requested.set(false);
+    }
+
+    /// Returns a shared handle to the shutdown flag for async runtimes
+    /// that need to poll it outside the kernel's direct borrow.
+    #[must_use]
+    pub fn shutdown_flag(&self) -> Rc<Cell<bool>> {
+        self.shutdown_requested.clone()
+    }
+
+    fn drain_shutdown_on_error_trigger(&self) {
+        try_drain_shutdown_on_error_trigger(|trigger| {
+            let command = ShutdownSystem::new(
+                self.config.trader_id(),
+                trigger.component,
+                Some(format!(
+                    "Error log received from {}: {}",
+                    trigger.component, trigger.message
+                )),
+                UUID4::new(),
+                trigger.timestamp,
+                None,
+            );
+
+            msgbus::try_publish_any(
+                MessagingSwitchboard::shutdown_system_topic(),
+                command.as_any(),
+            )
+        });
+    }
+
     /// Returns whether the kernel has been configured to load state.
     #[must_use]
     pub fn load_state(&self) -> bool {
@@ -378,7 +498,52 @@ impl NautilusKernel {
 
     /// Starts the Nautilus system kernel synchronously (for backtest use).
     pub fn start(&mut self) {
+        arm_shutdown_on_error(self.config.shutdown_on_error());
         log::info!("Starting");
+
+        self.event_store_replay = false;
+
+        if let Some(event_store) = self.event_store.as_deref_mut() {
+            self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
+
+            let components = Self::collect_registered_components(&self.trader);
+            let environment = self.config.environment();
+            let event_store_replay_configured = event_store.is_event_store_replay_configured();
+
+            if event_store_replay_configured && !self.config.load_state() {
+                log::error!("Event-store replay requires load_state=true");
+                return;
+            }
+
+            if self.config.load_state()
+                && let Err(e) =
+                    event_store.restore_parent_cache(self.instance_id, &mut self.cache.borrow_mut())
+            {
+                log::error!("Failed to restore cache from event-store replay source: {e}");
+                return;
+            }
+
+            if let Err(e) = event_store.open(self.instance_id, &components, environment) {
+                log::error!("Failed to open event-store run: {e}");
+                return;
+            }
+
+            let anchorer = event_store.snapshot_anchorer();
+            self.exec_engine
+                .borrow_mut()
+                .set_snapshot_anchorer(anchorer);
+            self.event_store_replay = event_store_replay_configured;
+        }
+
+        if self.event_store_replay {
+            log::info!(
+                "Event-store replay loaded; skipping engines, clients, trader startup, and live reconciliation",
+            );
+            self.ts_started = Some(self.clock.borrow().timestamp_ns());
+            log::info!("Started");
+            return;
+        }
+
         self.start_engines();
 
         log::info!("Initializing trader");
@@ -387,15 +552,33 @@ impl NautilusKernel {
             return;
         }
 
-        log::info!("Starting clients...");
-
-        if let Err(e) = self.start_clients() {
-            log::error!("Error starting clients: {e:?}");
-        }
-        log::info!("Clients started");
+        // Execution and data clients are started by their engines via `start_engines` above
 
         self.ts_started = Some(self.clock.borrow().timestamp_ns());
         log::info!("Started");
+    }
+
+    fn collect_registered_components(trader: &Rc<RefCell<Trader>>) -> RegisteredComponents {
+        let trader = trader.borrow();
+        let mut components = RegisteredComponents::default();
+        for actor_id in trader.actor_ids() {
+            components
+                .actors
+                .insert(actor_id.to_string(), String::new());
+        }
+
+        for strategy_id in trader.strategy_ids() {
+            components
+                .strategies
+                .insert(strategy_id.to_string(), String::new());
+        }
+
+        for algo_id in trader.exec_algorithm_ids() {
+            components
+                .algorithms
+                .insert(algo_id.to_string(), String::new());
+        }
+        components
     }
 
     /// Starts the Nautilus system kernel asynchronously.
@@ -420,6 +603,8 @@ impl NautilusKernel {
     /// which may trigger residual events such as order cancellations. The caller should
     /// continue processing events after calling this method to handle these residual events.
     pub fn stop_trader(&mut self) {
+        disarm_shutdown_on_error();
+
         if !self.trader.borrow().is_running() {
             return;
         }
@@ -436,20 +621,50 @@ impl NautilusKernel {
     /// This method should be called after the residual events grace period has elapsed
     /// and all remaining events have been processed. It disconnects clients and stops engines.
     pub async fn finalize_stop(&mut self) {
-        // Stop all adapter clients
-        if let Err(e) = self.stop_all_clients() {
-            log::error!("Error stopping clients: {e:?}");
-        }
+        disarm_shutdown_on_error();
+
+        // Execution and data clients are stopped by their engines via `stop_engines` below
 
         self.stop_engines();
         self.cancel_timers();
 
-        self.ts_shutdown = Some(self.clock.borrow().timestamp_ns());
+        let ts_shutdown = self.clock.borrow().timestamp_ns();
+
+        if let Some(event_store) = self.event_store.as_deref_mut() {
+            self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
+            event_store.seal(ts_shutdown);
+        }
+        self.ts_shutdown = Some(ts_shutdown);
         log::info!("Stopped");
+    }
+
+    /// Returns the kernel-managed event-store integration, when one was injected.
+    ///
+    /// Callers wire an implementation through
+    /// [`NautilusKernelBuilder::with_event_store`](crate::builder::NautilusKernelBuilder::with_event_store);
+    /// without an injected adapter this returns `None`.
+    #[must_use]
+    pub fn event_store(&self) -> Option<&dyn KernelEventStore> {
+        self.event_store.as_deref()
+    }
+
+    /// Returns whether the event-store integration is running an event-store replay start.
+    #[must_use]
+    pub fn is_event_store_replay(&self) -> bool {
+        self.event_store_replay
+    }
+
+    /// Returns whether the event-store integration is configured for an event-store replay start.
+    #[must_use]
+    pub fn is_event_store_replay_configured(&self) -> bool {
+        self.event_store
+            .as_deref()
+            .is_some_and(KernelEventStore::is_event_store_replay_configured)
     }
 
     /// Resets the Nautilus system kernel to its initial state.
     pub fn reset(&mut self) {
+        disarm_shutdown_on_error();
         log::info!("Resetting");
 
         if let Err(e) = self.trader.borrow_mut().reset() {
@@ -459,6 +674,7 @@ impl NautilusKernel {
         self.data_engine.borrow_mut().reset();
         self.exec_engine.borrow_mut().reset();
         self.risk_engine.borrow_mut().reset();
+        self.portfolio.borrow_mut().reset();
 
         self.ts_started = None;
         self.ts_shutdown = None;
@@ -468,6 +684,7 @@ impl NautilusKernel {
 
     /// Disposes of the Nautilus system kernel, releasing resources.
     pub fn dispose(&mut self) {
+        disarm_shutdown_on_error();
         log::info!("Disposing");
 
         if let Err(e) = self.trader.borrow_mut().dispose() {
@@ -475,6 +692,18 @@ impl NautilusKernel {
         }
 
         self.stop_engines();
+        self.portfolio.borrow_mut().reset();
+        self.cancel_timers();
+
+        // BacktestEngine::end() does not call finalize_stop, so dispose() seals the
+        // run for non-streaming backtests. finalize_stop (live) consumes the session
+        // first; this call is then a no-op. Callers that skip dispose entirely fall
+        // back to the event-store implementation's Drop.
+        if let Some(event_store) = self.event_store.as_deref_mut() {
+            self.exec_engine.borrow_mut().set_snapshot_anchorer(None);
+            let ts_dispose = self.clock.borrow().timestamp_ns();
+            event_store.seal(ts_dispose);
+        }
 
         self.data_engine.borrow_mut().dispose();
         self.exec_engine.borrow_mut().dispose();
@@ -499,63 +728,11 @@ impl NautilusKernel {
         self.risk_engine.borrow_mut().stop();
     }
 
-    /// Starts all engine clients.
-    ///
-    /// Note: Async connection (connect/disconnect) is handled by LiveNode for live clients.
-    /// This method only handles synchronous start operations on execution clients.
-    fn start_clients(&self) -> Result<(), Vec<anyhow::Error>> {
-        let mut errors = Vec::new();
-
-        {
-            let mut exec_engine = self.exec_engine.borrow_mut();
-            let exec_adapters = exec_engine.get_clients_mut();
-
-            for adapter in exec_adapters {
-                if let Err(e) = adapter.start() {
-                    log::error!("Error starting execution client {}: {e}", adapter.client_id);
-                    errors.push(e);
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Stops all engine clients.
-    ///
-    /// Note: Async disconnection is handled by LiveNode for live clients.
-    /// This method only handles synchronous stop operations on execution clients.
-    fn stop_all_clients(&self) -> Result<(), Vec<anyhow::Error>> {
-        let mut errors = Vec::new();
-
-        {
-            let mut exec_engine = self.exec_engine.borrow_mut();
-            let exec_adapters = exec_engine.get_clients_mut();
-
-            for adapter in exec_adapters {
-                if let Err(e) = adapter.stop() {
-                    log::error!("Error stopping execution client {}: {e}", adapter.client_id);
-                    errors.push(e);
-                }
-            }
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
     /// Connects data engine clients.
     ///
     /// Data clients are connected first so that instruments are published
     /// and can be drained into the cache before execution clients connect.
-    #[allow(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
+    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     pub async fn connect_data_clients(&mut self) {
         log::info!("Connecting data clients...");
         self.data_engine.borrow_mut().connect().await;
@@ -565,7 +742,7 @@ impl NautilusKernel {
     ///
     /// Must be called after data clients are connected and instrument events
     /// have been drained into the cache, so execution clients can load instruments.
-    #[allow(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
+    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     pub async fn connect_exec_clients(&mut self) {
         log::info!("Connecting execution clients...");
         self.exec_engine.borrow_mut().connect().await;
@@ -576,7 +753,7 @@ impl NautilusKernel {
     /// # Errors
     ///
     /// Returns an error if any client fails to disconnect.
-    #[allow(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
+    #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     pub async fn disconnect_clients(&mut self) -> anyhow::Result<()> {
         log::info!("Disconnecting clients...");
         self.data_engine.borrow_mut().disconnect().await?;
@@ -607,5 +784,89 @@ impl NautilusKernel {
     #[must_use]
     pub fn exec_client_connection_status(&self) -> Vec<(ClientId, bool)> {
         self.exec_engine.borrow().client_connection_status()
+    }
+}
+
+#[cfg(all(test, feature = "python"))]
+mod tests {
+    use nautilus_common::messages::system::ShutdownSystem;
+    use nautilus_core::UUID4;
+    use rstest::*;
+    use ustr::Ustr;
+
+    use super::*;
+    use crate::builder::NautilusKernelBuilder;
+
+    #[rstest]
+    fn test_shutdown_system_sets_kernel_flag() {
+        let kernel = NautilusKernelBuilder::default().build().unwrap();
+        assert!(!kernel.is_shutdown_requested());
+
+        let command = ShutdownSystem::new(
+            kernel.trader_id(),
+            Ustr::from("TestComponent"),
+            Some("unit test".to_string()),
+            UUID4::new(),
+            kernel.generate_timestamp_ns(),
+            None, // correlation_id
+        );
+
+        msgbus::publish_any(
+            MessagingSwitchboard::shutdown_system_topic(),
+            command.as_any(),
+        );
+        assert!(kernel.is_shutdown_requested());
+
+        kernel.reset_shutdown_flag();
+        assert!(!kernel.is_shutdown_requested());
+    }
+
+    #[rstest]
+    fn test_shutdown_system_idempotent() {
+        let kernel = NautilusKernelBuilder::default().build().unwrap();
+
+        let make_cmd = || {
+            ShutdownSystem::new(
+                kernel.trader_id(),
+                Ustr::from("TestComponent"),
+                None,
+                UUID4::new(),
+                kernel.generate_timestamp_ns(),
+                None, // correlation_id
+            )
+        };
+
+        let topic = MessagingSwitchboard::shutdown_system_topic();
+        msgbus::publish_any(topic, make_cmd().as_any());
+        assert!(kernel.is_shutdown_requested());
+
+        msgbus::publish_any(topic, make_cmd().as_any());
+        assert!(kernel.is_shutdown_requested());
+
+        kernel.reset_shutdown_flag();
+        assert!(!kernel.is_shutdown_requested());
+
+        msgbus::publish_any(topic, make_cmd().as_any());
+        assert!(kernel.is_shutdown_requested());
+    }
+
+    #[rstest]
+    fn test_shutdown_system_ignores_other_trader() {
+        let kernel = NautilusKernelBuilder::default().build().unwrap();
+
+        let command = ShutdownSystem::new(
+            TraderId::from("OTHER-TRADER"),
+            Ustr::from("TestComponent"),
+            None,
+            UUID4::new(),
+            kernel.generate_timestamp_ns(),
+            None, // correlation_id
+        );
+
+        msgbus::publish_any(
+            MessagingSwitchboard::shutdown_system_topic(),
+            command.as_any(),
+        );
+        assert!(!kernel.is_shutdown_requested());
     }
 }

@@ -34,6 +34,10 @@ from nautilus_trader.core.data import Data
 # ---------------------------
 # These type definitions provide import resolution and docstrings for Python types
 # implemented in PyO3. They will eventually be separated into per-module .pyi files.
+#
+# This hand-written stub tracks the default legacy `nautilus_pyo3` extension surface.
+# Do not add DeFi-only or other feature-gated v2 APIs here unless they are exposed by the
+# default legacy Python module at runtime.
 
 ###################################################################################################
 # Core
@@ -79,7 +83,7 @@ def get_exchange_rate(
     price_type: PriceType,
     quotes_bid: dict[str, float],
     quotes_ask: dict[str, float],
-) -> float | None: ...
+) -> Decimal | None: ...
 
 # Logging
 
@@ -99,6 +103,8 @@ def init_logging(
     is_bypassed: bool | None = None,
     print_config: bool | None = None,
     log_components_only: bool | None = None,
+    fileout_sync_on_flush: bool | None = None,
+    buffered_stdout: bool | None = None,
 ) -> LogGuard: ...
 def tracing_is_initialized() -> bool: ...
 def init_tracing() -> None: ...
@@ -110,6 +116,7 @@ def log_header(
 ) -> None: ...
 def log_sysinfo(component: str) -> None: ...
 def logger_flush() -> None: ...
+def logging_sync_to_disk() -> bool: ...
 
 # Messaging
 
@@ -144,6 +151,23 @@ class Signal:
     @property
     def ts_init(self) -> int: ...
 
+class TimeEvent:
+    def __init__(
+        self,
+        name: str,
+        event_id: UUID4,
+        ts_event: int,
+        ts_init: int,
+    ) -> None: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def event_id(self) -> UUID4: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+
 class CustomData:
     def __init__(self, data_type: DataType, data: object) -> None: ...
     @property
@@ -157,7 +181,6 @@ class CustomData:
     def to_json_bytes(self) -> bytes: ...
     @classmethod
     def from_json_bytes(cls, bytes: bytes) -> CustomData: ...
-    def __eq__(self, other: object) -> bool: ...
 
 class FifoCache:
     def __init__(self) -> None: ...
@@ -175,6 +198,12 @@ class FifoCache:
 
 class DataActor:
     def __init__(self, config: object = None) -> None: ...
+    @property
+    def clock(self) -> Any: ...
+    @property
+    def cache(self) -> Any: ...
+    @property
+    def log(self) -> Any: ...
     @property
     def actor_id(self) -> ActorId: ...
     @property
@@ -194,6 +223,14 @@ class DataActor:
     def degrade(self) -> None: ...
     def fault(self) -> None: ...
     def shutdown_system(self, reason: str | None = None) -> None: ...
+    def on_start(self) -> None: ...
+    def on_stop(self) -> None: ...
+    def on_resume(self) -> None: ...
+    def on_reset(self) -> None: ...
+    def on_dispose(self) -> None: ...
+    def on_degrade(self) -> None: ...
+    def on_fault(self) -> None: ...
+    def on_time_event(self, event: TimeEvent) -> None: ...
     def on_signal(self, signal: Signal) -> None: ...
     def on_data(self, data: Any) -> None: ...
     def on_instrument(self, instrument: Any) -> None: ...
@@ -204,8 +241,18 @@ class DataActor:
     def on_book(self, order_book: OrderBook) -> None: ...
     def on_mark_price(self, mark_price: MarkPriceUpdate) -> None: ...
     def on_index_price(self, index_price: IndexPriceUpdate) -> None: ...
+    def on_funding_rate(self, funding_rate: FundingRateUpdate) -> None: ...
     def on_instrument_status(self, data: InstrumentStatus) -> None: ...
     def on_instrument_close(self, update: InstrumentClose) -> None: ...
+    def on_option_greeks(self, greeks: OptionGreeks) -> None: ...
+    def on_option_chain(self, slice: OptionChainSlice) -> None: ...
+    def on_historical_data(self, data: Any) -> None: ...
+    def on_historical_quotes(self, quotes: list[QuoteTick]) -> None: ...
+    def on_historical_trades(self, trades: list[TradeTick]) -> None: ...
+    def on_historical_funding_rates(self, funding_rates: list[FundingRateUpdate]) -> None: ...
+    def on_historical_bars(self, bars: list[Bar]) -> None: ...
+    def on_historical_mark_prices(self, mark_prices: list[MarkPriceUpdate]) -> None: ...
+    def on_historical_index_prices(self, index_prices: list[IndexPriceUpdate]) -> None: ...
     def subscribe_data(
         self,
         data_type: DataType,
@@ -272,6 +319,18 @@ class DataActor:
         client_id: ClientId | None = None,
         params: dict[str, str] | None = None,
     ) -> None: ...
+    def subscribe_funding_rates(
+        self,
+        instrument_id: InstrumentId,
+        client_id: ClientId | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
+    def subscribe_option_greeks(
+        self,
+        instrument_id: InstrumentId,
+        client_id: ClientId | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
     def subscribe_instrument_status(
         self,
         instrument_id: InstrumentId,
@@ -284,6 +343,15 @@ class DataActor:
         client_id: ClientId | None = None,
         params: dict[str, str] | None = None,
     ) -> None: ...
+    def subscribe_option_chain(
+        self,
+        series_id: OptionSeriesId,
+        strike_range: StrikeRange,
+        snapshot_interval_ms: int | None = None,
+        client_id: ClientId | None = None,
+    ) -> None: ...
+    def subscribe_order_fills(self, instrument_id: InstrumentId) -> None: ...
+    def subscribe_order_cancels(self, instrument_id: InstrumentId) -> None: ...
     def unsubscribe_data(
         self,
         data_type: DataType,
@@ -345,6 +413,18 @@ class DataActor:
         client_id: ClientId | None = None,
         params: dict[str, str] | None = None,
     ) -> None: ...
+    def unsubscribe_funding_rates(
+        self,
+        instrument_id: InstrumentId,
+        client_id: ClientId | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
+    def unsubscribe_option_greeks(
+        self,
+        instrument_id: InstrumentId,
+        client_id: ClientId | None = None,
+        params: dict[str, str] | None = None,
+    ) -> None: ...
     def unsubscribe_instrument_status(
         self,
         instrument_id: InstrumentId,
@@ -357,6 +437,13 @@ class DataActor:
         client_id: ClientId | None = None,
         params: dict[str, str] | None = None,
     ) -> None: ...
+    def unsubscribe_option_chain(
+        self,
+        series_id: OptionSeriesId,
+        client_id: ClientId | None = None,
+    ) -> None: ...
+    def unsubscribe_order_fills(self, instrument_id: InstrumentId) -> None: ...
+    def unsubscribe_order_cancels(self, instrument_id: InstrumentId) -> None: ...
     def request_data(
         self,
         data_type: DataType,
@@ -399,6 +486,15 @@ class DataActor:
         params: dict[str, str] | None = None,
     ) -> str: ...
     def request_trades(
+        self,
+        instrument_id: InstrumentId,
+        start: int | None = None,
+        end: int | None = None,
+        limit: int | None = None,
+        client_id: ClientId | None = None,
+        params: dict[str, str] | None = None,
+    ) -> str: ...
+    def request_funding_rates(
         self,
         instrument_id: InstrumentId,
         start: int | None = None,
@@ -528,6 +624,24 @@ class Position:
     ) -> Money: ...
     def notional_value(self, price: Price) -> Money: ...
 
+class PositionChanged:
+    @staticmethod
+    def create(
+        position: Position, fill: OrderFilled, event_id: UUID4, ts_init: int
+    ) -> PositionChanged: ...
+
+class PositionClosed:
+    @staticmethod
+    def create(
+        position: Position, fill: OrderFilled, event_id: UUID4, ts_init: int
+    ) -> PositionClosed: ...
+
+class PositionOpened:
+    @staticmethod
+    def create(
+        position: Position, fill: OrderFilled, event_id: UUID4, ts_init: int
+    ) -> PositionOpened: ...
+
 class MarginAccount:
     def __init__(
         self,
@@ -544,12 +658,12 @@ class MarginAccount:
     def set_leverage(self, instrument_id: InstrumentId, leverage: float) -> None: ...
     def is_unleveraged(self) -> bool: ...
     def update_initial_margin(self, instrument_id: InstrumentId, initial_margin: Money) -> None: ...
-    def initial_margin(self, instrument_id: InstrumentId) -> Money: ...
+    def initial_margin(self, instrument_id: InstrumentId) -> Money | None: ...
     def initial_margins(self) -> dict[InstrumentId, Money]: ...
     def update_maintenance_margin(
         self, instrument_id: InstrumentId, maintenance_margin: Money
     ) -> None: ...
-    def maintenance_margin(self, instrument_id: InstrumentId) -> Money: ...
+    def maintenance_margin(self, instrument_id: InstrumentId) -> Money | None: ...
     def maintenance_margins(self) -> dict[InstrumentId, Money]: ...
     def calculate_initial_margin(
         self,
@@ -1060,9 +1174,12 @@ class OptionGreeks:
         open_interest: float | None = None,
         ts_event: int = 0,
         ts_init: int = 0,
+        convention: GreeksConvention | None = None,
     ) -> None: ...
     @property
     def instrument_id(self) -> InstrumentId: ...
+    @property
+    def convention(self) -> GreeksConvention: ...
     @property
     def delta(self) -> float: ...
     @property
@@ -1207,6 +1324,35 @@ class FundingRateUpdate:
     def to_dict(self) -> dict[str, Any]: ...
     def to_json(self) -> bytes: ...
     def to_msgpack(self) -> bytes: ...
+
+class Block:
+    def __init__(
+        self,
+        chain: Any,
+        hash: str,
+        parent_hash: str,
+        number: int,
+        miner: str,
+        gas_limit: int,
+        gas_used: int,
+        timestamp: int,
+    ) -> None: ...
+    @property
+    def chain(self) -> Any | None: ...
+    @property
+    def hash(self) -> str: ...
+    @property
+    def number(self) -> int: ...
+    @property
+    def parent_hash(self) -> str: ...
+    @property
+    def miner(self) -> str: ...
+    @property
+    def gas_limit(self) -> int: ...
+    @property
+    def gas_used(self) -> int: ...
+    @property
+    def timestamp(self) -> int: ...
 
 class InstrumentStatus:
     def __init__(
@@ -1402,6 +1548,10 @@ class OmsType(Enum):
 class OptionKind(Enum):
     CALL = "CALL"
     PUT = "PUT"
+
+class GreeksConvention(Enum):
+    BLACK_SCHOLES = "BLACK_SCHOLES"
+    PRICE_ADJUSTED = "PRICE_ADJUSTED"
 
 class OrderSide(Enum):
     NO_ORDER_SIDE = "NO_ORDER_SIDE"
@@ -2161,9 +2311,12 @@ class Money:
     def __abs__(self) -> Money: ...
     def __int__(self) -> int: ...
     def is_zero(self) -> bool: ...
+    def is_positive(self) -> bool: ...
     def as_decimal(self) -> Decimal: ...
     def as_double(self) -> float: ...
     def to_formatted_str(self) -> str: ...
+    def checked_add(self, other: Money) -> Money | None: ...
+    def checked_sub(self, other: Money) -> Money | None: ...
 
 class Price:
     def __init__(self, value: float, precision: int) -> None: ...
@@ -2192,6 +2345,8 @@ class Price:
     def as_double(self) -> float: ...
     def as_decimal(self) -> Decimal: ...
     def to_formatted_str(self) -> str: ...
+    def checked_add(self, other: Price) -> Price | None: ...
+    def checked_sub(self, other: Price) -> Price | None: ...
 
 class Quantity:
     def __init__(self, value: float, precision: int) -> None: ...
@@ -2220,6 +2375,9 @@ class Quantity:
     def as_decimal(self) -> Decimal: ...
     def as_double(self) -> float: ...
     def to_formatted_str(self) -> str: ...
+    def saturating_sub(self, other: Quantity) -> Quantity: ...
+    def checked_add(self, other: Quantity) -> Quantity | None: ...
+    def checked_sub(self, other: Quantity) -> Quantity | None: ...
 
 class AccountBalance:
     def __init__(self, total: Money, locked: Money, free: Money): ...
@@ -3170,6 +3328,190 @@ class FuturesSpread:
     def from_dict(cls, values: dict[str, str]) -> FuturesSpread: ...
     def to_dict(self) -> dict[str, Any]: ...
 
+class CryptoFuturesSpread:
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        raw_symbol: Symbol,
+        underlying: Currency,
+        quote_currency: Currency,
+        settlement_currency: Currency,
+        is_inverse: bool,
+        strategy_type: str,
+        activation_ns: int,
+        expiration_ns: int,
+        price_precision: int,
+        size_precision: int,
+        price_increment: Price,
+        size_increment: Quantity,
+        ts_event: int,
+        ts_init: int,
+        multiplier: Quantity | None = None,
+        lot_size: Quantity | None = None,
+        max_quantity: Quantity | None = None,
+        min_quantity: Quantity | None = None,
+        max_notional: Money | None = None,
+        min_notional: Money | None = None,
+        max_price: Price | None = None,
+        min_price: Price | None = None,
+        margin_init: Decimal | None = None,
+        margin_maint: Decimal | None = None,
+        maker_fee: Decimal | None = None,
+        taker_fee: Decimal | None = None,
+        info: dict[str, Any] | None = None,
+    ) -> None: ...
+    @property
+    def id(self) -> InstrumentId: ...
+    @property
+    def raw_symbol(self) -> Symbol: ...
+    @property
+    def underlying(self) -> Currency: ...
+    @property
+    def quote_currency(self) -> Currency: ...
+    @property
+    def settlement_currency(self) -> Currency: ...
+    @property
+    def is_inverse(self) -> bool: ...
+    @property
+    def strategy_type(self) -> str: ...
+    @property
+    def activation_ns(self) -> int: ...
+    @property
+    def expiration_ns(self) -> int: ...
+    @property
+    def price_precision(self) -> int: ...
+    @property
+    def size_precision(self) -> int: ...
+    @property
+    def price_increment(self) -> Price: ...
+    @property
+    def size_increment(self) -> Quantity: ...
+    @property
+    def multiplier(self) -> Quantity: ...
+    @property
+    def lot_size(self) -> Quantity: ...
+    @property
+    def max_quantity(self) -> Quantity | None: ...
+    @property
+    def min_quantity(self) -> Quantity | None: ...
+    @property
+    def max_notional(self) -> Money | None: ...
+    @property
+    def min_notional(self) -> Money | None: ...
+    @property
+    def max_price(self) -> Price | None: ...
+    @property
+    def min_price(self) -> Price | None: ...
+    @property
+    def margin_init(self) -> Decimal: ...
+    @property
+    def margin_maint(self) -> Decimal: ...
+    @property
+    def maker_fee(self) -> Decimal: ...
+    @property
+    def taker_fee(self) -> Decimal: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+    @property
+    def info(self) -> dict[str, Any]: ...
+    @classmethod
+    def from_dict(cls, values: dict[str, str]) -> CryptoFuturesSpread: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
+class CryptoOptionSpread:
+    def __init__(
+        self,
+        instrument_id: InstrumentId,
+        raw_symbol: Symbol,
+        underlying: Currency,
+        quote_currency: Currency,
+        settlement_currency: Currency,
+        is_inverse: bool,
+        strategy_type: str,
+        activation_ns: int,
+        expiration_ns: int,
+        price_precision: int,
+        size_precision: int,
+        price_increment: Price,
+        size_increment: Quantity,
+        ts_event: int,
+        ts_init: int,
+        multiplier: Quantity | None = None,
+        lot_size: Quantity | None = None,
+        max_quantity: Quantity | None = None,
+        min_quantity: Quantity | None = None,
+        max_notional: Money | None = None,
+        min_notional: Money | None = None,
+        max_price: Price | None = None,
+        min_price: Price | None = None,
+        margin_init: Decimal | None = None,
+        margin_maint: Decimal | None = None,
+        maker_fee: Decimal | None = None,
+        taker_fee: Decimal | None = None,
+        info: dict[str, Any] | None = None,
+    ) -> None: ...
+    @property
+    def id(self) -> InstrumentId: ...
+    @property
+    def raw_symbol(self) -> Symbol: ...
+    @property
+    def underlying(self) -> Currency: ...
+    @property
+    def quote_currency(self) -> Currency: ...
+    @property
+    def settlement_currency(self) -> Currency: ...
+    @property
+    def is_inverse(self) -> bool: ...
+    @property
+    def strategy_type(self) -> str: ...
+    @property
+    def activation_ns(self) -> int: ...
+    @property
+    def expiration_ns(self) -> int: ...
+    @property
+    def price_precision(self) -> int: ...
+    @property
+    def size_precision(self) -> int: ...
+    @property
+    def price_increment(self) -> Price: ...
+    @property
+    def size_increment(self) -> Quantity: ...
+    @property
+    def multiplier(self) -> Quantity: ...
+    @property
+    def lot_size(self) -> Quantity: ...
+    @property
+    def max_quantity(self) -> Quantity | None: ...
+    @property
+    def min_quantity(self) -> Quantity | None: ...
+    @property
+    def max_notional(self) -> Money | None: ...
+    @property
+    def min_notional(self) -> Money | None: ...
+    @property
+    def max_price(self) -> Price | None: ...
+    @property
+    def min_price(self) -> Price | None: ...
+    @property
+    def margin_init(self) -> Decimal: ...
+    @property
+    def margin_maint(self) -> Decimal: ...
+    @property
+    def maker_fee(self) -> Decimal: ...
+    @property
+    def taker_fee(self) -> Decimal: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
+    @property
+    def info(self) -> dict[str, Any]: ...
+    @classmethod
+    def from_dict(cls, values: dict[str, str]) -> CryptoOptionSpread: ...
+    def to_dict(self) -> dict[str, Any]: ...
+
 class IndexInstrument:
     def __init__(
         self,
@@ -3586,6 +3928,8 @@ type Instrument = Union[
     BettingInstrument,
     BinaryOption,
     CryptoFuture,
+    CryptoFuturesSpread,
+    CryptoOptionSpread,
     CryptoPerpetual,
     CurrencyPair,
     Equity,
@@ -5142,6 +5486,7 @@ class WebSocketConfig:
         reconnect_jitter_ms: int | None = 100,
         reconnect_max_attempts: int | None = None,
         idle_timeout_ms: int | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
 
 class WebSocketClient:
@@ -5213,6 +5558,8 @@ class NautilusDataType(Enum):
     TradeTick = 4
     Bar = 5
     MarkPriceUpdate = 6
+    InstrumentStatus = 7
+    OptionGreeks = 8
 
 class DataBackendSession:
     def __init__(self, chunk_size: int = 10_000) -> None: ...
@@ -5331,6 +5678,12 @@ def trades_to_arrow_record_batch_bytes(data: list[TradeTick]) -> bytes: ...
 def bars_to_arrow_record_batch_bytes(data: list[Bar]) -> bytes: ...
 def mark_prices_to_arrow_record_batch_bytes(data: list[IndexPriceUpdate]) -> bytes: ...
 def index_prices_to_arrow_record_batch_bytes(data: list[IndexPriceUpdate]) -> bytes: ...
+def instrument_status_to_arrow_record_batch_bytes(data: list[InstrumentStatus]) -> bytes: ...
+def instrument_status_from_arrow_record_batch_bytes(
+    data: bytes,
+) -> list[InstrumentStatus]: ...
+def option_greeks_to_arrow_record_batch_bytes(data: list[OptionGreeks]) -> bytes: ...
+def option_greeks_from_arrow_record_batch_bytes(data: bytes) -> list[OptionGreeks]: ...
 def instrument_closes_to_arrow_record_batch_bytes(data: list[InstrumentClose]) -> bytes: ...
 
 ###################################################################################################
@@ -6334,6 +6687,7 @@ class AxHttpClient:
     @property
     def api_key_masked(self) -> str: ...
     def cancel_all_requests(self) -> None: ...
+    async def cancel_all_orders(self, instrument_id: InstrumentId) -> None: ...
     def cache_instrument(self, instrument: Any) -> None: ...
     async def authenticate(
         self,
@@ -6405,9 +6759,14 @@ class AxMdWebSocketClient:
         url: str,
         auth_token: str,
         heartbeat: int = 30,
+        proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
-    def without_auth(url: str, heartbeat: int = 30) -> AxMdWebSocketClient: ...
+    def without_auth(
+        url: str,
+        heartbeat: int = 30,
+        proxy_url: str | None = None,
+    ) -> AxMdWebSocketClient: ...
     @property
     def url(self) -> str: ...
     def is_active(self) -> bool: ...
@@ -6440,6 +6799,7 @@ class AxOrdersWebSocketClient:
         account_id: AccountId,
         trader_id: TraderId,
         heartbeat: int = 30,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -6671,8 +7031,16 @@ class BybitMarginStatusResult:
     def ts_init(self) -> int: ...
 
 class BybitPositionMode(Enum):
-    MergedSingle = 0
-    BothSides = 3
+    MERGED_SINGLE = 0
+    BOTH_SIDES = 3
+
+class BybitPositionIdx(Enum):
+    ONE_WAY = 0
+    BUY_HEDGE = 1
+    SELL_HEDGE = 2
+
+    @classmethod
+    def from_str(cls, data: Any) -> BybitPositionIdx: ...
 
 class BybitServerTime:
     @property
@@ -6944,6 +7312,7 @@ class BybitHttpClient:
         self,
         product_type: BybitProductType,
         symbol: str | None = None,
+        base_coin: str | None = None,
     ) -> list[Instrument]: ...
     async def request_instrument_statuses(
         self,
@@ -7038,6 +7407,9 @@ class BybitHttpClient:
         reduce_only: bool = False,
         is_quote_quantity: bool = False,
         is_leverage: bool = False,
+        position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
     ) -> OrderStatusReport: ...
     async def cancel_order(
         self,
@@ -7071,6 +7443,7 @@ class BybitWebSocketClient:
         environment: BybitEnvironment,
         url: str | None = None,
         heartbeat: int = 20,
+        proxy_url: str | None = None,
     ) -> BybitWebSocketClient: ...
     @staticmethod
     def new_private(
@@ -7079,6 +7452,7 @@ class BybitWebSocketClient:
         api_secret: str | None = None,
         url: str | None = None,
         heartbeat: int = 20,
+        proxy_url: str | None = None,
     ) -> BybitWebSocketClient: ...
     @staticmethod
     def new_trade(
@@ -7087,6 +7461,7 @@ class BybitWebSocketClient:
         api_secret: str | None = None,
         url: str | None = None,
         heartbeat: int = 20,
+        proxy_url: str | None = None,
     ) -> BybitWebSocketClient: ...
     @property
     def api_key_masked(self) -> str | None: ...
@@ -7136,6 +7511,9 @@ class BybitWebSocketClient:
         post_only: bool | None = None,
         reduce_only: bool | None = None,
         is_leverage: bool = False,
+        position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
     ) -> None: ...
     async def modify_order(
         self,
@@ -7193,6 +7571,9 @@ class BybitWebSocketClient:
         is_leverage: bool = False,
         take_profit: Price | None = None,
         stop_loss: Price | None = None,
+        position_idx: BybitPositionIdx | None = None,
+        bbo_side_type: str | None = None,
+        bbo_level: str | None = None,
     ) -> BybitWsPlaceOrderParams: ...
     def build_amend_order_params(
         self,
@@ -7240,6 +7621,7 @@ class BybitWsPlaceOrderParams:
     tp_limit_price: str | None
     order_iv: str | None
     mmp: bool | None
+    position_idx: BybitPositionIdx | None
 
 class BybitWsAmendOrderParams:
     category: BybitProductType
@@ -7267,6 +7649,16 @@ def get_bybit_ws_url_public(
 ) -> str: ...
 def get_bybit_ws_url_private(environment: BybitEnvironment) -> str: ...
 def get_bybit_ws_url_trade(environment: BybitEnvironment) -> str: ...
+def bybit_resolve_position_idx(
+    position_mode: BybitPositionMode | None,
+    order_side: OrderSide,
+    is_reduce_only: bool,
+    manual_override: BybitPositionIdx | None = None,
+) -> BybitPositionIdx | None: ...
+def bybit_make_hedge_venue_position_id(
+    instrument_id: InstrumentId,
+    position_idx: BybitPositionIdx | None = None,
+) -> PositionId | None: ...
 def bybit_extract_raw_symbol(symbol: str) -> str: ...
 def bybit_bar_spec_to_interval(aggregation: int, step: int) -> str: ...
 def bybit_product_type_from_symbol(symbol: str) -> BybitProductType: ...
@@ -7287,6 +7679,13 @@ class DatabentoStatisticType(Enum):
     CLOSE_PRICE = "CLOSE_PRICE"
     NET_CHANGE = "NET_CHANGE"
     VWAP = "VWAP"
+    VOLATILITY = "VOLATILITY"
+    DELTA = "DELTA"
+    UNCROSSING_PRICE = "UNCROSSING_PRICE"
+    UPPER_PRICE_LIMIT = "UPPER_PRICE_LIMIT"
+    LOWER_PRICE_LIMIT = "LOWER_PRICE_LIMIT"
+    BLOCK_VOLUME = "BLOCK_VOLUME"
+    INDICATIVE_CLOSE_PRICE = "INDICATIVE_CLOSE_PRICE"
 
 class DatabentoStatisticUpdateAction(Enum):
     ADDED = "ADDED"
@@ -7375,6 +7774,8 @@ class DatabentoDataLoader:
     def set_dataset_for_venue(self, dataset: str, venue: Venue) -> None: ...
     def get_publishers(self) -> dict[int, DatabentoPublisher]: ...
     def get_dataset_for_venue(self, venue: Venue) -> str: ...
+    def set_price_precision(self, symbol: str, price_precision: int) -> None: ...
+    def get_price_precisions(self) -> dict[str, int]: ...
     def schema_for_file(self, filepath: str) -> str: ...
     def load_instruments(
         self,
@@ -7532,6 +7933,7 @@ class DatabentoHistoricalClient:
     ) -> None: ...
     @property
     def api_key(self) -> str: ...
+    def set_price_precision(self, symbol: str, price_precision: int) -> None: ...
     async def get_dataset_range(self, dataset: str) -> dict[str, str]: ...
     async def get_range_instruments(
         self,
@@ -7632,6 +8034,7 @@ class DatabentoLiveClient:
         stype_in: str | None = None,
         start: int | None = None,
         snapshot: bool | None = False,
+        price_precisions: list[int | None] | None = None,
     ) -> dict[str, str]: ...
     def start(
         self,
@@ -7648,7 +8051,7 @@ class DeribitHttpClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
-        is_testnet: bool = False,
+        environment: DeribitEnvironment = ...,
         timeout_secs: int = 10,
         max_retries: int = 3,
         retry_delay_ms: int = 1_000,
@@ -7714,14 +8117,21 @@ class DeribitWebSocketClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         heartbeat_interval: int = 30,
-        is_testnet: bool = False,
+        environment: DeribitEnvironment = ...,
+        proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
-    def new_public(is_testnet: bool) -> DeribitWebSocketClient: ...
+    def new_public(
+        environment: DeribitEnvironment,
+        proxy_url: str | None = None,
+    ) -> DeribitWebSocketClient: ...
     @staticmethod
     def with_credentials(
-        is_testnet: bool,
+        environment: DeribitEnvironment,
+        api_key: str | None = None,
+        api_secret: str | None = None,
         account_id: AccountId | None = None,
+        proxy_url: str | None = None,
     ) -> DeribitWebSocketClient: ...
     @property
     def url(self) -> str: ...
@@ -7766,6 +8176,21 @@ class DeribitWebSocketClient:
         instrument_id: InstrumentId,
         interval: DeribitUpdateInterval | None = None,
     ) -> None: ...
+    async def subscribe_mark_prices(
+        self,
+        instrument_id: InstrumentId,
+        interval: DeribitUpdateInterval | None = None,
+    ) -> None: ...
+    async def subscribe_index_prices(
+        self,
+        instrument_id: InstrumentId,
+        interval: DeribitUpdateInterval | None = None,
+    ) -> None: ...
+    async def subscribe_option_greeks(
+        self,
+        instrument_id: InstrumentId,
+        interval: DeribitUpdateInterval | None = None,
+    ) -> None: ...
     async def subscribe_trades(
         self,
         instrument_id: InstrumentId,
@@ -7789,6 +8214,7 @@ class DeribitWebSocketClient:
         self,
         instrument_id: InstrumentId,
     ) -> None: ...
+    async def subscribe_volatility_index(self, index_name: str) -> None: ...
     async def unsubscribe(self, channels: list[str]) -> None: ...
     async def unsubscribe_book(
         self,
@@ -7804,6 +8230,21 @@ class DeribitWebSocketClient:
         interval: DeribitUpdateInterval | None = None,
     ) -> None: ...
     async def unsubscribe_ticker(
+        self,
+        instrument_id: InstrumentId,
+        interval: DeribitUpdateInterval | None = None,
+    ) -> None: ...
+    async def unsubscribe_mark_prices(
+        self,
+        instrument_id: InstrumentId,
+        interval: DeribitUpdateInterval | None = None,
+    ) -> None: ...
+    async def unsubscribe_index_prices(
+        self,
+        instrument_id: InstrumentId,
+        interval: DeribitUpdateInterval | None = None,
+    ) -> None: ...
+    async def unsubscribe_option_greeks(
         self,
         instrument_id: InstrumentId,
         interval: DeribitUpdateInterval | None = None,
@@ -7824,6 +8265,7 @@ class DeribitWebSocketClient:
         self,
         instrument_id: InstrumentId,
     ) -> None: ...
+    async def unsubscribe_volatility_index(self, index_name: str) -> None: ...
     async def unsubscribe_chart(
         self,
         instrument_id: InstrumentId,
@@ -7880,8 +8322,12 @@ class DeribitWebSocketClient:
         instrument_id: InstrumentId,
     ) -> None: ...
 
-def get_deribit_http_base_url(is_testnet: bool) -> str: ...
-def get_deribit_ws_url(is_testnet: bool) -> str: ...
+def get_deribit_http_base_url(environment: DeribitEnvironment) -> str: ...
+def get_deribit_ws_url(environment: DeribitEnvironment) -> str: ...
+
+class DeribitEnvironment(Enum):
+    MAINNET = "MAINNET"
+    TESTNET = "TESTNET"
 
 class DeribitCurrency(Enum):
     BTC = "BTC"
@@ -8027,6 +8473,7 @@ class TardisHttpClient:
         base_url: str | None = None,
         timeout_secs: int = 60,
         normalize_symbols: bool = True,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def api_key(self) -> str | None: ...
@@ -8088,6 +8535,10 @@ async def run_tardis_machine_replay(
 
 # OKX
 
+class OKXEnvironment(Enum):
+    LIVE = "LIVE"
+    DEMO = "DEMO"
+
 class OKXHttpClient:
     def __init__(
         self,
@@ -8099,7 +8550,7 @@ class OKXHttpClient:
         max_retries: int = 3,
         retry_delay_ms: int = 1_000,
         retry_delay_max_ms: int = 10_000,
-        is_demo: bool = False,
+        environment: OKXEnvironment = ...,
         proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
@@ -8120,6 +8571,36 @@ class OKXHttpClient:
     async def request_instruments(
         self, instrument_type: OKXInstrumentType, instrument_family: str | None = None
     ) -> tuple[list[Instrument], list[tuple[str, int]]]: ...
+    async def request_spread_instruments(
+        self,
+        base_currency: str | None = None,
+        instrument_id: InstrumentId | None = None,
+        spread_id: str | None = None,
+        state: str | None = None,
+    ) -> list[CryptoFuturesSpread | CryptoOptionSpread]: ...
+    async def request_event_contract_series(
+        self,
+        series_id: str | None = None,
+    ) -> Any: ...
+    async def request_event_contract_events(
+        self,
+        series_id: str,
+        event_id: str | None = None,
+        state: str | None = None,
+        limit: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> Any: ...
+    async def request_event_contract_markets(
+        self,
+        series_id: str,
+        event_id: str | None = None,
+        inst_id: str | None = None,
+        state: str | None = None,
+        limit: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> Any: ...
     async def request_account_state(self, account_id: AccountId) -> AccountState: ...
     async def request_trades(
         self,
@@ -8215,6 +8696,9 @@ class OKXHttpClient:
         attach_algo_ords: list[dict[str, str]] | None = None,
         px_usd: str | None = None,
         px_vol: str | None = None,
+        speed_bump: str | None = None,
+        outcome: str | None = None,
+        slippage_pct: str | None = None,
     ) -> Any: ...
     async def place_algo_order(
         self,
@@ -8244,6 +8728,13 @@ class OKXHttpClient:
         self,
         orders: list[tuple[InstrumentId, str]],
     ) -> list[Any]: ...
+    async def cancel_order(
+        self,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId | None = None,
+        venue_order_id: VenueOrderId | None = None,
+    ) -> Any: ...
+    async def cancel_all_orders(self, instrument_id: InstrumentId) -> Any: ...
     async def amend_algo_order(
         self,
         instrument_id: InstrumentId,
@@ -8281,6 +8772,7 @@ class OKXWebSocketClient:
         account_id: AccountId | None = None,
         heartbeat: int | None = None,
         auth_timeout_secs: int | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @staticmethod
     def with_credentials(
@@ -8291,6 +8783,7 @@ class OKXWebSocketClient:
         account_id: AccountId | None = None,
         heartbeat: int | None = None,
         auth_timeout_secs: int | None = None,
+        proxy_url: str | None = None,
     ) -> OKXWebSocketClient: ...
     @staticmethod
     def from_env() -> OKXWebSocketClient: ...
@@ -8345,6 +8838,8 @@ class OKXWebSocketClient:
     async def unsubscribe_funding_rates(self, instrument_id: InstrumentId) -> None: ...
     async def subscribe_orders(self, instrument_type: OKXInstrumentType) -> None: ...
     async def unsubscribe_orders(self, instrument_type: OKXInstrumentType) -> None: ...
+    async def subscribe_spread_orders(self) -> None: ...
+    async def unsubscribe_spread_orders(self) -> None: ...
     async def subscribe_orders_algo(self, instrument_type: OKXInstrumentType) -> None: ...
     async def unsubscribe_orders_algo(self, instrument_type: OKXInstrumentType) -> None: ...
     async def subscribe_algo_advance(self, instrument_type: OKXInstrumentType) -> None: ...
@@ -8373,6 +8868,9 @@ class OKXWebSocketClient:
         attach_algo_ords: list[dict[str, str]] | None = None,
         px_usd: str | None = None,
         px_vol: str | None = None,
+        speed_bump: str | None = None,
+        outcome: str | None = None,
+        slippage_pct: str | None = None,
     ) -> None: ...
     async def cancel_order(
         self,
@@ -8393,6 +8891,7 @@ class OKXWebSocketClient:
         quantity: Quantity | None = None,
         new_px_usd: str | None = None,
         new_px_vol: str | None = None,
+        speed_bump: str | None = None,
     ) -> None: ...
     async def batch_submit_orders(
         self,
@@ -8427,9 +8926,9 @@ class OKXEndpointType(Enum):
     Business = "Business"
 
 def get_okx_http_base_url() -> str: ...
-def get_okx_ws_url_public(is_demo: bool) -> str: ...
-def get_okx_ws_url_private(is_demo: bool) -> str: ...
-def get_okx_ws_url_business(is_demo: bool) -> str: ...
+def get_okx_ws_url_public(environment: OKXEnvironment) -> str: ...
+def get_okx_ws_url_private(environment: OKXEnvironment) -> str: ...
+def get_okx_ws_url_business(environment: OKXEnvironment) -> str: ...
 def derive_okx_ws_url(base_url: str, channel: str) -> str: ...
 def okx_requires_authentication(endpoint_type: OKXEndpointType) -> bool: ...
 
@@ -8440,6 +8939,7 @@ class OKXInstrumentType(Enum):
     SWAP = "SWAP"
     FUTURES = "FUTURES"
     OPTION = "OPTION"
+    EVENTS = "EVENTS"
 
 class OKXContractType(Enum):
     NONE = "NONE"
@@ -8470,6 +8970,13 @@ class OKXOrderStatus(Enum):
     MMP_CANCELED = ...
     ORDER_PLACED = ...
 
+class OKXGreeksType(Enum):
+    BS = "BS"
+    PA = "PA"
+
+    @property
+    def value(self) -> int: ...  # type: ignore[override]
+
 class OKXVipLevel(Enum):
     VIP0 = "VIP0"
     VIP1 = "VIP1"
@@ -8487,8 +8994,12 @@ class OKXVipLevel(Enum):
 
 # BitMEX
 
-def get_bitmex_http_base_url(testnet: bool) -> str: ...
-def get_bitmex_ws_url(testnet: bool) -> str: ...
+class BitmexEnvironment(Enum):
+    MAINNET = "MAINNET"
+    TESTNET = "TESTNET"
+
+def get_bitmex_http_base_url(environment: BitmexEnvironment) -> str: ...
+def get_bitmex_ws_url(environment: BitmexEnvironment) -> str: ...
 
 class BitmexHttpClient:
     def __init__(
@@ -8496,7 +9007,7 @@ class BitmexHttpClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
-        testnet: bool = False,
+        environment: BitmexEnvironment = ...,
         timeout_secs: int = 60,
         max_retries: int = 3,
         retry_delay_ms: int = 1_000,
@@ -8625,7 +9136,8 @@ class BitmexWebSocketClient:
         api_secret: str | None = None,
         account_id: AccountId | None = None,
         heartbeat: int = 5,
-        testnet: bool = False,
+        environment: BitmexEnvironment = ...,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
@@ -8696,7 +9208,7 @@ class SubmitBroadcaster:
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
-        testnet: bool = False,
+        environment: BitmexEnvironment = ...,
         timeout_secs: int | None = None,
         max_retries: int | None = None,
         retry_delay_ms: int | None = None,
@@ -8707,6 +9219,7 @@ class SubmitBroadcaster:
         health_check_interval_secs: int = 30,
         health_check_timeout_secs: int = 5,
         expected_reject_patterns: list[str] | None = None,
+        proxy_urls: list[str | None] | None = None,
     ) -> None: ...
     def cache_instrument(self, instrument: Instrument) -> None: ...
     def get_metrics(self) -> dict[str, int]: ...
@@ -8743,7 +9256,7 @@ class CancelBroadcaster:
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
-        testnet: bool = False,
+        environment: BitmexEnvironment = ...,
         timeout_secs: int | None = None,
         max_retries: int | None = None,
         retry_delay_ms: int | None = None,
@@ -8755,6 +9268,7 @@ class CancelBroadcaster:
         health_check_timeout_secs: int = 5,
         expected_reject_patterns: list[str] | None = None,
         idempotent_success_patterns: list[str] | None = None,
+        proxy_urls: list[str | None] | None = None,
     ) -> None: ...
     def cache_instrument(self, instrument: Instrument) -> None: ...
     def get_metrics(self) -> dict[str, int]: ...
@@ -8781,12 +9295,22 @@ class CancelBroadcaster:
 
 # Hyperliquid
 
+class HyperliquidEnvironment(Enum):
+    MAINNET = "MAINNET"
+    TESTNET = "TESTNET"
+
 HYPERLIQUID_POST_ONLY_WOULD_MATCH: Final[str]
 
 def hyperliquid_product_type_from_symbol(symbol: str) -> HyperliquidProductType: ...
 def hyperliquid_cloid_from_client_order_id(client_order_id: ClientOrderId) -> str: ...
-def get_hyperliquid_http_base_url(is_testnet: bool = False) -> str: ...
-def get_hyperliquid_ws_url(is_testnet: bool = False) -> str: ...
+def hyperliquid_resolve_execution_account_address(
+    private_key: str | None = None,
+    vault_address: str | None = None,
+    account_address: str | None = None,
+    environment: HyperliquidEnvironment = ...,
+) -> str | None: ...
+def get_hyperliquid_http_base_url(environment: HyperliquidEnvironment = ...) -> str: ...
+def get_hyperliquid_ws_url(environment: HyperliquidEnvironment = ...) -> str: ...
 
 class HyperliquidProductType(Enum):
     PERP = "PERP"
@@ -8827,18 +9351,18 @@ class HyperliquidHttpClient:
         private_key: str | None = None,
         vault_address: str | None = None,
         account_address: str | None = None,
-        is_testnet: bool = False,
+        environment: HyperliquidEnvironment = ...,
         timeout_secs: int = 60,
         proxy_url: str | None = None,
         normalize_prices: bool = True,
     ) -> None: ...
     @staticmethod
-    def from_env() -> HyperliquidHttpClient: ...
+    def from_env(environment: HyperliquidEnvironment = ...) -> HyperliquidHttpClient: ...
     @staticmethod
     def from_credentials(
         private_key: str,
         vault_address: str | None = None,
-        is_testnet: bool = False,
+        environment: HyperliquidEnvironment = ...,
         timeout_secs: int = 60,
         proxy_url: str | None = None,
     ) -> HyperliquidHttpClient: ...
@@ -8855,11 +9379,17 @@ class HyperliquidHttpClient:
         include_spot: bool = True,
         include_perps: bool = True,
         include_perps_hip3: bool = False,
+        include_outcomes: bool = False,
     ) -> list[Instrument]: ...
     async def request_order_status_reports(
         self,
         instrument_id: str | None = None,
     ) -> list[OrderStatusReport]: ...
+    async def request_order_status_report(
+        self,
+        venue_order_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> OrderStatusReport | None: ...
     async def request_fill_reports(
         self,
         instrument_id: str | None = None,
@@ -8868,6 +9398,12 @@ class HyperliquidHttpClient:
         self,
         instrument_id: str | None = None,
     ) -> list[PositionStatusReport]: ...
+    async def request_spot_balances(self) -> list[AccountBalance]: ...
+    async def request_spot_position_status_reports(
+        self,
+        instrument_id: str | None = None,
+    ) -> list[PositionStatusReport]: ...
+    async def info_spot_clearinghouse_state(self) -> str: ...
     async def request_quote_ticks(
         self,
         instrument_id: InstrumentId,
@@ -8926,19 +9462,88 @@ class HyperliquidHttpClient:
         client_order_id: ClientOrderId | None = None,
         venue_order_id: VenueOrderId | None = None,
     ) -> None: ...
+    async def submit_split_outcome(self, outcome: int, amount: Decimal) -> str: ...
+    async def submit_merge_outcome(
+        self,
+        outcome: int,
+        amount: Decimal | None = None,
+    ) -> str: ...
+    async def submit_merge_question(
+        self,
+        question: int,
+        amount: Decimal | None = None,
+    ) -> str: ...
+    async def submit_negate_outcome(
+        self,
+        question: int,
+        outcome: int,
+        amount: Decimal,
+    ) -> str: ...
 
 class HyperliquidWebSocketClient:
     def __init__(
         self,
         url: str | None = None,
-        testnet: bool = False,
+        environment: HyperliquidEnvironment = ...,
         product_type: HyperliquidProductType = ...,
         account_id: str | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
     def is_active(self) -> bool: ...
     def is_closed(self) -> bool: ...
+    def set_post_timeout(self, timeout_secs: int) -> None: ...
+    async def submit_order(
+        self,
+        signer: HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Price | None = None,
+        trigger_price: Price | None = None,
+        post_only: bool = False,
+        reduce_only: bool = False,
+    ) -> None: ...
+    async def submit_orders(
+        self,
+        signer: HyperliquidHttpClient,
+        orders: list[Any],
+    ) -> None: ...
+    async def cancel_order(
+        self,
+        signer: HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId | None = None,
+        venue_order_id: VenueOrderId | None = None,
+    ) -> None: ...
+    async def cancel_orders(
+        self,
+        signer: HyperliquidHttpClient,
+        cancels: list[tuple[InstrumentId, ClientOrderId, VenueOrderId | None]],
+    ) -> list[str | None]: ...
+    async def modify_order(
+        self,
+        signer: HyperliquidHttpClient,
+        instrument_id: InstrumentId,
+        venue_order_id: VenueOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        price: Price,
+        quantity: Quantity,
+        trigger_price: Price | None,
+        reduce_only: bool,
+        post_only: bool,
+        time_in_force: TimeInForce,
+        client_order_id: ClientOrderId | None,
+    ) -> None: ...
+    def cache_all_dex_asset_ctxs_instrument_ids(
+        self,
+        mapping: dict[str, list[InstrumentId | None]],
+    ) -> None: ...
     def cache_spot_fill_coins(self, mapping: dict[str, str]) -> None: ...
     def cache_cloid_mapping(self, cloid: str, client_order_id: ClientOrderId) -> None: ...
     def remove_cloid_mapping(self, cloid: str) -> None: ...
@@ -8979,10 +9584,16 @@ class HyperliquidWebSocketClient:
     async def unsubscribe_index_prices(self, instrument_id: InstrumentId) -> None: ...
     async def unsubscribe_funding_rates(self, instrument_id: InstrumentId) -> None: ...
 
+# dYdX
+
+class DydxNetwork(Enum):
+    MAINNET = "MAINNET"
+    TESTNET = "TESTNET"
+
 # Kraken
 
 class KrakenEnvironment(Enum):
-    MAINNET = "mainnet"
+    LIVE = "live"
     DEMO = "demo"
 
 class KrakenProductType(Enum):
@@ -8995,7 +9606,6 @@ class KrakenSpotHttpClient:
         api_key: str | None = None,
         api_secret: str | None = None,
         base_url: str | None = None,
-        demo: bool = False,
         timeout_secs: int = 60,
         max_retries: int | None = None,
         retry_delay_ms: int | None = None,
@@ -9011,13 +9621,20 @@ class KrakenSpotHttpClient:
     def api_key_masked(self) -> str | None: ...
     def cache_instrument(self, instrument: Instrument) -> None: ...
     def cancel_all_requests(self) -> None: ...
-    def set_use_spot_position_reports(self, value: bool) -> None: ...
-    def set_spot_positions_quote_currency(self, currency: str) -> None: ...
     async def get_server_time(self) -> str: ...
     async def request_instruments(
         self,
         pairs: list[str] | None = None,
     ) -> list[Instrument]: ...
+    async def request_instrument_statuses(
+        self,
+        pairs: list[str] | None = None,
+    ) -> dict[InstrumentId, MarketStatusAction]: ...
+    async def request_book_snapshot(
+        self,
+        instrument_id: InstrumentId,
+        depth: int | None = None,
+    ) -> OrderBook: ...
     async def request_trades(
         self,
         instrument_id: InstrumentId,
@@ -9032,7 +9649,22 @@ class KrakenSpotHttpClient:
         end: dt.datetime | None = None,
         limit: int | None = None,
     ) -> list[Bar]: ...
-    async def request_account_state(self, account_id: AccountId) -> AccountState: ...
+    async def request_account_state(
+        self,
+        account_id: AccountId,
+        account_type: AccountType = ...,
+        margin_balance_asset: str | None = None,
+    ) -> AccountState: ...
+    async def request_margin_metrics(
+        self,
+        asset: str | None = None,
+    ) -> dict[str, str]: ...
+    async def request_account_state_with_metrics(
+        self,
+        account_id: AccountId,
+        account_type: AccountType = ...,
+        margin_balance_asset: str | None = None,
+    ) -> tuple[AccountState, dict[str, str]]: ...
     async def request_order_status_reports(
         self,
         account_id: AccountId,
@@ -9052,6 +9684,9 @@ class KrakenSpotHttpClient:
         self,
         account_id: AccountId,
         instrument_id: InstrumentId | None = None,
+        account_type: AccountType = ...,
+        use_spot_position_reports: bool = False,
+        quote_currency: str = "USDT",
     ) -> list[PositionStatusReport]: ...
     async def submit_order(
         self,
@@ -9065,9 +9700,39 @@ class KrakenSpotHttpClient:
         expire_time: int | None = None,
         price: Price | None = None,
         trigger_price: Price | None = None,
+        trigger_type: TriggerType | None = None,
+        trailing_offset: str | None = None,
+        limit_offset: str | None = None,
         reduce_only: bool = False,
         post_only: bool = False,
+        quote_quantity: bool = False,
+        display_qty: Quantity | None = None,
+        leverage: int | None = None,
+        account_type: AccountType = ...,
     ) -> VenueOrderId: ...
+    async def submit_orders_batch(
+        self,
+        orders: list[
+            tuple[
+                InstrumentId,
+                ClientOrderId,
+                OrderSide,
+                OrderType,
+                Quantity,
+                TimeInForce,
+                Price | None,
+                Price | None,
+                TriggerType | None,
+                bool,
+                bool,
+                Quantity | None,
+            ]
+        ],
+        leverage: int | None = None,
+        account_type: AccountType = ...,
+        per_order_leverages: list[int | None] | None = None,
+        per_order_reduce_only: list[bool] | None = None,
+    ) -> list[str]: ...
     async def modify_order(
         self,
         instrument_id: InstrumentId,
@@ -9115,6 +9780,14 @@ class KrakenFuturesHttpClient:
     async def request_mark_price(self, instrument_id: InstrumentId) -> float: ...
     async def request_index_price(self, instrument_id: InstrumentId) -> float: ...
     async def request_instruments(self) -> list[Instrument]: ...
+    async def request_instrument_statuses(
+        self,
+    ) -> dict[InstrumentId, MarketStatusAction]: ...
+    async def request_book_snapshot(
+        self,
+        instrument_id: InstrumentId,
+        depth: int | None = None,
+    ) -> OrderBook: ...
     async def request_trades(
         self,
         instrument_id: InstrumentId,
@@ -9164,6 +9837,7 @@ class KrakenFuturesHttpClient:
         time_in_force: TimeInForce,
         price: Price | None = None,
         trigger_price: Price | None = None,
+        trigger_type: TriggerType | None = None,
         reduce_only: bool = False,
         post_only: bool = False,
     ) -> OrderStatusReport: ...
@@ -9179,8 +9853,22 @@ class KrakenFuturesHttpClient:
                 TimeInForce,
                 Price | None,
                 Price | None,
+                TriggerType | None,
                 bool,
                 bool,
+            ]
+        ],
+    ) -> list[str]: ...
+    async def edit_orders_batch(
+        self,
+        orders: list[
+            tuple[
+                InstrumentId,
+                ClientOrderId | None,
+                VenueOrderId | None,
+                Quantity | None,
+                Price | None,
+                Price | None,
             ]
         ],
     ) -> list[str]: ...
@@ -9218,9 +9906,15 @@ class KrakenSpotWebSocketClient:
         heartbeat_secs: int | None = None,
         api_key: str | None = None,
         api_secret: str | None = None,
+        proxy_url: str | None = None,
+        l3: bool = False,
+        validate_l3_checksum: bool = True,
+        base_url_http: str | None = None,
     ) -> None: ...
     @property
     def url(self) -> str: ...
+    @property
+    def has_credentials(self) -> bool: ...
     def is_connected(self) -> bool: ...
     def is_active(self) -> bool: ...
     def is_closed(self) -> bool: ...
@@ -9241,6 +9935,8 @@ class KrakenSpotWebSocketClient:
     ) -> None: ...
     async def wait_until_active(self, timeout_secs: float) -> None: ...
     async def authenticate(self) -> None: ...
+    def is_authenticated(self) -> bool: ...
+    async def wait_until_authenticated(self, timeout_secs: float) -> None: ...
     async def send_ping(self) -> None: ...
     async def disconnect(self) -> None: ...
     async def close(self) -> None: ...
@@ -9249,6 +9945,7 @@ class KrakenSpotWebSocketClient:
         instrument_id: InstrumentId,
         depth: int | None = None,
     ) -> None: ...
+    async def subscribe_l3_book(self, symbol: str, depth: int) -> None: ...
     async def subscribe_quotes(self, instrument_id: InstrumentId) -> None: ...
     async def subscribe_trades(self, instrument_id: InstrumentId) -> None: ...
     async def subscribe_bars(self, bar_type: BarType) -> None: ...
@@ -9258,6 +9955,7 @@ class KrakenSpotWebSocketClient:
         snap_trades: bool = True,
     ) -> None: ...
     async def unsubscribe_book(self, instrument_id: InstrumentId) -> None: ...
+    async def unsubscribe_l3_book(self, symbol: str) -> None: ...
     async def unsubscribe_quotes(self, instrument_id: InstrumentId) -> None: ...
     async def unsubscribe_trades(self, instrument_id: InstrumentId) -> None: ...
     async def unsubscribe_bars(self, bar_type: BarType) -> None: ...
@@ -9270,6 +9968,7 @@ class KrakenFuturesWebSocketClient:
         heartbeat_secs: int = 60,
         api_key: str | None = None,
         api_secret: str | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def has_credentials(self) -> bool: ...
@@ -9319,6 +10018,197 @@ class KrakenFuturesWebSocketClient:
     async def subscribe_executions(self) -> None: ...
 
 def kraken_product_type_from_symbol(symbol: str) -> KrakenProductType: ...
+
+# Interactive Brokers
+
+class MarketDataType:
+    REALTIME: int = 1
+    FROZEN: int = 2
+    DELAYED: int = 3
+    DELAYED_FROZEN: int = 4
+
+class TradingMode:
+    Paper: str = "paper"
+    Live: str = "live"
+
+class InteractiveBrokersDataClientConfig:
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        client_id: int | None = None,
+        use_regular_trading_hours: bool | None = None,
+        market_data_type: MarketDataType | None = None,
+        ignore_quote_tick_size_updates: bool | None = None,
+        connection_timeout: int | None = None,
+        request_timeout: int | None = None,
+        handle_revised_bars: bool | None = None,
+    ) -> None: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def client_id(self) -> int: ...
+    @property
+    def use_regular_trading_hours(self) -> bool: ...
+    @property
+    def market_data_type(self) -> MarketDataType: ...
+    @property
+    def ignore_quote_tick_size_updates(self) -> bool: ...
+    @property
+    def connection_timeout(self) -> int: ...
+    @property
+    def request_timeout(self) -> int: ...
+    @property
+    def handle_revised_bars(self) -> bool: ...
+
+class InteractiveBrokersExecClientConfig:
+    def __init__(
+        self,
+        host: str | None = None,
+        port: int | None = None,
+        client_id: int | None = None,
+        connection_timeout: int | None = None,
+        fetch_all_open_orders: bool | None = None,
+        track_option_exercise_from_position_update: bool | None = None,
+    ) -> None: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def client_id(self) -> int: ...
+    @property
+    def connection_timeout(self) -> int: ...
+    @property
+    def fetch_all_open_orders(self) -> bool: ...
+    @property
+    def track_option_exercise_from_position_update(self) -> bool: ...
+
+class InteractiveBrokersInstrumentProviderConfig:
+    def __init__(self) -> None: ...
+    @property
+    def min_expiry_days(self) -> int | None: ...
+    @property
+    def max_expiry_days(self) -> int | None: ...
+    @property
+    def build_options_chain(self) -> bool | None: ...
+    @property
+    def build_futures_chain(self) -> bool | None: ...
+    @property
+    def cache_validity_days(self) -> int | None: ...
+    @property
+    def convert_exchange_to_mic_venue(self) -> bool: ...
+    @property
+    def symbol_to_mic_venue(self) -> dict[str, str]: ...
+    @property
+    def filter_sec_types(self) -> list[str]: ...
+    @property
+    def cache_path(self) -> str | None: ...
+    @cache_path.setter
+    def cache_path(self, cache_path: str | None) -> None: ...
+
+class DockerizedIBGatewayConfig:
+    def __init__(
+        self,
+        username: str | None = None,
+        password: str | None = None,
+        trading_mode: TradingMode | None = None,
+        read_only_api: bool | None = None,
+        timeout: int | None = None,
+        container_image: str | None = None,
+        vnc_port: int | None = None,
+    ) -> None: ...
+    @property
+    def username(self) -> str | None: ...
+    @property
+    def password(self) -> str | None: ...
+    @property
+    def trading_mode(self) -> TradingMode: ...
+    @property
+    def read_only_api(self) -> bool: ...
+    @property
+    def timeout(self) -> int: ...
+    @property
+    def container_image(self) -> str: ...
+    @property
+    def vnc_port(self) -> int | None: ...
+
+class ContainerStatus:
+    NoContainer: int = 1
+    ContainerCreated: int = 2
+    ContainerStarting: int = 3
+    ContainerStopped: int = 4
+    NotLoggedIn: int = 5
+    Ready: int = 6
+    Unknown: int = 7
+
+class DockerizedIBGateway:
+    def __init__(self, config: DockerizedIBGatewayConfig) -> None: ...
+    @property
+    def container_name(self) -> str: ...
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    async def start(self, wait: int | None = None) -> None: ...
+    async def safe_start(self, wait: int | None = None) -> None: ...
+    async def stop(self) -> None: ...
+    async def container_status(self) -> ContainerStatus: ...
+
+class HistoricalInteractiveBrokersClient:
+    async def request_bars(
+        self,
+        bar_specifications: list[str],
+        end_date_time: dt.datetime,
+        start_date_time: dt.datetime | None = None,
+        duration: str | None = None,
+        contracts: list[dict[str, Any]] | None = None,
+        instrument_ids: list[InstrumentId] | None = None,
+        use_rth: bool = True,
+        timeout: int = 60,
+    ) -> list[Bar]: ...
+    async def request_ticks(
+        self,
+        tick_type: str,
+        start_date_time: dt.datetime,
+        end_date_time: dt.datetime,
+        contracts: list[dict[str, Any]] | None = None,
+        instrument_ids: list[InstrumentId] | None = None,
+        use_rth: bool = True,
+        timeout: int = 60,
+    ) -> list[Data]: ...
+    async def request_instruments(
+        self,
+        instrument_ids: list[InstrumentId] | None = None,
+        contracts: list[dict[str, Any]] | None = None,
+    ) -> list[Instrument]: ...
+
+class InteractiveBrokersInstrumentProvider:
+    def __init__(self, config: InteractiveBrokersInstrumentProviderConfig) -> None: ...
+    def find(self, instrument_id: InstrumentId) -> Instrument | None: ...
+    def find_by_contract_id(self, contract_id: int) -> Instrument | None: ...
+    def get_all(self) -> list[Instrument]: ...
+    def count(self) -> int: ...
+    def get_price_magnifier(self, instrument_id: InstrumentId) -> int: ...
+    def fetch_contract_details(self) -> None: ...
+    async def batch_load(self, instrument_ids: list[InstrumentId]) -> int: ...
+    async def fetch_option_chain_by_range(
+        self,
+        underlying_symbol: str,
+        expiry_min: str | None = None,
+        expiry_max: str | None = None,
+    ) -> int: ...
+    async def fetch_futures_chain(
+        self,
+        underlying_symbol: str,
+        expiry_min: str | None = None,
+        expiry_max: str | None = None,
+    ) -> int: ...
+    async def fetch_bag_contract(self, bag_contract: str) -> None: ...
+    async def save_cache(self, cache_path: str) -> None: ...
+    async def load_cache(self, cache_path: str) -> bool: ...
 
 # Greeks
 
@@ -9578,11 +10468,35 @@ def calculate_reconciliation_price(
     target_position_qty: Decimal,
     target_position_avg_px: Decimal | None,
 ) -> Decimal | None: ...
-def adjust_fills_for_partial_window(
+def process_mass_status_for_reconciliation(
     mass_status: ExecutionMassStatus,
     instrument: Any,  # PyO3 InstrumentAny
     tolerance: str | None = None,
 ) -> tuple[dict[str, OrderStatusReport], dict[str, list[FillReport]]]: ...
+def create_inferred_reconciliation_trade_id(
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: VenueOrderId | None,
+    order_side: OrderSide,
+    order_type: OrderType,
+    filled_qty: Quantity,
+    last_qty: Quantity,
+    last_px: Price,
+    position_id: PositionId,
+    ts_last: int,
+) -> TradeId: ...
+def create_position_reconciliation_venue_order_id(
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    order_side: OrderSide,
+    order_type: OrderType,
+    quantity: Quantity,
+    price: Price | None = None,
+    venue_position_id: PositionId | None = None,
+    ts_last: int = 0,
+    tag: str | None = None,
+) -> VenueOrderId: ...
 
 ###################################################################################################
 # Test Kit
@@ -9777,6 +10691,15 @@ class LongRatio:
     def calculate_from_positions(self, positions: list[Position]) -> float | None: ...
 
 ###################################################################################################
+# Polymarket
+###################################################################################################
+
+def polymarket_trade_sort_key(
+    trade: dict[str, Any],
+) -> tuple[int, str, str, str, str, str]: ...
+def polymarket_trade_id(transaction_hash: str, asset: str, seq: int) -> str: ...
+
+###################################################################################################
 # Binance
 ###################################################################################################
 
@@ -9788,6 +10711,6 @@ class BinanceProductType(Enum):
     OPTIONS = "OPTIONS"
 
 class BinanceEnvironment(Enum):
-    MAINNET = "MAINNET"
+    LIVE = "LIVE"
     TESTNET = "TESTNET"
     DEMO = "DEMO"

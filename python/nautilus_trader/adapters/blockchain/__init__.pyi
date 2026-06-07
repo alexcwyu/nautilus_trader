@@ -10,6 +10,7 @@ __all__ = [
     "BlockchainDataClientFactory",
     "BlockchainExecutionClientFactory",
     "DexPoolFilters",
+    "load_pool_snapshot",
 ]
 
 @typing.final
@@ -26,6 +27,7 @@ class BlockchainDataClientConfig:
         from_block: int | None = None,
         pool_filters: DexPoolFilters | None = None,
         postgres_cache_database_config: infrastructure.PostgresConnectOptions | None = None,
+        proxy_url: str | None = None,
     ) -> None: ...
     @property
     def chain(self) -> model.Chain: ...
@@ -39,9 +41,14 @@ class BlockchainDataClientConfig:
     def use_hypersync_for_live_data(self) -> bool: ...
     @property
     def from_block(self) -> int | None: ...
+    @property
+    def proxy_url(self) -> str | None: ...
 
 @typing.final
-class BlockchainDataClientFactory: ...
+class BlockchainDataClientFactory:
+    def __init__(self) -> None: ...
+    def name(self) -> str: ...
+    def config_type(self) -> str: ...
 
 @typing.final
 class BlockchainExecutionClientFactory: ...
@@ -49,3 +56,11 @@ class BlockchainExecutionClientFactory: ...
 @typing.final
 class DexPoolFilters:
     def __init__(self, remove_pools_with_empty_erc20_fields: bool | None = ...) -> None: ...
+
+def load_pool_snapshot(
+    pg_config: infrastructure.PostgresConnectOptions,
+    chain_id: int,
+    pool_address: str,
+    before_block: int | None = None,
+    require_valid: bool = True,
+) -> model.PoolSnapshot | None: ...

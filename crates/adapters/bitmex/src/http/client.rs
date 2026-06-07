@@ -46,7 +46,7 @@ use nautilus_model::{
         PriceType, TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, Symbol, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, VenueOrderId},
     instruments::{Instrument as InstrumentTrait, InstrumentAny},
     reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{MarginBalance, Money, Price, Quantity},
@@ -77,14 +77,14 @@ use super::{
 };
 use crate::{
     common::{
-        consts::{BITMEX_HTTP_TESTNET_URL, BITMEX_HTTP_URL, BITMEX_VENUE},
+        consts::{BITMEX_HTTP_TESTNET_URL, BITMEX_HTTP_URL},
         credential::{Credential, credential_env_vars},
         enums::{
-            BitmexContingencyType, BitmexExecInstruction, BitmexOrderStatus, BitmexOrderType,
-            BitmexPegPriceType, BitmexSide, BitmexTimeInForce,
+            BitmexContingencyType, BitmexEnvironment, BitmexExecInstruction, BitmexOrderStatus,
+            BitmexOrderType, BitmexPegPriceType, BitmexSide, BitmexTimeInForce,
         },
         parse::{
-            bitmex_currency_divisor, map_bitmex_currency, parse_account_balance, quantity_to_u32,
+            bitmex_account_id, bitmex_currency_divisor, parse_account_balance, quantity_to_u32,
         },
     },
     http::{
@@ -179,7 +179,7 @@ impl BitmexRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if the retry manager cannot be created.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         base_url: Option<String>,
         timeout_secs: u64,
@@ -230,7 +230,7 @@ impl BitmexRawHttpClient {
     /// # Errors
     ///
     /// Returns an error if the retry manager cannot be created.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn with_credentials(
         api_key: String,
         api_secret: String,
@@ -797,7 +797,7 @@ impl BitmexRawHttpClient {
 )]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
 pub struct BitmexHttpClient {
     pub(crate) instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -832,7 +832,7 @@ impl Default for BitmexHttpClient {
             None,
             None,
             None,
-            false,
+            BitmexEnvironment::Mainnet,
             60,
             3,
             1_000,
@@ -852,12 +852,12 @@ impl BitmexHttpClient {
     /// # Errors
     ///
     /// Returns an error if the HTTP client cannot be created.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         base_url: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
-        testnet: bool,
+        environment: BitmexEnvironment,
         timeout_secs: u64,
         max_retries: u32,
         retry_delay_ms: u64,
@@ -868,15 +868,12 @@ impl BitmexHttpClient {
         proxy_url: Option<String>,
     ) -> Result<Self, BitmexHttpError> {
         // Determine the base URL
-        let url = base_url.unwrap_or_else(|| {
-            if testnet {
-                BITMEX_HTTP_TESTNET_URL.to_string()
-            } else {
-                BITMEX_HTTP_URL.to_string()
-            }
+        let url = base_url.unwrap_or_else(|| match environment {
+            BitmexEnvironment::Testnet => BITMEX_HTTP_TESTNET_URL.to_string(),
+            BitmexEnvironment::Mainnet => BITMEX_HTTP_URL.to_string(),
         });
 
-        let (key_var, secret_var) = credential_env_vars(testnet);
+        let (key_var, secret_var) = credential_env_vars(environment);
         let api_key = get_or_env_var_opt(api_key, key_var);
         let api_secret = get_or_env_var_opt(api_secret, secret_var);
 
@@ -943,7 +940,7 @@ impl BitmexHttpClient {
     /// # Errors
     ///
     /// Returns an error if one credential is provided without the other.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub fn with_credentials(
         api_key: Option<String>,
         api_secret: Option<String>,
@@ -957,10 +954,14 @@ impl BitmexHttpClient {
         max_requests_per_minute: u32,
         proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
-        // Determine testnet from URL first to select correct environment variables
-        let testnet = base_url.as_ref().is_some_and(|url| url.contains("testnet"));
+        // Determine environment from URL to select correct environment variables
+        let environment = if base_url.as_ref().is_some_and(|url| url.contains("testnet")) {
+            BitmexEnvironment::Testnet
+        } else {
+            BitmexEnvironment::Mainnet
+        };
 
-        let (key_var, secret_var) = credential_env_vars(testnet);
+        let (key_var, secret_var) = credential_env_vars(environment);
 
         let api_key = get_or_env_var_opt(api_key, key_var);
         let api_secret = get_or_env_var_opt(api_secret, secret_var);
@@ -978,7 +979,7 @@ impl BitmexHttpClient {
             base_url,
             api_key,
             api_secret,
-            testnet,
+            environment,
             timeout_secs,
             max_retries,
             retry_delay_ms,
@@ -1448,20 +1449,21 @@ impl BitmexHttpClient {
             .map_err(|e| anyhow::anyhow!(e))
     }
 
-    /// Request account state for the given account.
+    /// Request account state for the authenticated BitMEX account.
     ///
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails or no account state is returned.
     pub async fn request_account_state(
         &self,
-        account_id: AccountId,
+        fallback_account_id: AccountId,
     ) -> anyhow::Result<AccountState> {
         let margins = self
             .inner
             .get_all_margins()
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
+        let account_id = account_id_from_margins(&margins)?.unwrap_or(fallback_account_id);
 
         let ts_init =
             UnixNanos::from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64);
@@ -1515,17 +1517,13 @@ impl BitmexHttpClient {
 
             if !initial_dec.is_zero() || !maintenance_dec.is_zero() {
                 let currency = balance.total.currency;
-                let currency_str = map_bitmex_currency(margin_msg.currency.as_str());
-                let margin_instrument_id = InstrumentId::new(
-                    Symbol::from_str_unchecked(format!("ACCOUNT-{currency_str}")),
-                    *BITMEX_VENUE,
-                );
+                // BitMEX reports cross-margin aggregates per collateral currency.
                 margins_vec.push(MarginBalance::new(
                     Money::from_decimal(initial_dec, currency)
                         .unwrap_or_else(|_| Money::zero(currency)),
                     Money::from_decimal(maintenance_dec, currency)
                         .unwrap_or_else(|_| Money::zero(currency)),
-                    margin_instrument_id,
+                    None,
                 ));
             }
 
@@ -1564,7 +1562,7 @@ impl BitmexHttpClient {
     ///
     /// Returns an error if credentials are missing, the request fails, order validation fails,
     /// the order is rejected, or the API returns an error.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -2514,6 +2512,22 @@ impl BitmexHttpClient {
     }
 }
 
+fn account_id_from_margins(margins: &[BitmexMargin]) -> anyhow::Result<Option<AccountId>> {
+    let Some(first) = margins.first() else {
+        return Ok(None);
+    };
+
+    let account = first.account;
+    if let Some(mismatch) = margins.iter().find(|margin| margin.account != account) {
+        anyhow::bail!(
+            "BitMEX returned inconsistent margin account IDs: {account} and {}",
+            mismatch.account
+        );
+    }
+
+    Ok(Some(bitmex_account_id(account)))
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::UUID4;
@@ -2522,6 +2536,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn margin_with_account(account: i64) -> BitmexMargin {
+        BitmexMargin {
+            account,
+            currency: Ustr::from("XBt"),
+            risk_limit: None,
+            prev_state: None,
+            state: None,
+            action: None,
+            amount: None,
+            pending_credit: None,
+            pending_debit: None,
+            confirmed_debit: None,
+            prev_realised_pnl: None,
+            prev_unrealised_pnl: None,
+            gross_comm: None,
+            gross_open_cost: None,
+            gross_open_premium: None,
+            gross_exec_cost: None,
+            gross_mark_value: None,
+            risk_value: None,
+            taxable_margin: None,
+            init_margin: None,
+            maint_margin: None,
+            session_margin: None,
+            target_excess_margin: None,
+            var_margin: None,
+            realised_pnl: None,
+            unrealised_pnl: None,
+            indicative_tax: None,
+            unrealised_profit: None,
+            synthetic_margin: None,
+            wallet_balance: None,
+            margin_balance: None,
+            margin_balance_pcnt: None,
+            margin_leverage: None,
+            margin_used_pcnt: None,
+            excess_margin: None,
+            excess_margin_pcnt: None,
+            available_margin: None,
+            withdrawable_margin: None,
+            timestamp: None,
+            gross_last_value: None,
+            commission: None,
+        }
+    }
 
     fn build_report(
         client_order_id: &str,
@@ -2551,6 +2611,33 @@ mod tests {
         }
 
         report.with_contingency_type(contingency_type)
+    }
+
+    #[rstest]
+    fn test_account_id_from_margins_uses_bitmex_account_number() {
+        let margins = vec![margin_with_account(319111), margin_with_account(319111)];
+
+        let account_id = account_id_from_margins(&margins).unwrap().unwrap();
+
+        assert_eq!(account_id, AccountId::from("BITMEX-319111"));
+    }
+
+    #[rstest]
+    fn test_account_id_from_margins_empty_returns_none() {
+        let margins = [];
+
+        let account_id = account_id_from_margins(&margins).unwrap();
+
+        assert_eq!(account_id, None);
+    }
+
+    #[rstest]
+    fn test_account_id_from_margins_rejects_inconsistent_accounts() {
+        let margins = vec![margin_with_account(319111), margin_with_account(319112)];
+
+        let err = account_id_from_margins(&margins).unwrap_err();
+
+        assert!(err.to_string().contains("inconsistent margin account IDs"));
     }
 
     #[rstest]

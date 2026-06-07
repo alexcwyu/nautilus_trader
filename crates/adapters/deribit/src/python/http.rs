@@ -30,7 +30,7 @@ use nautilus_model::{
 use pyo3::{conversion::IntoPyObjectExt, prelude::*, types::PyList};
 
 use crate::{
-    common::consts::DERIBIT_VENUE,
+    common::{consts::DERIBIT_VENUE, enums::DeribitEnvironment},
     http::{
         client::DeribitHttpClient,
         error::DeribitHttpError,
@@ -50,20 +50,20 @@ impl DeribitHttpClient {
         api_key=None,
         api_secret=None,
         base_url=None,
-        is_testnet=false,
+        environment=DeribitEnvironment::Mainnet,
         timeout_secs=10,
         max_retries=3,
         retry_delay_ms=1000,
         retry_delay_max_ms=10_000,
         proxy_url=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[allow(unused_variables)]
     fn py_new(
         api_key: Option<String>,
         api_secret: Option<String>,
         base_url: Option<String>,
-        is_testnet: bool,
+        environment: DeribitEnvironment,
         timeout_secs: u64,
         max_retries: u32,
         retry_delay_ms: u64,
@@ -74,7 +74,7 @@ impl DeribitHttpClient {
             api_key,
             api_secret,
             base_url,
-            is_testnet,
+            environment,
             timeout_secs,
             max_retries,
             retry_delay_ms,
@@ -149,6 +149,28 @@ impl DeribitHttpClient {
                     .unwrap()
                     .into_any()
                     .unbind();
+                Ok(pylist)
+            })
+        })
+    }
+
+    /// Requests traded option expirations for a settlement currency.
+    #[pyo3(name = "request_option_expirations")]
+    fn py_request_option_expirations<'py>(
+        &self,
+        py: Python<'py>,
+        currency: DeribitCurrency,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let expirations = client
+                .request_option_expirations(currency)
+                .await
+                .map_err(to_pyvalue_err)?;
+
+            Python::attach(|py| {
+                let pylist = PyList::new(py, expirations)?.into_any().unbind();
                 Ok(pylist)
             })
         })

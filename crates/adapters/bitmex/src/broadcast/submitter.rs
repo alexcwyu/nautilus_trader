@@ -56,9 +56,14 @@ use nautilus_model::{
 use tokio::{sync::RwLock, task::JoinHandle, time::interval};
 
 use crate::{
-    common::{consts::BITMEX_HTTP_TESTNET_URL, enums::BitmexPegPriceType},
-    http::client::BitmexHttpClient,
+    common::{
+        consts::BITMEX_HTTP_TESTNET_URL,
+        enums::{BitmexEnvironment, BitmexPegPriceType},
+    },
+    http::{client::BitmexHttpClient, error::BitmexHttpError},
 };
+
+pub(crate) const DEFINITIVE_SUBMIT_REJECTION: &str = "DEFINITIVE_SUBMIT_REJECTION";
 
 /// Trait for order submission operations.
 ///
@@ -89,7 +94,7 @@ trait SubmitExecutor: Send + Sync {
     fn health_check(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>>;
 
     /// Submits a single order.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -127,7 +132,6 @@ impl SubmitExecutor for BitmexHttpClient {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -187,8 +191,8 @@ pub struct SubmitBroadcasterConfig {
     pub api_secret: Option<String>,
     /// Base URL for BitMEX HTTP API.
     pub base_url: Option<String>,
-    /// If connecting to BitMEX testnet.
-    pub testnet: bool,
+    /// BitMEX environment (mainnet or testnet).
+    pub environment: BitmexEnvironment,
     /// Timeout in seconds for HTTP requests.
     pub timeout_secs: u64,
     /// Maximum number of retry attempts for failed requests.
@@ -224,7 +228,7 @@ impl Default for SubmitBroadcasterConfig {
             api_key: None,
             api_secret: None,
             base_url: None,
-            testnet: false,
+            environment: BitmexEnvironment::Mainnet,
             timeout_secs: 60,
             max_retries: 3,
             retry_delay_ms: 1_000,
@@ -320,7 +324,7 @@ impl TransportClient {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     async fn submit_order(
         &self,
         instrument_id: InstrumentId,
@@ -388,7 +392,7 @@ impl TransportClient {
 #[cfg_attr(feature = "python", pyo3::pyclass)]
 #[cfg_attr(
     feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.bitmex")
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bitmex")
 )]
 #[derive(Debug)]
 pub struct SubmitBroadcaster {
@@ -411,11 +415,11 @@ impl SubmitBroadcaster {
     pub fn new(config: SubmitBroadcasterConfig) -> anyhow::Result<Self> {
         let mut transports = Vec::with_capacity(config.pool_size);
 
-        // Synthesize base_url when testnet is true but base_url is None
-        let base_url = if config.testnet && config.base_url.is_none() {
-            Some(BITMEX_HTTP_TESTNET_URL.to_string())
-        } else {
-            config.base_url.clone()
+        let base_url = match config.environment {
+            BitmexEnvironment::Testnet if config.base_url.is_none() => {
+                Some(BITMEX_HTTP_TESTNET_URL.to_string())
+            }
+            _ => config.base_url.clone(),
         };
 
         for i in 0..config.pool_size {
@@ -561,6 +565,7 @@ impl SubmitBroadcaster {
     {
         let mut errors = Vec::new();
         let mut all_duplicate_clordid = true;
+        let mut all_definitive_refusals = true;
 
         while !handles.is_empty() {
             let current_handles = std::mem::take(&mut handles);
@@ -580,9 +585,14 @@ impl SubmitBroadcaster {
                 Ok((client_id, Err(e))) => {
                     let error_msg = e.to_string();
                     let is_duplicate = error_msg.contains("Duplicate clOrdID");
+                    let is_definitive_refusal = is_definitive_submit_refusal(&e);
 
                     if !is_duplicate {
                         all_duplicate_clordid = false;
+                    }
+
+                    if !is_definitive_refusal {
+                        all_definitive_refusals = false;
                     }
 
                     if self.is_expected_reject(&error_msg) {
@@ -601,6 +611,7 @@ impl SubmitBroadcaster {
                 }
                 Err(e) => {
                     all_duplicate_clordid = false;
+                    all_definitive_refusals = false;
                     log::warn!("{operation} task join error: {e:?}");
                     errors.push(format!("Task panicked: {e:?}"));
                 }
@@ -618,6 +629,17 @@ impl SubmitBroadcaster {
                 operation.to_lowercase(),
             );
             anyhow::bail!("IDEMPOTENT_DUPLICATE: Order likely exists but confirmation was lost");
+        }
+
+        if all_definitive_refusals && !errors.is_empty() {
+            log::error!(
+                "All {} requests were refused by BitMEX: {errors:?} {params}",
+                operation.to_lowercase(),
+            );
+            anyhow::bail!(
+                "{DEFINITIVE_SUBMIT_REJECTION}: All {} requests were refused by BitMEX: {errors:?}",
+                operation.to_lowercase(),
+            );
         }
 
         log::error!(
@@ -641,7 +663,7 @@ impl SubmitBroadcaster {
     /// # Errors
     ///
     /// Returns an error if all submit requests fail or no healthy clients are available.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn broadcast_submit(
         &self,
         instrument_id: InstrumentId,
@@ -700,6 +722,7 @@ impl SubmitBroadcaster {
         );
 
         let mut handles = Vec::new();
+
         for transport in healthy_transports {
             // All transports use the same client_order_id. If multiple succeed,
             // BitMEX rejects duplicates with "duplicate clOrdID" (expected rejection).
@@ -817,6 +840,18 @@ impl SubmitBroadcaster {
     }
 }
 
+fn is_definitive_submit_refusal(err: &anyhow::Error) -> bool {
+    if err.chain().any(|cause| {
+        cause
+            .downcast_ref::<BitmexHttpError>()
+            .is_some_and(|e| matches!(e, BitmexHttpError::BitmexError { .. }))
+    }) {
+        return true;
+    }
+
+    err.to_string().starts_with("Order rejected:")
+}
+
 /// Broadcaster metrics snapshot.
 #[derive(Debug, Clone)]
 pub struct BroadcasterMetrics {
@@ -855,7 +890,7 @@ mod tests {
 
     /// Mock executor for testing.
     #[derive(Clone)]
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     struct MockExecutor {
         handler: Arc<
             dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<OrderStatusReport>> + Send>>
@@ -881,7 +916,6 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        #[allow(clippy::too_many_arguments)]
         fn submit_order(
             &self,
             _instrument_id: InstrumentId,
@@ -1099,6 +1133,110 @@ mod tests {
                 .to_string()
                 .contains("All submit requests failed")
         );
+
+        let metrics = broadcaster.get_metrics_async().await;
+        assert_eq!(metrics.failed_submits, 1);
+        assert_eq!(metrics.successful_submits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_submit_all_bitmex_refusals_preserves_definitive_outcome() {
+        let transports = vec![
+            create_stub_transport("client-0", || async {
+                Err(anyhow::Error::new(BitmexHttpError::BitmexError {
+                    error_name: "HTTPError".to_string(),
+                    message: "Invalid price".to_string(),
+                }))
+            }),
+            create_stub_transport("client-1", || async {
+                Err(anyhow::Error::new(BitmexHttpError::BitmexError {
+                    error_name: "HTTPError".to_string(),
+                    message: "Invalid price".to_string(),
+                }))
+            }),
+        ];
+
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
+
+        let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+        let result = broadcaster
+            .broadcast_submit(
+                instrument_id,
+                ClientOrderId::from("O-REFUSED"),
+                OrderSide::Sell,
+                OrderType::Limit,
+                Quantity::new(50.0, 0),
+                TimeInForce::Gtc,
+                Some(Price::new(50000.0, 2)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+
+        assert!(err.starts_with(DEFINITIVE_SUBMIT_REJECTION));
+
+        let metrics = broadcaster.get_metrics_async().await;
+        assert_eq!(metrics.failed_submits, 1);
+        assert_eq!(metrics.successful_submits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_submit_mixed_refusal_and_network_failure_stays_ambiguous() {
+        let transports = vec![
+            create_stub_transport("client-0", || async {
+                Err(anyhow::Error::new(BitmexHttpError::BitmexError {
+                    error_name: "HTTPError".to_string(),
+                    message: "Invalid price".to_string(),
+                }))
+            }),
+            create_stub_transport("client-1", || async { anyhow::bail!("Connection refused") }),
+        ];
+
+        let config = SubmitBroadcasterConfig::default();
+        let broadcaster = SubmitBroadcaster::new_with_transports(config, transports);
+
+        let instrument_id = InstrumentId::from_str("XBTUSD.BITMEX").unwrap();
+        let result = broadcaster
+            .broadcast_submit(
+                instrument_id,
+                ClientOrderId::from("O-MIXED-FAILURE"),
+                OrderSide::Sell,
+                OrderType::Limit,
+                Quantity::from("50"),
+                TimeInForce::Gtc,
+                Some(Price::from("50000.00")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+
+        assert!(err.starts_with("All submit requests failed"));
+        assert!(!err.starts_with(DEFINITIVE_SUBMIT_REJECTION));
 
         let metrics = broadcaster.get_metrics_async().await;
         assert_eq!(metrics.failed_submits, 1);
@@ -1326,7 +1464,7 @@ mod tests {
             pool_size: 1,
             api_key: Some("test_key".to_string()),
             api_secret: Some("test_secret".to_string()),
-            testnet: true,
+            environment: BitmexEnvironment::Testnet,
             base_url: None,
             ..Default::default()
         };
@@ -1560,7 +1698,6 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
 
-            #[allow(clippy::too_many_arguments)]
             fn submit_order(
                 &self,
                 _instrument_id: InstrumentId,
@@ -1686,7 +1823,6 @@ mod tests {
                 Box::pin(async { Ok(()) })
             }
 
-            #[allow(clippy::too_many_arguments)]
             fn submit_order(
                 &self,
                 _instrument_id: InstrumentId,

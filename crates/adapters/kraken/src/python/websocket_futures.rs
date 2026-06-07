@@ -30,23 +30,21 @@ use nautilus_core::{
 use nautilus_model::{
     data::{Data, OrderBookDeltas, OrderBookDeltas_API, QuoteTick},
     enums::{BookType, OrderSide, OrderStatus, OrderType, TimeInForce},
-    identifiers::{
-        AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId, VenueOrderId,
-    },
+    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orderbook::OrderBook,
     python::{data::data_to_pycapsule, instruments::pyobject_to_instrument_any},
     reports::{FillReport, OrderStatusReport},
     types::Quantity,
 };
-use nautilus_network::websocket::SubscriptionState;
+use nautilus_network::websocket::{SubscriptionState, TransportBackend};
 use pyo3::{IntoPyObjectExt, prelude::*};
 
 use crate::{
     common::{
-        consts::KRAKEN_VENUE,
         credential::KrakenCredential,
         enums::{KrakenEnvironment, KrakenProductType},
+        lookup_instrument_in_snapshot,
         urls::get_kraken_ws_public_url,
     },
     websocket::futures::{
@@ -70,22 +68,29 @@ use crate::{
 impl KrakenFuturesWebSocketClient {
     /// WebSocket client for the Kraken Futures v1 streaming API.
     #[new]
-    #[pyo3(signature = (environment=None, base_url=None, heartbeat_secs=60, api_key=None, api_secret=None))]
+    #[pyo3(signature = (environment=None, base_url=None, heartbeat_secs=60, api_key=None, api_secret=None, proxy_url=None))]
     fn py_new(
         environment: Option<KrakenEnvironment>,
         base_url: Option<String>,
         heartbeat_secs: u64,
         api_key: Option<String>,
         api_secret: Option<String>,
+        proxy_url: Option<String>,
     ) -> Self {
-        let env = environment.unwrap_or(KrakenEnvironment::Mainnet);
+        let env = environment.unwrap_or(KrakenEnvironment::Live);
         let demo = env == KrakenEnvironment::Demo;
         let url = base_url.unwrap_or_else(|| {
             get_kraken_ws_public_url(KrakenProductType::Futures, env).to_string()
         });
         let credential = KrakenCredential::resolve_futures(api_key, api_secret, demo);
 
-        Self::with_credentials(url, heartbeat_secs, credential)
+        Self::with_credentials(
+            url,
+            heartbeat_secs,
+            credential,
+            TransportBackend::default(),
+            proxy_url,
+        )
     }
 
     /// Returns true if the client has API credentials set.
@@ -134,10 +139,37 @@ impl KrakenFuturesWebSocketClient {
         })
     }
 
+    /// Returns true if the WebSocket is authenticated for private feeds.
+    #[pyo3(name = "is_authenticated")]
+    fn py_is_authenticated(&self) -> bool {
+        self.is_authenticated()
+    }
+
+    /// Waits until the WebSocket is authenticated or the timeout elapses.
+    ///
+    /// Returns an error on timeout or explicit auth failure.
+    #[pyo3(name = "wait_until_authenticated")]
+    fn py_wait_until_authenticated<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_secs: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client
+                .wait_until_authenticated(timeout_secs)
+                .await
+                .map_err(to_pyruntime_err)?;
+            Ok(())
+        })
+    }
+
     /// Authenticates the WebSocket connection for private feeds.
     ///
-    /// This sends a challenge request, waits for the response, signs it,
-    /// and stores the credentials for use in private subscriptions.
+    /// Sends a challenge request and waits for the handler to parse the response,
+    /// sign it, and mark the `AuthTracker` successful. Private subscriptions gate
+    /// on the stored challenge / signed-challenge pair.
     #[pyo3(name = "authenticate")]
     fn py_authenticate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
@@ -150,7 +182,7 @@ impl KrakenFuturesWebSocketClient {
 
     /// Connects to the WebSocket server.
     #[pyo3(name = "connect")]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_connect<'py>(
         &mut self,
         py: Python<'py>,
@@ -292,7 +324,6 @@ impl KrakenFuturesWebSocketClient {
 
     /// Caches an instrument for execution report parsing.
     #[pyo3(name = "cache_instrument")]
-    #[allow(clippy::needless_pass_by_value)]
     fn py_cache_instrument(&self, py: Python, instrument: Py<PyAny>) -> PyResult<()> {
         let inst_any = pyobject_to_instrument_any(py, instrument)?;
         self.cache_instrument(inst_any);
@@ -301,7 +332,6 @@ impl KrakenFuturesWebSocketClient {
 
     /// Caches multiple instruments for execution report parsing.
     #[pyo3(name = "cache_instruments")]
-    #[allow(clippy::needless_pass_by_value)]
     fn py_cache_instruments(&self, py: Python, instruments: Vec<Py<PyAny>>) -> PyResult<()> {
         let mut inst_vec = Vec::with_capacity(instruments.len());
         for inst in instruments {
@@ -664,14 +694,6 @@ impl KrakenFuturesWebSocketClient {
     }
 }
 
-fn lookup_instrument(
-    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    product_id: &str,
-) -> Option<InstrumentAny> {
-    let instrument_id = InstrumentId::new(Symbol::new(product_id), *KRAKEN_VENUE);
-    instruments.load().get(&instrument_id).cloned()
-}
-
 fn resolve_client_order_id(
     truncated: &str,
     truncated_id_map: &Arc<AtomicMap<String, ClientOrderId>>,
@@ -701,7 +723,7 @@ fn dispatch_fill_to_python(report: FillReport, call_soon: &Py<PyAny>, callback: 
     });
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_open_orders_delta(
     delta: &KrakenFuturesOpenOrdersDelta,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
@@ -714,9 +736,21 @@ fn handle_open_orders_delta(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
+    // The fills delta carries the real fill; skip the cancel-shaped delta
+    // Kraken emits when an order leaves the book because it filled.
+    if delta.is_fill_driven_cancel() {
+        log::debug!(
+            "Skipping fill-driven open_orders delta: order_id={}, reason={:?}",
+            delta.order.order_id,
+            delta.reason,
+        );
+        return;
+    }
+
     let product_id = delta.order.instrument.as_str();
 
-    let Some(instrument) = lookup_instrument(instruments, product_id) else {
+    let instruments = instruments.load();
+    let Some(instrument) = lookup_instrument_in_snapshot(&instruments, product_id) else {
         log::warn!("No instrument for product_id: {product_id}");
         return;
     };
@@ -735,7 +769,7 @@ fn handle_open_orders_delta(
         &delta.order,
         delta.is_cancel,
         delta.reason.as_deref(),
-        &instrument,
+        instrument,
         acct_id,
         ts_init,
     ) {
@@ -752,7 +786,7 @@ fn handle_open_orders_delta(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_open_orders_cancel(
     cancel: &KrakenFuturesOpenOrdersCancel,
     account_id: &Arc<RwLock<Option<AccountId>>>,
@@ -834,7 +868,6 @@ fn handle_open_orders_cancel(
     dispatch_report_to_python(report, call_soon, callback);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_fills_delta(
     fills_delta: &KrakenFuturesFillsDelta,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
@@ -849,6 +882,8 @@ fn handle_fills_delta(
         return;
     };
 
+    let instruments = instruments.load();
+
     for fill in &fills_delta.fills {
         let product_id = match &fill.instrument {
             Some(id) => id.as_str(),
@@ -858,12 +893,12 @@ fn handle_fills_delta(
             }
         };
 
-        let Some(instrument) = lookup_instrument(instruments, product_id) else {
+        let Some(instrument) = lookup_instrument_in_snapshot(&instruments, product_id) else {
             log::warn!("No instrument for product_id: {product_id}");
             continue;
         };
 
-        match parse_futures_ws_fill_report(fill, &instrument, acct_id, ts_init) {
+        match parse_futures_ws_fill_report(fill, instrument, acct_id, ts_init) {
             Ok(mut report) => {
                 if let Some(ref cl_ord_id) = fill.cli_ord_id {
                     let full_id = resolve_client_order_id(cl_ord_id, truncated_id_map);
@@ -883,25 +918,27 @@ fn handle_ticker(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = lookup_instrument(instruments, ticker.product_id.as_str()) else {
+    let instruments = instruments.load();
+    let Some(instrument) = lookup_instrument_in_snapshot(&instruments, ticker.product_id.as_str())
+    else {
         return;
     };
 
-    if let Some(mark_price) = parse_futures_ws_mark_price(ticker, &instrument, ts_init) {
+    if let Some(mark_price) = parse_futures_ws_mark_price(ticker, instrument, ts_init) {
         Python::attach(|py| {
             let py_obj = data_to_pycapsule(py, Data::MarkPriceUpdate(mark_price));
             call_python_threadsafe(py, call_soon, callback, py_obj);
         });
     }
 
-    if let Some(index_price) = parse_futures_ws_index_price(ticker, &instrument, ts_init) {
+    if let Some(index_price) = parse_futures_ws_index_price(ticker, instrument, ts_init) {
         Python::attach(|py| {
             let py_obj = data_to_pycapsule(py, Data::IndexPriceUpdate(index_price));
             call_python_threadsafe(py, call_soon, callback, py_obj);
         });
     }
 
-    if let Some(funding_rate) = parse_futures_ws_funding_rate(ticker, &instrument, ts_init) {
+    if let Some(funding_rate) = parse_futures_ws_funding_rate(ticker, instrument, ts_init) {
         Python::attach(|py| match funding_rate.into_py_any(py) {
             Ok(py_obj) => call_python_threadsafe(py, call_soon, callback, py_obj),
             Err(e) => log::error!("Failed to convert FundingRateUpdate to Python: {e}"),
@@ -916,11 +953,13 @@ fn handle_trade(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = lookup_instrument(instruments, trade.product_id.as_str()) else {
+    let instruments = instruments.load();
+    let Some(instrument) = lookup_instrument_in_snapshot(&instruments, trade.product_id.as_str())
+    else {
         return;
     };
 
-    match parse_futures_ws_trade_tick(trade, &instrument, ts_init) {
+    match parse_futures_ws_trade_tick(trade, instrument, ts_init) {
         Ok(tick) => {
             Python::attach(|py| {
                 let py_obj = data_to_pycapsule(py, Data::Trade(tick));
@@ -931,7 +970,7 @@ fn handle_trade(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_book_snapshot(
     snapshot: &KrakenFuturesBookSnapshot,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
@@ -943,7 +982,10 @@ fn handle_book_snapshot(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = lookup_instrument(instruments, snapshot.product_id.as_str()) else {
+    let instruments = instruments.load();
+    let Some(instrument) =
+        lookup_instrument_in_snapshot(&instruments, snapshot.product_id.as_str())
+    else {
         return;
     };
     let instrument_id = instrument.id();
@@ -953,7 +995,7 @@ fn handle_book_snapshot(
         Ordering::Relaxed,
     );
 
-    match parse_futures_ws_book_snapshot_deltas(snapshot, &instrument, sequence, ts_init) {
+    match parse_futures_ws_book_snapshot_deltas(snapshot, instrument, sequence, ts_init) {
         Ok(delta_vec) => {
             if delta_vec.is_empty() {
                 return;
@@ -993,7 +1035,7 @@ fn handle_book_snapshot(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn handle_book_delta(
     delta: &KrakenFuturesBookDelta,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
@@ -1005,14 +1047,16 @@ fn handle_book_delta(
     call_soon: &Py<PyAny>,
     callback: &Py<PyAny>,
 ) {
-    let Some(instrument) = lookup_instrument(instruments, delta.product_id.as_str()) else {
+    let instruments = instruments.load();
+    let Some(instrument) = lookup_instrument_in_snapshot(&instruments, delta.product_id.as_str())
+    else {
         return;
     };
     let instrument_id = instrument.id();
 
     let sequence = book_sequence.fetch_add(1, Ordering::Relaxed);
 
-    match parse_futures_ws_book_delta(delta, &instrument, sequence, ts_init) {
+    match parse_futures_ws_book_delta(delta, instrument, sequence, ts_init) {
         Ok(book_delta) => {
             let deltas = OrderBookDeltas::new(instrument_id, vec![book_delta]);
 

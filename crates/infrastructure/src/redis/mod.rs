@@ -25,7 +25,7 @@ use nautilus_common::{
     logging::log_task_awaiting,
     msgbus::database::{DatabaseConfig, MessageBusConfig},
 };
-use nautilus_core::{UUID4, string::SemVer};
+use nautilus_core::{UUID4, string::semver::SemVer};
 use nautilus_model::identifiers::TraderId;
 use redis::RedisError;
 
@@ -356,7 +356,7 @@ mod tests {
         };
 
         let key = get_stream_key(trader_id, instance_id, &config);
-        assert_eq!(key, format!("stream"));
+        assert_eq!(key, "stream".to_string());
     }
 
     #[rstest]

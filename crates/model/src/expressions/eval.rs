@@ -48,7 +48,7 @@ impl Default for CompiledExpression {
 
 impl CompiledExpression {
     #[must_use]
-    pub const fn result_type(&self) -> ValueType {
+    pub(crate) const fn result_type(&self) -> ValueType {
         self.result_type
     }
 
@@ -56,7 +56,7 @@ impl CompiledExpression {
     ///
     /// Returns an error if the compiled expression does not produce a numeric result.
     #[inline]
-    pub fn eval_number(&self, inputs: &[f64]) -> Result<f64> {
+    pub(crate) fn eval_number(&self, inputs: &[f64]) -> Result<f64> {
         self.eval_core(inputs, None)
     }
 
@@ -407,6 +407,7 @@ impl<'a> Compiler<'a> {
 
     fn compile_unary(&mut self, op: UnaryOp, expr: &Expr) -> Result<ValueType> {
         let expr_type = self.compile_expr(expr)?;
+
         match op {
             UnaryOp::Neg => {
                 ensure_type(expr_type, ValueType::Number, "unary `-`")?;

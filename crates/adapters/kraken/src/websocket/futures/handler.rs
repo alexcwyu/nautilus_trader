@@ -38,22 +38,16 @@ use super::messages::{
     KrakenFuturesOpenOrdersDelta, KrakenFuturesTickerData, KrakenFuturesTradeData,
     KrakenFuturesWsMessage, classify_futures_message,
 };
+use crate::common::consts::KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION;
 
 /// Commands sent from the outer client to the inner message handler.
 #[derive(Debug)]
 pub enum FuturesHandlerCommand {
     SetClient(WebSocketClient),
     Disconnect,
-    Subscribe {
-        payload: String,
-    },
-    Unsubscribe {
-        payload: String,
-    },
-    RequestChallenge {
-        payload: String,
-        response_tx: tokio::sync::oneshot::Sender<String>,
-    },
+    Subscribe { payload: String },
+    Unsubscribe { payload: String },
+    RequestChallenge { payload: String },
 }
 
 /// WebSocket message handler for Kraken Futures.
@@ -64,7 +58,6 @@ pub struct FuturesFeedHandler {
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
     subscriptions: SubscriptionState,
     pending_messages: VecDeque<KrakenFuturesWsMessage>,
-    pending_challenge_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 impl FuturesFeedHandler {
@@ -82,7 +75,6 @@ impl FuturesFeedHandler {
             raw_rx,
             subscriptions,
             pending_messages: VecDeque::new(),
-            pending_challenge_tx: None,
         }
     }
 
@@ -120,18 +112,16 @@ impl FuturesFeedHandler {
                         FuturesHandlerCommand::Subscribe { payload }
                         | FuturesHandlerCommand::Unsubscribe { payload } => {
                             if let Some(ref client) = self.inner
-                                && let Err(e) = client.send_text(payload, None).await
+                                && let Err(e) = client.send_text(payload, Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())).await
                             {
                                 log::error!("Failed to send text: {e}");
                             }
                         }
-                        FuturesHandlerCommand::RequestChallenge { payload, response_tx } => {
-                            log::debug!("Requesting challenge for authentication");
-                            self.pending_challenge_tx = Some(response_tx);
+                        FuturesHandlerCommand::RequestChallenge { payload } => {
                             if let Some(ref client) = self.inner
                                 && let Err(e) = client.send_text(payload, None).await
                             {
-                                log::error!("Failed to send challenge request: {e}");
+                                log::error!("Failed to send text: {e}");
                             }
                         }
                     }
@@ -293,13 +283,8 @@ impl FuturesFeedHandler {
                 let len = response.message.len();
                 log::debug!("Challenge received, length: {len}");
 
-                if let Some(tx) = self.pending_challenge_tx.take() {
-                    if tx.send(response.message).is_err() {
-                        log::warn!("Failed to send challenge response - receiver dropped");
-                    }
-                } else {
-                    log::warn!("Received challenge but no pending request");
-                }
+                self.pending_messages
+                    .push_back(KrakenFuturesWsMessage::Challenge(response.message));
             }
             Err(e) => {
                 log::error!("Failed to parse challenge response: {e}");
@@ -624,6 +609,21 @@ mod tests {
             fills.fills[0].fill_id,
             "6a22a3fb-e18e-4e76-b841-8689735c9158"
         );
+    }
+
+    #[rstest]
+    fn test_parse_challenge_emits_challenge_message() {
+        let mut handler = create_test_handler();
+        let json = r#"{"event":"challenge","message":"server-challenge-abc"}"#;
+
+        handler.parse_message(json);
+
+        assert_eq!(handler.pending_messages.len(), 1);
+        let msg = handler.pending_messages.pop_front().unwrap();
+        let KrakenFuturesWsMessage::Challenge(challenge) = msg else {
+            panic!("Expected Challenge message, was {msg:?}");
+        };
+        assert_eq!(challenge, "server-challenge-abc");
     }
 
     #[rstest]

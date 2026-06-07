@@ -87,7 +87,7 @@ impl TardisInstrumentMiniInfo {
 ///
 /// Returns an error if the bar aggregation kind is unsupported.
 #[pyfunction(name = "bar_spec_to_tardis_trade_bar_string")]
-#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.tardis")]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.tardis")]
 pub fn py_bar_spec_to_tardis_trade_bar_string(bar_spec: &BarSpecification) -> PyResult<String> {
     bar_spec_to_tardis_trade_bar_string(bar_spec).map_err(to_pyvalue_err)
 }
@@ -100,27 +100,29 @@ impl TardisDataClientConfig {
     #[pyo3(signature = (
         api_key = None,
         tardis_ws_url = None,
+        proxy_url = None,
         normalize_symbols = None,
         options = None,
         stream_options = None,
+        extract_bbo_as_quotes = None,
     ))]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Python constructor mirrors config fields"
-    )]
     fn py_new(
         api_key: Option<String>,
         tardis_ws_url: Option<String>,
+        proxy_url: Option<String>,
         normalize_symbols: Option<bool>,
         options: Option<Vec<ReplayNormalizedRequestOptions>>,
         stream_options: Option<Vec<StreamNormalizedRequestOptions>>,
+        extract_bbo_as_quotes: Option<bool>,
     ) -> Self {
         let defaults = Self::default();
         Self {
             api_key,
             tardis_ws_url,
+            proxy_url,
             normalize_symbols: normalize_symbols.unwrap_or(defaults.normalize_symbols),
             book_snapshot_output: defaults.book_snapshot_output,
+            extract_bbo_as_quotes: extract_bbo_as_quotes.unwrap_or(defaults.extract_bbo_as_quotes),
             options: options.unwrap_or_default(),
             stream_options: stream_options.unwrap_or_default(),
         }

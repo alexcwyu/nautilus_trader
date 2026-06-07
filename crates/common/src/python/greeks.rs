@@ -47,12 +47,12 @@ pub struct PyGreeksCalculator(GreeksCalculator);
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl PyGreeksCalculator {
     #[new]
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(clippy::needless_pass_by_value)]
     fn py_new(cache: PyCache, clock: PyClock) -> Self {
         Self(GreeksCalculator::new(cache.cache_rc(), clock.clock_rc()))
     }
 
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     #[pyo3(
         name = "instrument_greeks",
         signature = (
@@ -70,7 +70,9 @@ impl PyGreeksCalculator {
             percent_greeks=false,
             index_instrument_id=None,
             beta_weights=None,
-            vega_time_weight_base=None
+            vega_time_weight_base=None,
+            vol_index_instrument_id=None,
+            vol_beta_weights=None
         )
     )]
     fn py_instrument_greeks(
@@ -90,6 +92,8 @@ impl PyGreeksCalculator {
         index_instrument_id: Option<InstrumentId>,
         beta_weights: Option<HashMap<InstrumentId, f64>>,
         vega_time_weight_base: Option<i32>,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<HashMap<InstrumentId, f64>>,
     ) -> PyResult<GreeksData> {
         self.0
             .instrument_greeks(
@@ -109,11 +113,13 @@ impl PyGreeksCalculator {
                 index_instrument_id,
                 beta_weights.as_ref(),
                 vega_time_weight_base,
+                vol_index_instrument_id,
+                vol_beta_weights.as_ref(),
             )
             .map_err(to_pyvalue_err)
     }
 
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     #[pyo3(
         name = "modify_greeks",
         signature = (
@@ -128,7 +134,12 @@ impl PyGreeksCalculator {
             vega_input=0.0,
             vol=0.0,
             expiry_in_days=0,
-            vega_time_weight_base=None
+            vega_time_weight_base=None,
+            unshocked_vol=0.0,
+            vol_index_instrument_id=None,
+            vol_beta_weights=None,
+            index_price=None,
+            vol_index_price=None
         )
     )]
     fn py_modify_greeks(
@@ -145,24 +156,36 @@ impl PyGreeksCalculator {
         vol: f64,
         expiry_in_days: i32,
         vega_time_weight_base: Option<i32>,
-    ) -> (f64, f64, f64) {
-        self.0.modify_greeks(
-            delta_input,
-            gamma_input,
-            underlying_instrument_id,
-            underlying_price,
-            unshocked_underlying_price,
-            percent_greeks,
-            index_instrument_id,
-            beta_weights.as_ref(),
-            vega_input,
-            vol,
-            expiry_in_days,
-            vega_time_weight_base,
-        )
+        unshocked_vol: f64,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<HashMap<InstrumentId, f64>>,
+        index_price: Option<f64>,
+        vol_index_price: Option<f64>,
+    ) -> PyResult<(f64, f64, f64)> {
+        self.0
+            .modify_greeks(
+                delta_input,
+                gamma_input,
+                underlying_instrument_id,
+                underlying_price,
+                unshocked_underlying_price,
+                percent_greeks,
+                index_instrument_id,
+                beta_weights.as_ref(),
+                vega_input,
+                vol,
+                expiry_in_days,
+                vega_time_weight_base,
+                unshocked_vol,
+                vol_index_instrument_id,
+                vol_beta_weights.as_ref(),
+                index_price,
+                vol_index_price,
+            )
+            .map_err(to_pyvalue_err)
     }
 
-    #[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+    #[expect(clippy::too_many_arguments, clippy::needless_pass_by_value)]
     #[pyo3(
         name = "portfolio_greeks",
         signature = (
@@ -183,7 +206,9 @@ impl PyGreeksCalculator {
             index_instrument_id=None,
             beta_weights=None,
             greeks_filter=None,
-            vega_time_weight_base=None
+            vega_time_weight_base=None,
+            vol_index_instrument_id=None,
+            vol_beta_weights=None
         )
     )]
     fn py_portfolio_greeks(
@@ -206,6 +231,8 @@ impl PyGreeksCalculator {
         beta_weights: Option<HashMap<InstrumentId, f64>>,
         greeks_filter: Option<Py<PyAny>>,
         vega_time_weight_base: Option<i32>,
+        vol_index_instrument_id: Option<InstrumentId>,
+        vol_beta_weights: Option<HashMap<InstrumentId, f64>>,
     ) -> PyResult<PortfolioGreeks> {
         let greeks_filter: Option<GreeksFilter> = greeks_filter.map(|callback| {
             Box::new(move |data: &GreeksData| {
@@ -240,6 +267,8 @@ impl PyGreeksCalculator {
                 beta_weights.as_ref(),
                 greeks_filter.as_ref(),
                 vega_time_weight_base,
+                vol_index_instrument_id,
+                vol_beta_weights.as_ref(),
             )
             .map_err(to_pyvalue_err)
     }

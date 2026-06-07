@@ -21,7 +21,8 @@ use std::{
     ops::Deref,
 };
 
-use nautilus_core::UnixNanos;
+use nautilus_core::{UnixNanos, serialization::Serializable};
+use serde::{Deserialize, Serialize};
 
 use super::HasTsInit;
 use crate::{
@@ -29,12 +30,17 @@ use crate::{
         QuoteTick,
         greeks::{HasGreeks, OptionGreekValues},
     },
+    enums::GreeksConvention,
     identifiers::{InstrumentId, OptionSeriesId},
     types::Price,
 };
 
+/// Number of strikes either side of ATM that [`StrikeRange::Delta`] selects as a
+/// fallback when Greeks are not yet available for delta resolution.
+pub(crate) const DEFAULT_DELTA_FALLBACK_STRIKES: usize = 5;
+
 /// Defines which strikes to include in an option chain subscription.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum StrikeRange {
     /// Subscribe to a fixed set of strike prices.
     Fixed(Vec<Price>),
@@ -45,6 +51,13 @@ pub enum StrikeRange {
     },
     /// Subscribe to strikes within a percentage band around ATM price.
     AtmPercent { pct: f64 },
+    /// Subscribe to strikes whose absolute option delta is near `target`.
+    ///
+    /// Delta resolution needs Greeks, so the option chain aggregator performs it.
+    /// The model-level [`StrikeRange::resolve`] has no Greeks and falls back to an
+    /// ATM-relative window of `DEFAULT_DELTA_FALLBACK_STRIKES` strikes either side
+    /// of ATM until Greeks are available.
+    Delta { target: f64, tolerance: f64 },
 }
 
 impl StrikeRange {
@@ -53,6 +66,9 @@ impl StrikeRange {
     /// - `Fixed`: returns the fixed strikes directly (intersected with available).
     /// - `AtmRelative`: finds the closest strike to ATM, takes N above and N below.
     /// - `AtmPercent`: filters strikes within a percentage band around ATM.
+    /// - `Delta`: has no Greeks at this level, so it falls back to an ATM-relative
+    ///   window of `DEFAULT_DELTA_FALLBACK_STRIKES` strikes either side of ATM. The
+    ///   option chain aggregator resolves `Delta` from Greeks instead.
     ///
     /// If `atm_price` is `None` for ATM-based variants, returns an empty vec
     /// (subscriptions are deferred until ATM is known).
@@ -125,12 +141,19 @@ impl StrikeRange {
                     .copied()
                     .collect()
             }
+            Self::Delta { .. } => Self::AtmRelative {
+                strikes_above: DEFAULT_DELTA_FALLBACK_STRIKES,
+                strikes_below: DEFAULT_DELTA_FALLBACK_STRIKES,
+            }
+            .resolve(atm_price, all_strikes),
         }
     }
 }
 
 /// Exchange-provided option Greeks and implied volatility for a single instrument.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -142,6 +165,8 @@ impl StrikeRange {
 pub struct OptionGreeks {
     /// The instrument ID these Greeks apply to.
     pub instrument_id: InstrumentId,
+    /// The numeraire convention these Greeks are expressed in.
+    pub convention: GreeksConvention,
     /// Core Greek sensitivity values.
     pub greeks: OptionGreekValues,
     /// Mark implied volatility.
@@ -183,6 +208,7 @@ impl Default for OptionGreeks {
     fn default() -> Self {
         Self {
             instrument_id: InstrumentId::from("NULL.NULL"),
+            convention: GreeksConvention::default(),
             greeks: OptionGreekValues::default(),
             mark_iv: None,
             bid_iv: None,
@@ -199,11 +225,19 @@ impl Display for OptionGreeks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "OptionGreeks({}, delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4}, mark_iv={:?})",
-            self.instrument_id, self.delta, self.gamma, self.vega, self.theta, self.mark_iv
+            "OptionGreeks({}, {}, delta={:.4}, gamma={:.4}, vega={:.4}, theta={:.4}, mark_iv={:?})",
+            self.instrument_id,
+            self.convention,
+            self.delta,
+            self.gamma,
+            self.vega,
+            self.theta,
+            self.mark_iv
         )
     }
 }
+
+impl Serializable for OptionGreeks {}
 
 /// Combined quote and Greeks data for a single strike in an option chain.
 #[derive(Clone, Debug)]
@@ -420,6 +454,7 @@ mod tests {
     fn test_option_greeks_default_fields() {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            convention: GreeksConvention::BlackScholes,
             greeks: OptionGreekValues::default(),
             mark_iv: None,
             bid_iv: None,
@@ -434,12 +469,20 @@ mod tests {
         assert_eq!(greeks.vega, 0.0);
         assert_eq!(greeks.theta, 0.0);
         assert!(greeks.mark_iv.is_none());
+        assert_eq!(greeks.convention, GreeksConvention::BlackScholes);
+    }
+
+    #[rstest]
+    fn test_option_greeks_default_is_black_scholes() {
+        let greeks = OptionGreeks::default();
+        assert_eq!(greeks.convention, GreeksConvention::BlackScholes);
     }
 
     #[rstest]
     fn test_option_greeks_display() {
         let greeks = OptionGreeks {
             instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            convention: GreeksConvention::PriceAdjusted,
             greeks: OptionGreekValues {
                 delta: 0.55,
                 gamma: 0.001,
@@ -457,7 +500,36 @@ mod tests {
         };
         let display = format!("{greeks}");
         assert!(display.contains("OptionGreeks"));
+        assert!(display.contains("PRICE_ADJUSTED"));
         assert!(display.contains("0.55"));
+    }
+
+    #[rstest]
+    fn test_option_greeks_data_serde_round_trip() {
+        let greeks = OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-20240101-50000-C.DERIBIT"),
+            convention: GreeksConvention::PriceAdjusted,
+            greeks: OptionGreekValues {
+                delta: 0.55,
+                gamma: 0.001,
+                vega: 10.0,
+                theta: -5.0,
+                rho: 0.2,
+            },
+            mark_iv: Some(0.65),
+            bid_iv: None,
+            ask_iv: Some(0.66),
+            underlying_price: Some(50_000.0),
+            open_interest: None,
+            ts_event: UnixNanos::from(1u64),
+            ts_init: UnixNanos::from(2u64),
+        };
+        let data = crate::data::Data::OptionGreeks(greeks);
+
+        let json = serde_json::to_string(&data).unwrap();
+        let roundtripped: crate::data::Data = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(roundtripped, data);
     }
 
     #[rstest]
@@ -620,5 +692,42 @@ mod tests {
         assert_eq!(slice.call_count(), 0);
         assert_eq!(slice.put_count(), 0);
         assert!(slice.atm_strike.is_none());
+    }
+
+    #[rstest]
+    fn test_strike_range_resolve_delta_falls_back_to_atm_relative() {
+        // The model-level resolve has no Greeks, so Delta delegates to an
+        // AtmRelative window of DEFAULT_DELTA_FALLBACK_STRIKES either side of ATM.
+        let strikes: Vec<Price> = (0..=20)
+            .map(|i| Price::from(&(40000 + i * 1000).to_string()))
+            .collect();
+        let atm = Some(Price::from("50000")); // index 10
+        let delta = StrikeRange::Delta {
+            target: 0.25,
+            tolerance: 0.05,
+        };
+        let expected = StrikeRange::AtmRelative {
+            strikes_above: DEFAULT_DELTA_FALLBACK_STRIKES,
+            strikes_below: DEFAULT_DELTA_FALLBACK_STRIKES,
+        }
+        .resolve(atm, &strikes);
+
+        let result = delta.resolve(atm, &strikes);
+        assert_eq!(result, expected);
+        assert_eq!(result.len(), 2 * DEFAULT_DELTA_FALLBACK_STRIKES + 1);
+        assert!(result.contains(&Price::from("50000")));
+        assert!(!result.contains(&Price::from("40000")));
+        assert!(!result.contains(&Price::from("60000")));
+    }
+
+    #[rstest]
+    fn test_strike_range_resolve_delta_empty_without_atm() {
+        let delta = StrikeRange::Delta {
+            target: 0.25,
+            tolerance: 0.05,
+        };
+        let strikes = vec![Price::from("50000"), Price::from("55000")];
+        // No ATM -> deferred (empty), matching ATM-relative behaviour.
+        assert!(delta.resolve(None, &strikes).is_empty());
     }
 }

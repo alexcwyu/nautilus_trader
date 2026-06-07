@@ -15,21 +15,35 @@
 
 //! Parsing functions for converting Coinbase WebSocket messages to Nautilus domain types.
 
+use std::str::FromStr;
+
+use anyhow::Context;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{Bar, BarType, BookOrder, OrderBookDelta, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::{BookAction, OrderSide, RecordFlag},
-    identifiers::{InstrumentId, TradeId},
+    data::{
+        Bar, BarType, BookOrder, InstrumentStatus, OrderBookDelta, OrderBookDeltas, QuoteTick,
+        TradeTick,
+    },
+    enums::{BookAction, LiquiditySide, MarketStatusAction, OrderSide, OrderStatus, RecordFlag},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
-    types::Quantity,
+    reports::{FillReport, OrderStatusReport},
+    types::{Money, Price, Quantity},
 };
+use rust_decimal::{Decimal, prelude::ToPrimitive};
+use ustr::Ustr;
 
 use crate::{
+    common::enums::CoinbaseProductStatus,
     http::parse::{
-        coinbase_side_to_aggressor, parse_epoch_secs_timestamp, parse_price, parse_quantity,
-        parse_rfc3339_timestamp,
+        coinbase_side_to_aggressor, parse_epoch_secs_timestamp, parse_order_side,
+        parse_order_status, parse_order_type, parse_price, parse_quantity, parse_rfc3339_timestamp,
+        parse_time_in_force,
     },
-    websocket::messages::{WsBookSide, WsCandle, WsL2DataEvent, WsL2Update, WsTicker, WsTrade},
+    websocket::messages::{
+        WsBookSide, WsCandle, WsL2DataEvent, WsL2Update, WsOrderUpdate, WsStatusProduct, WsTicker,
+        WsTrade,
+    },
 };
 
 /// Parses a WebSocket trade into a [`TradeTick`].
@@ -96,23 +110,23 @@ pub fn parse_ws_candle(
 }
 
 /// Parses a WebSocket L2 snapshot event into [`OrderBookDeltas`].
+///
+/// All deltas in the batch share `ts_event`, which the caller derives from the
+/// message-level `timestamp`. Per-level `event_time` values are not monotonic
+/// across batches and would trigger out-of-order warnings in the managed book.
 pub fn parse_ws_l2_snapshot(
     event: &WsL2DataEvent,
     instrument: &InstrumentAny,
+    ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
     let instrument_id = instrument.id();
-    let ts_event = event
-        .updates
-        .first()
-        .map(|u| parse_rfc3339_timestamp(&u.event_time))
-        .transpose()?
-        .unwrap_or(ts_init);
 
     let total = event.updates.len();
     let mut deltas = Vec::with_capacity(total + 1);
 
     let mut clear = OrderBookDelta::clear(instrument_id, 0, ts_event, ts_init);
+    clear.flags |= RecordFlag::F_SNAPSHOT as u8;
 
     if total == 0 {
         clear.flags |= RecordFlag::F_LAST as u8;
@@ -137,9 +151,14 @@ pub fn parse_ws_l2_snapshot(
 }
 
 /// Parses a WebSocket L2 update event into [`OrderBookDeltas`].
+///
+/// All deltas in the batch share `ts_event`, which the caller derives from the
+/// message-level `timestamp`. Per-level `event_time` values are not monotonic
+/// across batches and would trigger out-of-order warnings in the managed book.
 pub fn parse_ws_l2_update(
     event: &WsL2DataEvent,
     instrument: &InstrumentAny,
+    ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderBookDeltas> {
     let instrument_id = instrument.id();
@@ -148,7 +167,6 @@ pub fn parse_ws_l2_update(
 
     for (i, update) in event.updates.iter().enumerate() {
         let is_last = i == total - 1;
-        let ts_event = parse_rfc3339_timestamp(&update.event_time)?;
         let price = parse_price(&update.price_level, instrument.price_precision())?;
         let size = parse_quantity(&update.new_quantity, instrument.size_precision())?;
         let side = ws_book_side_to_order_side(update.side);
@@ -175,7 +193,6 @@ pub fn parse_ws_l2_update(
 }
 
 /// Parses a single L2 snapshot level into an [`OrderBookDelta`].
-#[allow(clippy::too_many_arguments)]
 fn parse_l2_delta(
     update: &WsL2Update,
     instrument_id: InstrumentId,
@@ -189,7 +206,7 @@ fn parse_l2_delta(
     let size = parse_quantity(&update.new_quantity, size_precision)?;
     let side = ws_book_side_to_order_side(update.side);
 
-    let mut flags = RecordFlag::F_MBP as u8;
+    let mut flags = RecordFlag::F_MBP as u8 | RecordFlag::F_SNAPSHOT as u8;
 
     if is_last {
         flags |= RecordFlag::F_LAST as u8;
@@ -215,27 +232,202 @@ fn ws_book_side_to_order_side(side: WsBookSide) -> OrderSide {
     }
 }
 
+/// Parses a Coinbase user channel [`WsOrderUpdate`] into an [`OrderStatusReport`].
+///
+/// Derives the total quantity as `cumulative_quantity + leaves_quantity` and
+/// promotes the `Accepted` status to `PartiallyFilled` when the cumulative
+/// fill is positive but below the total quantity, mirroring the REST parser.
+///
+/// # Errors
+///
+/// Returns an error when any numeric field cannot be parsed against the
+/// instrument precision.
+pub fn parse_ws_user_event_to_order_status_report(
+    update: &WsOrderUpdate,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> anyhow::Result<OrderStatusReport> {
+    let instrument_id = instrument.id();
+    let size_precision = instrument.size_precision();
+
+    let order_side = parse_order_side(&update.order_side);
+    let order_type = parse_order_type(update.order_type);
+    let time_in_force = parse_time_in_force(Some(update.time_in_force));
+    let mut order_status = parse_order_status(update.status);
+
+    let venue_order_id = VenueOrderId::new(&update.order_id);
+    let client_order_id = if update.client_order_id.is_empty() {
+        None
+    } else {
+        Some(ClientOrderId::new(&update.client_order_id))
+    };
+
+    let filled_qty = if update.cumulative_quantity.is_empty() {
+        Quantity::zero(size_precision)
+    } else {
+        parse_quantity(&update.cumulative_quantity, size_precision)
+            .context("failed to parse cumulative_quantity")?
+    };
+    let leaves_qty = if update.leaves_quantity.is_empty() {
+        Quantity::zero(size_precision)
+    } else {
+        parse_quantity(&update.leaves_quantity, size_precision)
+            .context("failed to parse leaves_quantity")?
+    };
+
+    let quantity = filled_qty + leaves_qty;
+
+    if order_status == OrderStatus::Accepted && filled_qty.is_positive() && filled_qty < quantity {
+        order_status = OrderStatus::PartiallyFilled;
+    }
+
+    let ts_accepted = if update.creation_time.is_empty() {
+        ts_event
+    } else {
+        parse_rfc3339_timestamp(&update.creation_time).unwrap_or(ts_event)
+    };
+
+    let mut report = OrderStatusReport::new(
+        account_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        order_side,
+        order_type,
+        time_in_force,
+        order_status,
+        quantity,
+        filled_qty,
+        ts_accepted,
+        ts_event,
+        ts_init,
+        None,
+    );
+
+    if !update.avg_price.is_empty()
+        && let Ok(avg_decimal) = Decimal::from_str(&update.avg_price)
+        && avg_decimal.is_sign_positive()
+        && !avg_decimal.is_zero()
+    {
+        report = report.with_avg_px(avg_decimal.to_f64().unwrap_or_default())?;
+    }
+
+    Ok(report)
+}
+
+/// Parses a Coinbase user channel [`WsOrderUpdate`] into a [`FillReport`].
+///
+/// Coinbase's user channel reports cumulative totals rather than per-trade
+/// fills, so the caller must supply:
+/// - `last_qty`: the quantity delta since the previous cumulative state
+/// - `last_px`: the price of the new fill, derived by the caller from the
+///   cumulative notional delta (Coinbase's `avg_price` is the *cumulative*
+///   weighted average and is not safe to use as the new fill's price for
+///   multi-fill orders)
+/// - `commission`: the commission delta since the previous cumulative state
+/// - `trade_id`: synthesized from the order ID plus the new cumulative total
+#[allow(clippy::too_many_arguments)]
+pub fn parse_ws_user_event_to_fill_report(
+    update: &WsOrderUpdate,
+    last_qty: Quantity,
+    last_px: Price,
+    commission: Money,
+    trade_id: TradeId,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    liquidity_side: LiquiditySide,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> FillReport {
+    let instrument_id = instrument.id();
+
+    let venue_order_id = VenueOrderId::new(&update.order_id);
+    let client_order_id = if update.client_order_id.is_empty() {
+        None
+    } else {
+        Some(ClientOrderId::new(&update.client_order_id))
+    };
+    let order_side = parse_order_side(&update.order_side);
+
+    FillReport::new(
+        account_id,
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        order_side,
+        last_qty,
+        last_px,
+        commission,
+        liquidity_side,
+        client_order_id,
+        None,
+        ts_event,
+        ts_init,
+        None,
+    )
+}
+
+/// Parses a [`WsStatusProduct`] from the `status` channel into an
+/// [`InstrumentStatus`].
+///
+/// Returns `None` when the venue's status is unset (e.g. futures products in
+/// the FCM session), which carries no information for the data engine.
+pub fn parse_ws_status_product(
+    product: &WsStatusProduct,
+    instrument_id: InstrumentId,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+) -> Option<InstrumentStatus> {
+    let action = match product.status {
+        CoinbaseProductStatus::Online => MarketStatusAction::Trading,
+        CoinbaseProductStatus::Offline => MarketStatusAction::Halt,
+        CoinbaseProductStatus::Delisted => MarketStatusAction::Close,
+        // Unset (futures) carries no info; Unknown is an unmodeled status we cannot
+        // safely map to a market action, so emit nothing rather than guess.
+        CoinbaseProductStatus::Unset | CoinbaseProductStatus::Unknown => return None,
+    };
+    let reason = if product.status_message.is_empty() {
+        None
+    } else {
+        Some(Ustr::from(&product.status_message))
+    };
+    let is_trading = Some(matches!(action, MarketStatusAction::Trading));
+    Some(InstrumentStatus::new(
+        instrument_id,
+        action,
+        ts_event,
+        ts_init,
+        reason,
+        None,
+        is_trading,
+        None,
+        None,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use nautilus_model::{
         data::bar::BarSpecification,
         enums::{AggregationSource, AggressorSide, BarAggregation, PriceType},
-        identifiers::{Symbol, Venue},
+        identifiers::Symbol,
         instruments::CurrencyPair,
         types::{Currency, Price},
     };
     use rstest::rstest;
-    use ustr::Ustr;
 
     use super::*;
     use crate::{
-        common::testing::load_test_fixture,
+        common::{consts::COINBASE_VENUE, testing::load_test_fixture},
         websocket::messages::{CoinbaseWsMessage, WsEventType},
     };
 
     fn test_instrument() -> InstrumentAny {
-        let instrument_id =
-            InstrumentId::new(Symbol::new("BTC-USD"), Venue::new(Ustr::from("COINBASE")));
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD"), *COINBASE_VENUE);
         let raw_symbol = Symbol::new("BTC-USD");
         let base_currency = Currency::get_or_create_crypto("BTC");
         let quote_currency = Currency::get_or_create_crypto("USD");
@@ -370,12 +562,18 @@ mod tests {
         let ts_init = UnixNanos::default();
 
         match msg {
-            CoinbaseWsMessage::L2Data { events, .. } => {
+            CoinbaseWsMessage::L2Data {
+                timestamp, events, ..
+            } => {
                 let event = &events[0];
                 assert_eq!(event.event_type, WsEventType::Snapshot);
+                let ts_event = parse_rfc3339_timestamp(&timestamp).unwrap();
 
-                let deltas = parse_ws_l2_snapshot(event, &instrument, ts_init).unwrap();
+                let deltas = parse_ws_l2_snapshot(event, &instrument, ts_event, ts_init).unwrap();
                 assert_eq!(deltas.instrument_id, instrument.id());
+                for delta in &deltas.deltas {
+                    assert_eq!(delta.ts_event, ts_event);
+                }
 
                 // 6 levels + 1 clear = 7 deltas
                 assert_eq!(deltas.deltas.len(), 7);
@@ -395,6 +593,67 @@ mod tests {
                 // Last delta has F_LAST flag
                 let last = deltas.deltas.last().unwrap();
                 assert_ne!(last.flags & RecordFlag::F_LAST as u8, 0);
+
+                // Every delta in a snapshot sequence carries F_SNAPSHOT.
+                for delta in &deltas.deltas {
+                    assert_ne!(
+                        delta.flags & RecordFlag::F_SNAPSHOT as u8,
+                        0,
+                        "snapshot delta missing F_SNAPSHOT: {delta:?}",
+                    );
+                }
+            }
+            _ => panic!("Expected L2Data"),
+        }
+    }
+
+    // Empty-book snapshots must carry F_SNAPSHOT | F_LAST on the lone Clear
+    // delta so buffered consumers receive the clear event; without F_LAST the
+    // DataEngine never flushes and downstream subscribers see nothing.
+    #[rstest]
+    fn test_parse_ws_l2_snapshot_empty_book_clear_carries_snapshot_and_last() {
+        let event = WsL2DataEvent {
+            event_type: WsEventType::Snapshot,
+            product_id: Ustr::from("BTC-USD"),
+            updates: Vec::new(),
+        };
+        let instrument = test_instrument();
+        let ts_event = UnixNanos::from(1);
+        let ts_init = UnixNanos::from(2);
+
+        let deltas = parse_ws_l2_snapshot(&event, &instrument, ts_event, ts_init).unwrap();
+        assert_eq!(deltas.deltas.len(), 1);
+        let clear = &deltas.deltas[0];
+        assert_eq!(clear.action, BookAction::Clear);
+        assert_ne!(clear.flags & RecordFlag::F_SNAPSHOT as u8, 0);
+        assert_ne!(clear.flags & RecordFlag::F_LAST as u8, 0);
+    }
+
+    // Update deltas must NOT carry F_SNAPSHOT; only snapshot sequences do.
+    // A regression that copy-pastes the snapshot path would have updates
+    // misclassified by downstream consumers.
+    #[rstest]
+    fn test_parse_ws_l2_update_omits_snapshot_flag() {
+        let json = load_test_fixture("ws_l2_data_update.json");
+        let msg: CoinbaseWsMessage = serde_json::from_str(&json).unwrap();
+        let instrument = test_instrument();
+        let ts_init = UnixNanos::default();
+
+        match msg {
+            CoinbaseWsMessage::L2Data {
+                timestamp, events, ..
+            } => {
+                let event = &events[0];
+                let ts_event = parse_rfc3339_timestamp(&timestamp).unwrap();
+                let deltas = parse_ws_l2_update(event, &instrument, ts_event, ts_init).unwrap();
+
+                for delta in &deltas.deltas {
+                    assert_eq!(
+                        delta.flags & RecordFlag::F_SNAPSHOT as u8,
+                        0,
+                        "update delta must not carry F_SNAPSHOT: {delta:?}",
+                    );
+                }
             }
             _ => panic!("Expected L2Data"),
         }
@@ -408,12 +667,18 @@ mod tests {
         let ts_init = UnixNanos::default();
 
         match msg {
-            CoinbaseWsMessage::L2Data { events, .. } => {
+            CoinbaseWsMessage::L2Data {
+                timestamp, events, ..
+            } => {
                 let event = &events[0];
                 assert_eq!(event.event_type, WsEventType::Update);
+                let ts_event = parse_rfc3339_timestamp(&timestamp).unwrap();
 
-                let deltas = parse_ws_l2_update(event, &instrument, ts_init).unwrap();
+                let deltas = parse_ws_l2_update(event, &instrument, ts_event, ts_init).unwrap();
                 assert_eq!(deltas.deltas.len(), 2);
+                for delta in &deltas.deltas {
+                    assert_eq!(delta.ts_event, ts_event);
+                }
 
                 // First update: bid at 68900.00, qty 2.0 -> Update action
                 assert_eq!(deltas.deltas[0].order.side, OrderSide::Buy);
@@ -441,9 +706,12 @@ mod tests {
         let ts_init = UnixNanos::default();
 
         match msg {
-            CoinbaseWsMessage::L2Data { events, .. } => {
+            CoinbaseWsMessage::L2Data {
+                timestamp, events, ..
+            } => {
                 let event = &events[0];
-                let deltas = parse_ws_l2_update(event, &instrument, ts_init).unwrap();
+                let ts_event = parse_rfc3339_timestamp(&timestamp).unwrap();
+                let deltas = parse_ws_l2_update(event, &instrument, ts_event, ts_init).unwrap();
 
                 // The offer with new_quantity "0.00000000" should be a Delete
                 let delete_delta = deltas
@@ -452,6 +720,7 @@ mod tests {
                     .find(|d| d.action == BookAction::Delete)
                     .expect("should have a delete action for zero quantity");
                 assert_eq!(delete_delta.order.side, OrderSide::Sell);
+                assert_eq!(delete_delta.ts_event, ts_event);
             }
             _ => panic!("Expected L2Data"),
         }
@@ -464,5 +733,211 @@ mod tests {
             ws_book_side_to_order_side(WsBookSide::Offer),
             OrderSide::Sell
         );
+    }
+
+    #[rstest]
+    fn test_parse_ws_user_event_to_order_status_report_open() {
+        let json = load_test_fixture("ws_user.json");
+        let msg: CoinbaseWsMessage = serde_json::from_str(&json).unwrap();
+        let instrument = test_instrument();
+        let account_id = AccountId::new("COINBASE-001");
+        let ts_event = UnixNanos::from(1_705_314_600_000_000_000u64);
+        let ts_init = UnixNanos::from(1_705_314_700_000_000_000u64);
+
+        let order = match msg {
+            CoinbaseWsMessage::User { events, .. } => events[0].orders[0].clone(),
+            other => panic!("expected User, was {other:?}"),
+        };
+
+        let report = parse_ws_user_event_to_order_status_report(
+            &order,
+            &instrument,
+            account_id,
+            ts_event,
+            ts_init,
+        )
+        .unwrap();
+
+        assert_eq!(report.account_id, account_id);
+        assert_eq!(report.instrument_id, instrument.id());
+        assert_eq!(
+            report.venue_order_id.as_str(),
+            "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        );
+        assert_eq!(
+            report.client_order_id.unwrap().as_str(),
+            "11111-000000-000001"
+        );
+        assert_eq!(report.order_side, OrderSide::Buy);
+        assert_eq!(report.order_status, OrderStatus::Accepted);
+        assert_eq!(report.filled_qty, Quantity::from("0.00000000"));
+        assert_eq!(report.quantity, Quantity::from("0.00100000"));
+        assert_eq!(report.ts_init, ts_init);
+    }
+
+    #[rstest]
+    fn test_parse_ws_user_event_to_order_status_report_promotes_partial_fill() {
+        let mut update = WsOrderUpdate {
+            order_id: "venue-1".to_string(),
+            client_order_id: "client-1".to_string(),
+            contract_expiry_type: crate::common::enums::CoinbaseContractExpiryType::Unknown,
+            cumulative_quantity: "0.5".to_string(),
+            leaves_quantity: "0.5".to_string(),
+            avg_price: "100.00".to_string(),
+            total_fees: "0.05".to_string(),
+            status: crate::common::enums::CoinbaseOrderStatus::Open,
+            product_id: ustr::Ustr::from("BTC-USD"),
+            product_type: crate::common::enums::CoinbaseProductType::Spot,
+            creation_time: String::new(),
+            order_side: crate::common::enums::CoinbaseOrderSide::Buy,
+            order_type: crate::common::enums::CoinbaseOrderType::Limit,
+            risk_managed_by: crate::common::enums::CoinbaseRiskManagedBy::Unknown,
+            time_in_force: crate::common::enums::CoinbaseTimeInForce::GoodUntilCancelled,
+            trigger_status: crate::common::enums::CoinbaseTriggerStatus::InvalidOrderType,
+            cancel_reason: String::new(),
+            reject_reason: String::new(),
+            total_value_after_fees: String::new(),
+        };
+        update.creation_time = String::new();
+
+        let instrument = test_instrument();
+        let report = parse_ws_user_event_to_order_status_report(
+            &update,
+            &instrument,
+            AccountId::new("COINBASE-001"),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+
+        // Coinbase Open + positive cumulative + leaves > 0 should promote to PartiallyFilled.
+        assert_eq!(report.order_status, OrderStatus::PartiallyFilled);
+        assert_eq!(report.filled_qty, Quantity::from("0.50000000"));
+        assert_eq!(report.quantity, Quantity::from("1.00000000"));
+    }
+
+    #[rstest]
+    fn test_parse_ws_user_event_to_fill_report_uses_supplied_last_px_and_commission() {
+        let update = WsOrderUpdate {
+            order_id: "venue-1".to_string(),
+            client_order_id: "client-1".to_string(),
+            contract_expiry_type: crate::common::enums::CoinbaseContractExpiryType::Unknown,
+            cumulative_quantity: "0.5".to_string(),
+            leaves_quantity: "0.5".to_string(),
+            avg_price: "100.00".to_string(),
+            total_fees: "0.05".to_string(),
+            status: crate::common::enums::CoinbaseOrderStatus::Open,
+            product_id: ustr::Ustr::from("BTC-USD"),
+            product_type: crate::common::enums::CoinbaseProductType::Spot,
+            creation_time: String::new(),
+            order_side: crate::common::enums::CoinbaseOrderSide::Sell,
+            order_type: crate::common::enums::CoinbaseOrderType::Limit,
+            risk_managed_by: crate::common::enums::CoinbaseRiskManagedBy::Unknown,
+            time_in_force: crate::common::enums::CoinbaseTimeInForce::GoodUntilCancelled,
+            trigger_status: crate::common::enums::CoinbaseTriggerStatus::InvalidOrderType,
+            cancel_reason: String::new(),
+            reject_reason: String::new(),
+            total_value_after_fees: String::new(),
+        };
+
+        let instrument = test_instrument();
+        let usd = Currency::USD();
+        let last_px = Price::from("120.00");
+        let commission =
+            Money::from_decimal(rust_decimal::Decimal::from_str("0.10").unwrap(), usd).unwrap();
+        let trade_id = TradeId::new("venue-1-0.5");
+
+        let report = parse_ws_user_event_to_fill_report(
+            &update,
+            Quantity::from("0.50000000"),
+            last_px,
+            commission,
+            trade_id,
+            &instrument,
+            AccountId::new("COINBASE-001"),
+            LiquiditySide::Maker,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+
+        assert_eq!(report.venue_order_id.as_str(), "venue-1");
+        assert_eq!(report.client_order_id.unwrap().as_str(), "client-1");
+        assert_eq!(report.order_side, OrderSide::Sell);
+        assert_eq!(report.last_qty, Quantity::from("0.50000000"));
+        assert_eq!(report.last_px, Price::from("120.00"));
+        assert_eq!(report.commission, commission);
+        assert_eq!(report.liquidity_side, LiquiditySide::Maker);
+        assert_eq!(report.trade_id, trade_id);
+    }
+
+    fn make_status_product(status: CoinbaseProductStatus, message: &str) -> WsStatusProduct {
+        WsStatusProduct {
+            product_type: crate::common::enums::CoinbaseProductType::Spot,
+            id: Ustr::from("BTC-USD"),
+            base_currency: Ustr::from("BTC"),
+            quote_currency: Ustr::from("USD"),
+            base_increment: "0.00000001".to_string(),
+            quote_increment: "0.01".to_string(),
+            display_name: "BTC/USD".to_string(),
+            status,
+            status_message: message.to_string(),
+            min_market_funds: Decimal::ONE,
+        }
+    }
+
+    #[rstest]
+    #[case::online(
+        CoinbaseProductStatus::Online,
+        "",
+        Some(MarketStatusAction::Trading),
+        Some(true),
+        None
+    )]
+    #[case::offline_with_reason(
+        CoinbaseProductStatus::Offline,
+        "maintenance",
+        Some(MarketStatusAction::Halt),
+        Some(false),
+        Some("maintenance")
+    )]
+    #[case::delisted(
+        CoinbaseProductStatus::Delisted,
+        "",
+        Some(MarketStatusAction::Close),
+        Some(false),
+        None
+    )]
+    #[case::unset_skipped(CoinbaseProductStatus::Unset, "", None, None, None)]
+    fn test_parse_ws_status_product(
+        #[case] status: CoinbaseProductStatus,
+        #[case] message: &str,
+        #[case] expected_action: Option<MarketStatusAction>,
+        #[case] expected_is_trading: Option<bool>,
+        #[case] expected_reason: Option<&str>,
+    ) {
+        let product = make_status_product(status, message);
+        let instrument_id = InstrumentId::new(Symbol::new("BTC-USD"), *COINBASE_VENUE);
+        let result = parse_ws_status_product(
+            &product,
+            instrument_id,
+            UnixNanos::from(1),
+            UnixNanos::from(2),
+        );
+
+        match expected_action {
+            Some(action) => {
+                let status = result.expect("expected InstrumentStatus");
+                assert_eq!(status.instrument_id, instrument_id);
+                assert_eq!(status.action, action);
+                assert_eq!(status.is_trading, expected_is_trading);
+                assert_eq!(
+                    status.reason.map(|s| s.to_string()),
+                    expected_reason.map(|s| s.to_string()),
+                );
+                assert_eq!(status.ts_event, UnixNanos::from(1));
+                assert_eq!(status.ts_init, UnixNanos::from(2));
+            }
+            None => assert!(result.is_none(), "expected None for unset status"),
+        }
     }
 }

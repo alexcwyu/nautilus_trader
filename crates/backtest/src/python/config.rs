@@ -17,16 +17,29 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use nautilus_common::{enums::Environment, logging::logger::LoggerConfig};
+use nautilus_common::{
+    cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
+    msgbus::database::MessageBusConfig,
+};
 use nautilus_core::{UUID4, UnixNanos};
+use nautilus_data::engine::config::DataEngineConfig;
+use nautilus_execution::engine::config::ExecutionEngineConfig;
 use nautilus_model::{
     data::BarSpecification,
     enums::{AccountType, BookType, OmsType, OtoTriggerMode},
     identifiers::{ClientId, InstrumentId, TraderId},
     types::Currency,
 };
+use nautilus_portfolio::config::PortfolioConfig;
+use nautilus_risk::engine::config::RiskEngineConfig;
+use pyo3::{Py, PyAny, Python};
+use rust_decimal::Decimal;
 use ustr::Ustr;
 
+use super::engine::{
+    pyobject_to_fee_model_any, pyobject_to_fill_model_any, pyobject_to_latency_model_any,
+    pyobject_to_margin_model_any, pyobject_to_simulation_module_any,
+};
 use crate::config::{
     BacktestDataConfig, BacktestEngineConfig, BacktestRunConfig, BacktestVenueConfig,
     NautilusDataType,
@@ -41,6 +54,7 @@ impl BacktestEngineConfig {
         trader_id = None,
         load_state = None,
         save_state = None,
+        shutdown_on_error = None,
         bypass_logging = None,
         run_analysis = None,
         timeout_connection = None,
@@ -51,12 +65,19 @@ impl BacktestEngineConfig {
         timeout_shutdown = None,
         logging = None,
         instance_id = None,
+        cache = None,
+        msgbus = None,
+        data_engine = None,
+        risk_engine = None,
+        exec_engine = None,
+        portfolio = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         trader_id: Option<TraderId>,
         load_state: Option<bool>,
         save_state: Option<bool>,
+        shutdown_on_error: Option<bool>,
         bypass_logging: Option<bool>,
         run_analysis: Option<bool>,
         timeout_connection: Option<u64>,
@@ -67,6 +88,12 @@ impl BacktestEngineConfig {
         timeout_shutdown: Option<u64>,
         logging: Option<LoggerConfig>,
         instance_id: Option<UUID4>,
+        cache: Option<CacheConfig>,
+        msgbus: Option<MessageBusConfig>,
+        data_engine: Option<DataEngineConfig>,
+        risk_engine: Option<RiskEngineConfig>,
+        exec_engine: Option<ExecutionEngineConfig>,
+        portfolio: Option<PortfolioConfig>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -74,6 +101,7 @@ impl BacktestEngineConfig {
             trader_id: trader_id.unwrap_or_default(),
             load_state: load_state.unwrap_or(defaults.load_state),
             save_state: save_state.unwrap_or(defaults.save_state),
+            shutdown_on_error: shutdown_on_error.unwrap_or(defaults.shutdown_on_error),
             bypass_logging: bypass_logging.unwrap_or(defaults.bypass_logging),
             run_analysis: run_analysis.unwrap_or(defaults.run_analysis),
             timeout_connection: Duration::from_secs(timeout_connection.unwrap_or(60)),
@@ -84,12 +112,12 @@ impl BacktestEngineConfig {
             timeout_shutdown: Duration::from_secs(timeout_shutdown.unwrap_or(5)),
             logging: logging.unwrap_or_default(),
             instance_id,
-            cache: None,
-            msgbus: None,
-            data_engine: None,
-            risk_engine: None,
-            exec_engine: None,
-            portfolio: None,
+            cache,
+            msgbus,
+            data_engine,
+            risk_engine,
+            exec_engine,
+            portfolio,
             streaming: None,
         }
     }
@@ -113,6 +141,12 @@ impl BacktestEngineConfig {
     }
 
     #[getter]
+    #[pyo3(name = "shutdown_on_error")]
+    const fn py_shutdown_on_error(&self) -> bool {
+        self.shutdown_on_error
+    }
+
+    #[getter]
     #[pyo3(name = "bypass_logging")]
     const fn py_bypass_logging(&self) -> bool {
         self.bypass_logging
@@ -122,6 +156,78 @@ impl BacktestEngineConfig {
     #[pyo3(name = "run_analysis")]
     const fn py_run_analysis(&self) -> bool {
         self.run_analysis
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_connection")]
+    fn py_timeout_connection(&self) -> f64 {
+        self.timeout_connection.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_reconciliation")]
+    fn py_timeout_reconciliation(&self) -> f64 {
+        self.timeout_reconciliation.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_portfolio")]
+    fn py_timeout_portfolio(&self) -> f64 {
+        self.timeout_portfolio.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_disconnection")]
+    fn py_timeout_disconnection(&self) -> f64 {
+        self.timeout_disconnection.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "delay_post_stop")]
+    fn py_delay_post_stop(&self) -> f64 {
+        self.delay_post_stop.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "timeout_shutdown")]
+    fn py_timeout_shutdown(&self) -> f64 {
+        self.timeout_shutdown.as_secs_f64()
+    }
+
+    #[getter]
+    #[pyo3(name = "cache")]
+    fn py_cache(&self) -> Option<CacheConfig> {
+        self.cache.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "msgbus")]
+    fn py_msgbus(&self) -> Option<MessageBusConfig> {
+        self.msgbus.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "data_engine")]
+    fn py_data_engine(&self) -> Option<DataEngineConfig> {
+        self.data_engine.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "risk_engine")]
+    fn py_risk_engine(&self) -> Option<RiskEngineConfig> {
+        self.risk_engine.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "exec_engine")]
+    fn py_exec_engine(&self) -> Option<ExecutionEngineConfig> {
+        self.exec_engine.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "portfolio")]
+    const fn py_portfolio(&self) -> Option<PortfolioConfig> {
+        self.portfolio
     }
 
     fn __repr__(&self) -> String {
@@ -159,9 +265,18 @@ impl BacktestVenueConfig {
         base_currency = None,
         default_leverage = None,
         leverages = None,
+        margin_model = None,
+        modules = None,
+        fill_model = None,
+        latency_model = None,
+        fee_model = None,
         price_protection_points = None,
+        settlement_prices = None,
+        liquidation_enabled = None,
+        liquidation_trigger_ratio = None,
+        liquidation_cancel_open_orders = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         name: &str,
         oms_type: OmsType,
@@ -185,11 +300,43 @@ impl BacktestVenueConfig {
         queue_position: Option<bool>,
         oto_trigger_mode: Option<OtoTriggerMode>,
         base_currency: Option<Currency>,
-        default_leverage: Option<f64>,
-        leverages: Option<HashMap<InstrumentId, f64>>,
+        default_leverage: Option<Decimal>,
+        leverages: Option<HashMap<InstrumentId, Decimal>>,
+        margin_model: Option<Py<PyAny>>,
+        modules: Option<Vec<Py<PyAny>>>,
+        fill_model: Option<Py<PyAny>>,
+        latency_model: Option<Py<PyAny>>,
+        fee_model: Option<Py<PyAny>>,
         price_protection_points: Option<u32>,
-    ) -> Self {
-        Self::builder()
+        settlement_prices: Option<HashMap<InstrumentId, f64>>,
+        liquidation_enabled: Option<bool>,
+        liquidation_trigger_ratio: Option<f64>,
+        liquidation_cancel_open_orders: Option<bool>,
+    ) -> pyo3::PyResult<Self> {
+        let margin_model = margin_model
+            .map(|obj| Python::attach(|py| pyobject_to_margin_model_any(py, obj.bind(py))))
+            .transpose()?;
+        let modules = modules
+            .map(|objs| {
+                objs.into_iter()
+                    .map(|obj| {
+                        Python::attach(|py| pyobject_to_simulation_module_any(py, obj.bind(py)))
+                    })
+                    .collect::<pyo3::PyResult<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let fill_model = fill_model
+            .map(|obj| Python::attach(|py| pyobject_to_fill_model_any(py, obj.bind(py))))
+            .transpose()?;
+        let latency_model = latency_model
+            .map(|obj| Python::attach(|py| pyobject_to_latency_model_any(py, obj.bind(py))))
+            .transpose()?;
+        let fee_model = fee_model
+            .map(|obj| Python::attach(|py| pyobject_to_fee_model_any(py, obj.bind(py))))
+            .transpose()?;
+
+        Ok(Self::builder()
             .name(Ustr::from(name))
             .oms_type(oms_type)
             .account_type(account_type)
@@ -214,8 +361,17 @@ impl BacktestVenueConfig {
             .maybe_base_currency(base_currency)
             .maybe_default_leverage(default_leverage)
             .maybe_leverages(leverages.map(|m| m.into_iter().collect()))
+            .maybe_margin_model(margin_model)
+            .modules(modules)
+            .maybe_fill_model(fill_model)
+            .maybe_latency_model(latency_model)
+            .maybe_fee_model(fee_model)
             .maybe_price_protection_points(price_protection_points)
-            .build()
+            .maybe_settlement_prices(settlement_prices.map(|m| m.into_iter().collect()))
+            .maybe_liquidation_enabled(liquidation_enabled)
+            .maybe_liquidation_trigger_ratio(liquidation_trigger_ratio)
+            .maybe_liquidation_cancel_open_orders(liquidation_cancel_open_orders)
+            .build())
     }
 
     #[getter]
@@ -260,6 +416,24 @@ impl BacktestVenueConfig {
         self.trade_execution()
     }
 
+    #[getter]
+    #[pyo3(name = "liquidation_enabled")]
+    fn py_liquidation_enabled(&self) -> bool {
+        self.liquidation_enabled()
+    }
+
+    #[getter]
+    #[pyo3(name = "liquidation_trigger_ratio")]
+    fn py_liquidation_trigger_ratio(&self) -> f64 {
+        self.liquidation_trigger_ratio()
+    }
+
+    #[getter]
+    #[pyo3(name = "liquidation_cancel_open_orders")]
+    fn py_liquidation_cancel_open_orders(&self) -> bool {
+        self.liquidation_cancel_open_orders()
+    }
+
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }
@@ -275,6 +449,7 @@ impl BacktestDataConfig {
         catalog_path,
         catalog_fs_protocol = None,
         catalog_fs_storage_options = None,
+        catalog_fs_rust_storage_options = None,
         instrument_id = None,
         instrument_ids = None,
         start_time = None,
@@ -286,12 +461,13 @@ impl BacktestDataConfig {
         bar_types = None,
         optimize_file_loading = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         data_type: &str,
         catalog_path: String,
         catalog_fs_protocol: Option<String>,
         catalog_fs_storage_options: Option<HashMap<String, String>>,
+        catalog_fs_rust_storage_options: Option<HashMap<String, String>>,
         instrument_id: Option<InstrumentId>,
         instrument_ids: Option<Vec<InstrumentId>>,
         start_time: Option<u64>,
@@ -312,6 +488,9 @@ impl BacktestDataConfig {
             .maybe_catalog_fs_protocol(catalog_fs_protocol)
             .maybe_catalog_fs_storage_options(
                 catalog_fs_storage_options.map(|m| m.into_iter().collect()),
+            )
+            .maybe_catalog_fs_rust_storage_options(
+                catalog_fs_rust_storage_options.map(|m| m.into_iter().collect()),
             )
             .maybe_instrument_id(instrument_id)
             .maybe_instrument_ids(instrument_ids)
@@ -361,17 +540,19 @@ impl BacktestRunConfig {
         engine = None,
         id = None,
         chunk_size = None,
+        raise_exception = None,
         dispose_on_completion = None,
         start = None,
         end = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         venues: Vec<BacktestVenueConfig>,
         data: Vec<BacktestDataConfig>,
         engine: Option<BacktestEngineConfig>,
         id: Option<String>,
         chunk_size: Option<usize>,
+        raise_exception: Option<bool>,
         dispose_on_completion: Option<bool>,
         start: Option<u64>,
         end: Option<u64>,
@@ -382,6 +563,7 @@ impl BacktestRunConfig {
             .maybe_engine(engine)
             .maybe_id(id)
             .maybe_chunk_size(chunk_size)
+            .maybe_raise_exception(raise_exception)
             .maybe_dispose_on_completion(dispose_on_completion)
             .maybe_start(start.map(UnixNanos::from))
             .maybe_end(end.map(UnixNanos::from))

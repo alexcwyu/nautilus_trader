@@ -15,8 +15,7 @@
 
 use std::fmt::{Debug, Display};
 
-use derive_builder::Builder;
-use nautilus_core::{UUID4, UnixNanos, serialization::from_bool_as_u8};
+use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
@@ -36,11 +35,10 @@ use crate::{
 
 /// Represents an event where an order has been accepted by the trading venue.
 ///
-/// This event often corresponds to a `NEW` OrdStatus <39> field in FIX execution reports.
+/// This event often corresponds to a `NEW` `OrdStatus` <39> field in FIX execution reports.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Builder)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[cfg_attr(any(test, feature = "stubs"), builder(default))]
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
@@ -69,13 +67,16 @@ pub struct OrderAccepted {
     /// UNIX timestamp (nanoseconds) when the event was initialized.
     pub ts_init: UnixNanos,
     /// If the event was generated during reconciliation.
-    #[serde(deserialize_with = "from_bool_as_u8")]
-    pub reconciliation: u8, // TODO: Change to bool once Cython removed
+    pub reconciliation: bool,
+    /// The causation ID associated with the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<UUID4>,
 }
 
 impl OrderAccepted {
     /// Creates a new [`OrderAccepted`] instance.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
+    #[must_use]
     pub fn new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -98,7 +99,8 @@ impl OrderAccepted {
             event_id,
             ts_event,
             ts_init,
-            reconciliation: u8::from(reconciliation),
+            reconciliation,
+            causation_id: None,
         }
     }
 }
@@ -337,25 +339,6 @@ mod tests {
             display,
             "OrderAccepted(instrument_id=BTCUSDT.COINBASE, client_order_id=O-19700101-000000-001-001-1, venue_order_id=001, account_id=SIM-001, ts_event=0)"
         );
-    }
-
-    // TODO: Remove once reconciliation field is converted back to bool (post-Cython)
-    #[rstest]
-    fn test_reconciliation_bool_to_u8() {
-        let mut event = create_test_order_accepted();
-        event = OrderAccepted::new(
-            event.trader_id,
-            event.strategy_id,
-            event.instrument_id,
-            event.client_order_id,
-            event.venue_order_id,
-            event.account_id,
-            event.event_id,
-            event.ts_event,
-            event.ts_init,
-            true,
-        );
-        assert_eq!(event.reconciliation, 1);
     }
 
     #[rstest]

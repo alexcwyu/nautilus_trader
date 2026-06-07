@@ -22,9 +22,19 @@ use nautilus_model::{
     enums::BookType,
     identifiers::{ClientId, InstrumentId},
 };
+use serde::{Deserialize, Serialize};
 
 /// Configuration for the data tester actor.
-#[derive(Debug, Clone, bon::Builder)]
+#[derive(Debug, Clone, Deserialize, Serialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.testkit", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.testkit")
+)]
 pub struct DataTesterConfig {
     /// Base data actor configuration.
     #[builder(default)]
@@ -85,8 +95,7 @@ pub struct DataTesterConfig {
     /// Whether to request instruments on start.
     #[builder(default = false)]
     pub request_instruments: bool,
-    // TODO: Support request_quotes when historical data requests are available
-    /// Whether to request historical quotes (not yet implemented).
+    /// Whether to request historical quotes.
     #[builder(default = false)]
     pub request_quotes: bool,
     // TODO: Support request_trades when historical data requests are available
