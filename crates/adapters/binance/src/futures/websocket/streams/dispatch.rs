@@ -453,12 +453,12 @@ pub(crate) fn dispatch_order_update(
                 if !use_trade_lite && !is_duplicate {
                     let last_qty: f64 = order.last_filled_qty.parse().unwrap_or(0.0);
                     let last_px: f64 = order.last_filled_price.parse().unwrap_or(0.0);
-                    let commission: f64 = order
+                    let commission = order
                         .commission
                         .as_deref()
                         .unwrap_or("0")
-                        .parse()
-                        .unwrap_or(0.0);
+                        .parse::<Decimal>()
+                        .unwrap_or_default();
                     let commission_currency = order
                         .commission_asset
                         .as_ref()
@@ -489,7 +489,10 @@ pub(crate) fn dispatch_order_update(
                         ts_init,
                         false,
                         None,
-                        Some(Money::new(commission, commission_currency)),
+                        Some(
+                            Money::from_decimal(commission, commission_currency)
+                                .unwrap_or_else(|_| Money::zero(commission_currency)),
+                        ),
                     );
 
                     dispatch_state.insert_filled(client_order_id);

@@ -202,13 +202,8 @@ pub fn parse_derive_trade_to_fill_report(
     let order_side = derive_order_side_to_nautilus(trade.direction);
     let last_qty = quantity_from_decimal(trade.trade_amount, "trade_amount")?;
     let last_px = price_from_decimal(trade.trade_price, "trade_price")?;
-    let commission = Money::new(
-        trade
-            .trade_fee
-            .try_into()
-            .with_context(|| format!("trade_fee {} out of f64 range", trade.trade_fee))?,
-        fee_currency,
-    );
+    let commission = Money::from_decimal(trade.trade_fee, fee_currency)
+        .with_context(|| format!("Invalid trade_fee {}", trade.trade_fee))?;
     let liquidity_side = match trade.liquidity_role {
         DeriveLiquidityRole::Maker => LiquiditySide::Maker,
         DeriveLiquidityRole::Taker => LiquiditySide::Taker,

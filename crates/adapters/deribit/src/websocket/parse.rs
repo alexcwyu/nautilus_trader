@@ -818,7 +818,7 @@ pub fn parse_user_order_msg(
     if let Some(avg_price) = msg.average_price
         && !avg_price.is_zero()
     {
-        report = report.with_avg_px(avg_price.to_f64().unwrap_or_default())?;
+        report.avg_px = Some(avg_price);
     }
 
     // Add trigger price for stop/take orders

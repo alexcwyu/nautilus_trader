@@ -768,7 +768,7 @@ pub fn parse_order_status_report_sbe(
     }
 
     if let Some(ap) = avg_px {
-        report = report.with_avg_px(ap.as_f64())?;
+        report.avg_px = Some(ap.as_decimal());
     }
 
     if let Some(tp) = trigger_price {
@@ -909,7 +909,7 @@ pub fn parse_new_order_response_sbe(
     }
 
     if let Some(ap) = avg_px {
-        report = report.with_avg_px(ap.as_f64())?;
+        report.avg_px = Some(ap.as_decimal());
     }
 
     if let Some(tp) = trigger_price {

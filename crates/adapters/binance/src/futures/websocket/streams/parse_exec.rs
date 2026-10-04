@@ -77,12 +77,11 @@ pub fn parse_futures_order_update_to_order_status(
     let price: f64 = order.original_price.parse().unwrap_or(0.0);
 
     let avg_px = if filled_qty > 0.0 {
-        let avg: f64 = order.average_price.parse().unwrap_or(0.0);
-        if avg > 0.0 {
-            Some(Price::new(avg, price_precision))
-        } else {
-            None
-        }
+        order
+            .average_price
+            .parse::<Decimal>()
+            .ok()
+            .filter(|avg| *avg > Decimal::ZERO)
     } else {
         None
     };
@@ -125,9 +124,7 @@ pub fn parse_futures_order_update_to_order_status(
         }
     }
 
-    if let Some(avg) = avg_px {
-        report.avg_px = Some(avg.as_decimal());
-    }
+    report.avg_px = avg_px;
 
     Ok(report)
 }
@@ -147,23 +144,23 @@ pub fn resolve_commission(
     quote_currency: Option<Currency>,
 ) -> Money {
     if order.commission_asset.is_some() {
-        let amount: f64 = order
+        let amount = order
             .commission
             .as_deref()
             .unwrap_or("0")
-            .parse()
-            .unwrap_or(0.0);
+            .parse::<Decimal>()
+            .unwrap_or_default();
         let currency = order
             .commission_asset
             .as_ref()
             .map_or_else(Currency::USDT, |a| Currency::from(a.as_str()));
-        Money::new(amount, currency)
+        Money::from_decimal(amount, currency).unwrap_or_else(|_| Money::zero(currency))
     } else if let Some(fee) = taker_fee {
         let currency = quote_currency.unwrap_or_else(Currency::USDT);
         let notional = Decimal::try_from(last_qty * last_px).unwrap_or_default();
-        Money::from_decimal(fee * notional, currency).unwrap_or_else(|_| Money::new(0.0, currency))
+        Money::from_decimal(fee * notional, currency).unwrap_or_else(|_| Money::zero(currency))
     } else {
-        Money::new(0.0, Currency::USDT())
+        Money::zero(Currency::USDT())
     }
 }
 

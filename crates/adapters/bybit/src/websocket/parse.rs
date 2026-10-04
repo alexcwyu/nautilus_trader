@@ -820,9 +820,11 @@ pub fn parse_ws_order_status_report(
     if !order.avg_price.is_empty() && order.avg_price != "0" {
         let avg_px = order
             .avg_price
-            .parse::<f64>()
-            .with_context(|| format!("Failed to parse avg_price='{}' as f64", order.avg_price))?;
-        report = report.with_avg_px(avg_px)?;
+            .parse::<Decimal>()
+            .with_context(|| {
+                format!("Failed to parse avg_price='{}' as Decimal", order.avg_price)
+            })?;
+        report.avg_px = Some(avg_px);
     }
 
     if !order.trigger_price.is_empty() && order.trigger_price != "0" {
