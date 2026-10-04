@@ -113,6 +113,12 @@ cbindgen = { workspace = true, optional = true }
 
 # Run with `cargo run -p nautilus-backtest --features examples --example engine-ema-cross`
 [[example]]
+name = "parity-ema-cross"
+path = "examples/parity_ema_cross.rs"
+required-features = ["examples"]
+doc = false
+
+[[example]]
 name = "engine-ema-cross"
 path = "examples/engine_ema_cross.rs"
 required-features = ["examples"]
@@ -131,3 +137,13 @@ name = "tardis-option-chain"
 path = "examples/tardis_option_chain.rs"
 required-features = ["examples", "streaming"]
 doc = false
+
+[[example]]
+name = "parity-signals"
+path = "examples/parity_signals.rs"
+required-features = ["examples"]
+
+[[example]]
+name = "parity-limits"
+path = "examples/parity_limits.rs"
+required-features = ["examples"]
