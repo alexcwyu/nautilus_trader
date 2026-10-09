@@ -15,7 +15,7 @@
 
 use std::str::FromStr;
 
-use nautilus_core::UnixNanos;
+use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_model::{
     enums::{OrderSide, PositionSide},
     events::PositionSnapshot,
@@ -24,10 +24,12 @@ use nautilus_model::{
 };
 use sqlx::{FromRow, Row, postgres::PgRow};
 
-#[derive(Debug)]
-pub struct PositionSnapshotModel(pub PositionSnapshot);
+use crate::sql::models::decode_error;
 
-impl<'r> FromRow<'r, PgRow> for PositionSnapshotModel {
+#[derive(Debug)]
+pub struct PositionSnapshotRow(pub PositionSnapshot);
+
+impl<'r> FromRow<'r, PgRow> for PositionSnapshotRow {
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let id = row.try_get::<&str, _>("id").map(PositionId::from)?;
         let trader_id = row.try_get::<&str, _>("trader_id").map(TraderId::from)?;
@@ -79,15 +81,22 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotModel {
             .map_or_else(Vec::new, |c| {
                 c.into_iter().map(|s| Money::from(&s)).collect()
             });
-        let duration_ns: Option<u64> = row
-            .try_get::<Option<i64>, _>("duration_ns")?
-            .map(|value| value as u64);
+        let duration_ns = row
+            .try_get::<Option<&str>, _>("duration_ns")?
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map(DurationNanos::new)
+                    .map_err(|e| decode_error("duration_ns", value, e))
+            })
+            .transpose()?;
         let ts_opened = row.try_get::<String, _>("ts_opened").map(UnixNanos::from)?;
         let ts_closed: Option<UnixNanos> = row
             .try_get::<Option<String>, _>("ts_closed")?
             .map(UnixNanos::from);
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
         let ts_last = row.try_get::<String, _>("ts_last").map(UnixNanos::from)?;
+        let replay_state = row.try_get::<Option<serde_json::Value>, _>("replay_state")?;
 
         let snapshot = PositionSnapshot {
             trader_id,
@@ -116,6 +125,7 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotModel {
             ts_closed,
             ts_last,
             ts_init,
+            replay_state,
         };
 
         Ok(Self(snapshot))

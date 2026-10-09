@@ -15,16 +15,20 @@
 
 //! Wire frames and handler-output message types for Lighter streams.
 
-use std::fmt::Debug;
-
 use ahash::AHashMap;
-use nautilus_core::serialization::{
-    deserialize_decimal, deserialize_decimal_from_str, deserialize_optional_decimal,
+#[cfg(test)]
+use nautilus_core::string::secret::REDACTED;
+use nautilus_core::{
+    serialization::{
+        deserialize_decimal, deserialize_decimal_from_str, deserialize_decimal_native,
+        deserialize_decimal_or_zero, deserialize_optional_decimal,
+    },
+    string::secret::SecretString,
 };
 use nautilus_model::{
     data::{
-        Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        Bar, FundingRateUpdate, IndexPriceUpdate, MarkPriceUpdate, OrderBookDeltas, OrderBookDepth,
+        QuoteTick, TradeTick,
     },
     events::AccountState,
     reports::PositionStatusReport,
@@ -36,11 +40,14 @@ use serde::{
 };
 use serde_json::value::RawValue;
 use ustr::Ustr;
+use zeroize::Zeroize;
 
 use crate::{
     common::enums::LighterCandleResolution,
     http::models::{LighterOrder, LighterPriceLevel, LighterTrade},
 };
+
+pub(crate) const CANCEL_BATCH_ID_PREFIX: &str = "cancel-batch:";
 
 /// Inbound message produced by the Lighter feed handler and consumed by the
 /// data and execution clients.
@@ -55,25 +62,45 @@ pub enum NautilusWsMessage {
     Trades(Vec<TradeTick>),
     Quote(QuoteTick),
     Deltas(OrderBookDeltas),
-    Depth10(Box<OrderBookDepth10>),
+    Depth(Box<OrderBookDepth>),
     Bar(Bar),
     MarkPrice(MarkPriceUpdate),
     IndexPrice(IndexPriceUpdate),
     FundingRate(FundingRateUpdate),
     ExecutionReports(Vec<ExecutionReport>),
-    PositionSnapshot(Vec<PositionStatusReport>),
+    PositionSnapshot {
+        reports: Vec<PositionStatusReport>,
+        skipped_market_ids: Vec<i64>,
+    },
+    PositionUpdate {
+        reports: Vec<PositionStatusReport>,
+        closed_market_ids: Vec<i64>,
+        skipped_market_ids: Vec<i64>,
+    },
     AccountState(Box<AccountState>),
     SendTxAck {
+        connection_epoch: u64,
         tx_hash: Option<String>,
         code: i64,
     },
     SendTxRejected {
+        connection_epoch: u64,
         source: SendTxRejectionSource,
         code: Option<i64>,
         message: String,
+        tx_hash: Option<String>,
+    },
+    SendTxBatchResult {
+        connection_epoch: u64,
+        id: String,
+        code: i64,
+        message: String,
+        tx_hashes: Vec<String>,
     },
     Raw(serde_json::Value),
-    Reconnected,
+    Reconnected {
+        connection_epoch: u64,
+    },
     /// Marker emitted by the feed handler right after each account stream
     /// has delivered its first frame. The execution consumption loop forwards
     /// any preceding typed reports first, then marks the corresponding
@@ -82,7 +109,47 @@ pub enum NautilusWsMessage {
     AccountStreamFirstFrame(AccountStream),
 }
 
-/// Identifier for one of the four account-scoped WebSocket streams the
+impl NautilusWsMessage {
+    #[must_use]
+    pub(crate) fn with_connection_epoch(self, connection_epoch: u64) -> Self {
+        match self {
+            Self::SendTxAck { tx_hash, code, .. } => Self::SendTxAck {
+                connection_epoch,
+                tx_hash,
+                code,
+            },
+            Self::SendTxRejected {
+                source,
+                code,
+                message,
+                tx_hash,
+                ..
+            } => Self::SendTxRejected {
+                connection_epoch,
+                source,
+                code,
+                message,
+                tx_hash,
+            },
+            Self::SendTxBatchResult {
+                id,
+                code,
+                message,
+                tx_hashes,
+                ..
+            } => Self::SendTxBatchResult {
+                connection_epoch,
+                id,
+                code,
+                message,
+                tx_hashes,
+            },
+            other => other,
+        }
+    }
+}
+
+/// Identifier for one of the five account-scoped WebSocket streams the
 /// execution client subscribes to on connect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountStream {
@@ -90,14 +157,17 @@ pub enum AccountStream {
     Trades,
     Positions,
     Assets,
+    UserStats,
 }
 
 /// Origin of a Lighter `sendTx` rejection signal.
 ///
-/// `Ack` is a direct non-200 response to our own `jsonapi/sendtx` request and
-/// is always attributable to the most recent pending sendTx. `BareError` is a
-/// standalone error frame that carries no correlation field, so attribution
-/// relies on the FIFO pending queue plus a short attribution window.
+/// `Ack` is a direct non-200 response to our own `jsonapi/sendtx` request,
+/// attributable via the echoed `tx_hash` when present and the FIFO head
+/// otherwise. `BareError` is a standalone error frame that carries no
+/// correlation field, so attribution relies on the FIFO pending queue plus a
+/// short attribution window; only codes in the venue's transaction range are
+/// routed here at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendTxRejectionSource {
     Ack,
@@ -126,41 +196,27 @@ pub enum ExecutionReport {
     Fill(LighterTrade),
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum LighterWsRequest {
     #[serde(rename = "subscribe")]
     Subscribe {
         channel: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        auth: Option<String>,
+        auth: Option<SecretString>,
     },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { channel: String },
     #[serde(rename = "jsonapi/sendtx")]
     SendTx { data: LighterWsSendTx },
+    #[serde(rename = "jsonapi/sendtxbatch")]
+    SendTxBatch { data: LighterWsSendTxBatch },
 }
 
-impl Debug for LighterWsRequest {
-    /// Custom `Debug` that redacts the `auth` field of `Subscribe`. The
-    /// serialized form of this enum is what hits the wire as a Lighter L2
-    /// bearer token; deriving `Debug` would otherwise leak it via any
-    /// `format!("{request:?}")` call in error or trace paths.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Subscribe { channel, auth } => f
-                .debug_struct(stringify!(Subscribe))
-                .field("channel", channel)
-                .field("authed", &auth.is_some())
-                .finish(),
-            Self::Unsubscribe { channel } => f
-                .debug_struct(stringify!(Unsubscribe))
-                .field("channel", channel)
-                .finish(),
-            Self::SendTx { data } => f
-                .debug_struct(stringify!(SendTx))
-                .field("data", data)
-                .finish(),
+impl Zeroize for LighterWsRequest {
+    fn zeroize(&mut self) {
+        if let Self::Subscribe { auth, .. } = self {
+            auth.zeroize();
         }
     }
 }
@@ -175,7 +231,7 @@ impl LighterWsRequest {
     }
 
     #[must_use]
-    pub fn subscribe_auth(channel: impl Into<String>, auth: impl Into<String>) -> Self {
+    pub fn subscribe_auth(channel: impl Into<String>, auth: impl Into<SecretString>) -> Self {
         Self::Subscribe {
             channel: channel.into(),
             auth: Some(auth.into()),
@@ -202,6 +258,18 @@ pub struct LighterWsSendTx {
     pub tx_info: Box<RawValue>,
 }
 
+/// WebSocket batch payload with JSON-encoded transaction arrays.
+///
+/// `tx_types` encodes transaction type numbers; `tx_infos` encodes signed
+/// transaction JSON strings. Their positions correspond within the batch.
+/// `id` correlates the response. The venue permits at most 15 transactions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LighterWsSendTxBatch {
+    pub id: String,
+    pub tx_types: String,
+    pub tx_infos: String,
+}
+
 /// Wire labels for the Lighter WebSocket channel taxonomy.
 ///
 /// Centralizes the channel name strings (`"order_book"`, `"trade"`, ...) so
@@ -221,6 +289,7 @@ pub enum LighterWsChannelKind {
     AccountAllTrades,
     AccountAllPositions,
     AccountAllAssets,
+    UserStats,
     Height,
 }
 
@@ -241,6 +310,7 @@ impl LighterWsChannelKind {
             Self::AccountAllTrades => "account_all_trades",
             Self::AccountAllPositions => "account_all_positions",
             Self::AccountAllAssets => "account_all_assets",
+            Self::UserStats => "user_stats",
             Self::Height => "height",
         }
     }
@@ -261,6 +331,7 @@ impl LighterWsChannelKind {
             "account_all_trades" => Some(Self::AccountAllTrades),
             "account_all_positions" => Some(Self::AccountAllPositions),
             "account_all_assets" => Some(Self::AccountAllAssets),
+            "user_stats" => Some(Self::UserStats),
             "height" => Some(Self::Height),
             _ => None,
         }
@@ -269,24 +340,25 @@ impl LighterWsChannelKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LighterWsChannel {
-    OrderBook(i16),
-    Ticker(i16),
+    OrderBook(i64),
+    Ticker(i64),
     MarketStats(LighterMarketSelection),
     SpotMarketStats(LighterMarketSelection),
-    Trade(i16),
+    Trade(i64),
     Candle {
-        market_index: i16,
+        market_index: i64,
         resolution: LighterCandleResolution,
     },
     AccountAll(i64),
     AccountOrders {
-        market_index: i16,
+        market_index: i64,
         account_index: i64,
     },
     AccountAllOrders(i64),
     AccountAllTrades(i64),
     AccountAllPositions(i64),
     AccountAllAssets(i64),
+    UserStats(i64),
     Height,
 }
 
@@ -307,6 +379,7 @@ impl LighterWsChannel {
             Self::AccountAllTrades(_) => LighterWsChannelKind::AccountAllTrades,
             Self::AccountAllPositions(_) => LighterWsChannelKind::AccountAllPositions,
             Self::AccountAllAssets(_) => LighterWsChannelKind::AccountAllAssets,
+            Self::UserStats(_) => LighterWsChannelKind::UserStats,
             Self::Height => LighterWsChannelKind::Height,
         }
     }
@@ -330,7 +403,8 @@ impl LighterWsChannel {
             | Self::AccountAllOrders(account_index)
             | Self::AccountAllTrades(account_index)
             | Self::AccountAllPositions(account_index)
-            | Self::AccountAllAssets(account_index) => format!("{kind}/{account_index}"),
+            | Self::AccountAllAssets(account_index)
+            | Self::UserStats(account_index) => format!("{kind}/{account_index}"),
             Self::AccountOrders {
                 market_index,
                 account_index,
@@ -362,6 +436,7 @@ impl LighterWsChannel {
                 | Self::AccountAllTrades(_)
                 | Self::AccountAllPositions(_)
                 | Self::AccountAllAssets(_)
+                | Self::UserStats(_)
         )
     }
 }
@@ -369,7 +444,7 @@ impl LighterWsChannel {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum LighterMarketSelection {
     All,
-    Market(i16),
+    Market(i64),
 }
 
 impl LighterMarketSelection {
@@ -451,7 +526,7 @@ pub enum LighterWsFrame {
         #[serde(default, deserialize_with = "deserialize_trade_vec")]
         trades: Vec<LighterTrade>,
     },
-    #[serde(rename = "update/account_orders")]
+    #[serde(rename = "update/account_orders", alias = "subscribed/account_orders")]
     AccountOrders {
         account: i64,
         channel: Ustr,
@@ -485,16 +560,26 @@ pub enum LighterWsFrame {
         channel: Ustr,
         trades: AHashMap<Ustr, Vec<LighterTrade>>,
     },
-    #[serde(
-        rename = "update/account_all_positions",
-        alias = "subscribed/account_all_positions"
-    )]
+    #[serde(rename = "subscribed/account_all_positions")]
+    AccountAllPositionsSnapshot {
+        channel: Ustr,
+        positions: AHashMap<Ustr, LighterPosition>,
+        #[serde(default)]
+        shares: Vec<LighterPoolShares>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
+        last_funding_round: Option<AHashMap<Ustr, Decimal>>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
+        last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
+    },
+    #[serde(rename = "update/account_all_positions")]
     AccountAllPositions {
         channel: Ustr,
         positions: AHashMap<Ustr, LighterPosition>,
         #[serde(default)]
         shares: Vec<LighterPoolShares>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_round: Option<AHashMap<Ustr, Decimal>>,
+        #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
     },
     #[serde(
@@ -506,7 +591,13 @@ pub enum LighterWsFrame {
         channel: Ustr,
         timestamp: u64,
     },
-    #[serde(rename = "update/height")]
+    #[serde(rename = "update/user_stats", alias = "subscribed/user_stats")]
+    UserStats {
+        channel: Ustr,
+        stats: LighterUserStats,
+        timestamp: u64,
+    },
+    #[serde(rename = "update/height", alias = "subscribed/height")]
     Height {
         channel: Ustr,
         height: i64,
@@ -574,12 +665,12 @@ pub enum LighterMarketStatsPayload {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LighterMarketStats {
     pub symbol: Ustr,
-    pub market_id: i16,
+    pub market_id: i64,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub index_price: Decimal,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub mark_price: Decimal,
-    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub mid_price: Decimal,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub open_interest: Decimal,
@@ -618,10 +709,10 @@ pub enum LighterSpotMarketStatsPayload {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LighterSpotMarketStats {
     pub symbol: Ustr,
-    pub market_id: i16,
+    pub market_id: i64,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub index_price: Decimal,
-    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    #[serde(deserialize_with = "deserialize_decimal_or_zero")]
     pub mid_price: Decimal,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub last_trade_price: Decimal,
@@ -639,7 +730,7 @@ pub struct LighterSpotMarketStats {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LighterPosition {
-    pub market_id: i16,
+    pub market_id: i64,
     pub symbol: Ustr,
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub initial_margin_fraction: Decimal,
@@ -679,14 +770,80 @@ pub struct LighterPoolShares {
     pub entry_timestamp: u64,
 }
 
+/// Inner shape of the `user_stats.stats.cross_stats` and `.total_stats`
+/// substructs. Every field is a stringified decimal on the wire and
+/// denominated in the deployment settlement currency.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LighterUserStatsScoped {
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub available_balance: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub buying_power: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub collateral: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub leverage: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub margin_usage: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub portfolio_value: Decimal,
+}
+
+/// Body of the `user_stats` frame. Top-level equity numbers mirror
+/// `total_stats`; `cross_stats` reports cross-margin equity only.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct LighterUserStats {
+    #[serde(default)]
+    pub account_trading_mode: i32,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub available_balance: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub buying_power: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub collateral: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub leverage: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub margin_usage: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_str")]
+    pub portfolio_value: Decimal,
+    pub cross_stats: Option<LighterUserStatsScoped>,
+    pub total_stats: Option<LighterUserStatsScoped>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct LighterAsset {
     pub symbol: Ustr,
     pub asset_id: i16,
+    /// Spot-side balance for this asset.
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub balance: Decimal,
+    /// Spot-side amount reserved by resting spot orders.
     #[serde(deserialize_with = "deserialize_decimal_from_str")]
     pub locked_balance: Decimal,
+    /// Perp-side collateral for this asset. Defaults to zero when the wire
+    /// omits the field (spot-only frames).
+    #[serde(default, deserialize_with = "deserialize_decimal_from_str")]
+    pub margin_balance: Decimal,
+    /// Per-asset margin treatment. Observed values: "disabled" (asset not
+    /// pledged as collateral). Defaults to empty when the wire omits it.
+    #[serde(default)]
+    pub margin_mode: Ustr,
+}
+
+#[derive(Deserialize)]
+struct JsonDecimal(#[serde(deserialize_with = "deserialize_decimal_native")] Decimal);
+
+fn deserialize_optional_decimal_map<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<AHashMap<Ustr, Decimal>>, D::Error> {
+    let values = Option::<AHashMap<Ustr, JsonDecimal>>::deserialize(deserializer)?;
+    Ok(values.map(|values| {
+        values
+            .into_iter()
+            .map(|(key, value)| (key, value.0))
+            .collect()
+    }))
 }
 
 fn deserialize_trade_vec<'de, D>(deserializer: D) -> Result<Vec<LighterTrade>, D::Error>
@@ -758,12 +915,18 @@ mod tests {
         include_str!("../../test_data/ws_market_stats_subscribed_single.json");
     const WS_MARKET_STATS_UPDATE_ALL: &str =
         include_str!("../../test_data/ws_market_stats_update_all.json");
+    const WS_MARKET_STATS_UPDATE_SINGLE_WIDENED: &str =
+        include_str!("../../test_data/ws_market_stats_update_single_widened.json");
     const WS_SPOT_MARKET_STATS_UPDATE_SINGLE: &str =
         include_str!("../../test_data/ws_spot_market_stats_update_single.json");
     const WS_SPOT_MARKET_STATS_SUBSCRIBED_SINGLE: &str =
         include_str!("../../test_data/ws_spot_market_stats_subscribed_single.json");
     const WS_SPOT_MARKET_STATS_UPDATE_ALL: &str =
         include_str!("../../test_data/ws_spot_market_stats_update_all.json");
+    const WS_SPOT_MARKET_STATS_UPDATE_SINGLE_WIDENED: &str =
+        include_str!("../../test_data/ws_spot_market_stats_update_single_widened.json");
+    const WS_SPOT_MARKET_STATS_SUBSCRIBED_SINGLE_EMPTY_MID: &str =
+        include_str!("../../test_data/ws_spot_market_stats_subscribed_single_empty_mid.json");
     const WS_ACCOUNT_ALL_ASSETS_UPDATE: &str =
         include_str!("../../test_data/ws_account_all_assets_update.json");
     const WS_ACCOUNT_ORDERS_UPDATE: &str =
@@ -775,6 +938,94 @@ mod tests {
     const WS_HEIGHT_UPDATE: &str = include_str!("../../test_data/ws_height_update.json");
     const WS_CANDLE_SUBSCRIBED: &str = include_str!("../../test_data/ws_candle_subscribed.json");
     const WS_CANDLE_UPDATE: &str = include_str!("../../test_data/ws_candle_update.json");
+
+    #[rstest]
+    #[case("subscribed/account_all_positions")]
+    #[case("update/account_all_positions")]
+    fn test_funding_decimal_maps(#[case] kind: &str) {
+        let value = serde_json::json!({
+            "type": kind,
+            "channel": "account_all_positions:7",
+            "positions": {},
+            "last_funding_round": {"1": 9007199254740993u64, "3": 1.25},
+            "last_funding_discount": {
+                "2": "0.1234567890123456789012345678",
+                "4": "0.12345678901234567890123456789"
+            }
+        });
+        let text = value.to_string();
+
+        for frame in [
+            serde_json::from_str::<LighterWsFrame>(&text).unwrap(),
+            serde_json::from_value(value).unwrap(),
+        ] {
+            let (round, discount) = funding_maps(frame);
+            assert_eq!(
+                round.unwrap(),
+                AHashMap::from_iter([
+                    (Ustr::from("1"), Decimal::from(9_007_199_254_740_993u64)),
+                    (Ustr::from("3"), Decimal::new(125, 2))
+                ])
+            );
+            assert_eq!(
+                discount.unwrap(),
+                AHashMap::from_iter([
+                    (
+                        Ustr::from("2"),
+                        Decimal::from_str_exact("0.1234567890123456789012345678").unwrap()
+                    ),
+                    (
+                        Ustr::from("4"),
+                        Decimal::from_str_exact("0.1234567890123456789012345679").unwrap()
+                    ),
+                ])
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_funding_decimal_maps_absent(
+        #[values("subscribed/account_all_positions", "update/account_all_positions")] kind: &str,
+        #[values(false, true)] explicit_null: bool,
+    ) {
+        let mut value = serde_json::json!({
+            "type": kind,
+            "channel": "account_all_positions:7",
+            "positions": {},
+        });
+
+        if explicit_null {
+            value["last_funding_round"] = serde_json::Value::Null;
+            value["last_funding_discount"] = serde_json::Value::Null;
+        }
+
+        let text = value.to_string();
+
+        for frame in [
+            serde_json::from_str::<LighterWsFrame>(&text).unwrap(),
+            serde_json::from_value(value).unwrap(),
+        ] {
+            assert_eq!(funding_maps(frame), (None, None));
+        }
+    }
+
+    type FundingMap = Option<AHashMap<Ustr, Decimal>>;
+
+    fn funding_maps(frame: LighterWsFrame) -> (FundingMap, FundingMap) {
+        match frame {
+            LighterWsFrame::AccountAllPositionsSnapshot {
+                last_funding_round,
+                last_funding_discount,
+                ..
+            }
+            | LighterWsFrame::AccountAllPositions {
+                last_funding_round,
+                last_funding_discount,
+                ..
+            } => (last_funding_round, last_funding_discount),
+            _ => panic!("expected account positions"),
+        }
+    }
 
     #[rstest]
     fn test_subscription_request_serializes_public_channel() {
@@ -816,7 +1067,7 @@ mod tests {
     #[rstest]
     fn test_subscribe_request_debug_redacts_auth_token() {
         let token = "schnorr-signature-bytes-do-not-leak";
-        let request = LighterWsRequest::subscribe_auth("account_all/123", token);
+        let mut request = LighterWsRequest::subscribe_auth("account_all/123", token);
 
         let dbg = format!("{request:?}");
 
@@ -824,7 +1075,13 @@ mod tests {
             !dbg.contains(token),
             "Debug output must not contain the auth token, found: {dbg}",
         );
-        assert!(dbg.contains("authed"), "Debug should include authed flag");
+        assert!(dbg.contains(REDACTED));
+
+        request.zeroize();
+        assert!(matches!(
+            &request,
+            LighterWsRequest::Subscribe { auth: None, .. }
+        ));
     }
 
     #[rstest]
@@ -1153,6 +1410,70 @@ mod tests {
     }
 
     #[rstest]
+    fn test_market_stats_frame_deserializes_widened_market_id() {
+        let frame: LighterWsFrame =
+            serde_json::from_str(WS_MARKET_STATS_UPDATE_SINGLE_WIDENED).unwrap();
+
+        match frame {
+            LighterWsFrame::MarketStats {
+                channel,
+                market_stats: LighterMarketStatsPayload::One(stats),
+                timestamp,
+            } => {
+                assert_eq!(channel, Ustr::from("market_stats:40000"));
+                assert_eq!(stats.symbol, Ustr::from("FUTURE"));
+                assert_eq!(stats.market_id, 40_000);
+                assert_eq!(stats.mark_price, Decimal::from_str("12.47").unwrap());
+                assert_eq!(timestamp, 1_774_883_844_933);
+            }
+            _ => panic!("expected single market stats frame"),
+        }
+    }
+
+    #[rstest]
+    fn test_spot_market_stats_frame_deserializes_widened_market_id() {
+        let frame: LighterWsFrame =
+            serde_json::from_str(WS_SPOT_MARKET_STATS_UPDATE_SINGLE_WIDENED).unwrap();
+
+        match frame {
+            LighterWsFrame::SpotMarketStats {
+                channel,
+                spot_market_stats: LighterSpotMarketStatsPayload::One(stats),
+                timestamp,
+            } => {
+                assert_eq!(channel, Ustr::from("spot_market_stats:50000"));
+                assert_eq!(stats.symbol, Ustr::from("FUTURE/USDC"));
+                assert_eq!(stats.market_id, 50_000);
+                assert_eq!(stats.mid_price, Decimal::from_str("1.000001").unwrap());
+                assert_eq!(timestamp, 1_774_883_844_933);
+            }
+            _ => panic!("expected single spot market stats frame"),
+        }
+    }
+
+    #[rstest]
+    fn test_spot_market_stats_frame_deserializes_empty_mid_as_zero() {
+        let frame: LighterWsFrame =
+            serde_json::from_str(WS_SPOT_MARKET_STATS_SUBSCRIBED_SINGLE_EMPTY_MID).unwrap();
+
+        match frame {
+            LighterWsFrame::SpotMarketStats {
+                channel,
+                spot_market_stats: LighterSpotMarketStatsPayload::One(stats),
+                timestamp,
+            } => {
+                assert_eq!(channel, Ustr::from("spot_market_stats:4098"));
+                assert_eq!(stats.symbol, Ustr::from("ETH/USDC"));
+                assert_eq!(stats.market_id, 4098);
+                assert_eq!(stats.mid_price, Decimal::ZERO);
+                assert_eq!(stats.index_price, Decimal::from_str("2471.940000").unwrap());
+                assert_eq!(timestamp, 1_789_706_424_060);
+            }
+            _ => panic!("expected single spot market stats frame"),
+        }
+    }
+
+    #[rstest]
     fn test_spot_market_stats_frame_deserializes_single_payload() {
         let frame: LighterWsFrame =
             serde_json::from_str(WS_SPOT_MARKET_STATS_UPDATE_SINGLE).unwrap();
@@ -1218,6 +1539,9 @@ mod tests {
 
     #[rstest]
     fn test_account_all_assets_frame_deserializes() {
+        // Fixture is the captured production no-position payload: USDC
+        // sits at asset_id=3, balance=10 on spot, margin_balance=40 on
+        // perp, margin_mode="disabled", no spot-order reservation.
         let frame: LighterWsFrame = serde_json::from_str(WS_ACCOUNT_ALL_ASSETS_UPDATE).unwrap();
 
         match frame {
@@ -1227,10 +1551,17 @@ mod tests {
                 timestamp,
             } => {
                 assert_eq!(channel, Ustr::from("account_all_assets:1234"));
-                let asset = assets.get(&Ustr::from("0")).unwrap();
+                let asset = assets.get(&Ustr::from("3")).unwrap();
                 assert_eq!(asset.symbol, Ustr::from("USDC"));
-                assert_eq!(asset.locked_balance, Decimal::from_str("1.000000").unwrap());
-                assert_eq!(timestamp, 1_774_883_844_933);
+                assert_eq!(asset.asset_id, 3);
+                assert_eq!(asset.balance, Decimal::from_str("10.000000").unwrap());
+                assert_eq!(asset.locked_balance, Decimal::ZERO);
+                assert_eq!(
+                    asset.margin_balance,
+                    Decimal::from_str("40.000000").unwrap()
+                );
+                assert_eq!(asset.margin_mode, Ustr::from("disabled"));
+                assert_eq!(timestamp, 1_781_161_199_648);
             }
             _ => panic!("expected account all assets frame"),
         }
@@ -1283,6 +1614,7 @@ mod tests {
                 let market_orders = orders.get(&Ustr::from("0")).unwrap();
                 assert_eq!(market_orders.len(), 1);
                 assert_eq!(market_orders[0].order_id, "281476929510110");
+                assert_eq!(market_orders[0].nonce, 281_474_720_725_346);
                 assert_eq!(
                     market_orders[0].filled_base_amount,
                     Decimal::from_str("0.0020").unwrap(),
@@ -1290,6 +1622,17 @@ mod tests {
             }
             _ => panic!("expected account orders frame, was {frame:?}"),
         }
+    }
+
+    #[rstest]
+    fn test_account_orders_subscribed_frame_deserializes() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
+        payload["type"] = serde_json::json!("subscribed/account_orders");
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        assert!(matches!(frame, LighterWsFrame::AccountOrders { .. }));
     }
 
     #[rstest]
@@ -1388,6 +1731,27 @@ mod tests {
     }
 
     #[rstest]
+    fn test_account_all_positions_snapshot_frame_deserializes() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ALL_POSITIONS_UPDATE).unwrap();
+        value["type"] = serde_json::json!("subscribed/account_all_positions");
+        let frame: LighterWsFrame = serde_json::from_value(value).unwrap();
+
+        match frame {
+            LighterWsFrame::AccountAllPositionsSnapshot {
+                channel, positions, ..
+            } => {
+                assert_eq!(channel, Ustr::from("account_all_positions:1234"));
+                let position = positions.get(&Ustr::from("0")).unwrap();
+                assert_eq!(position.market_id, 0);
+                assert_eq!(position.position, Decimal::from_str("1.5000").unwrap());
+                assert_eq!(position.sign, 1);
+            }
+            _ => panic!("expected account all positions snapshot, was {frame:?}"),
+        }
+    }
+
+    #[rstest]
     fn test_height_frame_deserializes() {
         let frame: LighterWsFrame = serde_json::from_str(WS_HEIGHT_UPDATE).unwrap();
 
@@ -1403,6 +1767,16 @@ mod tests {
             }
             _ => panic!("expected height frame"),
         }
+    }
+
+    #[rstest]
+    fn test_height_subscribed_frame_deserializes() {
+        let mut payload: serde_json::Value = serde_json::from_str(WS_HEIGHT_UPDATE).unwrap();
+        payload["type"] = serde_json::json!("subscribed/height");
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        assert!(matches!(frame, LighterWsFrame::Height { .. }));
     }
 
     #[rstest]
@@ -1454,13 +1828,22 @@ mod tests {
                 assert_eq!(candle.h, Decimal::from_str("2264.34").unwrap());
                 assert_eq!(candle.l, Decimal::from_str("2263.36").unwrap());
                 assert_eq!(candle.c, Decimal::from_str("2263.97").unwrap());
-                // f64 JSON numbers round-trip through `deserialize_decimal::visit_f64`
-                // which converts via `Decimal::try_from(f64)`; the resulting value is the
-                // nearest representable decimal to the float, not the JSON literal text.
-                assert_eq!(candle.v, Decimal::from_str("13.2237").unwrap());
+                let arbitrary_precision =
+                    serde_json::from_str::<serde_json::Number>("79228162514264337593543950335")
+                        .unwrap()
+                        .to_string()
+                        == "79228162514264337593543950335";
+
+                let (volume, quote_volume) = if arbitrary_precision {
+                    ("13.223699999999997", "29934.600011999984")
+                } else {
+                    ("13.2237", "29934.60001199998")
+                };
+
+                assert_eq!(candle.v, Decimal::from_str_exact(volume).unwrap());
                 assert_eq!(
                     candle.quote_volume,
-                    Decimal::from_str("29934.60001199998").unwrap(),
+                    Decimal::from_str_exact(quote_volume).unwrap()
                 );
                 assert_eq!(candle.i, 19_993_571_166);
             }

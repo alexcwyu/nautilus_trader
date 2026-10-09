@@ -13,38 +13,33 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Authentication state tracking for WebSocket clients.
+//! Adapter authentication state independent of the WebSocket transport state.
 //!
-//! This module provides a robust authentication tracker that coordinates login attempts
-//! and ensures each attempt produces a fresh success or failure signal before operations
-//! resume. It follows a proven pattern used in production.
+//! [`AuthTracker`] separates a specific authentication attempt from the shared session state.
+//! [`AuthTracker::begin`] returns a oneshot receiver for the attempt and fails any earlier pending
+//! attempt as superseded. [`AuthTracker::succeed`] and [`AuthTracker::fail`] resolve the active
+//! attempt and wake state waiters. [`AuthTracker::invalidate`] returns an authenticated session to
+//! unauthenticated without resolving a pending attempt or clearing terminal failure.
 //!
-//! # Key Features
+//! # Client integration
 //!
-//! - **Three-state model**: `Unauthenticated`, `Authenticated`, `Failed` via `AuthState` enum.
-//! - **Oneshot signaling**: Each auth attempt gets a dedicated channel for result notification.
-//! - **Superseding logic**: New authentication requests cancel pending ones.
-//! - **Timeout handling**: Configurable timeout for authentication responses.
-//! - **Generic error mapping**: Adapters can map to their specific error types.
-//! - **Auth-gated waiting**: `wait_for_authenticated()` blocks until auth completes or fails.
-//!
-//! # Recommended Integration Pattern
-//!
-//! Based on production usage, the recommended pattern is:
-//!
-//! 1. **Order operations**: Call `wait_for_authenticated()` before private operations.
-//!    This waits for re-auth after reconnection instead of rejecting immediately.
-//! 2. **Reconnection flow**: Authenticate BEFORE resubscribing to topics.
-//! 3. **Event propagation**: Send auth failures through event channels to consumers.
-//! 4. **State lifecycle**: Call `invalidate()` on disconnect, `succeed()`/`fail()` handle auth results.
+//! Registering a tracker with the client invalidates it on reconnectable connection loss and fails
+//! it on terminal shutdown. When authentication-gated replay is enabled, ordinary buffered sends
+//! wait for `Authenticated` and are discarded on `Failed`. The adapter remains responsible for
+//! sending authentication, interpreting the response, and ordering resubscription.
 
 use std::{
+    pin::pin,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU8, Ordering},
     },
     time::Duration,
 };
+
+use parking_lot::Mutex;
+
+use crate::dst;
 
 pub type AuthResultSender = tokio::sync::oneshot::Sender<Result<(), String>>;
 pub type AuthResultReceiver = tokio::sync::oneshot::Receiver<Result<(), String>>;
@@ -53,12 +48,12 @@ pub type AuthResultReceiver = tokio::sync::oneshot::Receiver<Result<(), String>>
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum AuthState {
-    /// Not authenticated (initial state, after invalidate/begin).
+    /// Not authenticated (initial state, after begin, or after invalidating authenticated state).
     #[default]
     Unauthenticated = 0,
     /// Successfully authenticated (after succeed).
     Authenticated = 1,
-    /// Authentication explicitly rejected by the server (after fail).
+    /// Authentication failed or became impossible (after fail).
     Failed = 2,
 }
 
@@ -85,28 +80,31 @@ impl AuthState {
     }
 }
 
-/// Generic authentication state tracker for WebSocket connections.
+/// Tracks authentication state for WebSocket connections.
 ///
-/// Coordinates authentication attempts by providing a channel-based signaling
-/// mechanism. Each authentication attempt receives a dedicated oneshot channel
-/// that will be resolved when the server responds.
+/// Each authentication attempt receives a dedicated oneshot channel that resolves when the server
+/// responds.
 ///
-/// # State Management
+/// # State management
 ///
-/// The tracker maintains a three-state machine:
-/// - `Unauthenticated`: after `begin()`, `invalidate()`, or initial construction.
-/// - `Authenticated`: after `succeed()`. Queryable via `is_authenticated()`.
-/// - `Failed`: after `fail()`. Causes `wait_for_authenticated()` to return early.
+/// The tracker maintains three states:
 ///
-/// # Superseding Behavior
+/// - [`AuthState::Unauthenticated`]: The initial state, the state after [`Self::begin`], and the
+///   result of [`Self::invalidate`] from [`AuthState::Authenticated`].
+/// - [`AuthState::Authenticated`]: The state after [`Self::succeed`].
+/// - [`AuthState::Failed`]: The state after [`Self::fail`]. Authentication waiters return early in
+///   this state.
 ///
-/// If a new authentication attempt begins while a previous one is pending,
-/// the old attempt is automatically cancelled with an error. This prevents
-/// auth response race conditions during rapid reconnections.
+/// # Superseding behavior
 ///
-/// # Thread Safety
+/// If a new authentication attempt begins while another remains pending, the old attempt is
+/// cancelled with an error. This prevents responses from an earlier attempt from racing with a
+/// later attempt during rapid reconnections.
 ///
-/// All operations are thread-safe and can be called concurrently from multiple tasks.
+/// # Thread safety
+///
+/// Clones share the pending attempt and session state. All operations are thread-safe and can run
+/// concurrently from multiple tasks.
 #[derive(Clone, Debug)]
 pub struct AuthTracker {
     tx: Arc<Mutex<Option<AuthResultSender>>>,
@@ -137,14 +135,24 @@ impl AuthTracker {
         self.auth_state() == AuthState::Authenticated
     }
 
-    /// Clears the authentication state without affecting pending auth attempts.
+    /// Clears authenticated state without affecting pending auth attempts.
     ///
-    /// Call this on disconnect or when the connection is closed to ensure
-    /// operations requiring authentication are properly guarded.
+    /// Call this when a live connection drops and reconnect may authenticate
+    /// again, so operations requiring authentication are properly guarded. A
+    /// terminal [`AuthState::Failed`] state remains failed.
     pub fn invalidate(&self) {
-        self.state
-            .store(AuthState::Unauthenticated.as_u8(), Ordering::Release);
-        self.state_notify.notify_waiters();
+        let _guard = self.tx.lock();
+
+        if self
+            .state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (AuthState::from_u8(state) == AuthState::Authenticated)
+                    .then_some(AuthState::Unauthenticated.as_u8())
+            })
+            .is_ok()
+        {
+            self.state_notify.notify_waiters();
+        }
     }
 
     /// Begins a new authentication attempt.
@@ -161,18 +169,17 @@ impl AuthTracker {
     )]
     pub fn begin(&self) -> AuthResultReceiver {
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let mut guard = self.tx.lock();
         self.state
             .store(AuthState::Unauthenticated.as_u8(), Ordering::Release);
 
-        if let Ok(mut guard) = self.tx.lock() {
-            if let Some(old) = guard.take() {
-                log::warn!("New authentication request superseding previous pending request");
-                let _ = old.send(Err("Authentication attempt superseded".to_string()));
-            } else {
-                log::debug!("Starting new authentication request");
-            }
-            *guard = Some(sender);
+        if let Some(old) = guard.take() {
+            log::warn!("New authentication request superseding previous pending request");
+            let _ = old.send(Err("Authentication attempt superseded".to_string()));
+        } else {
+            log::debug!("Starting new authentication request");
         }
+        *guard = Some(sender);
 
         receiver
     }
@@ -186,13 +193,12 @@ impl AuthTracker {
     /// The state is always updated even if no receiver is waiting (e.g., after
     /// a timeout), since the server has confirmed authentication.
     pub fn succeed(&self) {
+        let mut guard = self.tx.lock();
         self.state
             .store(AuthState::Authenticated.as_u8(), Ordering::Release);
         self.state_notify.notify_waiters();
 
-        if let Ok(mut guard) = self.tx.lock()
-            && let Some(sender) = guard.take()
-        {
+        if let Some(sender) = guard.take() {
             let _ = sender.send(Ok(()));
         }
     }
@@ -201,19 +207,18 @@ impl AuthTracker {
     ///
     /// Transitions to `Failed` and notifies any waiting receiver
     /// with `Err(message)`. This should be called when the server sends an
-    /// authentication error response.
+    /// authentication error response, or on terminal client shutdown.
     ///
     /// The state is always updated even if no receiver is waiting, since the
-    /// server has rejected authentication.
+    /// server has rejected authentication or future auth is impossible.
     pub fn fail(&self, error: impl Into<String>) {
+        let message = error.into();
+        let mut guard = self.tx.lock();
         self.state
             .store(AuthState::Failed.as_u8(), Ordering::Release);
         self.state_notify.notify_waiters();
-        let message = error.into();
 
-        if let Ok(mut guard) = self.tx.lock()
-            && let Some(sender) = guard.take()
-        {
+        if let Some(sender) = guard.take() {
             let _ = sender.send(Err(message));
         }
     }
@@ -242,7 +247,7 @@ impl AuthTracker {
     where
         E: From<String>,
     {
-        match tokio::time::timeout(timeout, receiver).await {
+        match dst::time::timeout(timeout, receiver).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(msg))) => Err(E::from(msg)),
             Ok(Err(_)) => Err(E::from("Authentication channel closed".to_string())),
@@ -273,9 +278,11 @@ impl AuthTracker {
             return true;
         }
 
-        tokio::time::timeout(timeout, async {
+        dst::time::timeout(timeout, async {
             loop {
-                let notified = self.state_notify.notified();
+                // Enable before the state check: an unpolled Notified is unregistered and misses notifies
+                let mut notified = pin!(self.state_notify.notified());
+                notified.as_mut().enable();
 
                 match self.auth_state() {
                     AuthState::Authenticated => return true,
@@ -296,9 +303,13 @@ impl Default for AuthTracker {
 }
 
 #[cfg(test)]
+#[cfg(not(all(feature = "simulation", madsim)))]
 mod tests {
     use std::{
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         time::Duration,
     };
 
@@ -312,6 +323,108 @@ mod tests {
     impl From<String> for TestError {
         fn from(msg: String) -> Self {
             Self(msg)
+        }
+    }
+
+    #[rstest]
+    fn test_begin_during_failure_keeps_receiver_and_state_consistent() {
+        struct DeferredError {
+            entered: mpsc::SyncSender<()>,
+            proceed: mpsc::Receiver<()>,
+        }
+
+        impl From<DeferredError> for String {
+            fn from(error: DeferredError) -> Self {
+                error.entered.send(()).unwrap();
+                error.proceed.recv_timeout(Duration::from_secs(2)).unwrap();
+                "credentials rejected".to_string()
+            }
+        }
+
+        let tracker = AuthTracker::new();
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (proceed_tx, proceed_rx) = mpsc::sync_channel(1);
+
+        let mut receiver = std::thread::scope(|scope| {
+            let completion = scope.spawn(|| {
+                tracker.fail(DeferredError {
+                    entered: entered_tx,
+                    proceed: proceed_rx,
+                });
+            });
+
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let receiver = tracker.begin();
+            proceed_tx.send(()).unwrap();
+            completion.join().unwrap();
+            receiver
+        });
+
+        assert_eq!(
+            receiver.try_recv(),
+            Ok(Err("credentials rejected".to_string()))
+        );
+        assert_eq!(tracker.auth_state(), AuthState::Failed);
+    }
+
+    #[rstest]
+    #[case::success(AuthTracker::succeed, Ok(()), AuthState::Authenticated)]
+    #[case::failure(|tracker: &AuthTracker| tracker.fail("rejected"), Err("rejected".to_string()), AuthState::Failed)]
+    fn test_concurrent_begin_and_completion_keep_receiver_and_state_consistent(
+        #[case] complete: fn(&AuthTracker),
+        #[case] result: Result<(), String>,
+        #[case] state: AuthState,
+    ) {
+        const ATTEMPTS: usize = 2_000;
+
+        let tracker = AuthTracker::new();
+        let (begin_tx, begin_rx) = mpsc::sync_channel(1);
+        let (complete_tx, complete_rx) = mpsc::sync_channel(1);
+        let (receiver_tx, receiver_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+
+        let observations = std::thread::scope(|scope| {
+            let tracker = &tracker;
+
+            scope.spawn(move || {
+                for _ in 0..ATTEMPTS {
+                    begin_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    receiver_tx.send(tracker.begin()).unwrap();
+                }
+            });
+
+            scope.spawn(move || {
+                for _ in 0..ATTEMPTS {
+                    complete_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    complete(tracker);
+                    done_tx.send(()).unwrap();
+                }
+            });
+
+            let mut observations = Vec::with_capacity(ATTEMPTS);
+
+            for _ in 0..ATTEMPTS {
+                begin_tx.send(()).unwrap();
+                complete_tx.send(()).unwrap();
+                let mut receiver = receiver_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                observations.push((receiver.try_recv(), tracker.auth_state()));
+            }
+
+            observations
+        });
+
+        for (received, actual_state) in observations {
+            match received {
+                Ok(actual_result) => {
+                    assert_eq!(actual_result, result);
+                    assert_eq!(actual_state, state);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    assert_eq!(actual_state, AuthState::Unauthenticated);
+                }
+                Err(receive_error) => panic!("authentication channel closed: {receive_error}"),
+            }
         }
     }
 
@@ -389,8 +502,9 @@ mod tests {
     async fn test_succeed_without_pending_auth() {
         let tracker = AuthTracker::new();
 
-        // Calling succeed without begin should not panic
         tracker.succeed();
+
+        assert_eq!(tracker.auth_state(), AuthState::Authenticated);
     }
 
     #[rstest]
@@ -398,8 +512,9 @@ mod tests {
     async fn test_fail_without_pending_auth() {
         let tracker = AuthTracker::new();
 
-        // Calling fail without begin should not panic
         tracker.fail("Some error");
+
+        assert_eq!(tracker.auth_state(), AuthState::Failed);
     }
 
     #[rstest]
@@ -438,17 +553,16 @@ mod tests {
         let tracker = AuthTracker::new();
         let rx = tracker.begin();
 
-        // Drop the tracker's sender by starting a new auth
-        tracker.begin();
+        drop(tracker.tx.lock().take());
 
-        // Original receiver should get channel closed error
         let result: Result<(), TestError> =
             tracker.wait_for_result(Duration::from_secs(1), rx).await;
 
         assert_eq!(
-            result.unwrap_err(),
-            TestError("Authentication attempt superseded".to_string())
+            result,
+            Err(TestError("Authentication channel closed".to_string()))
         );
+        assert_eq!(tracker.auth_state(), AuthState::Unauthenticated);
     }
 
     #[rstest]
@@ -932,6 +1046,35 @@ mod tests {
     }
 
     #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn test_invalidate_preserves_terminal_failure(#[case] invalidate_first: bool) {
+        let tracker = AuthTracker::new();
+        let receiver = tracker.begin();
+
+        if invalidate_first {
+            tracker.invalidate();
+            tracker.fail("terminal");
+        } else {
+            tracker.fail("terminal");
+            tracker.invalidate();
+        }
+
+        let result: Result<(), TestError> = tracker
+            .wait_for_result(Duration::from_secs(1), receiver)
+            .await;
+
+        assert_eq!(tracker.auth_state(), AuthState::Failed);
+        assert_eq!(result.unwrap_err(), TestError("terminal".to_string()));
+        assert!(
+            !tracker
+                .wait_for_authenticated(Duration::from_millis(10))
+                .await
+        );
+    }
+
+    #[rstest]
     #[tokio::test]
     async fn test_begin_clears_auth_state() {
         let tracker = AuthTracker::new();
@@ -1034,6 +1177,30 @@ mod tests {
         });
 
         assert!(tracker.wait_for_authenticated(Duration::from_secs(1)).await);
+    }
+
+    #[rstest]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_wait_for_authenticated_no_lost_wakeup_under_race() {
+        // Regression: a succeed() landing between the waiter's state check and
+        // its first poll of Notified must not be lost. Notified only registers
+        // with the Notify once polled or enabled, so without enable() this
+        // stalls for the full timeout and returns false on some iterations.
+        for _ in 0..200 {
+            let tracker = AuthTracker::new();
+            let _rx = tracker.begin();
+
+            let succeeder = tracker.clone();
+            let handle = std::thread::spawn(move || succeeder.succeed());
+
+            assert!(
+                tracker
+                    .wait_for_authenticated(Duration::from_millis(500))
+                    .await,
+                "wakeup lost despite successful authentication"
+            );
+            handle.join().unwrap();
+        }
     }
 
     #[rstest]
@@ -1155,6 +1322,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg(not(all(feature = "simulation", madsim)))]
 mod proptest_tests {
     use std::{sync::Arc, time::Duration};
 
@@ -1163,7 +1331,209 @@ mod proptest_tests {
 
     use super::*;
 
+    const AUTH_FAILED: &str = "model auth failed";
+    const AUTH_SUPERSEDED: &str = "Authentication attempt superseded";
+
+    #[derive(Debug, Clone)]
+    enum AuthTraceOp {
+        Begin,
+        Succeed,
+        Fail,
+        Invalidate,
+        WaitForAuthenticated,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ExpectedAuthResult {
+        Success,
+        Failed(&'static str),
+    }
+
+    #[derive(Debug)]
+    struct AuthTraceModel {
+        state: AuthState,
+        pending_receiver: Option<usize>,
+        expected_results: Vec<Option<ExpectedAuthResult>>,
+    }
+
+    impl AuthTraceModel {
+        fn new() -> Self {
+            Self {
+                state: AuthState::Unauthenticated,
+                pending_receiver: None,
+                expected_results: Vec::new(),
+            }
+        }
+
+        fn begin(&mut self) {
+            if let Some(receiver_index) = self.pending_receiver.take() {
+                self.expected_results[receiver_index] =
+                    Some(ExpectedAuthResult::Failed(AUTH_SUPERSEDED));
+            }
+
+            self.pending_receiver = Some(self.expected_results.len());
+            self.expected_results.push(None);
+            self.state = AuthState::Unauthenticated;
+        }
+
+        fn succeed(&mut self) {
+            self.state = AuthState::Authenticated;
+
+            if let Some(receiver_index) = self.pending_receiver.take() {
+                self.expected_results[receiver_index] = Some(ExpectedAuthResult::Success);
+            }
+        }
+
+        fn fail(&mut self) {
+            self.state = AuthState::Failed;
+
+            if let Some(receiver_index) = self.pending_receiver.take() {
+                self.expected_results[receiver_index] =
+                    Some(ExpectedAuthResult::Failed(AUTH_FAILED));
+            }
+        }
+
+        fn invalidate(&mut self) {
+            if self.state == AuthState::Authenticated {
+                self.state = AuthState::Unauthenticated;
+            }
+        }
+    }
+
+    fn auth_trace_op_strategy() -> impl Strategy<Value = AuthTraceOp> {
+        prop_oneof![
+            Just(AuthTraceOp::Begin),
+            Just(AuthTraceOp::Succeed),
+            Just(AuthTraceOp::Fail),
+            Just(AuthTraceOp::Invalidate),
+            Just(AuthTraceOp::WaitForAuthenticated),
+        ]
+    }
+
+    fn assert_auth_receivers_match_model(
+        receivers: &mut [Option<AuthResultReceiver>],
+        model: &AuthTraceModel,
+        step: usize,
+    ) -> Result<(), TestCaseError> {
+        for (receiver_index, receiver_slot) in receivers.iter_mut().enumerate() {
+            let Some(receiver) = receiver_slot.as_mut() else {
+                continue;
+            };
+
+            let mut clear_receiver = false;
+
+            match &model.expected_results[receiver_index] {
+                Some(ExpectedAuthResult::Success) => {
+                    match receiver.try_recv() {
+                        Ok(Ok(())) => {}
+                        actual => prop_assert!(
+                            false,
+                            "receiver {} should succeed at step {}, was {:?}",
+                            receiver_index,
+                            step,
+                            actual
+                        ),
+                    }
+                    clear_receiver = true;
+                }
+                Some(ExpectedAuthResult::Failed(expected)) => {
+                    match receiver.try_recv() {
+                        Ok(Err(actual)) => prop_assert_eq!(
+                            actual,
+                            *expected,
+                            "receiver {} should fail at step {}",
+                            receiver_index,
+                            step
+                        ),
+                        actual => prop_assert!(
+                            false,
+                            "receiver {} should fail at step {}, was {:?}",
+                            receiver_index,
+                            step,
+                            actual
+                        ),
+                    }
+                    clear_receiver = true;
+                }
+                None => {
+                    prop_assert_eq!(
+                        receiver.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty),
+                        "receiver {} should stay pending at step {}",
+                        receiver_index,
+                        step
+                    );
+                }
+            }
+
+            if clear_receiver {
+                *receiver_slot = None;
+            }
+        }
+
+        Ok(())
+    }
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Property: auth attempt traces match the cycle model for success,
+        /// failure, superseded stale receivers, invalidation, and auth waits.
+        #[rstest]
+        fn test_auth_tracker_trace_matches_cycle_model(
+            ops in proptest::collection::vec(auth_trace_op_strategy(), 1..80)
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            let tracker = AuthTracker::new();
+            let mut model = AuthTraceModel::new();
+            let mut receivers: Vec<Option<AuthResultReceiver>> = Vec::new();
+
+            for (step, op) in ops.iter().enumerate() {
+                match op {
+                    AuthTraceOp::Begin => {
+                        receivers.push(Some(tracker.begin()));
+                        model.begin();
+                    }
+                    AuthTraceOp::Succeed => {
+                        tracker.succeed();
+                        model.succeed();
+                    }
+                    AuthTraceOp::Fail => {
+                        tracker.fail(AUTH_FAILED);
+                        model.fail();
+                    }
+                    AuthTraceOp::Invalidate => {
+                        tracker.invalidate();
+                        model.invalidate();
+                    }
+                    AuthTraceOp::WaitForAuthenticated => {
+                        let actual = runtime
+                            .block_on(tracker.wait_for_authenticated(Duration::from_millis(0)));
+                        let expected = model.state == AuthState::Authenticated;
+                        prop_assert_eq!(
+                            actual,
+                            expected,
+                            "wait_for_authenticated mismatch at step {}, op {:?}",
+                            step,
+                            op
+                        );
+                    }
+                }
+
+                prop_assert_eq!(
+                    tracker.auth_state(),
+                    model.state,
+                    "auth state mismatch at step {}, op {:?}",
+                    step,
+                    op
+                );
+                assert_auth_receivers_match_model(&mut receivers, &model, step)?;
+            }
+        }
+
         /// Verifies that any sequence of begin/succeed/fail/invalidate calls
         /// leaves the tracker in a consistent state where `is_authenticated`
         /// agrees with the last state-setting call.
@@ -1278,5 +1648,42 @@ mod proptest_tests {
                 "wait_for_authenticated took {elapsed:?} for auth_result={auth_result}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "simulation", madsim))]
+mod simulation_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[madsim::test]
+    async fn test_wait_for_result_succeeds_without_tokio_reactor() {
+        let tracker = AuthTracker::new();
+        let rx = tracker.begin();
+        tracker.succeed();
+        let result: Result<(), String> = tracker.wait_for_result(Duration::from_secs(1), rx).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[madsim::test]
+    async fn test_wait_for_result_times_out_on_virtual_clock() {
+        let tracker = AuthTracker::new();
+        let rx = tracker.begin();
+        let result: Result<(), String> =
+            tracker.wait_for_result(Duration::from_millis(10), rx).await;
+        assert_eq!(result, Err("Authentication timed out".to_string()));
+    }
+
+    #[madsim::test]
+    async fn test_wait_for_authenticated_succeeds_without_tokio_reactor() {
+        let tracker = AuthTracker::new();
+        let pending = tracker.clone();
+
+        madsim::task::spawn(async move {
+            madsim::time::sleep(Duration::from_millis(1)).await;
+            pending.succeed();
+        });
+        assert!(tracker.wait_for_authenticated(Duration::from_secs(1)).await);
     }
 }

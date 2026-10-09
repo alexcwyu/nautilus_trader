@@ -19,7 +19,7 @@ use nautilus_network::error::SendError;
 use thiserror::Error;
 
 /// Errors emitted by the Lighter WebSocket client.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum LighterWsError {
     /// Underlying transport failure.
     #[error("network error: {0}")]
@@ -37,4 +37,8 @@ pub enum LighterWsError {
     /// Generic client error.
     #[error("client error: {0}")]
     Client(String),
+    /// The handler accepted a signed transaction command but disappeared
+    /// before reporting whether it queued the frame to the network writer.
+    #[error("sendTx outcome unknown: {0}")]
+    SendTxOutcomeUnknown(String),
 }

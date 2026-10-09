@@ -44,10 +44,12 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
+//! - `extension-module`: Builds as a Python extension module.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `extension-module`: Builds the crate as a Python extension module.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::clone_on_ref_ptr)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -55,6 +57,29 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::similar_names,
+    reason = "portfolio timing and domain terms such as interval_ms/interval_ns are intentionally parallel"
+)]
+#![allow(
+    clippy::manual_let_else,
+    reason = "match and if-let early returns are consistent with surrounding portfolio flow code"
+)]
+#![allow(
+    clippy::single_match_else,
+    reason = "match can be clearer than if-let-else for some portfolio state transitions"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "portfolio calculation and event update flows exceed the default threshold by design"
+)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod config;
 pub mod manager;

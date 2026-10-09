@@ -26,6 +26,8 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 use serde_json::Value;
 
+use super::time_range::TIME_RANGE_GENERATOR;
+
 pub(super) const CONTINUOUS_FUTURE_PARENT_REQUEST_ID: &str = "continuous_future_parent_request_id";
 
 const CONTINUOUS_FUTURE_TRANSITIONS: &str = "continuous_future_transitions";
@@ -38,6 +40,8 @@ const BAR_TYPES: &str = "bar_types";
 pub(super) struct RequestBarAggregation {
     pub(super) bar_types: Vec<BarType>,
     pub(super) update_subscriptions: bool,
+    pub(super) disable_build_with_no_updates: bool,
+    pub(super) skip_first_non_full_bar: Option<bool>,
 }
 
 impl RequestBarAggregation {
@@ -196,6 +200,10 @@ impl ContinuousFutureRequest {
         child_params.shift_remove(LAST_POST_INSTRUMENT_ID);
         child_params.shift_remove(FIRST_PRE_INSTRUMENT_ID);
         child_params.shift_remove(BAR_TYPES);
+
+        // The parent consumes each segment as one response, so a segment must not fan out into
+        // time-range windows.
+        child_params.shift_remove(TIME_RANGE_GENERATOR);
         child_params.insert(
             CONTINUOUS_FUTURE_PARENT_REQUEST_ID.to_string(),
             Value::String(parent_id.to_string()),
@@ -239,7 +247,7 @@ pub(super) fn request_params(req: &RequestCommand) -> Option<&Params> {
         RequestCommand::Quotes(cmd) => cmd.params.as_ref(),
         RequestCommand::Trades(cmd) => cmd.params.as_ref(),
         RequestCommand::FundingRates(cmd) => cmd.params.as_ref(),
-        RequestCommand::ForwardPrices(cmd) => cmd.params.as_ref(),
+        RequestCommand::OptionChainReferencePrice(cmd) => cmd.params.as_ref(),
         RequestCommand::Bars(cmd) => cmd.params.as_ref(),
         RequestCommand::Join(cmd) => cmd.params.as_ref(),
     }
@@ -256,7 +264,7 @@ pub(super) fn response_params(resp: &DataResponse) -> Option<&Params> {
         DataResponse::Quotes(resp) => resp.params.as_ref(),
         DataResponse::Trades(resp) => resp.params.as_ref(),
         DataResponse::FundingRates(resp) => resp.params.as_ref(),
-        DataResponse::ForwardPrices(resp) => resp.params.as_ref(),
+        DataResponse::OptionChainReferencePrice(resp) => resp.params.as_ref(),
         DataResponse::Bars(resp) => resp.params.as_ref(),
     }
 }
@@ -302,10 +310,13 @@ pub(super) fn request_bar_aggregation_from_params(
     }
 
     let update_subscriptions = params.get_bool("update_subscriptions").unwrap_or(false);
+    let skip_first_non_full_bar = params.get_bool("skip_first_non_full_bar");
 
     Ok(Some(RequestBarAggregation {
         bar_types: unique_bar_types,
         update_subscriptions,
+        disable_build_with_no_updates: false,
+        skip_first_non_full_bar,
     }))
 }
 
@@ -419,6 +430,9 @@ fn parse_continuous_future(
         request_bar_aggregation: RequestBarAggregation {
             bar_types,
             update_subscriptions: false,
+            // Roll gaps and weekends must not emit synthetic last-close bars (v1 parity)
+            disable_build_with_no_updates: true,
+            skip_first_non_full_bar: None,
         },
         transitions,
         adjustment_mode,

@@ -26,21 +26,31 @@
 use std::str::FromStr;
 
 use ahash::AHashMap;
-use nautilus_core::serialization::{deserialize_decimal, deserialize_optional_decimal};
+use nautilus_core::{
+    serialization::{deserialize_decimal, deserialize_optional_decimal},
+    string::secret::SecretString,
+};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer, Serialize, de::Visitor};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{MapAccess, Visitor, value::MapAccessDeserializer},
+};
 use ustr::Ustr;
+use zeroize::Zeroize;
 
 use crate::common::{
-    consts::{STREAM_OP_AUTHENTICATION, STREAM_OP_HEARTBEAT, STREAM_OP_RACE_SUBSCRIPTION},
+    consts::{
+        STREAM_OP_AUTHENTICATION, STREAM_OP_CRICKET_SUBSCRIPTION, STREAM_OP_HEARTBEAT,
+        STREAM_OP_RACE_SUBSCRIPTION,
+    },
     enums::{
         ChangeType, LapseStatusReasonCode, MarketBettingType, MarketDataFilterField, MarketStatus,
         PriceLadderType, RunnerStatus, SegmentType, StatusErrorCode, StreamingOrderStatus,
         StreamingOrderType, StreamingPersistenceType, StreamingSide,
     },
     types::{
-        Handicap, MarketId, SelectionId, deserialize_optional_string_lenient,
-        deserialize_selection_id,
+        Handicap, JsonDecimal, MarketId, SelectionId, deserialize_optional_decimal_native,
+        deserialize_optional_string_lenient, deserialize_selection_id,
     },
 };
 
@@ -61,6 +71,8 @@ pub enum StreamMessage {
     OrderChange(OCM),
     #[serde(rename = "rcm")]
     RaceChange(RCM),
+    #[serde(rename = "ccm")]
+    CricketChange(CCM),
 }
 
 /// Connection confirmation sent on stream connect.
@@ -173,6 +185,7 @@ pub struct RunnerChange {
     #[serde(deserialize_with = "deserialize_selection_id")]
     pub id: SelectionId,
     /// Handicap value.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub hc: Option<Handicap>,
     /// Available to back.
     pub atb: Option<Vec<PV>>,
@@ -214,7 +227,7 @@ where
 {
     struct LenientOptionalDecimalVisitor;
 
-    impl Visitor<'_> for LenientOptionalDecimalVisitor {
+    impl<'de> Visitor<'de> for LenientOptionalDecimalVisitor {
         type Value = Option<Decimal>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -247,6 +260,11 @@ where
 
         fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
             Ok(Decimal::try_from(value).ok())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            let number = serde_json::Number::deserialize(MapAccessDeserializer::new(map))?;
+            self.visit_str(&number.to_string())
         }
 
         fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
@@ -342,6 +360,7 @@ pub struct MarketDefinition {
 pub struct RunnerDefinition {
     #[serde(deserialize_with = "deserialize_selection_id")]
     pub id: SelectionId,
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub hc: Option<Handicap>,
     pub sort_priority: Option<u32>,
     pub name: Option<String>,
@@ -376,15 +395,15 @@ impl<'de> Deserialize<'de> for PV {
         D: serde::Deserializer<'de>,
     {
         // Handles both `[price, volume]` and `[level, price, volume]` (RESUB_DELTA)
-        let arr: Vec<Decimal> = Deserialize::deserialize(deserializer)?;
+        let arr: Vec<JsonDecimal> = Deserialize::deserialize(deserializer)?;
         match arr.len() {
             2 => Ok(Self {
-                price: arr[0],
-                volume: arr[1],
+                price: arr[0].0,
+                volume: arr[1].0,
             }),
             3 => Ok(Self {
-                price: arr[1],
-                volume: arr[2],
+                price: arr[1].0,
+                volume: arr[2].0,
             }),
             n => Err(serde::de::Error::invalid_length(n, &"2 or 3 elements")),
         }
@@ -413,11 +432,11 @@ impl<'de> Deserialize<'de> for LPV {
     where
         D: serde::Deserializer<'de>,
     {
-        let arr: (u32, Decimal, Decimal) = Deserialize::deserialize(deserializer)?;
+        let arr: (u32, JsonDecimal, JsonDecimal) = Deserialize::deserialize(deserializer)?;
         Ok(Self {
             level: arr.0,
-            price: arr.1,
-            volume: arr.2,
+            price: arr.1.0,
+            volume: arr.2.0,
         })
     }
 }
@@ -454,6 +473,7 @@ pub struct OrderRunnerChange {
     #[serde(rename = "fullImage", default)]
     pub full_image: bool,
     /// Handicap.
+    #[serde(default, deserialize_with = "deserialize_optional_decimal_native")]
     pub hc: Option<Handicap>,
     /// Matched backs.
     pub mb: Option<Vec<MatchedOrder>>,
@@ -477,10 +497,10 @@ impl<'de> Deserialize<'de> for MatchedOrder {
     where
         D: serde::Deserializer<'de>,
     {
-        let arr: (Decimal, Decimal) = Deserialize::deserialize(deserializer)?;
+        let arr: (JsonDecimal, JsonDecimal) = Deserialize::deserialize(deserializer)?;
         Ok(Self {
-            price: arr.0,
-            size: arr.1,
+            price: arr.0.0,
+            size: arr.1.0,
         })
     }
 }
@@ -567,24 +587,39 @@ pub struct UnmatchedOrder {
 }
 
 /// Authentication request sent on stream connect.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize)]
 pub struct Authentication {
     pub op: String,
     pub id: Option<u64>,
     #[serde(rename = "appKey")]
-    pub app_key: String,
-    pub session: String,
+    pub app_key: SecretString,
+    pub session: SecretString,
 }
 
 impl Authentication {
     /// Creates a new authentication request.
     #[must_use]
-    pub fn new(app_key: String, session: String) -> Self {
+    pub fn new(app_key: impl Into<SecretString>, session: impl Into<SecretString>) -> Self {
         Self {
             op: STREAM_OP_AUTHENTICATION.to_string(),
             id: None,
-            app_key,
-            session,
+            app_key: app_key.into(),
+            session: session.into(),
+        }
+    }
+
+    /// Creates a correlated authentication request.
+    #[must_use]
+    pub fn with_id(
+        app_key: impl Into<SecretString>,
+        session: impl Into<SecretString>,
+        id: u64,
+    ) -> Self {
+        Self {
+            op: STREAM_OP_AUTHENTICATION.to_string(),
+            id: Some(id),
+            app_key: app_key.into(),
+            session: session.into(),
         }
     }
 }
@@ -642,6 +677,24 @@ impl RaceSubscription {
     pub fn new(id: u64) -> Self {
         Self {
             op: STREAM_OP_RACE_SUBSCRIPTION.to_string(),
+            id: Some(id),
+        }
+    }
+}
+
+/// Cricket stream subscription request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CricketSubscription {
+    pub op: String,
+    pub id: Option<u64>,
+}
+
+impl CricketSubscription {
+    #[must_use]
+    pub fn new(id: u64) -> Self {
+        Self {
+            op: STREAM_OP_CRICKET_SUBSCRIPTION.to_string(),
             id: Some(id),
         }
     }
@@ -768,15 +821,23 @@ pub struct RaceRunnerChange {
     /// Selection identifier.
     pub id: Option<i64>,
     /// Latitude (GPS coordinate).
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub lat: Option<f64>,
     /// Longitude (GPS coordinate).
-    #[serde(rename = "long")]
+    #[serde(
+        rename = "long",
+        default,
+        deserialize_with = "deserialize_optional_f64"
+    )]
     pub lng: Option<f64>,
     /// Speed in m/s (Doppler-derived).
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub spd: Option<f64>,
     /// Distance to finish in meters.
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub prg: Option<f64>,
     /// Stride frequency in Hz.
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub sfq: Option<f64>,
 }
 
@@ -788,18 +849,56 @@ pub struct RaceProgressChange {
     /// Gate/sectional name (e.g. "1f", "2f", "Finish").
     pub g: Option<String>,
     /// Sectional time in seconds.
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub st: Option<f64>,
     /// Running time since race start in seconds.
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub rt: Option<f64>,
     /// Speed of lead horse in m/s.
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub spd: Option<f64>,
     /// Distance to finish for leading horse in meters.
+    #[serde(default, deserialize_with = "deserialize_optional_f64")]
     pub prg: Option<f64>,
     /// Runner order by selection ID (current race position).
     pub ord: Option<Vec<i64>>,
     /// Obstacle data for jump races.
     #[serde(rename = "J")]
     pub jumps: Option<Vec<Jump>>,
+}
+
+/// Cricket Change Message (CCM) - live cricket match data.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CCM {
+    /// Subscription identifier.
+    pub id: Option<u64>,
+    /// Publish time (epoch millis).
+    pub pt: u64,
+    /// Clock token (may be integer or string depending on feed state).
+    pub clk: Option<serde_json::Value>,
+    /// Cricket match changes (None on heartbeat).
+    pub cc: Option<Vec<CricketChange>>,
+}
+
+/// Delta update for a single cricket match within a CCM.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CricketChange {
+    /// Betfair event identifier.
+    #[serde(default, deserialize_with = "deserialize_optional_string_lenient")]
+    pub event_id: Option<String>,
+    /// Betfair market identifier.
+    pub market_id: Option<String>,
+    /// Fixture metadata.
+    pub fixture_info: Option<serde_json::Value>,
+    /// Home team metadata.
+    pub home_team: Option<serde_json::Value>,
+    /// Away team metadata.
+    pub away_team: Option<serde_json::Value>,
+    /// Match statistics.
+    pub match_stats: Option<serde_json::Value>,
+    /// Match incidents.
+    pub incident_list_wrapper: Option<serde_json::Value>,
 }
 
 /// Jump obstacle location data.
@@ -809,8 +908,26 @@ pub struct Jump {
     #[serde(rename = "J")]
     pub number: i32,
     /// Distance from finish line in meters.
-    #[serde(rename = "L")]
+    #[serde(rename = "L", deserialize_with = "deserialize_f64")]
     pub distance: f64,
+}
+
+fn deserialize_f64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    serde_json::Number::deserialize(deserializer)?
+        .as_f64()
+        .ok_or_else(|| serde::de::Error::custom("number out of range for f64"))
+}
+
+fn deserialize_optional_f64<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    Option::<serde_json::Number>::deserialize(deserializer)?
+        .map(|number| {
+            number
+                .as_f64()
+                .ok_or_else(|| serde::de::Error::custom("number out of range for f64"))
+        })
+        .transpose()
 }
 
 /// Decode a single JSON stream line into a [`StreamMessage`].
@@ -828,6 +945,265 @@ mod tests {
 
     use super::*;
     use crate::common::testing::load_test_json;
+
+    #[rstest]
+    fn test_decimal_preserves_rounding() {
+        let text = include_str!("../../test_data/stream/decimal_compatibility.json");
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+        let direct: RunnerChange = serde_json::from_str(text).unwrap();
+        let buffered: RunnerChange = serde_json::from_value(value.clone()).unwrap();
+        let tagged =
+            serde_json::json!({"op": "mcm", "pt": 123, "mc": [{"id": "1.2", "rc": [value]}]});
+
+        let StreamMessage::MarketChange(message) =
+            stream_decode(tagged.to_string().as_bytes()).unwrap()
+        else {
+            panic!("expected market change");
+        };
+
+        let tagged = message.mc.unwrap().remove(0).rc.unwrap().remove(0);
+
+        let numeric = if is_arbitrary_precision() {
+            Decimal::from_str_exact("13.223699999999997").unwrap()
+        } else {
+            Decimal::from_str_exact("13.2237").unwrap()
+        };
+
+        let rounded = Decimal::from_str_exact("0.1234567890123456789012345679").unwrap();
+
+        for (runner, expected_numeric) in [
+            (direct, numeric),
+            (buffered, Decimal::from_str_exact("13.2237").unwrap()),
+            (tagged, numeric),
+        ] {
+            assert_eq!(runner.spn, Some(expected_numeric));
+            assert_eq!(runner.spf, Some(rounded));
+            assert_eq!(runner.hc, Some(rounded));
+            assert_eq!(
+                runner.atb,
+                Some(vec![PV {
+                    price: rounded,
+                    volume: Decimal::new(12500, 4)
+                }])
+            );
+            assert_eq!(runner.atb.unwrap()[0].volume.scale(), 4);
+            assert_eq!(
+                runner.batb,
+                Some(vec![LPV {
+                    level: 3,
+                    price: rounded,
+                    volume: Decimal::new(23750, 4)
+                }])
+            );
+            assert_eq!(runner.batb.unwrap()[0].volume.scale(), 4);
+        }
+    }
+
+    #[rstest]
+    fn test_matched_order_preserves_rounding() {
+        let value = serde_json::json!(["0.12345678901234567890123456789", "1.2500"]);
+        let direct: MatchedOrder = serde_json::from_str(&value.to_string()).unwrap();
+        let buffered: MatchedOrder = serde_json::from_value(value).unwrap();
+        let expected = Decimal::from_str_exact("0.1234567890123456789012345679").unwrap();
+
+        for order in [direct, buffered] {
+            assert_eq!(order.price, expected);
+            assert_eq!(order.size, Decimal::new(12500, 4));
+            assert_eq!(order.size.scale(), 4);
+        }
+    }
+
+    #[rstest]
+    fn test_decimal_routes_preserve_available_precision() {
+        let text = include_str!("../../test_data/stream/decimal_routes.json");
+        let value: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        let expected_price = if is_arbitrary_precision() {
+            Decimal::from_str_exact("123456789.123456789").unwrap()
+        } else {
+            Decimal::from_str_exact("123456789.12345679").unwrap()
+        };
+
+        let direct: MCM = serde_json::from_str(text).unwrap();
+        let buffered: MCM = serde_json::from_value(value.clone()).unwrap();
+
+        let StreamMessage::MarketChange(tagged) = stream_decode(text.as_bytes()).unwrap() else {
+            panic!("expected market change");
+        };
+
+        let StreamMessage::MarketChange(buffered_tagged) = serde_json::from_value(value).unwrap()
+        else {
+            panic!("expected market change");
+        };
+
+        let direct_scale = u32::from(is_arbitrary_precision());
+        let buffered_scale = serde_json::from_value::<Decimal>(serde_json::json!(2.0))
+            .unwrap()
+            .scale();
+
+        for (message, numeric_scale) in [
+            (direct, direct_scale),
+            (buffered, buffered_scale),
+            (tagged, direct_scale),
+            (buffered_tagged, buffered_scale),
+        ] {
+            let markets = message.mc.unwrap();
+            let runner = &markets[0].rc.as_ref().unwrap()[0];
+            assert_eq!(message.pt, 123);
+            assert_eq!(markets[0].id, "1.2");
+            assert_eq!(runner.id, 7);
+            assert_eq!(
+                runner.hc,
+                Some(Decimal::from_str_exact("-0.1234567890123456789012345678").unwrap())
+            );
+            assert_eq!(
+                runner.atb,
+                Some(vec![PV {
+                    price: expected_price,
+                    volume: Decimal::from(9_007_199_254_740_993u64)
+                }])
+            );
+            assert_eq!(
+                runner.atl,
+                Some(vec![PV {
+                    price: Decimal::new(2125, 3),
+                    volume: Decimal::from(17)
+                }])
+            );
+            assert_eq!(
+                runner.batb,
+                Some(vec![LPV {
+                    level: 3,
+                    price: Decimal::new(4875, 3),
+                    volume: Decimal::from(29)
+                }])
+            );
+            assert_eq!(runner.spn, None);
+            assert_eq!(runner.spf, Some(Decimal::new(125, 1)));
+            let other = &markets[0].rc.as_ref().unwrap()[1];
+            assert_eq!(other.id, 8);
+            assert_eq!(other.hc, Some(Decimal::from(2)));
+            assert_eq!(other.hc.unwrap().scale(), numeric_scale);
+            assert_eq!(
+                crate::common::parse::make_symbol(&markets[0].id, other.id, other.hc.unwrap())
+                    .as_str(),
+                if numeric_scale == 0 {
+                    "1.2-8-2"
+                } else {
+                    "1.2-8-2.0"
+                }
+            );
+        }
+    }
+
+    fn is_arbitrary_precision() -> bool {
+        serde_json::from_str::<serde_json::Number>("1.2500")
+            .unwrap()
+            .to_string()
+            == "1.2500"
+    }
+
+    #[rstest]
+    fn test_matched_order_decimal_routes() {
+        let value = serde_json::json!(["0.1234567890123456789012345678", 9007199254740993u64]);
+
+        let expected = MatchedOrder {
+            price: Decimal::from_str_exact("0.1234567890123456789012345678").unwrap(),
+            size: Decimal::from(9_007_199_254_740_993u64),
+        };
+
+        assert_eq!(
+            serde_json::from_str::<MatchedOrder>(&value.to_string()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::from_value::<MatchedOrder>(value).unwrap(),
+            expected
+        );
+
+        for invalid in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<MatchedOrder>(serde_json::json!([invalid, 1])).is_err()
+            );
+        }
+    }
+
+    #[rstest]
+    #[case("1e400")]
+    #[case("-1e400")]
+    fn test_deserialize_numeric_out_of_range(#[case] input: &str) {
+        let required = deserialize_f64(&mut serde_json::Deserializer::from_str(input));
+        let optional = deserialize_optional_f64(&mut serde_json::Deserializer::from_str(input));
+
+        assert!(required.is_err());
+        assert!(optional.is_err());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_stream_decode_race_optional_floats(#[case] explicit_null: bool) {
+        let runner = if explicit_null {
+            serde_json::json!({"lat": null, "long": null, "spd": null, "prg": null, "sfq": null})
+        } else {
+            serde_json::json!({})
+        };
+        let progress = if explicit_null {
+            serde_json::json!({"st": null, "rt": null, "spd": null, "prg": null})
+        } else {
+            serde_json::json!({})
+        };
+        let json = serde_json::json!({
+            "op": "rcm", "pt": 123, "rc": [{"rrc": [runner], "rpc": progress}]
+        });
+        let StreamMessage::RaceChange(message) =
+            stream_decode(json.to_string().as_bytes()).unwrap()
+        else {
+            panic!("Expected race change");
+        };
+        let races = message.rc.unwrap();
+        let runner = &races[0].rrc.as_ref().unwrap()[0];
+        let progress = races[0].rpc.as_ref().unwrap();
+
+        assert_eq!(
+            (runner.lat, runner.lng, runner.spd, runner.prg, runner.sfq),
+            (None, None, None, None, None)
+        );
+        assert_eq!(
+            (progress.st, progress.rt, progress.spd, progress.prg),
+            (None, None, None, None)
+        );
+    }
+
+    #[rstest]
+    #[case(serde_json::json!({"J": 2}))]
+    #[case(serde_json::json!({"J": 2, "L": null}))]
+    #[case(serde_json::json!({"J": 2, "L": "370.1"}))]
+    #[case(serde_json::json!({"J": 2, "L": {"number": "370.1"}}))]
+    fn test_stream_decode_jump_requires_number(#[case] jump: serde_json::Value) {
+        let json = serde_json::json!({
+            "op": "rcm", "pt": 123, "rc": [{"rpc": {"J": [jump]}}]
+        });
+
+        assert!(stream_decode(json.to_string().as_bytes()).is_err());
+    }
+
+    #[rstest]
+    fn test_jump_serialization() {
+        let jump = Jump {
+            number: 2,
+            distance: 370.1,
+        };
+
+        assert_eq!(
+            serde_json::to_value(jump).unwrap(),
+            serde_json::json!({"J": 2, "L": 370.1})
+        );
+    }
 
     #[rstest]
     #[case("stream/ocm_NEW_FULL_IMAGE.json")]
@@ -896,6 +1272,75 @@ mod tests {
     }
 
     #[rstest]
+    fn test_stream_decode_mcm_segments() {
+        let data = load_test_json("stream/mcm_SEGMENTS.jsonl");
+        let expected = [
+            (SegmentType::SegStart, "1.100001", None),
+            (SegmentType::Seg, "1.100002", None),
+            (SegmentType::SegEnd, "1.100003", Some("mcm-segment-clk")),
+        ];
+
+        let messages: Vec<StreamMessage> = data
+            .lines()
+            .map(|line| stream_decode(line.as_bytes()).unwrap())
+            .collect();
+
+        assert_eq!(messages.len(), expected.len());
+        for (message, (segment_type, market_id, clk)) in messages.into_iter().zip(expected) {
+            let StreamMessage::MarketChange(mcm) = message else {
+                panic!("Expected MarketChange");
+            };
+            assert_eq!(mcm.id, Some(1));
+            assert_eq!(mcm.pt, 1_700_000_000_000);
+            assert_eq!(mcm.clk.as_deref(), clk);
+            assert_eq!(mcm.initial_clk, None);
+            assert_eq!(mcm.ct, None);
+            assert_eq!(mcm.conflate_ms, None);
+            assert_eq!(mcm.heartbeat_ms, None);
+            assert_eq!(mcm.segment_type, Some(segment_type));
+            assert_eq!(mcm.status, None);
+            let market_changes = mcm.mc.unwrap();
+            assert_eq!(market_changes.len(), 1);
+            assert_eq!(market_changes[0].id, market_id);
+        }
+    }
+
+    #[rstest]
+    fn test_stream_decode_ocm_segments() {
+        let data = load_test_json("stream/ocm_SEGMENTS.jsonl");
+        let expected = [
+            (SegmentType::SegStart, "1.100001", None),
+            (SegmentType::Seg, "1.100002", None),
+            (SegmentType::SegEnd, "1.100003", Some("ocm-segment-clk")),
+        ];
+
+        let messages: Vec<StreamMessage> = data
+            .lines()
+            .map(|line| stream_decode(line.as_bytes()).unwrap())
+            .collect();
+
+        assert_eq!(messages.len(), expected.len());
+        for (message, (segment_type, market_id, clk)) in messages.into_iter().zip(expected) {
+            let StreamMessage::OrderChange(ocm) = message else {
+                panic!("Expected OrderChange");
+            };
+            assert_eq!(ocm.id, Some(1));
+            assert_eq!(ocm.pt, 1_700_000_000_000);
+            assert_eq!(ocm.clk.as_deref(), clk);
+            assert_eq!(ocm.initial_clk, None);
+            assert_eq!(ocm.ct, None);
+            assert_eq!(ocm.conflate_ms, None);
+            assert_eq!(ocm.heartbeat_ms, None);
+            assert_eq!(ocm.segment_type, Some(segment_type));
+            assert_eq!(ocm.status, None);
+            let order_changes = ocm.oc.unwrap();
+            assert_eq!(order_changes.len(), 1);
+            assert_eq!(order_changes[0].id, market_id);
+            assert_eq!(order_changes[0].orc.as_ref().unwrap().len(), 0);
+        }
+    }
+
+    #[rstest]
     fn test_stream_decode_connection() {
         let data = load_test_json("stream/connection.json");
         let msg = stream_decode(data.as_bytes()).unwrap();
@@ -927,6 +1372,10 @@ mod tests {
                     "spf":"NaN",
                     "ltp":5.0,
                     "tv":10.63
+                }, {
+                    "id":96146808,
+                    "spn":6.75,
+                    "spf":7.5e-1
                 }]
             }]
         }"#;
@@ -940,6 +1389,9 @@ mod tests {
                 assert_eq!(rc.spf, None);
                 assert_eq!(rc.ltp, Some(Decimal::new(50, 1)));
                 assert_eq!(rc.tv, Some(Decimal::new(1063, 2)));
+                let rc = &mcm.mc.as_ref().unwrap()[0].rc.as_ref().unwrap()[1];
+                assert_eq!(rc.spn, Some(Decimal::new(675, 2)));
+                assert_eq!(rc.spf, Some(Decimal::new(75, 2)));
             }
             other => panic!("Expected MarketChange, was {other:?}"),
         }
@@ -1016,6 +1468,22 @@ mod tests {
     }
 
     #[rstest]
+    fn test_stream_decode_ccm_single() {
+        let data = load_test_json("stream/ccm_single.json");
+        let msg = stream_decode(data.as_bytes()).unwrap();
+        match msg {
+            StreamMessage::CricketChange(ccm) => {
+                let cc = ccm.cc.as_ref().unwrap();
+                assert_eq!(cc.len(), 1);
+                assert_eq!(cc[0].event_id.as_deref(), Some("35741575"));
+                assert_eq!(cc[0].market_id.as_deref(), Some("1.259334639"));
+                assert!(cc[0].match_stats.is_some());
+            }
+            other => panic!("Expected CricketChange, was {other:?}"),
+        }
+    }
+
+    #[rstest]
     fn test_stream_decode_ocm_voided() {
         let data = load_test_json("stream/ocm_VOIDED.json");
         let msg = stream_decode(data.as_bytes()).unwrap();
@@ -1072,5 +1540,28 @@ mod tests {
             }
             other => panic!("Expected OrderChange, was {other:?}"),
         }
+    }
+
+    #[rstest]
+    fn test_authentication_serializes_and_redacts_debug() {
+        let authentication = Authentication::with_id(
+            "application-key-token".to_string(),
+            "session-token-value".to_string(),
+            42,
+        );
+
+        let json = serde_json::to_value(&authentication).unwrap();
+        let formatted = format!("{authentication:?}");
+
+        assert_eq!(json["op"], STREAM_OP_AUTHENTICATION);
+        assert_eq!(json["id"], 42);
+        assert_eq!(json["appKey"], "application-key-token");
+        assert_eq!(json["session"], "session-token-value");
+        assert_eq!(
+            formatted,
+            "Authentication { op: \"authentication\", id: Some(42), app_key: <redacted>, session: <redacted> }",
+        );
+        assert!(!formatted.contains("application-key-token"));
+        assert!(!formatted.contains("session-token-value"));
     }
 }

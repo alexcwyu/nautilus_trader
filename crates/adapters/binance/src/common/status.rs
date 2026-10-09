@@ -16,7 +16,7 @@
 //! Instrument status mapping and polling for the Binance adapter.
 
 use ahash::AHashMap;
-use nautilus_common::messages::DataEvent;
+use nautilus_common::{live::sender::EventSender, messages::DataEvent};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::InstrumentStatus, enums::MarketStatusAction, identifiers::InstrumentId,
@@ -31,6 +31,7 @@ impl From<SymbolStatus> for MarketStatusAction {
             SymbolStatus::EndOfDay => Self::Close,
             SymbolStatus::Halt => Self::Halt,
             SymbolStatus::Break => Self::Pause,
+            SymbolStatus::CancelOnly => Self::Halt,
             SymbolStatus::NonRepresentable | SymbolStatus::NullVal => Self::NotAvailableForTrading,
         }
     }
@@ -44,7 +45,7 @@ impl From<SymbolStatus> for MarketStatusAction {
 pub fn diff_and_emit_statuses(
     new_statuses: &AHashMap<InstrumentId, MarketStatusAction>,
     cached_statuses: &mut AHashMap<InstrumentId, MarketStatusAction>,
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
 ) {
@@ -79,7 +80,7 @@ pub fn diff_and_emit_statuses(
 }
 
 fn emit_status(
-    sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    sender: &EventSender<DataEvent>,
     instrument_id: InstrumentId,
     action: MarketStatusAction,
     ts_event: UnixNanos,
@@ -118,6 +119,7 @@ mod tests {
     #[case(SymbolStatus::EndOfDay, MarketStatusAction::Close)]
     #[case(SymbolStatus::Halt, MarketStatusAction::Halt)]
     #[case(SymbolStatus::Break, MarketStatusAction::Pause)]
+    #[case(SymbolStatus::CancelOnly, MarketStatusAction::Halt)]
     #[case(
         SymbolStatus::NonRepresentable,
         MarketStatusAction::NotAvailableForTrading
@@ -139,6 +141,14 @@ mod tests {
     #[case(BinanceTradingStatus::Halt, MarketStatusAction::Halt)]
     #[case(BinanceTradingStatus::AuctionMatch, MarketStatusAction::Cross)]
     #[case(BinanceTradingStatus::Break, MarketStatusAction::Pause)]
+    #[case(BinanceTradingStatus::PreDelivering, MarketStatusAction::PreClose)]
+    #[case(BinanceTradingStatus::Delivering, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::Delivered, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::PreSettle, MarketStatusAction::PreClose)]
+    #[case(BinanceTradingStatus::Settling, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::Close, MarketStatusAction::Close)]
+    #[case(BinanceTradingStatus::TradingHalt, MarketStatusAction::Halt)]
+    #[case(BinanceTradingStatus::TradingCancelOnly, MarketStatusAction::Halt)]
     #[case(
         BinanceTradingStatus::Unknown,
         MarketStatusAction::NotAvailableForTrading
@@ -156,6 +166,11 @@ mod tests {
     #[case(BinanceContractStatus::PreDelivering, MarketStatusAction::PreClose)]
     #[case(BinanceContractStatus::Delivering, MarketStatusAction::Close)]
     #[case(BinanceContractStatus::Delivered, MarketStatusAction::Close)]
+    #[case(BinanceContractStatus::PreSettle, MarketStatusAction::PreClose)]
+    #[case(BinanceContractStatus::Settling, MarketStatusAction::Close)]
+    #[case(BinanceContractStatus::Close, MarketStatusAction::Close)]
+    #[case(BinanceContractStatus::TradingHalt, MarketStatusAction::Halt)]
+    #[case(BinanceContractStatus::TradingCancelOnly, MarketStatusAction::Halt)]
     #[case(BinanceContractStatus::PreDelisting, MarketStatusAction::PreClose)]
     #[case(BinanceContractStatus::Delisting, MarketStatusAction::Suspend)]
     #[case(
@@ -187,7 +202,7 @@ mod tests {
         diff_and_emit_statuses(
             &new_statuses,
             &mut cached,
-            &tx,
+            &tx.into(),
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -219,7 +234,7 @@ mod tests {
         diff_and_emit_statuses(
             &new_statuses,
             &mut cached,
-            &tx,
+            &tx.into(),
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -239,7 +254,7 @@ mod tests {
         diff_and_emit_statuses(
             &new_statuses,
             &mut cached,
-            &tx,
+            &tx.into(),
             UnixNanos::default(),
             UnixNanos::default(),
         );
@@ -268,7 +283,7 @@ mod tests {
         diff_and_emit_statuses(
             &new_statuses,
             &mut cached,
-            &tx,
+            &tx.into(),
             UnixNanos::default(),
             UnixNanos::default(),
         );

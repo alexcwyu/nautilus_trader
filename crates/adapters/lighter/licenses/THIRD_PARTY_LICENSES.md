@@ -3,7 +3,7 @@
 This crate references third-party material for the cryptographic primitives
 and oracle fixtures Lighter requires for L2 transaction signing.
 
-- **Thomas Pornin – `ecgfp5` reference Rust implementation**
+- **Thomas Pornin - `ecgfp5` reference Rust implementation**
   - Usage: The Rust implementation under `src/signing/field/` and
     `src/signing/curve/` is an original Rust implementation of the Goldilocks
     field `Fp = 2^64 - 2^32 + 1`, the quintic extension `GF(p^5)`, and the
@@ -12,13 +12,12 @@ and oracle fixtures Lighter requires for L2 transaction signing.
     the author's reference Rust code as a reading reference. Any
     constants and test vectors copied from upstream are pinned to a specific
     upstream revision and reproduced under `test_data/` for equivalence
-    verification. The reference crate itself is also consumed
-    as a `#[cfg(test)]` dev-dependency (zero transitive deps; commit-pinned
-    via the `rev` field in `Cargo.toml`) by the differential proptest at
-    `src/signing/pornin_diff.rs` and the fuzz targets at
-    `fuzz/fuzz_targets/fuzz_pornin_diff_*.rs`, which assert byte-equality
-    of every public algebra operation against the reference on each
-    random sample. The dev-dep is never linked into the production binary.
+    verification. The reference crate itself is consumed only by the
+    publish=false fuzz crate under `fuzz/pornin/` (zero transitive deps; commit-pinned
+    via the `rev` field in `fuzz/pornin/Cargo.toml`) and is not part of the
+    crates.io-publishable package graph. The
+    `fuzz/pornin/fuzz_targets/fuzz_pornin_diff_*.rs` targets assert byte-equality of
+    every public algebra operation against the reference.
   - Attribution: Copyright (c) 2022 Thomas Pornin.
   - License: MIT License.
   - Source: <https://github.com/pornin/ecgfp5>
@@ -29,7 +28,7 @@ and oracle fixtures Lighter requires for L2 transaction signing.
     `src/signing/schnorr/` is an original Rust implementation of Poseidon2
     hashing and the Schnorr binding Lighter applies on top of `ecgfp5`. It is
     written from public specifications, with `poseidon_crypto` used as the
-    behavioural reference for Lighter's specific parameter sets (round
+    behavioral reference for Lighter's specific parameter sets (round
     constants, MDS matrices). Test vectors reproduced verbatim under
     `test_data/signing_field_goldilocks_vectors.json`,
     `test_data/signing_field_quintic_vectors.json`,
@@ -45,7 +44,7 @@ and oracle fixtures Lighter requires for L2 transaction signing.
   - Full text: `Apache-2.0-poseidon-crypto.txt`
 
 - **`elliottech/lighter-python` SDK contributors**
-  - Usage: The script under `tests/oracle-py/` loads the compiled signer
+  - Usage: The script under `scripts/oracle-py/lighter/` loads the compiled signer
     distributed with the official Python SDK to generate deterministic
     transaction and auth-token oracle fixtures under `test_data/`. The compiled
     signer is not vendored in this repository and is not linked into the crate;

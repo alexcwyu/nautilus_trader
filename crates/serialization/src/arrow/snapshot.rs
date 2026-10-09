@@ -43,11 +43,11 @@ const ORDER_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("trailing_offset", true),
     JsonFieldSpec::utf8("trailing_offset_type", true),
     JsonFieldSpec::utf8("time_in_force", false),
-    JsonFieldSpec::u64("expire_time", true),
+    JsonFieldSpec::timestamp("expire_time", true),
     JsonFieldSpec::utf8("filled_qty", false),
     JsonFieldSpec::utf8("liquidity_side", true),
-    JsonFieldSpec::f64("avg_px", true),
-    JsonFieldSpec::f64("slippage", true),
+    JsonFieldSpec::utf8("avg_px", true),
+    JsonFieldSpec::utf8("slippage", true),
     JsonFieldSpec::utf8_json("commissions", false),
     JsonFieldSpec::utf8("status", false),
     JsonFieldSpec::boolean("is_post_only", false),
@@ -65,8 +65,11 @@ const ORDER_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("exec_spawn_id", true),
     JsonFieldSpec::utf8_json("tags", true),
     JsonFieldSpec::utf8("init_id", false),
-    JsonFieldSpec::u64("ts_init", false),
-    JsonFieldSpec::u64("ts_last", false),
+    JsonFieldSpec::timestamp("ts_init", false),
+    JsonFieldSpec::timestamp("ts_last", false),
+    // Appended (not inserted) so older batches without this column fail with a clean
+    // `MissingColumn` error rather than silently reading a shifted column.
+    JsonFieldSpec::utf8("activation_price", true),
 ];
 
 const POSITION_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
@@ -92,10 +95,11 @@ const POSITION_SNAPSHOT_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("unrealized_pnl", true),
     JsonFieldSpec::utf8_json("commissions", false),
     JsonFieldSpec::u64("duration_ns", true),
-    JsonFieldSpec::u64("ts_opened", false),
-    JsonFieldSpec::u64("ts_closed", true),
-    JsonFieldSpec::u64("ts_init", false),
-    JsonFieldSpec::u64("ts_last", false),
+    JsonFieldSpec::timestamp("ts_opened", false),
+    JsonFieldSpec::timestamp("ts_closed", true),
+    JsonFieldSpec::timestamp("ts_init", false),
+    JsonFieldSpec::timestamp("ts_last", false),
+    JsonFieldSpec::utf8_json("replay_state", true),
 ];
 
 fn instrument_metadata(type_name: &'static str, instrument_id: &str) -> HashMap<String, String> {
@@ -113,11 +117,19 @@ macro_rules! impl_snapshot_arrow {
         }
 
         impl EncodeToRecordBatch for $type {
-            fn encode_batch(
+            fn encode_batch<T>(
                 metadata: &HashMap<String, String>,
-                data: &[Self],
-            ) -> Result<RecordBatch, ArrowError> {
-                encode_batch($type_name, metadata, data, $fields)
+                data: &[T],
+            ) -> Result<RecordBatch, ArrowError>
+            where
+                T: std::borrow::Borrow<Self>,
+            {
+                encode_batch(
+                    $type_name,
+                    metadata,
+                    data.iter().map(std::borrow::Borrow::borrow),
+                    $fields,
+                )
             }
 
             fn metadata(&self) -> HashMap<String, String> {
@@ -147,15 +159,17 @@ impl_snapshot_arrow!(
 mod tests {
     use std::str::FromStr;
 
-    use nautilus_core::UnixNanos;
+    use arrow::datatypes::DataType;
+    use nautilus_core::{DurationNanos, UnixNanos};
     use nautilus_model::{
-        enums::{OrderSide, OrderType, PositionSide},
+        enums::{OrderSide, OrderType, PositionSide, TrailingOffsetType},
         identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
         orders::OrderTestBuilder,
         types::{Currency, Money, Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -168,6 +182,7 @@ mod tests {
             .trigger_price(Price::from("50500"))
             .limit_offset(Decimal::from_str("0.123456789123456789").unwrap())
             .trailing_offset(Decimal::from_str("0.987654321987654321").unwrap())
+            .trailing_offset_type(TrailingOffsetType::Price)
             .quantity(Quantity::from("0.5"))
             .build();
         let snapshot = OrderSnapshot::from(order);
@@ -177,6 +192,84 @@ mod tests {
         let decoded = OrderSnapshot::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
         assert_eq!(decoded, vec![snapshot]);
+    }
+
+    fn make_order_snapshot(avg_px: Option<Decimal>, slippage: Option<Decimal>) -> OrderSnapshot {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(InstrumentId::from("BTCUSDT.BINANCE"))
+            .side(OrderSide::Buy)
+            .price(Price::from("50000"))
+            .quantity(Quantity::from("0.5"))
+            .build();
+        let mut snapshot = OrderSnapshot::from(order);
+        snapshot.avg_px = avg_px;
+        snapshot.slippage = slippage;
+        snapshot
+    }
+
+    // The catalog spec before `avg_px` and `slippage` became exact
+    fn float64_fields() -> Vec<JsonFieldSpec> {
+        ORDER_SNAPSHOT_FIELDS
+            .iter()
+            .map(|spec| match spec.name {
+                "avg_px" | "slippage" => JsonFieldSpec::f64(spec.name, spec.nullable),
+                _ => *spec,
+            })
+            .collect()
+    }
+
+    #[rstest]
+    fn test_order_snapshot_round_trip_preserves_exact_avg_px_and_slippage() {
+        // A quotient at full `Decimal` scale, which is the precision the `Float64` column could
+        // not hold.
+        let snapshot = make_order_snapshot(
+            Some(Decimal::from_str("1.6666666666666666666666666667").unwrap()),
+            Some(Decimal::from_str("0.0000000000000000000000000001").unwrap()),
+        );
+        let metadata = snapshot.metadata();
+        let batch =
+            OrderSnapshot::encode_batch(&metadata, std::slice::from_ref(&snapshot)).unwrap();
+
+        let avg_px_field = batch.schema().field_with_name("avg_px").unwrap().clone();
+        let slippage_field = batch.schema().field_with_name("slippage").unwrap().clone();
+        let decoded = OrderSnapshot::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
+
+        assert_eq!(avg_px_field.data_type(), &DataType::Utf8);
+        assert_eq!(slippage_field.data_type(), &DataType::Utf8);
+        assert_eq!(decoded, vec![snapshot]);
+    }
+
+    #[rstest]
+    fn test_order_snapshot_round_trip_null_avg_px_and_slippage() {
+        let snapshot = make_order_snapshot(None, None);
+        let metadata = snapshot.metadata();
+        let batch =
+            OrderSnapshot::encode_batch(&metadata, std::slice::from_ref(&snapshot)).unwrap();
+        let decoded = OrderSnapshot::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
+
+        assert_eq!(decoded, vec![snapshot]);
+    }
+
+    #[rstest]
+    fn test_order_snapshot_rejects_float64_avg_px_column() {
+        // Converting a float into an exact price would lose precision silently
+        let snapshot = make_order_snapshot(Some(dec!(1.07)), Some(dec!(0.07)));
+        let metadata = snapshot.metadata();
+        let batch = encode_batch(
+            "OrderSnapshot",
+            &metadata,
+            std::slice::from_ref(&snapshot),
+            &float64_fields(),
+        )
+        .unwrap();
+
+        let error =
+            OrderSnapshot::decode_typed_batch(batch.schema().metadata(), batch).unwrap_err();
+
+        assert!(matches!(
+            error,
+            EncodingError::InvalidColumnType("avg_px", _, DataType::Utf8, DataType::Float64)
+        ));
     }
 
     fn make_position_snapshot() -> PositionSnapshot {
@@ -202,17 +295,19 @@ mod tests {
             realized_pnl: Some(Money::new(100.0, Currency::USD())),
             unrealized_pnl: Some(Money::new(50.0, Currency::USD())),
             commissions: vec![Money::new(2.0, Currency::USD())],
-            duration_ns: Some(3_600_000_000_000),
+            duration_ns: Some(DurationNanos::new(3_600_000_000_000)),
             ts_opened: UnixNanos::from(1_000_000_000),
             ts_closed: Some(UnixNanos::from(4_600_000_000)),
             ts_init: UnixNanos::from(2_000_000_000),
             ts_last: UnixNanos::from(4_600_000_000),
+            replay_state: None,
         }
     }
 
     #[rstest]
     fn test_position_snapshot_round_trip() {
-        let snapshot = make_position_snapshot();
+        let mut snapshot = make_position_snapshot();
+        snapshot.replay_state = Some(serde_json::json!({"fill_voids": []}));
         let metadata = snapshot.metadata();
         let batch =
             PositionSnapshot::encode_batch(&metadata, std::slice::from_ref(&snapshot)).unwrap();

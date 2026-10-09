@@ -17,9 +17,9 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use nautilus_core::{
-    AtomicTime, UnixNanos, consts::NAUTILUS_USER_AGENT, time::get_atomic_clock_realtime,
+    AtomicTime, UnixNanos, string::secret::SecretString, time::get_atomic_clock_realtime,
 };
 use nautilus_model::{
     data::{Bar, BarType, FundingRateUpdate, OrderBookDeltas, TradeTick},
@@ -27,11 +27,16 @@ use nautilus_model::{
     instruments::{Instrument, InstrumentAny},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpResponse, Method, USER_AGENT},
+    http::{
+        HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
+    },
     ratelimiter::quota::Quota,
     retry::{RetryManager, create_http_retry_manager},
 };
+use rust_decimal::Decimal;
 use serde::{Serialize, de::DeserializeOwned};
+use url::form_urlencoded;
+use zeroize::Zeroizing;
 
 use crate::{
     common::{
@@ -52,22 +57,22 @@ use crate::{
         },
         models::{
             LighterAccountDetail, LighterAccountsResponse, LighterCandle, LighterCandles,
-            LighterFundings, LighterNextNonce, LighterOrderBookDetails, LighterOrderBookOrders,
-            LighterOrderBooks, LighterOrders, LighterResultCode, LighterSendTxBatchRequest,
-            LighterSendTxBatchResponse, LighterSendTxRequest, LighterSendTxResponse, LighterTrade,
-            LighterTrades,
+            LighterFundings, LighterMakerOnlyApiKeys, LighterNextNonce, LighterOrderBookDetails,
+            LighterOrderBookOrders, LighterOrderBooks, LighterOrders, LighterResultCode,
+            LighterSendTxBatchRequest, LighterSendTxBatchResponse, LighterSendTxRequest,
+            LighterSendTxResponse, LighterTrade, LighterTrades, LighterTx,
         },
         parse::{
             parse_candle_bar, parse_funding_rate_update,
             parse_order_book_details_instruments_with_status, parse_order_book_snapshot,
-            parse_trade_tick, register_order_books, register_perp_order_book_details,
-            register_spot_order_book_details,
+            parse_trade_tick, register_order_books,
         },
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
             LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery, LighterFundingsQuery,
-            LighterNextNonceQuery, LighterOrderBookDetailsQuery, LighterOrderBookOrdersQuery,
-            LighterOrderBooksQuery, LighterRecentTradesQuery, LighterTradesQuery,
+            LighterMakerOnlyApiKeysQuery, LighterNextNonceQuery, LighterOrderBookDetailsQuery,
+            LighterOrderBookOrdersQuery, LighterOrderBooksQuery, LighterRecentTradesQuery,
+            LighterTradesQuery, LighterTxLookup, LighterTxQuery,
         },
     },
 };
@@ -78,14 +83,18 @@ const ENDPOINT_ACCOUNT_ACTIVE_ORDERS: &str = "/api/v1/accountActiveOrders";
 const ENDPOINT_ACCOUNT_INACTIVE_ORDERS: &str = "/api/v1/accountInactiveOrders";
 const ENDPOINT_CANDLES: &str = "/api/v1/candles";
 const ENDPOINT_FUNDINGS: &str = "/api/v1/fundings";
+const ENDPOINT_MAKER_ONLY_API_KEYS: &str = "/api/v1/getMakerOnlyApiKeys";
 const ENDPOINT_NEXT_NONCE: &str = "/api/v1/nextNonce";
 const ENDPOINT_ORDER_BOOK_DETAILS: &str = "/api/v1/orderBookDetails";
 const ENDPOINT_ORDER_BOOK_ORDERS: &str = "/api/v1/orderBookOrders";
 const ENDPOINT_ORDER_BOOKS: &str = "/api/v1/orderBooks";
 const ENDPOINT_RECENT_TRADES: &str = "/api/v1/recentTrades";
+const ENDPOINT_REFERRAL_USE: &str = "/api/v1/referral/use";
 const ENDPOINT_SEND_TX: &str = "/api/v1/sendTx";
 const ENDPOINT_SEND_TX_BATCH: &str = "/api/v1/sendTxBatch";
 const ENDPOINT_TRADES: &str = "/api/v1/trades";
+const ENDPOINT_TX: &str = "/api/v1/tx";
+const HEADER_AUTHORIZATION: &str = "authorization";
 const MULTIPART_BOUNDARY: &str = "nautilus-lighter-form-boundary";
 
 /// Maximum page size accepted by Lighter REST list endpoints (`/api/v1/trades`,
@@ -95,9 +104,13 @@ const MULTIPART_BOUNDARY: &str = "nautilus-lighter-form-boundary";
 pub const LIGHTER_REST_PAGE_SIZE: u16 = 100;
 pub const LIGHTER_CANDLES_MAX_LIMIT: u16 = 500;
 
+/// Maximum rows returned per `/api/v1/fundings` call (the venue per-call cap).
+pub const LIGHTER_FUNDINGS_MAX_LIMIT: u16 = 100;
+
 const DEFAULT_BARS_LIMIT: usize = LIGHTER_CANDLES_MAX_LIMIT as usize;
 const DEFAULT_FUNDING_RATES_LIMIT: usize = 100;
 const MAX_BAR_REQUEST_PAGES: usize = 500;
+const MAX_FUNDING_REQUEST_PAGES: usize = 500;
 
 trait LighterResponseCheck {
     fn response_code(&self) -> i32;
@@ -124,6 +137,7 @@ impl_lighter_response_check!(
     LighterAccountsResponse,
     LighterCandles,
     LighterFundings,
+    LighterMakerOnlyApiKeys,
     LighterNextNonce,
     LighterOrderBookDetails,
     LighterOrderBookOrders,
@@ -133,6 +147,7 @@ impl_lighter_response_check!(
     LighterSendTxBatchResponse,
     LighterSendTxResponse,
     LighterTrades,
+    LighterTx,
 );
 
 /// Raw HTTP client for Lighter REST API operations.
@@ -184,7 +199,7 @@ impl LighterRawHttpClient {
     /// resolved from the client's configured `rest_quota_per_min` (detected tier
     /// only logs hints). `tx_rate_limiter` paces `sendTx` / `sendTxBatch`; the
     /// execution client shares one limiter across this and the WebSocket
-    /// `sendTx` path so their combined rate honours the single venue tx bucket.
+    /// `sendTx` path so their combined rate honors the single venue tx bucket.
     /// The data client passes `None` (it sends no transactions).
     ///
     /// # Errors
@@ -206,14 +221,13 @@ impl LighterRawHttpClient {
         Ok(Self {
             base_url,
             environment,
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(default_quota),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            client: HttpClient::builder()
+                .redirect_policy(HttpRedirectPolicy::Reject)
+                .headers(Self::default_headers())
+                .default_quota(default_quota)
+                .timeout_secs(timeout_secs)
+                .maybe_proxy_url(proxy_url)
+                .build()?,
             retry_manager: create_http_retry_manager(),
             tx_rate_limiter,
         })
@@ -378,6 +392,57 @@ impl LighterRawHttpClient {
             .await
     }
 
+    /// Calls `GET /api/v1/tx`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_tx(&self, query: &LighterTxQuery) -> LighterHttpResult<LighterTx> {
+        self.send_get_request(ENDPOINT_TX, Some(query)).await
+    }
+
+    /// Calls `GET /api/v1/getMakerOnlyApiKeys`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_maker_only_api_keys(
+        &self,
+        query: &LighterMakerOnlyApiKeysQuery,
+    ) -> LighterHttpResult<LighterMakerOnlyApiKeys> {
+        let params = LighterMakerOnlyApiKeysParams {
+            account_index: query.account_index,
+        };
+        let headers = query
+            .authorization
+            .as_ref()
+            .or(query.auth.as_ref())
+            .map(|auth| {
+                HashMap::from([(
+                    HEADER_AUTHORIZATION.to_string(),
+                    auth.expose_secret().to_owned(),
+                )])
+            });
+        self.send_get_request_with_headers(ENDPOINT_MAKER_ONLY_API_KEYS, Some(&params), headers)
+            .await
+    }
+
+    /// Calls `POST /api/v1/referral/use`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn use_referral(
+        &self,
+        l1_address: &str,
+        referral_code: &str,
+        auth_token: &str,
+    ) -> LighterHttpResult<LighterResultCode> {
+        let fields = [("l1_address", l1_address), ("referral_code", referral_code)];
+        self.send_post_urlencoded(ENDPOINT_REFERRAL_USE, &fields, auth_token)
+            .await
+    }
+
     /// Calls `POST /api/v1/sendTx`.
     ///
     /// # Errors
@@ -413,22 +478,38 @@ impl LighterRawHttpClient {
         T: DeserializeOwned + LighterResponseCheck,
         P: Serialize,
     {
+        self.send_get_request_with_headers(endpoint, params, None)
+            .await
+    }
+
+    async fn send_get_request_with_headers<T, P>(
+        &self,
+        endpoint: &str,
+        params: Option<&P>,
+        headers: Option<HashMap<String, String>>,
+    ) -> LighterHttpResult<T>
+    where
+        T: DeserializeOwned + LighterResponseCheck,
+        P: Serialize,
+    {
         let url = self.url(endpoint);
         let rate_limit_keys = Self::rate_limit_keys(endpoint);
         self.retry_manager
-            .execute_with_retry(
+            .invocation(
                 endpoint,
                 || {
                     let url = url.clone();
                     let rate_limit_keys = rate_limit_keys.clone();
+                    let headers = headers.clone();
+
                     async move {
                         let response = self
                             .client
-                            .request_with_params(
+                            .request_with_params_url_redacted(
                                 Method::GET,
                                 url,
                                 params,
-                                None,
+                                headers,
                                 None,
                                 None,
                                 Some(rate_limit_keys),
@@ -438,8 +519,9 @@ impl LighterRawHttpClient {
                     }
                 },
                 should_retry_lighter_http_error,
-                create_lighter_http_timeout_error,
+                |e| create_lighter_http_timeout_error(e.to_string()),
             )
+            .execute()
             .await
     }
 
@@ -482,6 +564,46 @@ impl LighterRawHttpClient {
         Self::parse_response(&response)
     }
 
+    // Single-shot because referral use changes account-level state and the API
+    // does not document idempotency for a response lost after submission.
+    async fn send_post_urlencoded<T>(
+        &self,
+        endpoint: &str,
+        fields: &[(&str, &str)],
+        auth_token: &str,
+    ) -> LighterHttpResult<T>
+    where
+        T: DeserializeOwned + LighterResponseCheck,
+    {
+        let mut serializer = form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(fields.iter().copied());
+        let body = serializer.finish().into_bytes();
+
+        let headers = HashMap::from([
+            ("Accept".to_string(), "application/json".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            ),
+            (HEADER_AUTHORIZATION.to_string(), auth_token.to_string()),
+        ]);
+
+        let response = self
+            .client
+            .request(
+                Method::POST,
+                self.url(endpoint),
+                None,
+                Some(headers),
+                Some(body),
+                None,
+                Some(Self::rate_limit_keys(endpoint)),
+            )
+            .await?;
+
+        Self::parse_response(&response)
+    }
+
     fn parse_response<T>(response: &HttpResponse) -> LighterHttpResult<T>
     where
         T: DeserializeOwned + LighterResponseCheck,
@@ -496,7 +618,8 @@ impl LighterRawHttpClient {
                 return Err(LighterHttpError::Http { status, body });
             }
 
-            if status == 429 {
+            // HTTP 405 is a Lighter rate-limit status like 429 per the docs, not a method error
+            if status == 429 || status == 405 {
                 return Err(LighterHttpError::RateLimit(body));
             }
 
@@ -509,11 +632,15 @@ impl LighterRawHttpClient {
             return Err(LighterHttpError::Http { status, body });
         }
 
-        if let Ok(result) = serde_json::from_slice::<LighterResultCode>(&response.body) {
-            Self::check_response(&result)?;
-        }
-
-        let payload: T = serde_json::from_slice(&response.body)?;
+        let payload: T = match serde_json::from_slice(&response.body) {
+            Ok(payload) => payload,
+            Err(payload_error) => {
+                if let Ok(result) = serde_json::from_slice::<LighterResultCode>(&response.body) {
+                    Self::check_response(&result)?;
+                }
+                return Err(payload_error.into());
+            }
+        };
         Self::check_response(&payload)?;
         Ok(payload)
     }
@@ -553,8 +680,13 @@ impl LighterRawHttpClient {
     }
 
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())])
+        create_standard_nautilus_headers().into_iter().collect()
     }
+}
+
+#[derive(Serialize)]
+struct LighterMakerOnlyApiKeysParams {
+    account_index: i64,
 }
 
 fn multipart_headers() -> HashMap<String, String> {
@@ -690,8 +822,12 @@ impl LighterHttpClient {
         query: &LighterOrderBookDetailsQuery,
     ) -> LighterHttpResult<LighterOrderBookDetails> {
         let response = self.inner.get_order_book_details(query).await?;
-        register_perp_order_book_details(&self.market_registry, &response.order_book_details);
-        register_spot_order_book_details(&self.market_registry, &response.spot_order_book_details);
+        parse_order_book_details_instruments_with_status(
+            &self.market_registry,
+            &response.order_book_details,
+            &response.spot_order_book_details,
+            self.generate_ts_init(),
+        )?;
         Ok(response)
     }
 
@@ -818,6 +954,57 @@ impl LighterHttpClient {
         self.inner.get_next_nonce(&query).await
     }
 
+    /// Calls `GET /api/v1/tx` for `tx_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_tx(&self, tx_hash: impl Into<String>) -> LighterHttpResult<LighterTx> {
+        self.inner
+            .get_tx(&LighterTxQuery {
+                by: LighterTxLookup::Hash,
+                value: tx_hash.into(),
+            })
+            .await
+    }
+
+    /// Calls `GET /api/v1/getMakerOnlyApiKeys` for `account_index`.
+    ///
+    /// `auth_token` is the canonical Lighter auth string minted from the
+    /// caller's credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_maker_only_api_keys(
+        &self,
+        account_index: i64,
+        auth_token: impl Into<SecretString>,
+    ) -> LighterHttpResult<LighterMakerOnlyApiKeys> {
+        let query = Zeroizing::new(LighterMakerOnlyApiKeysQuery {
+            authorization: Some(auth_token.into()),
+            auth: None,
+            account_index,
+        });
+        self.inner.get_maker_only_api_keys(&query).await
+    }
+
+    /// Applies `referral_code` to the L1 address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn use_referral(
+        &self,
+        l1_address: &str,
+        referral_code: &str,
+        auth_token: &SecretString,
+    ) -> LighterHttpResult<LighterResultCode> {
+        self.inner
+            .use_referral(l1_address, referral_code, auth_token.expose_secret())
+            .await
+    }
+
     /// Calls `POST /api/v1/sendTx`.
     ///
     /// # Errors
@@ -870,8 +1057,9 @@ impl LighterHttpClient {
     pub async fn request_trades(
         &self,
         instrument: &InstrumentAny,
-        mut query: LighterTradesQuery,
+        query: LighterTradesQuery,
     ) -> LighterHttpResult<Vec<TradeTick>> {
+        let mut query = Zeroizing::new(query);
         if query.market_id.is_none() {
             query.market_id = Some(self.market_index(instrument)?);
         }
@@ -884,19 +1072,20 @@ impl LighterHttpClient {
     /// # Errors
     ///
     /// Returns an error if the instrument has not been registered, the bar
-    /// type is unsupported, the request fails, or a candle cannot be parsed.
+    /// type is unsupported, the request fails, the page cap leaves part of the
+    /// requested range uncovered, or a candle cannot be parsed.
     pub async fn request_bars(
         &self,
         instrument: &InstrumentAny,
         bar_type: BarType,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<u32>,
     ) -> LighterHttpResult<Vec<Bar>> {
         let market_id = self.market_index(instrument)?;
         let resolution = LighterCandleResolution::try_from(&bar_type)?;
         let interval_ms = resolution.interval_millis();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         if let (Some(start), Some(end)) = (start, end)
             && start >= end
@@ -917,8 +1106,8 @@ impl LighterHttpClient {
         let requested_limit = limit.filter(|n| *n > 0).map(|n| n as usize);
         let target_limit = requested_limit.unwrap_or(DEFAULT_BARS_LIMIT);
         let start_was_unspecified = start.is_none();
-        let end_ms = end.timestamp_millis().max(0);
-        let now_ms = now.timestamp_millis();
+        let end_ms = end.as_millisecond().max(0);
+        let now_ms = now.as_millisecond();
 
         if end_ms == 0 {
             return Ok(Vec::new());
@@ -931,7 +1120,7 @@ impl LighterHttpClient {
                 let lookback_ms = interval_ms.saturating_mul(lookback_bars);
                 end_ms.saturating_sub(lookback_ms)
             },
-            |dt| dt.timestamp_millis().max(0),
+            |dt| dt.as_millisecond().max(0),
         );
 
         if start_ms >= end_ms {
@@ -971,6 +1160,7 @@ impl LighterHttpClient {
             for bar in page {
                 let bar_start_ms = i64::try_from(bar.ts_event.as_u64() / 1_000_000)
                     .map_err(|e| LighterHttpError::Parse(e.to_string()))?;
+
                 if bar_start_ms < cursor_ms
                     || bar_start_ms >= end_ms
                     || bar_start_ms.saturating_add(interval_ms) > now_ms
@@ -998,8 +1188,13 @@ impl LighterHttpClient {
             pages += 1;
         }
 
-        if pages >= MAX_BAR_REQUEST_PAGES {
-            log::warn!("Stopped Lighter bar request after {MAX_BAR_REQUEST_PAGES} pages");
+        let limit_satisfied =
+            !start_was_unspecified && requested_limit.is_some_and(|limit| bars.len() >= limit);
+        if pages >= MAX_BAR_REQUEST_PAGES && cursor_ms < end_ms && !limit_satisfied {
+            return Err(LighterHttpError::HistoryIncomplete {
+                data_type: "bar",
+                pages,
+            });
         }
 
         if start_was_unspecified && bars.len() > target_limit {
@@ -1018,13 +1213,13 @@ impl LighterHttpClient {
     /// # Errors
     ///
     /// Returns an error if the instrument is not a perpetual, the instrument
-    /// has not been registered, the request range is invalid, or a row cannot
-    /// be parsed.
+    /// has not been registered, the request range is invalid, the page cap
+    /// leaves part of the requested range uncovered, or a row cannot be parsed.
     pub async fn request_funding_rates(
         &self,
         instrument: &InstrumentAny,
-        start: Option<DateTime<Utc>>,
-        end: Option<DateTime<Utc>>,
+        start: Option<Timestamp>,
+        end: Option<Timestamp>,
         limit: Option<usize>,
     ) -> LighterHttpResult<Vec<FundingRateUpdate>> {
         if !matches!(instrument, InstrumentAny::CryptoPerpetual(_)) {
@@ -1037,7 +1232,7 @@ impl LighterHttpClient {
         let market_id = self.market_index(instrument)?;
         let resolution = LighterFundingResolution::OneHour;
         let interval_ms = resolution.interval_millis();
-        let now = Utc::now();
+        let now = Timestamp::now();
 
         if let (Some(start), Some(end)) = (start, end)
             && start >= end
@@ -1058,7 +1253,7 @@ impl LighterHttpClient {
         let requested_limit = limit.filter(|n| *n > 0);
         let target_limit = requested_limit.unwrap_or(DEFAULT_FUNDING_RATES_LIMIT);
         let start_was_unspecified = start.is_none();
-        let end_ms = end.timestamp_millis().max(0);
+        let end_ms = end.as_millisecond().max(0);
 
         if end_ms == 0 {
             return Ok(Vec::new());
@@ -1071,45 +1266,91 @@ impl LighterHttpClient {
                 let lookback_ms = interval_ms.saturating_mul(lookback_rows);
                 end_ms.saturating_sub(lookback_ms)
             },
-            |dt| dt.timestamp_millis().max(0),
+            |dt| dt.as_millisecond().max(0),
         );
 
         if start_ms >= end_ms {
             return Ok(Vec::new());
         }
 
-        let query = LighterFundingsQuery {
-            market_id,
-            resolution,
-            start_timestamp: start_ms,
-            end_timestamp: end_ms,
-            count_back: i64::try_from(target_limit).unwrap_or(i64::MAX),
-        };
-        let response = self.get_fundings(&query).await?;
         let ts_init = self.generate_ts_init();
         let interval = Some(resolution.interval_minutes());
-        let mut funding_rates = Vec::with_capacity(response.fundings.len());
+        let mut funding_rates = Vec::new();
+        let mut cursor_ms = start_ms;
+        let mut pages = 0_usize;
+        // `cap - 1`, not `cap`: the endpoint excludes `end_timestamp`, so a
+        // full-cap span with `count_back = cap` would drop the row at the cursor.
+        let page_span_ms =
+            interval_ms.saturating_mul(i64::from(LIGHTER_FUNDINGS_MAX_LIMIT.saturating_sub(1)));
 
-        for funding in &response.fundings {
-            let update = parse_funding_rate_update(funding, instrument.id(), interval, ts_init)
-                .map_err(LighterHttpError::from)?;
-            let timestamp_ms = i64::try_from(update.ts_event.as_u64() / 1_000_000)
-                .map_err(|e| LighterHttpError::Parse(e.to_string()))?;
-
-            if timestamp_ms < start_ms || timestamp_ms > end_ms {
-                continue;
+        while cursor_ms < end_ms && pages < MAX_FUNDING_REQUEST_PAGES {
+            if !start_was_unspecified
+                && let Some(limit) = requested_limit
+                && funding_rates.len() >= limit
+            {
+                break;
             }
-            funding_rates.push(update);
+
+            let window_end_ms = cursor_ms.saturating_add(page_span_ms).min(end_ms);
+            if window_end_ms <= cursor_ms {
+                break;
+            }
+
+            let query = LighterFundingsQuery {
+                market_id,
+                resolution,
+                start_timestamp: cursor_ms,
+                end_timestamp: window_end_ms,
+                count_back: i64::from(LIGHTER_FUNDINGS_MAX_LIMIT),
+            };
+            let response = self.get_fundings(&query).await?;
+
+            let mut page = Vec::with_capacity(response.fundings.len());
+            for funding in &response.fundings {
+                let update = parse_funding_rate_update(funding, instrument.id(), interval, ts_init)
+                    .map_err(LighterHttpError::from)?;
+                let timestamp_ms = i64::try_from(update.ts_event.as_u64() / 1_000_000)
+                    .map_err(|e| LighterHttpError::Parse(e.to_string()))?;
+
+                if timestamp_ms < cursor_ms || timestamp_ms > end_ms {
+                    continue;
+                }
+                page.push(update);
+            }
+
+            page.sort_by_key(|rate| rate.ts_event);
+            for update in page {
+                if funding_rates
+                    .last()
+                    .is_some_and(|last: &FundingRateUpdate| last.ts_event == update.ts_event)
+                {
+                    continue;
+                }
+                funding_rates.push(update);
+
+                if !start_was_unspecified
+                    && let Some(limit) = requested_limit
+                    && funding_rates.len() >= limit
+                {
+                    break;
+                }
+            }
+
+            cursor_ms = window_end_ms;
+            pages += 1;
         }
 
-        funding_rates.sort_by_key(|rate| rate.ts_event);
+        let limit_satisfied = !start_was_unspecified
+            && requested_limit.is_some_and(|limit| funding_rates.len() >= limit);
+        if pages >= MAX_FUNDING_REQUEST_PAGES && cursor_ms < end_ms && !limit_satisfied {
+            return Err(LighterHttpError::HistoryIncomplete {
+                data_type: "funding rate",
+                pages,
+            });
+        }
 
         if start_was_unspecified && funding_rates.len() > target_limit {
             funding_rates = funding_rates.split_off(funding_rates.len() - target_limit);
-        } else if let Some(limit) = requested_limit
-            && funding_rates.len() > limit
-        {
-            funding_rates.truncate(limit);
         }
 
         Ok(funding_rates)
@@ -1121,7 +1362,7 @@ impl LighterHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or an instrument cannot be parsed.
+    /// Returns an error if the request fails or nonempty metadata contains no valid instruments.
     pub async fn request_instruments(&self) -> LighterHttpResult<Vec<InstrumentAny>> {
         self.request_instruments_for_query(&LighterOrderBookDetailsQuery::default())
             .await
@@ -1131,7 +1372,7 @@ impl LighterHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or an instrument cannot be parsed.
+    /// Returns an error if the request fails or nonempty metadata contains no valid instruments.
     pub async fn request_instruments_with_status(
         &self,
     ) -> LighterHttpResult<Vec<(InstrumentAny, LighterMarketStatus)>> {
@@ -1225,7 +1466,7 @@ impl LighterHttpClient {
         &self,
         query: &LighterOrderBookDetailsQuery,
     ) -> LighterHttpResult<Vec<(InstrumentAny, LighterMarketStatus)>> {
-        let response = self.get_order_book_details(query).await?;
+        let response = self.inner.get_order_book_details(query).await?;
         let ts_init = self.generate_ts_init();
         parse_order_book_details_instruments_with_status(
             &self.market_registry,
@@ -1257,13 +1498,26 @@ impl LighterHttpClient {
         let ts_init = self.generate_ts_init();
         candles
             .iter()
-            .map(|candle| {
-                parse_candle_bar(candle, bar_type, instrument, ts_init).map_err(Into::into)
+            .filter_map(|candle| {
+                let has_positive_ohlc = candle.open > Decimal::ZERO
+                    && candle.high > Decimal::ZERO
+                    && candle.low > Decimal::ZERO
+                    && candle.close > Decimal::ZERO;
+
+                if !has_positive_ohlc {
+                    log::warn!(
+                        "Skipping Lighter candle at timestamp {} with non-positive OHLC values",
+                        candle.timestamp,
+                    );
+                    return None;
+                }
+
+                Some(parse_candle_bar(candle, bar_type, instrument, ts_init).map_err(Into::into))
             })
             .collect()
     }
 
-    fn market_index(&self, instrument: &InstrumentAny) -> LighterHttpResult<i16> {
+    fn market_index(&self, instrument: &InstrumentAny) -> LighterHttpResult<i64> {
         self.market_registry
             .market_index(&instrument.id())
             .ok_or_else(|| {
@@ -1288,9 +1542,26 @@ fn venue_error(code: i32, message: Option<&str>, default_message: &str) -> Light
 
 #[cfg(test)]
 mod tests {
+    use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_authenticated_client_rejects_redirects() {
+        let client = LighterRawHttpClient::new(LighterEnvironment::Testnet, None, 3, None)
+            .unwrap()
+            .client;
+        assert_http_redirect_rejected(|url| async move {
+            client
+                .get(url, None, None, Some(3), None)
+                .await
+                .unwrap()
+                .status
+                .as_u16()
+        })
+        .await;
+    }
 
     #[rstest]
     #[case(ENDPOINT_TRADES, "lighter:trades")]

@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
@@ -22,16 +23,17 @@ use pyo3::prelude::*;
 use crate::{
     average::rma::WilderMovingAverage,
     indicator::{Indicator, MovingAverage},
+    python::float_precision,
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl WilderMovingAverage {
-    /// Creates a new `WilderMovingAverage` instance.
+    /// Wilder moving average.
     #[new]
     #[pyo3(signature = (period, price_type=None))]
-    fn py_new(period: usize, price_type: Option<PriceType>) -> Self {
-        Self::new(period, price_type)
+    fn py_new(period: usize, price_type: Option<PriceType>) -> PyResult<Self> {
+        Self::new_checked(period, price_type).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -48,6 +50,12 @@ impl WilderMovingAverage {
     #[pyo3(name = "period")]
     const fn py_period(&self) -> usize {
         self.period
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    const fn py_price_type(&self) -> PriceType {
+        self.price_type
     }
 
     #[getter]
@@ -81,18 +89,23 @@ impl WilderMovingAverage {
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) {
-        self.py_update_raw(quote.extract_price(self.price_type).into());
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        float_precision::check_quote(quote)?;
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "handle_trade_tick")]
-    fn py_handle_trade_tick(&mut self, trade: &TradeTick) {
-        self.update_raw((&trade.price).into());
+    fn py_handle_trade_tick(&mut self, trade: &TradeTick) -> PyResult<()> {
+        float_precision::check_trade(trade)?;
+        self.handle_trade(trade);
+        Ok(())
     }
 
     #[pyo3(name = "handle_bar")]
-    fn py_handle_bar(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into());
+    fn py_handle_bar(&mut self, bar: &Bar) -> PyResult<()> {
+        float_precision::check_bar(bar)?;
+        self.handle_bar(bar);
+        Ok(())
     }
 
     #[pyo3(name = "reset")]

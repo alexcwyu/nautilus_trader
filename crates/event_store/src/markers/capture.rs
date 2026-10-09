@@ -25,7 +25,7 @@ use std::{
 };
 
 use ahash::AHashSet;
-use nautilus_core::UnixNanos;
+use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_system::event_store::DataMarkerConfig;
 
 use crate::{
@@ -51,6 +51,7 @@ pub struct DataMarkerCapture {
     hifi: AHashSet<String>,
     last_flush: UnixNanos,
     safety_flush_interval: Duration,
+    lane_failed: bool,
 }
 
 impl DataMarkerCapture {
@@ -71,6 +72,7 @@ impl DataMarkerCapture {
             hifi: config.high_fidelity.iter().cloned().collect(),
             last_flush: UnixNanos::default(),
             safety_flush_interval: config.safety_flush_interval,
+            lane_failed: false,
         }
     }
 
@@ -140,8 +142,10 @@ impl DataMarkerCapture {
         }
     }
 
-    fn submit_dict(&self, entry: StreamDictEntry) {
-        let _ = self.writer.put_dict(entry);
+    fn submit_dict(&mut self, entry: StreamDictEntry) {
+        if self.writer.put_dict(entry).is_err() {
+            self.note_lane_failure();
+        }
     }
 
     fn flush_snapshot(&mut self, now: UnixNanos) {
@@ -158,13 +162,26 @@ impl DataMarkerCapture {
     }
 
     fn submit_marker(&mut self, msg: MarkerMsg, marker_seq: u64) {
-        let _ = self.writer.submit(msg, marker_seq);
+        if self.writer.submit(msg, marker_seq).is_err() {
+            self.note_lane_failure();
+        }
         self.marker_seq = marker_seq;
+    }
+
+    // The marker lane is best-effort by contract, but its death must be visible:
+    // without this latch the run's marker_seq just ends with no diagnostic.
+    fn note_lane_failure(&mut self) {
+        if !self.lane_failed {
+            self.lane_failed = true;
+            log::error!(
+                "Marker writer lane failed; data marker capture is disabled for the rest of the run"
+            );
+        }
     }
 }
 
-fn duration_nanos_saturating(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+fn duration_nanos_saturating(duration: Duration) -> DurationNanos {
+    DurationNanos::try_from(duration).unwrap_or(DurationNanos::MAX)
 }
 
 #[cfg(test)]
@@ -273,11 +290,7 @@ mod tests {
         submit_counter: Arc<AtomicU64>,
     ) -> (DataMarkerCapture, SharedMemoryMarkerState) {
         let (wrapper, shared) = SharedMemoryMarker::new();
-        shared
-            .lock()
-            .expect("shared marker")
-            .open_run(manifest())
-            .expect("open marker run");
+        shared.lock().open_run(manifest()).expect("open marker run");
 
         let writer = MarkerWriter::spawn(
             Box::new(wrapper),
@@ -297,27 +310,15 @@ mod tests {
     }
 
     fn snapshots(shared: &SharedMemoryMarkerState) -> Vec<DataCursorSnapshot> {
-        shared
-            .lock()
-            .expect("shared marker")
-            .scan_snapshots()
-            .expect("scan snapshots")
+        shared.lock().scan_snapshots().expect("scan snapshots")
     }
 
     fn hifi(shared: &SharedMemoryMarkerState) -> Vec<HiFiMarker> {
-        shared
-            .lock()
-            .expect("shared marker")
-            .scan_hifi()
-            .expect("scan hifi")
+        shared.lock().scan_hifi().expect("scan hifi")
     }
 
     fn dict(shared: &SharedMemoryMarkerState) -> Vec<StreamDictEntry> {
-        shared
-            .lock()
-            .expect("shared marker")
-            .scan_dict()
-            .expect("scan dict")
+        shared.lock().scan_dict().expect("scan dict")
     }
 
     #[rstest]

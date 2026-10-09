@@ -19,6 +19,7 @@ use std::fmt::Debug;
 
 use ahash::AHashSet;
 use nautilus_common::actor::DataActor;
+use nautilus_core::DurationNanos;
 use nautilus_model::{
     data::QuoteTick,
     enums::{OrderSide, TimeInForce},
@@ -42,6 +43,7 @@ use crate::{
 /// A second instrument (typically a `SyntheticInstrument`) supplies a signal
 /// whose residual against a baseline shifts both sides up or down. Inventory
 /// skew shifts both sides in the opposite direction of the current position.
+/// With nonzero signal skew, quoting waits for a valid signal quote and baseline.
 /// Orders persist across ticks and are only replaced when either the anchor
 /// or the signal residual's price impact (`signal_skew_factor * residual`)
 /// moves by at least `requote_threshold_bps` of the anchor.
@@ -117,11 +119,20 @@ impl CompositeMarketMaker {
         self.should_requote_on_anchor(anchor) || self.should_requote_on_residual(residual, anchor)
     }
 
-    pub(super) fn signal_residual(&self) -> f64 {
-        match (self.last_signal, self.signal_baseline) {
-            (Some(signal), Some(baseline)) if baseline != 0.0 => signal / baseline - 1.0,
-            _ => 0.0,
+    pub(super) fn signal_residual(&self) -> Option<f64> {
+        if self.config.signal_skew_factor == 0.0 {
+            return Some(0.0);
         }
+
+        let signal = self.last_signal?;
+        let baseline = self.signal_baseline?;
+
+        if !signal.is_finite() || signal <= 0.0 || !baseline.is_finite() || baseline <= 0.0 {
+            return None;
+        }
+
+        let residual = signal / baseline - 1.0;
+        residual.is_finite().then_some(residual)
     }
 
     pub(super) fn compute_quotes(
@@ -197,6 +208,30 @@ nautilus_strategy!(CompositeMarketMaker, {
         self.last_quoted_anchor = None;
         self.last_quoted_residual = None;
     }
+
+    fn on_order_filled(&mut self, event: &OrderFilled) {
+        let closed = {
+            let cache = self.cache();
+            cache
+                .order(&event.client_order_id)
+                .is_some_and(|o| o.is_closed())
+        };
+
+        if closed {
+            self.pending_self_cancels.remove(&event.client_order_id);
+        }
+    }
+
+    fn on_order_canceled(&mut self, event: &OrderCanceled) {
+        if self.pending_self_cancels.remove(&event.client_order_id) {
+            return;
+        }
+
+        if self.config.on_cancel_resubmit {
+            self.last_quoted_anchor = None;
+            self.last_quoted_residual = None;
+        }
+    }
 });
 
 impl Debug for CompositeMarketMaker {
@@ -217,14 +252,10 @@ impl DataActor for CompositeMarketMaker {
 
         let (instrument, size_precision, min_quantity) = {
             let cache = self.cache();
-            let instrument = cache
-                .instrument(&instrument_id)
-                .ok_or_else(|| anyhow::anyhow!("Instrument {instrument_id} not found in cache"))?;
-            (
-                instrument.clone(),
-                instrument.size_precision(),
-                instrument.min_quantity(),
-            )
+            let instrument = cache.try_instrument(&instrument_id)?;
+            let size_precision = instrument.size_precision();
+            let min_quantity = instrument.min_quantity();
+            (instrument, size_precision, min_quantity)
         };
         self.price_precision = Some(instrument.price_precision());
         self.instrument = Some(instrument);
@@ -242,8 +273,8 @@ impl DataActor for CompositeMarketMaker {
     fn on_stop(&mut self) -> anyhow::Result<()> {
         let instrument_id = self.config.instrument_id;
         let signal_instrument_id = self.config.signal_instrument_id;
-        self.cancel_all_orders(instrument_id, None, None, None)?;
-        self.close_all_positions(instrument_id, None, None, None, None, None, None)?;
+        self.cancel_all_orders(instrument_id, None, None, true, None)?;
+        self.close_all_positions(instrument_id, None, None, None, None, None, None, None)?;
         self.unsubscribe_quotes(instrument_id, None, None);
         self.unsubscribe_quotes(signal_instrument_id, None, None);
         Ok(())
@@ -251,7 +282,14 @@ impl DataActor for CompositeMarketMaker {
 
     fn on_quote(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         if quote.instrument_id == self.config.signal_instrument_id {
-            let signal_mid = (quote.bid_price.as_f64() + quote.ask_price.as_f64()) / 2.0;
+            let bid = quote.bid_price.as_f64();
+            let ask = quote.ask_price.as_f64();
+
+            if bid <= 0.0 || ask <= 0.0 || bid > ask {
+                return Ok(());
+            }
+
+            let signal_mid = f64::midpoint(bid, ask);
             self.last_signal = Some(signal_mid);
             if self.signal_baseline.is_none() {
                 self.signal_baseline = Some(signal_mid);
@@ -263,15 +301,18 @@ impl DataActor for CompositeMarketMaker {
             return Ok(());
         }
 
-        let anchor_f64 = (quote.bid_price.as_f64() + quote.ask_price.as_f64()) / 2.0;
+        let Some(signal_residual) = self.signal_residual() else {
+            return Ok(());
+        };
+
+        let anchor_f64 = f64::midpoint(quote.bid_price.as_f64(), quote.ask_price.as_f64());
         let price_precision = self.price_precision.ok_or_else(|| {
             anyhow::anyhow!("Cannot handle quote: price_precision is not resolved")
         })?;
         let anchor = Price::new(anchor_f64, price_precision);
 
-        let signal_residual = self.signal_residual();
         let instrument_id = self.config.instrument_id;
-        let strategy_id = StrategyId::from(self.actor_id.inner().as_str());
+        let strategy_id = self.strategy_id().expect("Strategy must be registered");
 
         let has_resting = {
             let cache = self.cache();
@@ -296,69 +337,19 @@ impl DataActor for CompositeMarketMaker {
             let strategy = Some(&strategy_id);
             let ids: Vec<ClientOrderId> = {
                 let cache = self.cache();
-                cache
-                    .orders_open(None, inst, strategy, None, None)
-                    .iter()
-                    .chain(
-                        cache
-                            .orders_inflight(None, inst, strategy, None, None)
-                            .iter(),
-                    )
-                    .map(|o| o.client_order_id())
+                let open = cache.orders_open(None, inst, strategy, None, None);
+                let inflight = cache.orders_inflight(None, inst, strategy, None, None);
+                open.iter()
+                    .chain(inflight.iter())
+                    .map(Order::client_order_id)
                     .collect()
             };
             self.pending_self_cancels.extend(ids);
         }
 
-        self.cancel_all_orders(instrument_id, None, None, None)?;
+        self.cancel_all_orders(instrument_id, None, None, true, None)?;
 
-        let (net_position, worst_long, worst_short) = {
-            let instrument_id = Some(&instrument_id);
-            let strategy = Some(&strategy_id);
-            let cache = self.cache();
-
-            let mut position_qty = 0.0_f64;
-            let mut position_dec = Decimal::ZERO;
-
-            for p in cache.positions_open(None, instrument_id, strategy, None, None) {
-                position_qty += p.signed_qty;
-                position_dec += p.quantity.as_decimal()
-                    * if p.signed_qty < 0.0 {
-                        Decimal::NEGATIVE_ONE
-                    } else {
-                        Decimal::ONE
-                    };
-            }
-
-            let mut pending_buy_dec = Decimal::ZERO;
-            let mut pending_sell_dec = Decimal::ZERO;
-            let mut seen = AHashSet::new();
-
-            for order in cache
-                .orders_open(None, instrument_id, strategy, None, None)
-                .iter()
-                .chain(
-                    cache
-                        .orders_inflight(None, instrument_id, strategy, None, None)
-                        .iter(),
-                )
-            {
-                if !seen.insert(order.client_order_id()) {
-                    continue;
-                }
-                let qty = order.leaves_qty().as_decimal();
-                match order.order_side() {
-                    OrderSide::Buy => pending_buy_dec += qty,
-                    _ => pending_sell_dec += qty,
-                }
-            }
-
-            (
-                position_qty,
-                position_dec + pending_buy_dec,
-                position_dec - pending_sell_dec,
-            )
-        };
+        let (net_position, worst_long, worst_short) = self.position_exposure(strategy_id);
 
         let quotes = self.compute_quotes(
             anchor,
@@ -378,15 +369,14 @@ impl DataActor for CompositeMarketMaker {
 
         let (tif, expire_time) = match self.config.expire_time_secs {
             Some(secs) => {
-                let now_ns = self.core.clock().timestamp_ns();
-                let expire_ns = now_ns + secs * 1_000_000_000;
+                let expire_ns = self.clock().timestamp_ns() + DurationNanos::try_from_secs(secs)?;
                 (Some(TimeInForce::Gtd), Some(expire_ns))
             }
             None => (None, None),
         };
 
         for (side, price) in quotes {
-            let order = self.core.order_factory().limit(
+            let order = self.order().limit(
                 instrument_id,
                 side,
                 trade_size,
@@ -412,32 +402,6 @@ impl DataActor for CompositeMarketMaker {
         Ok(())
     }
 
-    fn on_order_filled(&mut self, event: &OrderFilled) -> anyhow::Result<()> {
-        let closed = {
-            let cache = self.cache();
-            cache
-                .order(&event.client_order_id)
-                .is_some_and(|o| o.is_closed())
-        };
-
-        if closed {
-            self.pending_self_cancels.remove(&event.client_order_id);
-        }
-        Ok(())
-    }
-
-    fn on_order_canceled(&mut self, event: &OrderCanceled) -> anyhow::Result<()> {
-        if self.pending_self_cancels.remove(&event.client_order_id) {
-            return Ok(());
-        }
-
-        if self.config.on_cancel_resubmit {
-            self.last_quoted_anchor = None;
-            self.last_quoted_residual = None;
-        }
-        Ok(())
-    }
-
     fn on_reset(&mut self) -> anyhow::Result<()> {
         self.instrument = None;
         self.trade_size = self.config.trade_size;
@@ -448,5 +412,50 @@ impl DataActor for CompositeMarketMaker {
         self.last_signal = None;
         self.pending_self_cancels.clear();
         Ok(())
+    }
+}
+
+impl CompositeMarketMaker {
+    fn position_exposure(&self, strategy_id: StrategyId) -> (f64, Decimal, Decimal) {
+        let instrument_id = Some(&self.config.instrument_id);
+        let strategy = Some(&strategy_id);
+        let cache = self.cache();
+
+        let mut position_qty = 0.0_f64;
+        let mut position_dec = Decimal::ZERO;
+
+        for p in cache.positions_open(None, instrument_id, strategy, None, None) {
+            position_qty += p.signed_qty;
+            position_dec += p.quantity.as_decimal()
+                * if p.signed_qty < 0.0 {
+                    Decimal::NEGATIVE_ONE
+                } else {
+                    Decimal::ONE
+                };
+        }
+
+        let mut pending_buy_dec = Decimal::ZERO;
+        let mut pending_sell_dec = Decimal::ZERO;
+        let mut seen = AHashSet::new();
+
+        let open = cache.orders_open(None, instrument_id, strategy, None, None);
+        let inflight = cache.orders_inflight(None, instrument_id, strategy, None, None);
+        for order in open.iter().chain(inflight.iter()) {
+            if !seen.insert(order.client_order_id()) {
+                continue;
+            }
+
+            let qty = order.leaves_qty().as_decimal();
+            match order.order_side() {
+                OrderSide::Buy => pending_buy_dec += qty,
+                _ => pending_sell_dec += qty,
+            }
+        }
+
+        (
+            position_qty,
+            position_dec + pending_buy_dec,
+            position_dec - pending_sell_dec,
+        )
     }
 }

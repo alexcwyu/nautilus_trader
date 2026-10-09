@@ -13,17 +13,41 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+//! Kernel construction, component ownership, and run-lifecycle orchestration.
+//!
+//! # Architecture
+//!
+//! [`NautilusKernel`] owns the shared clock, cache, portfolio, trader, order emulator, and data,
+//! risk, and execution engines around an in-process message bus. These components use
+//! `Rc<RefCell<_>>`, so the kernel is not a cross-thread synchronization boundary.
+//!
+//! # Lifecycle
+//!
+//! Construction initializes logging, optional persistence, message-bus handlers, and shutdown
+//! routing. Normal startup starts the engines before initializing the trader. Live callers then
+//! connect data clients, let instrument events populate the cache, connect execution clients, and
+//! call [`NautilusKernel::start_trader`]. Event-store replay instead restores state and skips
+//! engines, clients, trader startup, and live reconciliation.
+//!
+//! Shutdown is split so [`NautilusKernel::stop_trader`] can emit residual events before
+//! [`NautilusKernel::finalize_stop`] saves state, stops engines, cancels timers, and seals the
+//! event-store run. [`NautilusKernel::reset`] retains the assembled system for reuse, while
+//! [`NautilusKernel::dispose`] releases its resources.
+
+#[cfg(feature = "streaming")]
+use std::collections::HashSet;
 use std::{
     cell::{Cell, Ref, RefCell},
+    fmt::Debug,
     rc::Rc,
     time::Duration,
 };
 
 use nautilus_common::{
     cache::{Cache, CacheConfig, database::CacheDatabaseAdapter},
-    clock::{Clock, TestClock},
+    clock::Clock,
     component::Component,
-    enums::Environment,
+    enums::{ComponentState, Environment},
     logging::{
         arm_shutdown_on_error, disarm_shutdown_on_error, headers, init_logging,
         logger::{LogGuard, LoggerConfig},
@@ -37,14 +61,31 @@ use nautilus_common::{
 };
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_data::engine::DataEngine;
-use nautilus_execution::{engine::ExecutionEngine, order_emulator::adapter::OrderEmulatorAdapter};
+use nautilus_execution::{
+    engine::ExecutionEngine,
+    order_emulator::{adapter::OrderEmulatorAdapter, emulator::OrderEmulator},
+};
 use nautilus_model::identifiers::{ClientId, TraderId};
+#[cfg(feature = "streaming")]
+use nautilus_persistence::{
+    backend::{default_catalog_factories, default_writer_factories},
+    catalog::factory::create_catalog,
+    common::paths::{create_local_directory, environment_directory},
+    config::{DataCatalogConfig, StreamingConfig},
+    writer::{
+        factory::{WriterConnectConfig, create_writer, replace_existing_writer_data},
+        feather::WriterClock,
+        filter::WriterRecordFilter,
+        subscription::StreamingSinkSubscription,
+    },
+};
 use nautilus_portfolio::portfolio::Portfolio;
 use nautilus_risk::engine::RiskEngine;
 use ustr::Ustr;
 
 use crate::{
     builder::NautilusKernelBuilder,
+    clock_factory::ClockFactory,
     config::NautilusKernelConfig,
     event_store::{EventStoreFactory, KernelEventStore, RegisteredComponents},
     trader::Trader,
@@ -53,7 +94,6 @@ use crate::{
 /// Core Nautilus system kernel.
 ///
 /// Orchestrates data and execution engines, cache, clock, and messaging across environments.
-#[derive(Debug)]
 pub struct NautilusKernel {
     /// The kernel name (for logging and identification).
     pub name: String,
@@ -90,9 +130,161 @@ pub struct NautilusKernel {
     shutdown_requested: Rc<Cell<bool>>,
     event_store: Option<Box<dyn KernelEventStore>>,
     event_store_replay: bool,
+    state_save_armed: bool,
+    #[cfg(feature = "streaming")]
+    streaming_writer: Option<(String, StreamingSinkSubscription)>,
+}
+
+impl Debug for NautilusKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(NautilusKernel))
+            .field("name", &self.name)
+            .field("instance_id", &self.instance_id)
+            .field("machine_id", &self.machine_id)
+            .field("environment", &self.config.environment())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Optional construction-time dependencies for [`NautilusKernel`].
+#[derive(Default)]
+pub struct NautilusKernelDependencies {
+    clock_factory: Option<ClockFactory>,
+    cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
+    event_store_factory: Option<EventStoreFactory>,
+}
+
+impl Debug for NautilusKernelDependencies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(NautilusKernelDependencies))
+            .field("clock_factory", &self.clock_factory.is_some())
+            .field("cache_database", &self.cache_database.is_some())
+            .field("event_store_factory", &self.event_store_factory.is_some())
+            .finish()
+    }
+}
+
+impl NautilusKernelDependencies {
+    /// Add a clock factory.
+    #[must_use]
+    pub fn with_clock_factory(mut self, clock_factory: Option<ClockFactory>) -> Self {
+        self.clock_factory = clock_factory;
+        self
+    }
+
+    /// Add a cache database adapter.
+    #[must_use]
+    pub fn with_cache_database(
+        mut self,
+        cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
+    ) -> Self {
+        self.cache_database = cache_database;
+        self
+    }
+
+    /// Add an event-store factory.
+    #[must_use]
+    pub fn with_event_store_factory(
+        mut self,
+        event_store_factory: Option<EventStoreFactory>,
+    ) -> Self {
+        self.event_store_factory = event_store_factory;
+        self
+    }
 }
 
 impl NautilusKernel {
+    #[cfg(feature = "streaming")]
+    fn setup_streaming_writer(
+        environment: Environment,
+        instance_id: UUID4,
+        config: &StreamingConfig,
+        clock: &Rc<RefCell<dyn Clock>>,
+    ) -> anyhow::Result<(String, StreamingSinkSubscription)> {
+        config.validate()?;
+
+        let writer_path = config.writer_path.trim_end_matches('/');
+        let uri = format!(
+            "{writer_path}/{}/{instance_id}",
+            environment_directory(environment)
+        );
+        let catalog = config
+            .catalog
+            .as_ref()
+            .map(DataCatalogConfig::connect_config);
+        let mut connect = WriterConnectConfig::new(&uri, catalog);
+        connect.rotation_config = config.rotation_config.to_writer_rotation_config()?;
+        connect.flush_interval_ms = Some(config.flush_interval_ms);
+        connect.params.clone_from(&config.params);
+        connect.record_filter = Self::writer_record_filter(config);
+        connect.promotion_interval_ms = config.promotion_interval_ms;
+        connect.promote_on_close = config.promote_on_close;
+        connect.delete_feather_after_promotion = config.delete_feather_after_promotion;
+        connect.use_ts_event_for_ts_init = config.use_ts_event_for_ts_init;
+
+        if config.replace_existing {
+            // Writer creation follows replacement, so open the catalog first to fail before the
+            // run directory is emptied.
+            if let Some(catalog) = &config.catalog
+                && let Some(catalog_connect) = &connect.catalog
+            {
+                create_local_directory(&catalog_connect.uri)?;
+                create_catalog(
+                    catalog.catalog_backend(),
+                    catalog_connect,
+                    &default_catalog_factories(),
+                )?;
+            }
+
+            replace_existing_writer_data(&connect)?;
+        }
+
+        let (writer_clock, bridge) = WriterClock::from_shared_clock(clock);
+        let sink = create_writer(
+            &config.writer_backend(),
+            &connect,
+            writer_clock,
+            &default_writer_factories(),
+        )?;
+        let subscription = StreamingSinkSubscription::subscribe_named(
+            Rc::new(RefCell::new(sink)),
+            bridge.map(|atomic| (Rc::clone(clock), atomic)),
+            uri.clone(),
+        );
+
+        log::info!("Writing data and events to {uri}");
+        Ok((uri, subscription))
+    }
+
+    #[cfg(feature = "streaming")]
+    fn writer_record_filter(config: &StreamingConfig) -> Option<WriterRecordFilter> {
+        let mut filter = config
+            .record_types
+            .clone()
+            .map(WriterRecordFilter::from_record_types)
+            .unwrap_or_default();
+
+        if let Some(data_types) = &config.data_types {
+            for data_type in data_types {
+                filter.insert(data_type.clone(), None);
+            }
+        }
+
+        if let Some(instrument_types) = &config.instrument_types {
+            for instrument_type in instrument_types {
+                filter.insert_instrument_type(*instrument_type);
+            }
+        }
+
+        if let Some(entries) = &config.record_filters {
+            for entry in entries {
+                filter.insert(entry.record_type, entry.identifiers.clone());
+            }
+        }
+
+        (!filter.is_empty()).then_some(filter)
+    }
+
     /// Create a new [`NautilusKernelBuilder`] for fluent configuration.
     #[must_use]
     pub const fn builder(
@@ -147,6 +339,34 @@ impl NautilusKernel {
         cache_database: Option<Box<dyn CacheDatabaseAdapter>>,
         event_store_factory: Option<EventStoreFactory>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_dependencies(
+            name,
+            config,
+            NautilusKernelDependencies::default()
+                .with_cache_database(cache_database)
+                .with_event_store_factory(event_store_factory),
+        )
+    }
+
+    /// Create a new [`NautilusKernel`] instance with construction-time dependencies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the kernel fails to initialize or an injected factory fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "kernel construction keeps initialization order and ownership visible in one place"
+    )]
+    pub fn new_with_dependencies<T: NautilusKernelConfig + 'static>(
+        name: String,
+        config: T,
+        dependencies: NautilusKernelDependencies,
+    ) -> anyhow::Result<Self> {
+        let NautilusKernelDependencies {
+            clock_factory,
+            cache_database,
+            event_store_factory,
+        } = dependencies;
         let instance_id = config.instance_id().unwrap_or_default();
         let machine_id = Self::determine_machine_id()?;
 
@@ -161,7 +381,9 @@ impl NautilusKernel {
 
         log::info!("Building system kernel");
 
-        let clock = Self::initialize_clock(&config.environment());
+        let clock_factory =
+            clock_factory.unwrap_or_else(|| ClockFactory::for_environment(config.environment()));
+        let clock = clock_factory.clock();
         let event_store = match event_store_factory {
             Some(factory) => Some(factory(instance_id, clock.clone())?),
             None => None,
@@ -176,9 +398,15 @@ impl NautilusKernel {
         )));
         set_message_bus(msgbus);
 
+        if let Some(config) = config.msgbus()
+            && let Some(filter) = config.types_filter
+        {
+            get_message_bus().borrow_mut().set_types_filter(filter);
+        }
+
         let portfolio = Rc::new(RefCell::new(Portfolio::new(
-            cache.clone(),
             clock.clone(),
+            cache.clone(),
             config.portfolio(),
         )));
 
@@ -193,15 +421,51 @@ impl NautilusKernel {
         let exec_engine = ExecutionEngine::new(clock.clone(), cache.clone(), config.exec_engine());
         let exec_engine = Rc::new(RefCell::new(exec_engine));
 
-        let order_emulator =
-            OrderEmulatorAdapter::new(config.trader_id(), clock.clone(), cache.clone());
+        let order_emulator = OrderEmulatorAdapter::new(clock.clone(), cache.clone());
 
         let data_engine = DataEngine::new(clock.clone(), cache.clone(), config.data_engine());
+        #[cfg(feature = "streaming")]
+        let mut data_engine = data_engine;
+        #[cfg(feature = "streaming")]
+        {
+            let catalog_factories = default_catalog_factories();
+            let mut unnamed_index = 0;
+            let mut catalog_names = HashSet::new();
+
+            for catalog_config in config.catalogs() {
+                let name = catalog_config.name().map_or_else(
+                    || {
+                        let name = format!("catalog_{unnamed_index}");
+                        unnamed_index += 1;
+                        name
+                    },
+                    str::to_owned,
+                );
+                anyhow::ensure!(
+                    catalog_names.insert(name.clone()),
+                    "Duplicate data catalog name '{name}'",
+                );
+
+                let catalog = create_catalog(
+                    catalog_config.catalog_backend(),
+                    &catalog_config.connect_config(),
+                    &catalog_factories,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to create data catalog from '{}': {e:#}",
+                        catalog_config.path()
+                    )
+                })?;
+                data_engine.register_catalog(catalog, Some(&name));
+            }
+        }
         let data_engine = Rc::new(RefCell::new(data_engine));
 
         DataEngine::register_msgbus_handlers(&data_engine);
         RiskEngine::register_msgbus_handlers(&risk_engine);
         ExecutionEngine::register_msgbus_handlers(&exec_engine);
+        OrderEmulator::register_msgbus_handlers(&order_emulator.emulator());
 
         let shutdown_requested = Rc::new(Cell::new(false));
         Self::register_shutdown_handler(config.trader_id(), shutdown_requested.clone());
@@ -210,12 +474,20 @@ impl NautilusKernel {
             config.trader_id(),
             instance_id,
             config.environment(),
-            clock.clone(),
+            clock_factory,
             cache.clone(),
             portfolio.clone(),
         )));
 
         let ts_created = clock.borrow().timestamp_ns();
+
+        #[cfg(feature = "streaming")]
+        let streaming_writer = config
+            .streaming()
+            .map(|streaming| {
+                Self::setup_streaming_writer(config.environment(), instance_id, &streaming, &clock)
+            })
+            .transpose()?;
 
         Ok(Self {
             name,
@@ -237,13 +509,16 @@ impl NautilusKernel {
             ts_shutdown: None,
             shutdown_requested,
             event_store_replay: false,
+            state_save_armed: false,
+            #[cfg(feature = "streaming")]
+            streaming_writer,
         })
     }
 
     fn register_shutdown_handler(trader_id: TraderId, shutdown_requested: Rc<Cell<bool>>) {
         let handler = ShareableMessageHandler::from_typed(move |cmd: &ShutdownSystem| {
             if cmd.trader_id != trader_id {
-                log::warn!("Received {cmd} not for this trader {trader_id}, ignoring",);
+                log::warn!("Received {cmd} not for this trader {trader_id}, ignoring");
                 return;
             }
 
@@ -301,27 +576,6 @@ impl NautilusKernel {
         }
 
         Ok(log_guard)
-    }
-
-    fn initialize_clock(environment: &Environment) -> Rc<RefCell<dyn Clock>> {
-        match environment {
-            Environment::Backtest => {
-                let test_clock = TestClock::new();
-                Rc::new(RefCell::new(test_clock))
-            }
-            #[cfg(feature = "live")]
-            Environment::Live | Environment::Sandbox => {
-                let live_clock = nautilus_common::live::clock::LiveClock::default(); // nautilus-import-ok
-                Rc::new(RefCell::new(live_clock))
-            }
-            #[cfg(not(feature = "live"))]
-            Environment::Live | Environment::Sandbox => {
-                panic!(
-                    "Live/Sandbox environment requires the 'live' feature to be enabled. \
-                     Build with `--features live` or add `features = [\"live\"]` to your dependency."
-                );
-            }
-        }
     }
 
     fn initialize_cache(
@@ -546,10 +800,15 @@ impl NautilusKernel {
 
         self.start_engines();
 
-        log::info!("Initializing trader");
-        if let Err(e) = self.trader.borrow_mut().initialize() {
-            log::error!("Error initializing trader: {e:?}");
-            return;
+        // `Trader::reset` ends in `Ready`, where `initialize` is an invalid transition
+        let trader_state = self.trader.borrow().state();
+        if trader_state == ComponentState::PreInitialized {
+            log::info!("Initializing trader");
+
+            if let Err(e) = self.trader.borrow_mut().initialize() {
+                log::error!("Error initializing trader: {e:?}");
+                return;
+            }
         }
 
         // Execution and data clients are started by their engines via `start_engines` above
@@ -582,6 +841,10 @@ impl NautilusKernel {
     }
 
     /// Starts the Nautilus system kernel asynchronously.
+    #[expect(
+        clippy::unused_async,
+        reason = "keeps the public async kernel API shape stable"
+    )]
     pub async fn start_async(&mut self) {
         self.start();
     }
@@ -589,12 +852,49 @@ impl NautilusKernel {
     /// Starts the trader (strategies and actors).
     ///
     /// This should be called after clients are connected and instruments are cached.
-    pub fn start_trader(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the trader or a registered component fails to start. A failed partial
+    /// start is stopped immediately before the error is returned.
+    pub fn start_trader(&mut self) -> anyhow::Result<()> {
         log::info!("Starting trader...");
-        if let Err(e) = self.trader.borrow_mut().start() {
-            log::error!("Error starting trader: {e:?}");
+
+        let load_state = self.config.load_state();
+        let save_state = self.config.save_state();
+
+        if (load_state || save_state) && !self.cache.borrow().has_backing() {
+            log::warn!(
+                "Cache has no database backing, load_state={load_state} and save_state={save_state} will have no effect"
+            );
         }
+
+        if load_state {
+            Trader::load_state(&self.trader)
+                .map_err(|e| anyhow::anyhow!("Failed to load actor and strategy state: {e:#}"))?;
+        }
+
+        self.state_save_armed = save_state;
+        self.order_emulator.start();
+
+        if let Err(start_err) = Trader::start_with_component_callbacks(&self.trader) {
+            let stop_result = self.stop_trader_after_start_failure();
+            self.order_emulator.stop();
+            let save_result = self.save_trader_state();
+
+            let mut errors = vec![format!("Failed to start trader: {start_err}")];
+            if let Err(e) = stop_result {
+                errors.push(format!("failed to stop partial trader start: {e}"));
+            }
+
+            if let Err(e) = save_result {
+                errors.push(format!("failed to save partial trader state: {e}"));
+            }
+            anyhow::bail!("{}", errors.join("; "));
+        }
+
         log::info!("Trader started");
+        Ok(())
     }
 
     /// Stops the trader and its registered components.
@@ -616,15 +916,46 @@ impl NautilusKernel {
         }
     }
 
+    /// Stops a partially started trader without deferring managed strategy shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any active trader component cannot be stopped.
+    pub fn stop_trader_after_start_failure(&mut self) -> anyhow::Result<()> {
+        disarm_shutdown_on_error();
+
+        if !matches!(
+            self.trader.borrow().state(),
+            ComponentState::Starting | ComponentState::Running
+        ) {
+            return Ok(());
+        }
+
+        log::info!("Stopping trader immediately...");
+        self.trader.borrow_mut().stop_after_start_failure()
+    }
+
     /// Finalizes the kernel shutdown after the grace period.
     ///
     /// This method should be called after the residual events grace period has elapsed
     /// and all remaining events have been processed. It disconnects clients and stops engines.
-    pub async fn finalize_stop(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if actor or strategy state cannot be saved.
+    #[allow(unknown_lints)]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "keeps the public async kernel API shape stable"
+    )]
+    pub async fn finalize_stop(&mut self) -> anyhow::Result<()> {
         disarm_shutdown_on_error();
 
         // Execution and data clients are stopped by their engines via `stop_engines` below
 
+        let save_result = self.save_trader_state();
+        self.portfolio.borrow_mut().finalize_equity_curve();
         self.stop_engines();
         self.cancel_timers();
 
@@ -636,6 +967,21 @@ impl NautilusKernel {
         }
         self.ts_shutdown = Some(ts_shutdown);
         log::info!("Stopped");
+        save_result?;
+        self.flush_streaming_writer()
+    }
+
+    /// Saves actor and strategy state at most once for the current trader run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a component callback or cache persistence operation fails.
+    pub fn save_trader_state(&mut self) -> anyhow::Result<()> {
+        if !std::mem::take(&mut self.state_save_armed) {
+            return Ok(());
+        }
+
+        Trader::save_state(&self.trader)
     }
 
     /// Returns the kernel-managed event-store integration, when one was injected.
@@ -674,10 +1020,12 @@ impl NautilusKernel {
         self.data_engine.borrow_mut().reset();
         self.exec_engine.borrow_mut().reset();
         self.risk_engine.borrow_mut().reset();
+        self.order_emulator.reset();
         self.portfolio.borrow_mut().reset();
 
         self.ts_started = None;
         self.ts_shutdown = None;
+        self.state_save_armed = false;
 
         log::info!("Reset");
     }
@@ -687,8 +1035,34 @@ impl NautilusKernel {
         disarm_shutdown_on_error();
         log::info!("Disposing");
 
-        if let Err(e) = self.trader.borrow_mut().dispose() {
-            log::error!("Error disposing trader: {e:?}");
+        let trader_state = self.trader.borrow().state();
+        match trader_state {
+            ComponentState::Running => self.stop_trader(),
+            ComponentState::Starting => {
+                if let Err(e) = self.stop_trader_after_start_failure() {
+                    log::error!("Error stopping partial trader start during disposal: {e:?}");
+                }
+            }
+            _ => {}
+        }
+
+        if let Err(e) = self.save_trader_state() {
+            log::error!("Error saving trader state during disposal: {e:?}");
+        }
+
+        {
+            let mut trader = self.trader.borrow_mut();
+            if trader.state() == ComponentState::PreInitialized
+                && let Err(e) = trader.initialize()
+            {
+                log::error!("Error initializing trader for disposal: {e:?}");
+            }
+
+            if !trader.is_disposed()
+                && let Err(e) = trader.dispose()
+            {
+                log::error!("Error disposing trader: {e:?}");
+            }
         }
 
         self.stop_engines();
@@ -705,13 +1079,92 @@ impl NautilusKernel {
             event_store.seal(ts_dispose);
         }
 
+        if let Err(e) = self.close_streaming_writer() {
+            log::warn!("{e}");
+        }
+
         self.data_engine.borrow_mut().dispose();
         self.exec_engine.borrow_mut().dispose();
         self.risk_engine.borrow_mut().dispose();
+        self.order_emulator.dispose();
         self.cache.borrow_mut().dispose();
         get_message_bus().borrow_mut().dispose();
 
         log::info!("Disposed");
+    }
+
+    /// Reopens the configured streaming writer after [`Self::close_streaming_writer`].
+    ///
+    /// A reset engine runs again under the same instance ID, so the writer reopens in the same
+    /// run folder and keeps the files the previous run wrote there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer cannot be created.
+    pub fn reopen_streaming_writer(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "streaming")]
+        if self.streaming_writer.is_none()
+            && let Some(mut config) = self.config.streaming()
+        {
+            config.replace_existing = false;
+            self.streaming_writer = Some(Self::setup_streaming_writer(
+                self.config.environment(),
+                self.instance_id,
+                &config,
+                &self.clock,
+            )?);
+        }
+
+        Ok(())
+    }
+
+    // Live shutdown still processes drained events after this, so the writer stays subscribed
+    // until dispose closes it.
+    #[cfg(feature = "streaming")]
+    fn flush_streaming_writer(&self) -> anyhow::Result<()> {
+        match &self.streaming_writer {
+            Some((destination, writer)) => writer.flush().map_err(|e| {
+                anyhow::anyhow!("Failed to flush streaming writer at {destination}: {e}")
+            }),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(not(feature = "streaming"))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        clippy::unused_self,
+        reason = "matches the streaming variant's signature"
+    )]
+    fn flush_streaming_writer(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Closes the configured streaming writer, sealing its open files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write recorded since the last flush failed, or if sealing or
+    /// promoting the writer's files fails.
+    #[cfg(feature = "streaming")]
+    pub fn close_streaming_writer(&mut self) -> anyhow::Result<()> {
+        match self.streaming_writer.take() {
+            Some((destination, writer)) => writer.close().map_err(|e| {
+                anyhow::anyhow!("Failed to close streaming writer at {destination}: {e}")
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Closes the configured streaming writer, sealing its open files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a write recorded since the last flush failed, or if sealing or
+    /// promoting the writer's files fails.
+    #[cfg(not(feature = "streaming"))]
+    pub fn close_streaming_writer(&mut self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     /// Starts all engine components.
@@ -726,6 +1179,7 @@ impl NautilusKernel {
         self.data_engine.borrow_mut().stop();
         self.exec_engine.borrow_mut().stop();
         self.risk_engine.borrow_mut().stop();
+        self.order_emulator.stop();
     }
 
     /// Connects data engine clients.
@@ -756,9 +1210,20 @@ impl NautilusKernel {
     #[expect(clippy::await_holding_refcell_ref)] // Single-threaded runtime, intentional design
     pub async fn disconnect_clients(&mut self) -> anyhow::Result<()> {
         log::info!("Disconnecting clients...");
-        self.data_engine.borrow_mut().disconnect().await?;
-        self.exec_engine.borrow_mut().disconnect().await?;
-        Ok(())
+        let mut data_engine = self.data_engine.borrow_mut();
+        let mut exec_engine = self.exec_engine.borrow_mut();
+        let (data_result, exec_result) =
+            futures::join!(data_engine.disconnect(), exec_engine.disconnect());
+
+        match (data_result, exec_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(data_err), Ok(())) => Err(data_err),
+            (Ok(()), Err(exec_err)) => Err(exec_err),
+            (Err(data_err), Err(exec_err)) => anyhow::bail!(
+                "Failed to disconnect data clients: {data_err}; failed to disconnect execution \
+                 clients: {exec_err}"
+            ),
+        }
     }
 
     /// Returns `true` if all engine clients are connected.
@@ -868,5 +1333,965 @@ mod tests {
             command.as_any(),
         );
         assert!(!kernel.is_shutdown_requested());
+    }
+}
+
+#[cfg(all(test, feature = "streaming"))]
+mod streaming_tests {
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    use nautilus_common::{
+        clock::VirtualClock,
+        messages::data::{DataCommand, QuotesResponse, RequestCommand, RequestQuotes},
+        msgbus::{self, MStr, ShareableMessageHandler},
+    };
+    use nautilus_core::Params;
+    use nautilus_model::{
+        data::{CustomData, DataType, NautilusDataType, QuoteTick},
+        identifiers::InstrumentId,
+        types::{Price, Quantity},
+    };
+    use nautilus_persistence::{
+        backend::parquet::catalog::ParquetDataCatalog, config::DataCatalogConfig,
+        test_data::RustTestCustomData,
+    };
+    use nautilus_serialization::ensure_custom_data_registered;
+    use rstest::rstest;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::config::{KernelConfig, RotationConfig, StreamingConfig};
+
+    #[rstest]
+    fn test_configured_catalog_serves_builtin_quotes() {
+        let directory = tempdir().unwrap();
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let quotes = vec![
+            QuoteTick::new(
+                instrument_id,
+                Price::from("1.00001"),
+                Price::from("1.00003"),
+                Quantity::from("100_000"),
+                Quantity::from("200_000"),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ),
+            QuoteTick::new(
+                instrument_id,
+                Price::from("1.00002"),
+                Price::from("1.00004"),
+                Quantity::from("300_000"),
+                Quantity::from("400_000"),
+                UnixNanos::from(2),
+                UnixNanos::from(2),
+            ),
+        ];
+        let catalog = ParquetDataCatalog::new(directory.path(), None, None, None, None);
+        catalog.write_to_parquet(&quotes, None, None, None).unwrap();
+        let config = KernelConfig {
+            catalogs: vec![
+                DataCatalogConfig::new(
+                    directory.path().to_string_lossy().into_owned(),
+                    Some("file".to_string()),
+                    None,
+                )
+                .with_name(Some("history".to_string())),
+            ],
+            ..KernelConfig::default()
+        };
+        let mut kernel = NautilusKernel::new("CatalogQueryTest".to_string(), config).unwrap();
+        kernel
+            .clock
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .unwrap()
+            .set_time(UnixNanos::from(3));
+        let request_id = UUID4::new();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let received_quotes = received.clone();
+        msgbus::register_response_handler(
+            &request_id,
+            ShareableMessageHandler::from_typed(move |response: &QuotesResponse| {
+                *received_quotes.borrow_mut() = response.data.clone();
+            }),
+        );
+        let request = RequestQuotes::new(
+            instrument_id,
+            Some(UnixNanos::from(1).to_datetime_utc()),
+            Some(UnixNanos::from(2).to_datetime_utc()),
+            None,
+            None,
+            request_id,
+            UnixNanos::from(3),
+            None,
+        );
+
+        kernel
+            .data_engine
+            .borrow_mut()
+            .execute(DataCommand::Request(RequestCommand::Quotes(request)));
+
+        assert_eq!(*received.borrow(), quotes);
+        assert_eq!(kernel.data_engine.borrow().request_count(), 1);
+        assert_eq!(kernel.data_engine.borrow().response_count(), 1);
+        kernel.dispose();
+    }
+
+    #[rstest]
+    fn test_configured_catalog_error_names_rejected_param() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().to_string_lossy().into_owned();
+        let mut params = Params::new();
+        params.insert("batch_size".to_string(), serde_json::json!(1024));
+
+        let config = KernelConfig {
+            catalogs: vec![
+                DataCatalogConfig::new(path.clone(), Some("file".to_string()), None)
+                    .with_params(Some(params)),
+            ],
+            ..KernelConfig::default()
+        };
+
+        let error = NautilusKernel::new("CatalogParamTest".to_string(), config)
+            .err()
+            .unwrap();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Failed to create data catalog from '{path}': Unknown Parquet catalog param \
+                 'batch_size': this catalog takes no params"
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_configured_streaming_excludes_custom_data() {
+        ensure_custom_data_registered::<RustTestCustomData>();
+
+        let directory = tempdir().unwrap();
+        let instance_id = UUID4::new();
+        let mut streaming = StreamingConfig::new(
+            directory.path().to_string_lossy().into_owned(),
+            None,
+            1_000,
+            false,
+            RotationConfig::NoRotation,
+        );
+        streaming.data_types = Some(vec![NautilusDataType::QuoteTick]);
+        let config = KernelConfig {
+            instance_id: Some(instance_id),
+            streaming: Some(streaming),
+            ..KernelConfig::default()
+        };
+        let mut kernel = NautilusKernel::new("BuiltInStreamingTest".to_string(), config).unwrap();
+        let instrument_id = InstrumentId::from("RUST.TEST");
+        let custom = CustomData::new(
+            Arc::new(RustTestCustomData {
+                instrument_id,
+                value: 1.23,
+                flag: true,
+                ts_event: UnixNanos::from(1_000),
+                ts_init: UnixNanos::from(1_000),
+            }),
+            DataType::new("RustTestCustomData", None, Some(instrument_id.to_string())),
+        );
+
+        msgbus::publish_any(MStr::from("data.custom"), &custom);
+        kernel.close_streaming_writer().unwrap();
+
+        let custom_path = directory
+            .path()
+            .join("backtest")
+            .join(instance_id.to_string())
+            .join("data/custom");
+        assert!(!custom_path.exists());
+        kernel.dispose();
+    }
+
+    #[rstest]
+    #[case::promotion_without_catalog(
+        None,
+        "promotion_interval_ms requires catalog: promotion needs a catalog"
+    )]
+    #[case::catalog_param(
+        Some(serde_json::json!({"params": {"batch_size": 1024}})),
+        "Unknown Parquet catalog param 'batch_size': this catalog takes no params"
+    )]
+    #[case::zero_batch_size(
+        Some(serde_json::json!({"batch_size": 0})),
+        "invalid batch_size: must be a positive number of rows; omit the field for the \
+         backend default"
+    )]
+    fn test_invalid_streaming_config_fails_before_replacing_files(
+        #[case] catalog_fields: Option<serde_json::Value>,
+        #[case] expected: &str,
+    ) {
+        let directory = tempdir().unwrap();
+        let instance_id = UUID4::new();
+        let run_directory = directory
+            .path()
+            .join("backtest")
+            .join(instance_id.to_string());
+        std::fs::create_dir_all(&run_directory).unwrap();
+        let existing = run_directory.join("existing.feather");
+        std::fs::write(&existing, b"preserve").unwrap();
+
+        let catalog_path = directory.path().join("catalog");
+
+        // Deserialized like a config file, which skips `DataCatalogConfig::validate`
+        let catalog = catalog_fields.map(|mut fields| {
+            fields["path"] = serde_json::json!(catalog_path.to_string_lossy());
+            serde_json::from_value::<DataCatalogConfig>(fields).unwrap()
+        });
+
+        let mut streaming = StreamingConfig::new(
+            directory.path().to_string_lossy().into_owned(),
+            catalog,
+            1_000,
+            true,
+            RotationConfig::NoRotation,
+        );
+        streaming.promotion_interval_ms = Some(1_000);
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+
+        let error = NautilusKernel::setup_streaming_writer(
+            Environment::Backtest,
+            instance_id,
+            &streaming,
+            &clock,
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"preserve");
+    }
+
+    #[rstest]
+    fn test_streaming_replace_existing_creates_missing_catalog_directory() {
+        let directory = tempdir().unwrap();
+        let instance_id = UUID4::new();
+        let run_directory = directory
+            .path()
+            .join("backtest")
+            .join(instance_id.to_string());
+        std::fs::create_dir_all(&run_directory).unwrap();
+        let existing = run_directory.join("existing.feather");
+        std::fs::write(&existing, b"replace").unwrap();
+        let catalog_path = directory.path().join("catalog");
+
+        let streaming = StreamingConfig::new(
+            directory.path().to_string_lossy().into_owned(),
+            Some(DataCatalogConfig::new(
+                catalog_path.to_string_lossy().into_owned(),
+                None,
+                None,
+            )),
+            1_000,
+            true,
+            RotationConfig::NoRotation,
+        );
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+
+        let (_, subscription) = NautilusKernel::setup_streaming_writer(
+            Environment::Backtest,
+            instance_id,
+            &streaming,
+            &clock,
+        )
+        .unwrap();
+        subscription.close().unwrap();
+
+        assert!(!existing.exists());
+        assert!(catalog_path.is_dir());
+    }
+
+    #[rstest]
+    fn test_configured_streaming_promotes_into_separate_catalog() {
+        let writer_directory = tempdir().unwrap();
+        let catalog_directory = tempdir().unwrap();
+        let catalog_path = catalog_directory.path().join("catalog");
+        let instance_id = UUID4::new();
+
+        let mut streaming = StreamingConfig::new(
+            writer_directory.path().to_string_lossy().into_owned(),
+            Some(DataCatalogConfig::new(
+                catalog_path.to_string_lossy().into_owned(),
+                None,
+                None,
+            )),
+            1_000,
+            false,
+            RotationConfig::NoRotation,
+        );
+        streaming.data_types = Some(vec![NautilusDataType::QuoteTick]);
+
+        let config = KernelConfig {
+            instance_id: Some(instance_id),
+            streaming: Some(streaming),
+            ..KernelConfig::default()
+        };
+
+        let mut kernel =
+            NautilusKernel::new("SeparateCatalogStreamingTest".to_string(), config).unwrap();
+
+        let quote = QuoteTick::new(
+            InstrumentId::from("AUD/USD.SIM"),
+            Price::from("1.00001"),
+            Price::from("1.00003"),
+            Quantity::from("100_000"),
+            Quantity::from("200_000"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+
+        msgbus::publish_quote(MStr::from("data.quotes.SIM.AUD/USD"), &quote);
+        kernel.close_streaming_writer().unwrap();
+
+        let mut catalog = ParquetDataCatalog::new(&catalog_path, None, None, None, None);
+        let promoted = catalog
+            .query::<QuoteTick>(None, None, None, None, None, true)
+            .unwrap();
+        let run_directory = writer_directory
+            .path()
+            .join("backtest")
+            .join(instance_id.to_string());
+        assert_eq!(promoted, vec![quote]);
+        assert!(run_directory.join("quotes").is_dir());
+        assert!(!catalog_path.join("backtest").exists());
+        kernel.dispose();
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use futures::FutureExt;
+    use indexmap::IndexMap;
+    use nautilus_common::{
+        actor::registry::get_actor_unchecked,
+        cache::Cache,
+        clock::VirtualClock,
+        messages::data::{DataCommand, SubscribeCommand, UnsubscribeCommand},
+        msgbus::stubs::{TypedIntoMessageSavingHandler, get_typed_into_message_saving_handler},
+    };
+    use nautilus_execution::engine::SnapshotAnchorer;
+    use nautilus_model::{
+        enums::{OrderSide, OrderStatus, OrderType, TriggerType},
+        identifiers::{ActorId, ClientOrderId, StrategyId},
+        instruments::{
+            CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
+        },
+        orders::{Order, OrderAny, OrderTestBuilder},
+        types::{Price, Quantity},
+    };
+    use nautilus_testkit::{
+        cache::TestCacheDatabaseControl,
+        components::{StateActor, StateStrategy},
+    };
+    use rstest::rstest;
+    use ustr::Ustr;
+
+    use super::*;
+    use crate::{
+        builder::NautilusKernelBuilder,
+        event_store::{KernelEventStore, RegisteredComponents},
+    };
+
+    #[derive(Debug)]
+    struct RecordingEventStore {
+        control: TestCacheDatabaseControl,
+        opened: bool,
+    }
+
+    impl KernelEventStore for RecordingEventStore {
+        fn restore_parent_cache(
+            &mut self,
+            _instance_id: UUID4,
+            _cache: &mut Cache,
+        ) -> anyhow::Result<()> {
+            self.control.record("event_store.restore");
+            Ok(())
+        }
+
+        fn open(
+            &mut self,
+            _instance_id: UUID4,
+            _components: &RegisteredComponents,
+            _environment: Environment,
+        ) -> anyhow::Result<()> {
+            self.control.record("event_store.open");
+            self.opened = true;
+            Ok(())
+        }
+
+        fn snapshot_anchorer(&self) -> Option<SnapshotAnchorer> {
+            None
+        }
+
+        fn seal(&mut self, _ts_init: UnixNanos) {
+            if self.opened {
+                self.control.record("event_store.seal");
+                self.opened = false;
+            }
+        }
+
+        fn run_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn parent_run_id(&self) -> Option<&str> {
+            None
+        }
+
+        fn is_halted(&self) -> bool {
+            false
+        }
+    }
+
+    fn state(key: &str, value: &[u8]) -> IndexMap<String, Vec<u8>> {
+        IndexMap::from([(key.to_string(), value.to_vec())])
+    }
+
+    fn finalize(kernel: &mut NautilusKernel) -> anyhow::Result<()> {
+        kernel
+            .finalize_stop()
+            .now_or_never()
+            .expect("kernel finalization must not yield")
+    }
+
+    fn add_state_components(
+        kernel: &NautilusKernel,
+        control: &TestCacheDatabaseControl,
+        actor: StateActor,
+        strategy: StateStrategy,
+    ) {
+        kernel.trader.borrow_mut().add_actor(actor).unwrap();
+        kernel.trader.borrow_mut().add_strategy(strategy).unwrap();
+        control.record("components.registered");
+    }
+
+    fn create_stop_market_order(instrument: &CryptoPerpetual, client_order_id: &str) -> OrderAny {
+        OrderTestBuilder::new(OrderType::StopMarket)
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .side(OrderSide::Buy)
+            .trigger_price(Price::from("5100.00"))
+            .quantity(Quantity::from(1))
+            .emulation_trigger(TriggerType::BidAsk)
+            .build()
+    }
+
+    fn register_data_command_handler(id: &str) -> TypedIntoMessageSavingHandler<DataCommand> {
+        let (handler, saving_handler) =
+            get_typed_into_message_saving_handler::<DataCommand>(Some(Ustr::from(id)));
+        msgbus::register_data_command_endpoint(
+            MessagingSwitchboard::data_engine_queue_execute(),
+            handler,
+        );
+        saving_handler
+    }
+
+    #[rstest]
+    fn test_state_persistence_orders_restore_load_start_stop_save_seal_and_dispose() {
+        let actor_id = ActorId::from("STATE-ACTOR");
+        let strategy_id = StrategyId::from("STATE-STRATEGY-001");
+        let actor_load = state("actor-loaded", b"actor-load-value");
+        let strategy_load = state("strategy-loaded", b"strategy-load-value");
+        let actor_save = state("actor-saved", b"actor-save-value");
+        let strategy_save = state("strategy-saved", b"strategy-save-value");
+        let (database, control) = TestCacheDatabaseControl::create();
+        control.set_actor_state(actor_id, &actor_load);
+        control.set_strategy_state(strategy_id, &strategy_load);
+
+        let event_store_control = control.clone();
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .with_event_store(move |_instance_id, _clock| {
+                Ok(Box::new(RecordingEventStore {
+                    control: event_store_control,
+                    opened: false,
+                }))
+            })
+            .build()
+            .unwrap();
+
+        let actor = StateActor::new(actor_id, control.clone(), actor_save.clone());
+        let strategy = StateStrategy::new(strategy_id, control.clone(), strategy_save.clone());
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+
+        let actor_state = get_actor_unchecked::<StateActor>(&actor_id.inner())
+            .state_load()
+            .cloned();
+        let strategy_state = get_actor_unchecked::<StateStrategy>(&strategy_id.inner())
+            .state_load()
+            .cloned();
+        assert_eq!(actor_state, Some(actor_load));
+        assert_eq!(strategy_state, Some(strategy_load));
+
+        kernel.stop_trader();
+        kernel.stop_trader();
+        finalize(&mut kernel).unwrap();
+        finalize(&mut kernel).unwrap();
+        kernel.dispose();
+
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "event_store.restore",
+                "event_store.open",
+                "actor.load:STATE-ACTOR",
+                "actor.on_load",
+                "strategy.load:STATE-STRATEGY-001",
+                "strategy.on_load",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+                "actor.on_save",
+                "actor.update:STATE-ACTOR",
+                "strategy.on_save",
+                "strategy.update:STATE-STRATEGY-001",
+                "event_store.seal",
+                "database.close",
+            ]
+        );
+        assert_eq!(control.actor_state(&actor_id), Some(actor_save));
+        assert_eq!(control.strategy_state(&strategy_id), Some(strategy_save));
+    }
+
+    #[rstest]
+    fn test_state_persistence_skips_callbacks_without_cache_backing() {
+        let actor_id = ActorId::from("NO-BACKING-ACTOR");
+        let strategy_id = StrategyId::from("NO-BACKING-STRATEGY-001");
+        let control = TestCacheDatabaseControl::default();
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), state("actor", b"save"));
+        let strategy = StateStrategy::new(strategy_id, control.clone(), state("strategy", b"save"));
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.stop_trader();
+        finalize(&mut kernel).unwrap();
+        kernel.dispose();
+
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_state_persistence_skips_empty_load_and_persists_empty_save() {
+        let actor_id = ActorId::from("EMPTY-STATE-ACTOR");
+        let strategy_id = StrategyId::from("EMPTY-STATE-STRATEGY-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .build()
+            .unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), IndexMap::new());
+        let strategy = StateStrategy::new(strategy_id, control.clone(), IndexMap::new());
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.stop_trader();
+        finalize(&mut kernel).unwrap();
+
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "actor.load:EMPTY-STATE-ACTOR",
+                "strategy.load:EMPTY-STATE-STRATEGY-001",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+                "actor.on_save",
+                "actor.update:EMPTY-STATE-ACTOR",
+                "strategy.on_save",
+                "strategy.update:EMPTY-STATE-STRATEGY-001",
+            ]
+        );
+        assert_eq!(control.actor_state(&actor_id), Some(IndexMap::new()));
+        assert_eq!(control.strategy_state(&strategy_id), Some(IndexMap::new()));
+        kernel.dispose();
+    }
+
+    #[rstest]
+    fn test_state_save_reports_all_callback_errors_and_continues_shutdown() {
+        let actor_id = ActorId::from("FAIL-SAVE-ACTOR");
+        let strategy_id = StrategyId::from("FAIL-SAVE-STRATEGY-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        let event_store_control = control.clone();
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .with_event_store(move |_instance_id, _clock| {
+                Ok(Box::new(RecordingEventStore {
+                    control: event_store_control,
+                    opened: false,
+                }))
+            })
+            .build()
+            .unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), IndexMap::new()).with_fail_save();
+        let strategy =
+            StateStrategy::new(strategy_id, control.clone(), IndexMap::new()).with_fail_save();
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.stop_trader();
+        let expected_shutdown = kernel.clock.borrow().timestamp_ns();
+        let error = finalize(&mut kernel).unwrap_err();
+        kernel.dispose();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to save component state: actor FAIL-SAVE-ACTOR callback: test actor on_save \
+             failure; strategy FAIL-SAVE-STRATEGY-001 callback: test strategy on_save failure"
+        );
+        assert_eq!(kernel.ts_shutdown, Some(expected_shutdown));
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "event_store.restore",
+                "event_store.open",
+                "actor.load:FAIL-SAVE-ACTOR",
+                "strategy.load:FAIL-SAVE-STRATEGY-001",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+                "actor.on_save",
+                "strategy.on_save",
+                "event_store.seal",
+                "database.close",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_state_load_callback_failure_prevents_start_and_save() {
+        let actor_id = ActorId::from("FAIL-LOAD-ACTOR");
+        let strategy_id = StrategyId::from("FAIL-LOAD-STRATEGY-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        control.set_actor_state(actor_id, &state("actor", b"load"));
+        control.set_strategy_state(strategy_id, &state("strategy", b"load"));
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .build()
+            .unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), IndexMap::new()).with_fail_load();
+        let strategy = StateStrategy::new(strategy_id, control.clone(), IndexMap::new());
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        let error = kernel.start_trader().unwrap_err();
+        kernel.dispose();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to load actor and strategy state: Failed to restore actor FAIL-LOAD-ACTOR \
+             state: test actor on_load failure"
+        );
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "actor.load:FAIL-LOAD-ACTOR",
+                "actor.on_load",
+                "database.close",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_state_save_reports_all_persistence_errors() {
+        let actor_id = ActorId::from("FAIL-UPDATE-ACTOR");
+        let strategy_id = StrategyId::from("FAIL-UPDATE-STRATEGY-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        control.set_fail_update_actor(true);
+        control.set_fail_update_strategy(true);
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .build()
+            .unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), state("actor", b"save"));
+        let strategy = StateStrategy::new(strategy_id, control.clone(), state("strategy", b"save"));
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.stop_trader();
+        let error = finalize(&mut kernel).unwrap_err();
+        kernel.dispose();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to save component state: actor FAIL-UPDATE-ACTOR persistence: test actor \
+             update failure; strategy FAIL-UPDATE-STRATEGY-001 persistence: test strategy update \
+             failure"
+        );
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "actor.load:FAIL-UPDATE-ACTOR",
+                "strategy.load:FAIL-UPDATE-STRATEGY-001",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+                "actor.on_save",
+                "actor.update:FAIL-UPDATE-ACTOR",
+                "strategy.on_save",
+                "strategy.update:FAIL-UPDATE-STRATEGY-001",
+                "database.close",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_partial_startup_stops_and_saves_once() {
+        let actor_id = ActorId::from("PARTIAL-ACTOR");
+        let strategy_id = StrategyId::from("PARTIAL-STRATEGY-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .build()
+            .unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), state("actor", b"partial"));
+        let strategy =
+            StateStrategy::new(strategy_id, control.clone(), state("strategy", b"partial"))
+                .with_fail_start();
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        let error = kernel.start_trader().unwrap_err();
+        kernel.dispose();
+
+        assert_eq!(
+            error.to_string(),
+            "Failed to start trader: test strategy on_start failure"
+        );
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "actor.load:PARTIAL-ACTOR",
+                "strategy.load:PARTIAL-STRATEGY-001",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+                "actor.on_save",
+                "actor.update:PARTIAL-ACTOR",
+                "strategy.on_save",
+                "strategy.update:PARTIAL-STRATEGY-001",
+                "database.close",
+            ]
+        );
+        assert_eq!(
+            control.actor_state(&actor_id),
+            Some(state("actor", b"partial"))
+        );
+        assert_eq!(
+            control.strategy_state(&strategy_id),
+            Some(state("strategy", b"partial"))
+        );
+    }
+
+    #[rstest]
+    fn test_forced_dispose_stops_and_saves_once() {
+        let actor_id = ActorId::from("FORCED-ACTOR");
+        let strategy_id = StrategyId::from("FORCED-STRATEGY-001");
+        let (database, control) = TestCacheDatabaseControl::create();
+        let mut kernel = NautilusKernelBuilder::default()
+            .with_cache_database(Box::new(database))
+            .build()
+            .unwrap();
+        let actor = StateActor::new(actor_id, control.clone(), state("actor", b"forced"));
+        let strategy =
+            StateStrategy::new(strategy_id, control.clone(), state("strategy", b"forced"));
+        add_state_components(&kernel, &control, actor, strategy);
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.dispose();
+
+        assert_eq!(
+            control.events(),
+            vec![
+                "components.registered",
+                "actor.load:FORCED-ACTOR",
+                "strategy.load:FORCED-STRATEGY-001",
+                "actor.on_start",
+                "strategy.on_start",
+                "actor.on_stop",
+                "strategy.on_stop",
+                "actor.on_save",
+                "actor.update:FORCED-ACTOR",
+                "strategy.on_save",
+                "strategy.update:FORCED-STRATEGY-001",
+                "database.close",
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_start_trader_starts_order_emulator_for_cached_emulated_orders() {
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        let data_commands = register_data_command_handler("DataEngine.queue_execute.kernel_start");
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let first_order = create_stop_market_order(&instrument, "O-KERNEL-001");
+        let second_order = create_stop_market_order(&instrument, "O-KERNEL-002");
+        let first_client_order_id = first_order.client_order_id();
+        let second_client_order_id = second_order.client_order_id();
+        kernel
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        kernel
+            .cache
+            .borrow_mut()
+            .add_order(first_order, None, None, false)
+            .unwrap();
+        kernel
+            .cache
+            .borrow_mut()
+            .add_order(second_order, None, None, false)
+            .unwrap();
+
+        kernel.start();
+        assert!(
+            kernel
+                .order_emulator
+                .get_emulator()
+                .get_matching_core(&instrument_id)
+                .is_none()
+        );
+        kernel.start_trader().unwrap();
+
+        let commands = data_commands.get_messages();
+        let cache = kernel.cache.borrow();
+        let first_status = cache.order(&first_client_order_id).unwrap().status();
+        let second_status = cache.order(&second_client_order_id).unwrap().status();
+        drop(cache);
+        let emulator = kernel.order_emulator.get_emulator();
+        assert!(emulator.get_matching_core(&instrument_id).is_some());
+        assert_eq!(emulator.subscribed_quotes(), vec![instrument_id]);
+        assert_eq!(first_status, OrderStatus::Emulated);
+        assert_eq!(second_status, OrderStatus::Emulated);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            DataCommand::Subscribe(SubscribeCommand::Quotes(command))
+                if command.instrument_id == instrument_id
+        )));
+
+        data_commands.clear();
+        drop(emulator);
+        kernel.stop_trader();
+        kernel.dispose();
+
+        let commands = data_commands.get_messages();
+        let emulator = kernel.order_emulator.get_emulator();
+        assert!(emulator.subscribed_quotes().is_empty());
+        assert!(emulator.get_matching_core(&instrument_id).is_none());
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(command))
+                if command.instrument_id == instrument_id
+        )));
+    }
+
+    #[rstest]
+    fn test_reset_resets_order_emulator_state() {
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        let data_commands = register_data_command_handler("DataEngine.queue_execute.kernel_reset");
+        let instrument = crypto_perpetual_ethusdt();
+        let instrument_id = instrument.id();
+        let order = create_stop_market_order(&instrument, "O-KERNEL-RESET-001");
+        kernel
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CryptoPerpetual(instrument))
+            .unwrap();
+        kernel
+            .cache
+            .borrow_mut()
+            .add_order(order, None, None, false)
+            .unwrap();
+
+        kernel.start();
+        kernel.start_trader().unwrap();
+        assert!(
+            kernel
+                .order_emulator
+                .get_emulator()
+                .get_matching_core(&instrument_id)
+                .is_some()
+        );
+        kernel.stop_trader();
+        data_commands.clear();
+
+        kernel.reset();
+
+        let commands = data_commands.get_messages();
+        let emulator = kernel.order_emulator.get_emulator();
+        assert!(emulator.subscribed_quotes().is_empty());
+        assert!(emulator.get_matching_core(&instrument_id).is_none());
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(command))
+                if command.instrument_id == instrument_id
+        )));
+
+        drop(emulator);
+        kernel.dispose();
+    }
+
+    #[rstest]
+    fn test_start_after_reset_skips_trader_initialize() {
+        let mut kernel = NautilusKernelBuilder::default().build().unwrap();
+        kernel.start();
+        kernel.start_trader().unwrap();
+        kernel.stop_trader();
+        kernel.reset();
+        let restart_ns = UnixNanos::from(1_700_000_000_000_000_000);
+        kernel
+            .clock
+            .borrow_mut()
+            .as_any_mut()
+            .downcast_mut::<VirtualClock>()
+            .unwrap()
+            .set_time(restart_ns);
+
+        kernel.start();
+        let ts_started = kernel.ts_started();
+        kernel.start_trader().unwrap();
+        let trader_state = kernel.trader.borrow().state();
+        kernel.stop_trader();
+        kernel.dispose();
+
+        assert_eq!(ts_started, Some(restart_ns));
+        assert_eq!(trader_state, ComponentState::Running);
     }
 }

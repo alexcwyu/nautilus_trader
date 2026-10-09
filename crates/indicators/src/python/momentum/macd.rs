@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
     enums::PriceType,
@@ -23,22 +24,24 @@ use crate::{
     average::MovingAverageType,
     indicator::{Indicator, MovingAverage},
     momentum::macd::MovingAverageConvergenceDivergence,
+    python::float_precision,
 };
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl MovingAverageConvergenceDivergence {
-    /// Creates a new `MovingAverageConvergenceDivergence` instance.
+    /// Moving average convergence/divergence, signal, and histogram.
     #[new]
-    #[pyo3(signature = (fast_period, slow_period, ma_type=None, price_type=None))]
-    #[must_use]
+    #[pyo3(signature = (fast_period, slow_period, signal_period=None, ma_type=None, price_type=None))]
     pub fn py_new(
         fast_period: usize,
         slow_period: usize,
+        signal_period: Option<usize>,
         ma_type: Option<MovingAverageType>,
         price_type: Option<PriceType>,
-    ) -> Self {
-        Self::new(fast_period, slow_period, ma_type, price_type)
+    ) -> PyResult<Self> {
+        Self::new_checked(fast_period, slow_period, signal_period, ma_type, price_type)
+            .map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -46,6 +49,18 @@ impl MovingAverageConvergenceDivergence {
             "MovingAverageConvergenceDivergence({},{},{:?})",
             self.fast_period, self.slow_period, self.price_type
         )
+    }
+
+    #[getter]
+    #[pyo3(name = "ma_type")]
+    const fn py_ma_type(&self) -> MovingAverageType {
+        self.ma_type
+    }
+
+    #[getter]
+    #[pyo3(name = "price_type")]
+    const fn py_price_type(&self) -> PriceType {
+        self.price_type
     }
 
     #[getter]
@@ -64,6 +79,24 @@ impl MovingAverageConvergenceDivergence {
     #[pyo3(name = "slow_period")]
     const fn py_slow_period(&self) -> usize {
         self.slow_period
+    }
+
+    #[getter]
+    #[pyo3(name = "signal_period")]
+    const fn py_signal_period(&self) -> usize {
+        self.signal_period
+    }
+
+    #[getter]
+    #[pyo3(name = "signal")]
+    const fn py_signal(&self) -> f64 {
+        self.signal
+    }
+
+    #[getter]
+    #[pyo3(name = "histogram")]
+    const fn py_histogram(&self) -> f64 {
+        self.histogram
     }
 
     #[getter]
@@ -91,18 +124,23 @@ impl MovingAverageConvergenceDivergence {
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) {
-        self.py_update_raw(quote.extract_price(self.price_type).into());
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        float_precision::check_quote(quote)?;
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "handle_trade_tick")]
-    fn py_handle_trade_tick(&mut self, trade: &TradeTick) {
-        self.update_raw((&trade.price).into());
+    fn py_handle_trade_tick(&mut self, trade: &TradeTick) -> PyResult<()> {
+        float_precision::check_trade(trade)?;
+        self.handle_trade(trade);
+        Ok(())
     }
 
     #[pyo3(name = "handle_bar")]
-    fn py_handle_bar(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into());
+    fn py_handle_bar(&mut self, bar: &Bar) -> PyResult<()> {
+        float_precision::check_bar(bar)?;
+        self.handle_bar(bar);
+        Ok(())
     }
 
     #[pyo3(name = "reset")]

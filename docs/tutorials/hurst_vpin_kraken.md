@@ -91,8 +91,7 @@ curl -L -o /tmp/tardis_kraken/PF_XBTUSD_quotes.csv.gz \
 
 The runnable example binary shown later in this tutorial reads from
 `/tmp/tardis_kraken/` by default, so downloading into that directory up front
-means `cargo run` works without needing `KRAKEN_TRADES` or `KRAKEN_QUOTES`
-overrides.
+means `cargo run` works without editing the example's path constants.
 
 :::tip
 Full historical ranges require a paid Tardis API key. Use the
@@ -110,14 +109,14 @@ use nautilus_tardis::csv::load::{load_quotes, load_trades};
 
 let instrument_id = InstrumentId::from("PF_XBTUSD.KRAKEN");
 let trades = load_trades(
-    "PF_XBTUSD_trades.csv.gz",
+    "/tmp/tardis_kraken/PF_XBTUSD_trades.csv.gz",
     Some(1),               // price_precision
     Some(4),               // size_precision
     Some(instrument_id),
     None,                  // limit
 )?;
 let quotes = load_quotes(
-    "PF_XBTUSD_quotes.csv.gz",
+    "/tmp/tardis_kraken/PF_XBTUSD_quotes.csv.gz",
     Some(1),
     Some(4),
     Some(instrument_id),
@@ -146,33 +145,27 @@ use nautilus_model::{
 };
 use rust_decimal_macros::dec;
 
-let instrument = CryptoPerpetual::new(
-    InstrumentId::from("PF_XBTUSD.KRAKEN"),
-    Symbol::from("PF_XBTUSD"),
-    Currency::BTC(),      // base
-    Currency::USD(),      // quote
-    Currency::USD(),      // settlement (linear)
-    false,                // is_inverse
-    1,                    // price_precision
-    4,                    // size_precision
-    Price::from("0.5"),
-    Quantity::from("0.0001"),
-    None,                 // multiplier
-    None,                 // lot_size
-    None, None,           // max/min quantity
-    None, None,           // max/min notional
-    None, None,           // max/min price
-    Some(dec!(0.02)),     // margin_init
-    Some(dec!(0.01)),     // margin_maint
-    Some(dec!(0.0002)),   // maker_fee
-    Some(dec!(0.0005)),   // taker_fee
-    None,                 // info
-    0.into(),             // ts_event
-    0.into(),             // ts_init
-);
+let instrument = CryptoPerpetual::builder()
+    .instrument_id(InstrumentId::from("PF_XBTUSD.KRAKEN"))
+    .raw_symbol(Symbol::from("PF_XBTUSD"))
+    .base_currency(Currency::BTC())       // base
+    .quote_currency(Currency::USD())      // quote
+    .settlement_currency(Currency::USD()) // settlement (linear)
+    .is_inverse(false)
+    .price_precision(1)
+    .size_precision(4)
+    .price_increment(Price::from("0.5"))
+    .size_increment(Quantity::from("0.0001"))
+    .margin_init(dec!(0.02))
+    .margin_maint(dec!(0.01))
+    .ts_event(0.into())
+    .ts_init(0.into())
+    .build()
+    .unwrap();
 ```
 
-Fees and margin are explicit backtest assumptions. Check the
+Margin and fee rates are explicit backtest assumptions. This example uses a
+maker/taker fee model with 0.02% maker and 0.05% taker rates. Check the
 [Kraken Futures fee schedule](https://futures.kraken.com/features/fee-schedule)
 for current rates.
 
@@ -316,17 +309,19 @@ when aggressor side was not directly observable.
 
 ### Configuration
 
-| Parameter          | Value            | Description                                          |
-| ------------------ | ---------------- | ---------------------------------------------------- |
-| `bar_type`         | `2M-VALUE-LAST`  | Dollar bars closing every USD 2,000,000 of notional. |
-| `trade_size`       | `0.0100`         | 0.0100 XBT per trade (matches instrument precision). |
-| `hurst_window`     | `128`            | Rolling window of dollar bar log returns.            |
-| `hurst_lags`       | `[4, 8, 16, 32]` | Lag set used in the R/S regression.                  |
-| `hurst_enter`      | `0.55`           | Above this, the regime is treated as trending.       |
-| `hurst_exit`       | `0.50`           | Below this, open positions are flattened.            |
-| `vpin_window`      | `50`             | Completed volume buckets averaged for VPIN.          |
-| `vpin_threshold`   | `0.30`           | Minimum VPIN for flow to be considered informed.     |
+| Parameter          | Value            | Description                                                       |
+| ------------------ | ---------------- | ----------------------------------------------------------------- |
+| `bar_type`         | `2M-VALUE-LAST`  | Dollar bars closing every USD 2,000,000 of notional.              |
+| `trade_size`       | `0.0100`         | 0.0100 XBT per trade (matches instrument precision).              |
+| `hurst_window`     | `128`            | Rolling window of dollar bar log returns.                         |
+| `hurst_lags`       | `[4, 8, 16, 32]` | Lag set used in the R/S regression.                               |
+| `hurst_enter`      | `0.55`           | Above this, the regime is treated as trending.                    |
+| `hurst_exit`       | `0.50`           | Below this, open positions are flattened.                         |
+| `vpin_window`      | `50`             | Completed volume buckets averaged for VPIN.                       |
+| `vpin_threshold`   | `0.30`           | Minimum VPIN for flow to be considered informed.                  |
 | `max_holding_secs` | `1800`           | Seconds a position may be held (default `3600`; overridden here). |
+
+Set `hurst_window` and `vpin_window` to values in `[1, 16_384]`.
 
 :::tip
 Dollar-bar size, Hurst lags, and VPIN window are all coupled. Smaller
@@ -343,6 +338,7 @@ use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
 };
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_model::{
     data::Data,
     enums::{AccountType, BookType, OmsType},
@@ -360,7 +356,10 @@ engine.add_venue(
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::from("100_000 USD")])
-        .build(),
+        .fee_model(
+            FeeModelAny::MakerTaker(MakerTakerFeeModel::new(dec!(0.0002), dec!(0.0005))).into(),
+        )
+        .build()?,
 )?;
 
 engine.add_instrument(&InstrumentAny::CryptoPerpetual(instrument))?;
@@ -382,12 +381,12 @@ use nautilus_trading::examples::strategies::{
     HurstVpinDirectional, HurstVpinDirectionalConfig,
 };
 
-let config = HurstVpinDirectionalConfig::new(
-    instrument_id,
-    bar_type,
-    Quantity::from("0.0100"),  // match instrument size_precision
-)
-.with_max_holding_secs(1800);
+let config = HurstVpinDirectionalConfig::builder()
+    .instrument_id(instrument_id)
+    .bar_type(bar_type)
+    .trade_size(Quantity::from("0.0100")) // match instrument size_precision
+    .max_holding_secs(1800)
+    .build();
 
 engine.add_strategy(HurstVpinDirectional::new(config))?;
 ```
@@ -421,8 +420,8 @@ cargo run -p nautilus-kraken --features examples \
 ```
 
 By default it reads `PF_XBTUSD_trades.csv.gz` and `PF_XBTUSD_quotes.csv.gz`
-from `/tmp/tardis_kraken/`. Override with `KRAKEN_TRADES` and
-`KRAKEN_QUOTES` environment variables.
+from `/tmp/tardis_kraken/`. To read other files, edit the `TRADES_PATH` and
+`QUOTES_PATH` constants in `crates/adapters/kraken/examples/engine_hurst_vpin_backtest.rs`.
 
 ![Trade detail during the active window](./assets/hurst_vpin_kraken/panel_a_price_regime.png)
 
@@ -440,15 +439,19 @@ VPIN. Shaded quadrant marks the entry-eligible region.*
 
 The backtest strategy logs `Hurst=… VPIN=… signed=… bar_close=…` on every
 bar close and standard `OrderFilled` events on entries and exits, so the
-panels above are fully reproducible from the run's stdout:
+panels above are fully reproducible from the run's stdout.
+
+After building NautilusTrader from source, run these commands from the repository root:
 
 ```bash
+make sync
+
 RUST_LOG=info cargo run -p nautilus-kraken --features examples \
     --example kraken-hurst-vpin-backtest --release > /tmp/backtest.log 2>&1
 
-uv sync --extra visualization
 BACKTEST_LOG=/tmp/backtest.log \
-    python3 docs/tutorials/assets/hurst_vpin_kraken/render_panels.py
+    uv run --project python --no-sync \
+        python docs/tutorials/assets/hurst_vpin_kraken/render_panels.py
 ```
 
 The renderer uses the shared `nautilus_dark` tearsheet theme and writes
@@ -467,23 +470,31 @@ static PNGs via Plotly's Kaleido exporter.
 - **Add a volatility gate**. Overlay a realized-volatility estimator
   on the same bars to suppress entries during clearly chaotic
   sessions.
-- **Go live on Kraken Futures demo**. Once the backtest behaves, drive
-  the same strategy through the Kraken live client factories against
-  [demo-futures.kraken.com](https://demo-futures.kraken.com). A runnable
-  live wiring ships as:
+- **Go live on Kraken Futures**. Once the backtest behaves, drive the
+  same strategy through the Kraken live client factories. A runnable live
+  wiring ships as `kraken-hurst-vpin-live`.
+
+  The example trades **Kraken Futures production with real funds** by
+  default: both clients use the default `KrakenEnvironment::Live`, and it
+  reads `KRAKEN_FUTURES_API_KEY` and `KRAKEN_FUTURES_API_SECRET`. To paper
+  trade on [demo-futures.kraken.com](https://demo-futures.kraken.com)
+  instead, edit `crates/adapters/kraken/examples/node_hurst_vpin_live.rs`
+  before running: pass `true` as the `demo` argument to
+  `KrakenCredential::resolve_futures`, and set
+  `environment: KrakenEnvironment::Demo` (from `nautilus_kraken::common::enums`)
+  on both `KrakenDataClientConfig` and `KrakenExecutionClientConfig`. The
+  example then reads `KRAKEN_FUTURES_DEMO_API_KEY` and
+  `KRAKEN_FUTURES_DEMO_API_SECRET`.
 
   ```bash
   cargo run -p nautilus-kraken --features examples \
     --example kraken-hurst-vpin-live
   ```
 
-  Set `KRAKEN_FUTURES_API_KEY` and `KRAKEN_FUTURES_API_SECRET` in the
-  environment before running.
-
 ## Further reading
 
 - [`HurstVpinDirectional` strategy source](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/trading/src/examples/strategies/hurst_vpin_directional)
-- [Data concepts: bar types and aggregation](../concepts/data.md)
+- [Data concepts: bar types and aggregation](../concepts/data/index.md#bars-and-aggregation)
 - [Tardis integration guide](../integrations/tardis.md)
 - [Kraken integration guide](../integrations/kraken.md)
 - [Kraken Futures documentation](https://docs.kraken.com/api/docs/futures-api)

@@ -7,12 +7,13 @@ This guide covers the release process and the standards for writing release note
 NautilusTrader uses a three-branch model:
 
 - **`develop`**: active development; publishes dev wheels to Cloudflare R2 on every push.
-- **`nightly`**: pre-release testing; publishes alpha wheels and CLI binaries.
+- **`nightly`**: pre-release testing; publishes all supported pre-release wheels and CLI binaries.
 - **`master`**: stable releases; triggers the full release pipeline.
 
-Pushing to `master` automatically tags the version from `pyproject.toml`, creates a draft GitHub
-release, uploads release assets, publishes Cargo crates to crates.io, publishes wheels and sdist to
-PyPI, publishes the GitHub release, builds Docker images, and triggers a docs rebuild.
+Merging a release commit to `master` automatically tags the version from `python/pyproject.toml`,
+creates a draft GitHub release, uploads release assets, publishes Cargo crates to crates.io,
+publishes wheels and sdist to PyPI, publishes the GitHub release, builds Docker images, and triggers
+a docs rebuild.
 
 ## Stable release workflow
 
@@ -25,7 +26,8 @@ the registry verification and final integrity assets are complete.
 flowchart TD
     push["Push to master"]
     wheels["Build wheel artifacts<br/>Linux x86/ARM, macOS, Windows"]
-    audits["Release gates<br/>cargo-deny + cargo-vet"]
+    audits["Release gates<br/>Rust suite + cargo-deny + cargo-vet<br/>Cargo publish + docs/features preflights"]
+    security["security-audit<br/>Zizmor + supply chain"]
     tag["tag-release<br/>Create tag and draft GitHub release"]
     wheel_assets["publish-wheels-master<br/>Upload wheels to GitHub release and R2<br/>release env"]
     build_sdist["build-sdist<br/>Build sdist workflow artifact"]
@@ -38,8 +40,10 @@ flowchart TD
 
     push --> wheels
     push --> audits
+    push --> security
     wheels --> tag
     audits --> tag
+    security --> tag
     tag --> build_sdist
     build_sdist --> sdist_asset
     tag --> sdist_asset
@@ -61,30 +65,94 @@ flowchart TD
 Keep these sequencing rules intact when editing `.github/workflows/build.yml`:
 
 - The draft GitHub release must exist before any release asset upload or package registry publish.
+- `tag-release` must depend on `security-audit` so stable release tagging cannot proceed after an
+  audit failure.
 - Wheel and sdist assets must be attached to the GitHub release before package index publishing
   starts (`packages.nautechsystems.io`, PyPI, crates.io).
 - PyPI and crates.io Trusted Publishing jobs must keep `environment: release` and
   `id-token: write`; those registrations depend on the `release` environment.
 - Non-OIDC integrity and asset-upload jobs should avoid `environment: release` unless they need
   release environment secrets or approvals.
-- `publish-release-integrity` must run after PyPI and crates.io publishing so it verifies the
-  registries against the release manifest before attaching final integrity assets.
+- `publish-release-integrity` must run after PyPI and crates.io publishing. It generates the
+  release manifest first, verifies registries against that manifest, then attaches final integrity
+  assets only after verification passes.
 - `publish-github-release` must be the final stable release job. GitHub recommends creating a
   draft release, attaching all assets, then publishing the draft before enabling release
   immutability. Once GitHub release immutability is enabled for the repo, published release assets
   and the release tag cannot be changed; only the title and release notes remain editable. The job
-  verifies GitHub's release attestation after publishing the draft.
+  verifies the final draft asset set before publishing and verifies GitHub's release attestation
+  after publishing the draft.
+
+## Recovering a missing release tag
+
+The `Create git tag` step creates `v<version>` only when the version at the run's commit differs
+from the version at the previous commit (`HEAD~1`), and never when the tag already exists. A run
+whose commit carries the same version as its parent therefore never creates the tag, and when the
+tag is missing `Verify release tag` fails no matter how often the failed jobs are re-run. This is
+the normal shape of a retried release: one or more commits land on `master` after the version
+bump, so the retry run carries the same version as its parent. Because `tag-release` anchors the
+draft release and every downstream publish job, the run cannot proceed while the tag is missing.
+
+First check whether the tag exists and whether the run's commit bumps the version:
+
+- If the tag is missing and the run's commit bumps the version, re-running the failed jobs is
+  enough: once the failed jobs pass, `tag-release` creates the tag.
+- If the tag is missing and the run's commit carries the same version as its parent, no re-run
+  creates the tag. Recover with the manual tag procedure below.
+
+Manual tag recovery works because of the remaining `tag-release` mechanics:
+
+- On a re-run after the manual push, `Create git tag` skips creation under the same rule.
+- `Verify release tag` requires `v<version>` to resolve to the run's commit (`GITHUB_SHA`), so a
+  manually pushed tag at that exact commit passes the check.
+- Draft release creation is idempotent, so a re-run updates the existing draft if one was already
+  created.
+
+To recover, a maintainer creates the tag manually and re-runs the failed jobs:
+
+1. From the failed run page, note the run's commit SHA. Check out that commit locally and confirm
+   the version it carries:
+
+   ```bash
+   ./scripts/package-version.sh
+   ```
+
+1. Create a signed annotated tag at the run's exact commit, using the existing tag message
+   convention, and push it:
+
+   ```bash
+   git tag -s v<version> -m "Released version <version>" <run-commit-sha>
+   git push origin v<version>
+   ```
+
+1. Verify the tag locally. The signature must be good and `git rev-parse 'v<version>^{commit}'`
+   must equal the run's commit SHA:
+
+   ```bash
+   git tag -v v<version>
+   git rev-parse 'v<version>^{commit}'
+   ```
+
+1. On the failed run, select "Re-run failed jobs". `Verify release tag` passes with the pushed
+   tag, and draft release creation and the downstream publishing jobs continue.
+
+Only do this when the release commit and version are final. The tag is the permanent release
+anchor, and once release immutability applies the published release tag cannot be changed. If
+`v<version>` already exists but points at a different commit, do not move or re-push the tag;
+investigate the mismatch instead, because `Verify release tag` fails in that case by design.
 
 ## Versioning
 
 The project maintains two version numbers:
 
-| File                     | Scope          | Example   |
-|--------------------------|----------------|-----------|
-| `pyproject.toml`         | Python package | `1.223.0` |
-| `Cargo.toml` (workspace) | Rust crates    | `0.55.0`  |
+| File                     | Scope          |
+| ------------------------ | -------------- |
+| `python/pyproject.toml`  | Python package |
+| `Cargo.toml` (workspace) | Rust crates    |
 
-These are bumped independently. The Python version drives the release tag (`v1.223.0`).
+These are bumped independently. The Python version drives the `v<python-version>` release tag.
+Versions ending in `aN`, `bN`, or `rcN` create a GitHub pre-release; final versions create a normal
+release.
 
 ## Crates.io publishing
 
@@ -93,7 +161,7 @@ crates.io Trusted Publishing through GitHub Actions OIDC, so it does not use a p
 token. Configure each crate on crates.io with:
 
 | Field       | Value             |
-|-------------|-------------------|
+| ----------- | ----------------- |
 | Owner       | `nautechsystems`  |
 | Repository  | `nautilus_trader` |
 | Workflow    | `build.yml`       |
@@ -113,14 +181,18 @@ an absent crate would leave that feature unusable.
 
 Post-publish verification treats an existing crate version as `previously_published` only when
 crates.io shows it was trusted-published by this repository. It still fails for user-published
-crate versions, wrong trusted-publishing repositories, and checksum or sparse-index mismatches.
+crate versions unless `CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS` names each recovered `crate@version`
+entry for emergency token-publish recovery. Accepted manual entries are recorded in
+`crates-manifest.json` with `release_status: "manual_token_publish"`, and malformed or unused
+exception entries fail the job. Wrong trusted-publishing repositories and checksum or sparse-index
+mismatches also fail.
 
 ## Release checklist
 
 ### Pre-release (on `develop`)
 
 - [ ] Finalize `RELEASES.md`: review all items, remove empty sections
-- [ ] Ensure versions are set in `pyproject.toml` and `Cargo.toml` workspace
+- [ ] Ensure versions are set in `python/pyproject.toml` and the `Cargo.toml` workspace
 - [ ] Ensure crates.io Trusted Publishing is configured for every crate that CI publishes:
   `bash scripts/ci/check-crates-io-trusted-publishing.sh`
 - [ ] Ensure all CI checks pass on `develop`
@@ -132,12 +204,17 @@ crate versions, wrong trusted-publishing repositories, and checksum or sparse-in
 - [ ] Verify the `build` workflow completes:
   - Wheels built for Linux x86/ARM, macOS, Windows
   - `cargo-deny` and `cargo-vet` pass
+  - `security-audit` passes its Zizmor and supply-chain checks
+  - Release docs/features and Cargo publish preflights pass before tagging
   - Tag and draft GitHub release created
   - Wheels and sdist attached to the GitHub release before package registry publishing
   - Cargo crates published to crates.io or skipped because the version already exists
   - Wheels and sdist published to PyPI
-  - Release checksums, registry verification, crates manifest, and attestation siblings published
+  - Registry verification passes before release checksums, crates manifest, and attestation siblings
+    are attached
   - GitHub release published after all release assets and integrity assets are attached
+  - If the run fails with the release tag missing, follow
+    [Recovering a missing release tag](#recovering-a-missing-release-tag) and re-run the failed jobs
 - [ ] Verify the `docker` workflow completes (images built and pushed)
 - [ ] Verify the `build-docs` workflow completes (docs rebuild triggered)
 
@@ -146,7 +223,7 @@ crate versions, wrong trusted-publishing repositories, and checksum or sparse-in
 - [ ] Update the release date in `RELEASES.md` for the published version
 - [ ] Add horizontal separator `---` below the completed release
 - [ ] Add the next version template at the top of `RELEASES.md` (see below)
-- [ ] Bump `pyproject.toml` version to the next release number
+- [ ] Bump `python/pyproject.toml` version to the next release number
 - [ ] Bump crate versions in tutorial and how-to `Cargo.toml` snippets
   (`docs/concepts/rust.md`, `docs/how_to/run_rust_backtest.md`,
   `docs/how_to/run_rust_live_trading.md`)
@@ -177,7 +254,7 @@ New features and user-visible improvements.
 
 ```markdown
 - Added `subscribe_order_fills(...)` and `unsubscribe_order_fills(...)` for `Actor`
-- Added BitMEX conditional orders support
+- Added Bybit conditional orders support
 - Added support for `OrderBookDepth10` requests (#2955), thanks @faysou
 ```
 
@@ -212,7 +289,6 @@ Includes significant hardening improvements elevated from Internal Improvements.
 **Format**:
 
 ```markdown
-- Fixed non-executable stack for Cython extensions to support hardened Linux systems
 - Fixed divide-by-zero and overflow bugs in model crate that could cause crashes
 - Fixed core arithmetic operations to reject NaN/Infinity values and improve overflow handling
 ```
@@ -277,7 +353,7 @@ Features marked for removal.
 **Format**:
 
 ```markdown
-- Deprecated `some_config_option`; disable (`False`) to maintain consistent behaviour. Will be removed in future version
+- Deprecated `some_config_option`; disable (`False`) to maintain consistent behavior. Will be removed in future version
 ```
 
 **Guidelines**:
@@ -299,8 +375,8 @@ Features marked for removal.
 **Be specific**:
 
 ```markdown
-❌ Improved Binance adapter
-✅ Improved Binance fill handling when instrument not cached
+Bad:  Improved Binance adapter
+Good: Improved Binance fill handling when instrument not cached
 ```
 
 ## Security classification
@@ -324,7 +400,7 @@ Note: Plain logic panics belong in Fixes unless they threaten system stability o
 
 ```markdown
 - Fixed divide-by-zero in margin calculations that could crash the engine
-- Fixed non-executable stack for Cython extensions to support hardened systems
+- Fixed integer overflow in model arithmetic that could crash the process
 ```
 
 **Fixes** (incorrect but safe):
@@ -337,13 +413,13 @@ Note: Plain logic panics belong in Fixes unless they threaten system stability o
 **Enhancements** (user-facing):
 
 ```markdown
-- Added BitMEX conditional orders support
+- Added Bybit conditional orders support
 ```
 
 **Internal** (implementation):
 
 ```markdown
-- Implemented BitMEX ping/pong handling
+- Implemented Bybit ping/pong handling
 ```
 
 ## Release notes template

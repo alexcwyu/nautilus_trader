@@ -86,13 +86,20 @@ fn extract_tardis_data_config(
     }
 }
 
-/// Loaded as `nautilus_pyo3.tardis`.
+/// Exposed through `nautilus_trader.adapters.tardis`.
 ///
 /// # Errors
 ///
 /// Returns a `PyErr` if registering any module components fails.
 #[pymodule]
 pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<csv::TardisBatchedDeltasStreamIterator>()?;
+    m.add_class::<csv::TardisDeltaStreamIterator>()?;
+    m.add_class::<csv::TardisDepthStreamIterator>()?;
+    m.add_class::<csv::TardisFundingRateStreamIterator>()?;
+    m.add_class::<csv::TardisOptionsChainStreamIterator>()?;
+    m.add_class::<csv::TardisQuoteStreamIterator>()?;
+    m.add_class::<csv::TardisTradeStreamIterator>()?;
     m.add_class::<super::machine::types::TardisInstrumentMiniInfo>()?;
     m.add_class::<super::machine::types::ReplayNormalizedRequestOptions>()?;
     m.add_class::<super::machine::types::StreamNormalizedRequestOptions>()?;
@@ -118,25 +125,31 @@ pub fn tardis(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(machine::py_run_tardis_machine_replay, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(
-        csv::py_load_tardis_depth10_from_snapshot5,
+        csv::py_load_tardis_depth_from_snapshot5,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        csv::py_load_tardis_depth10_from_snapshot25,
+        csv::py_load_tardis_depth_from_snapshot25,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_quotes, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_trades, m)?)?;
+    m.add_function(wrap_pyfunction!(csv::py_load_tardis_options_chain, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        csv::py_convert_tardis_options_chain_csv,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_batched_deltas, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_quotes, m)?)?;
+    m.add_function(wrap_pyfunction!(csv::py_stream_tardis_options_chain, m)?)?;
     m.add_function(wrap_pyfunction!(csv::py_stream_tardis_trades, m)?)?;
     m.add_function(wrap_pyfunction!(
-        csv::py_stream_tardis_depth10_from_snapshot5,
+        csv::py_stream_tardis_depth_from_snapshot5,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        csv::py_stream_tardis_depth10_from_snapshot25,
+        csv::py_stream_tardis_depth_from_snapshot25,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(csv::py_load_tardis_funding_rates, m)?)?;

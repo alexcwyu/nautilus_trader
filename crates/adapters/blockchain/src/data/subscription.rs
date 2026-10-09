@@ -20,44 +20,98 @@ use nautilus_model::defi::DexType;
 
 /// Manages subscriptions to DeFi protocol events (swaps, mints, burns, collects) across different DEXs.
 ///
-/// This manager tracks which pool addresses are subscribed for each event type
-/// and maintains the event signature encodings for efficient filtering.
-#[derive(Debug)]
+/// This manager counts the owners of each pool address per event type, so overlapping
+/// subscriptions (a complete pool and a narrower event subscription) release independently.
+/// It also maintains the event signature encodings for efficient filtering.
+#[derive(Debug, Default)]
 pub struct DefiDataSubscriptionManager {
+    block_demand_explicit: bool,
+    block_demand_pool_events: bool,
+    block_feed_backend: Option<BlockFeedBackend>,
     pool_swap_event_encoded: AHashMap<DexType, String>,
     pool_mint_event_encoded: AHashMap<DexType, String>,
     pool_burn_event_encoded: AHashMap<DexType, String>,
     pool_collect_event_encoded: AHashMap<DexType, String>,
     pool_flash_event_encoded: AHashMap<DexType, String>,
-    subscribed_pool_swaps: AHashMap<DexType, AHashSet<Address>>,
-    subscribed_pool_mints: AHashMap<DexType, AHashSet<Address>>,
-    subscribed_pool_burns: AHashMap<DexType, AHashSet<Address>>,
-    subscribed_pool_collects: AHashMap<DexType, AHashSet<Address>>,
-    subscribed_pool_flashes: AHashMap<DexType, AHashSet<Address>>,
-}
-
-impl Default for DefiDataSubscriptionManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    pool_fee_protocol_update_event_encoded: AHashMap<DexType, String>,
+    pool_fee_protocol_collect_event_encoded: AHashMap<DexType, String>,
+    subscribed_pool_swaps: AHashMap<DexType, PoolEventDemand>,
+    subscribed_pool_mints: AHashMap<DexType, PoolEventDemand>,
+    subscribed_pool_burns: AHashMap<DexType, PoolEventDemand>,
+    subscribed_pool_collects: AHashMap<DexType, PoolEventDemand>,
+    subscribed_pool_flashes: AHashMap<DexType, PoolEventDemand>,
+    subscribed_pool_fee_protocol_updates: AHashMap<DexType, PoolEventDemand>,
+    subscribed_pool_fee_protocol_collects: AHashMap<DexType, PoolEventDemand>,
 }
 
 impl DefiDataSubscriptionManager {
     /// Creates a new [`DefiDataSubscriptionManager`] instance.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            pool_swap_event_encoded: AHashMap::new(),
-            pool_burn_event_encoded: AHashMap::new(),
-            pool_mint_event_encoded: AHashMap::new(),
-            pool_collect_event_encoded: AHashMap::new(),
-            pool_flash_event_encoded: AHashMap::new(),
-            subscribed_pool_burns: AHashMap::new(),
-            subscribed_pool_mints: AHashMap::new(),
-            subscribed_pool_swaps: AHashMap::new(),
-            subscribed_pool_collects: AHashMap::new(),
-            subscribed_pool_flashes: AHashMap::new(),
+        Self::default()
+    }
+
+    pub(crate) fn add_block_demand(
+        &mut self,
+        owner: BlockFeedOwner,
+        preferred_backend: BlockFeedBackend,
+    ) -> Option<BlockFeedBackend> {
+        match owner {
+            BlockFeedOwner::Explicit => self.block_demand_explicit = true,
+            BlockFeedOwner::PoolEvents => self.block_demand_pool_events = true,
         }
+
+        self.block_feed_backend
+            .is_none()
+            .then_some(preferred_backend)
+    }
+
+    pub(crate) fn block_feed_started(&mut self, backend: BlockFeedBackend) {
+        self.block_feed_backend = Some(backend);
+    }
+
+    pub(crate) fn remove_block_demand(
+        &mut self,
+        owner: BlockFeedOwner,
+    ) -> Option<BlockFeedBackend> {
+        match owner {
+            BlockFeedOwner::Explicit => self.block_demand_explicit = false,
+            BlockFeedOwner::PoolEvents => self.block_demand_pool_events = false,
+        }
+
+        if self.has_block_demand() {
+            None
+        } else {
+            self.block_feed_backend
+        }
+    }
+
+    pub(crate) fn block_feed_stopped(&mut self, backend: BlockFeedBackend) {
+        if self.block_feed_backend == Some(backend) {
+            self.block_feed_backend = None;
+        }
+    }
+
+    pub(crate) fn clear_block_demand(&mut self) {
+        self.block_demand_explicit = false;
+        self.block_demand_pool_events = false;
+        self.block_feed_backend = None;
+    }
+
+    pub(crate) fn has_pool_event_subscriptions(&self) -> bool {
+        self.subscribed_pool_swaps
+            .values()
+            .chain(self.subscribed_pool_mints.values())
+            .chain(self.subscribed_pool_burns.values())
+            .chain(self.subscribed_pool_collects.values())
+            .chain(self.subscribed_pool_flashes.values())
+            .chain(self.subscribed_pool_fee_protocol_updates.values())
+            .chain(self.subscribed_pool_fee_protocol_collects.values())
+            .any(|addresses| !addresses.is_empty())
+    }
+
+    fn has_block_demand(&self) -> bool {
+        self.block_demand_explicit || self.block_demand_pool_events
     }
 
     /// Gets all unique contract addresses subscribed for any event type for a given DEX.
@@ -66,23 +120,31 @@ impl DefiDataSubscriptionManager {
         let mut unique_addresses = AHashSet::new();
 
         if let Some(addresses) = self.subscribed_pool_swaps.get(dex) {
-            unique_addresses.extend(addresses.iter().copied());
+            unique_addresses.extend(addresses.keys().copied());
         }
 
         if let Some(addresses) = self.subscribed_pool_mints.get(dex) {
-            unique_addresses.extend(addresses.iter().copied());
+            unique_addresses.extend(addresses.keys().copied());
         }
 
         if let Some(addresses) = self.subscribed_pool_burns.get(dex) {
-            unique_addresses.extend(addresses.iter().copied());
+            unique_addresses.extend(addresses.keys().copied());
         }
 
         if let Some(addresses) = self.subscribed_pool_collects.get(dex) {
-            unique_addresses.extend(addresses.iter().copied());
+            unique_addresses.extend(addresses.keys().copied());
         }
 
         if let Some(addresses) = self.subscribed_pool_flashes.get(dex) {
-            unique_addresses.extend(addresses.iter().copied());
+            unique_addresses.extend(addresses.keys().copied());
+        }
+
+        if let Some(addresses) = self.subscribed_pool_fee_protocol_updates.get(dex) {
+            unique_addresses.extend(addresses.keys().copied());
+        }
+
+        if let Some(addresses) = self.subscribed_pool_fee_protocol_collects.get(dex) {
+            unique_addresses.extend(addresses.keys().copied());
         }
 
         unique_addresses.into_iter().collect()
@@ -113,7 +175,156 @@ impl DefiDataSubscriptionManager {
             result.push(flash_event_signature.clone());
         }
 
+        if let Some(fee_protocol_update_event_signature) =
+            self.pool_fee_protocol_update_event_encoded.get(dex)
+        {
+            result.push(fee_protocol_update_event_signature.clone());
+        }
+
+        if let Some(fee_protocol_collect_event_signature) =
+            self.pool_fee_protocol_collect_event_encoded.get(dex)
+        {
+            result.push(fee_protocol_collect_event_signature.clone());
+        }
+
         result
+    }
+
+    /// Gets event signatures with at least one subscribed pool address for a given DEX.
+    #[must_use]
+    pub fn get_active_subscribed_dex_event_signatures(&self, dex: &DexType) -> Vec<String> {
+        let mut result = Vec::new();
+
+        if self
+            .subscribed_pool_swaps
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_swap_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_mints
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_mint_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_burns
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_burn_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_collects
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_collect_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_flashes
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_flash_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_fee_protocol_updates
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_fee_protocol_update_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        if self
+            .subscribed_pool_fee_protocol_collects
+            .get(dex)
+            .is_some_and(|addresses| !addresses.is_empty())
+            && let Some(signature) = self.pool_fee_protocol_collect_event_encoded.get(dex)
+        {
+            result.push(signature.clone());
+        }
+
+        result
+    }
+
+    /// Gets pool addresses subscribed to swap events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_swap_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_swaps
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to mint events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_mint_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_mints
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to burn events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_burn_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_burns
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to collect events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_collect_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_collects
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to flash events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_flash_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_flashes
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to fee-protocol update events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_fee_protocol_update_addresses(&self, dex: &DexType) -> Vec<Address> {
+        self.subscribed_pool_fee_protocol_updates
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Gets pool addresses subscribed to fee-protocol collect events for a given DEX.
+    #[must_use]
+    pub fn get_subscribed_pool_fee_protocol_collect_addresses(
+        &self,
+        dex: &DexType,
+    ) -> Vec<Address> {
+        self.subscribed_pool_fee_protocol_collects
+            .get(dex)
+            .map(|addresses| addresses.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Gets the swap event signature for a specific DEX.
@@ -137,6 +348,34 @@ impl DefiDataSubscriptionManager {
     #[must_use]
     pub fn get_dex_pool_collect_event_signature(&self, dex: &DexType) -> Option<String> {
         self.pool_collect_event_encoded.get(dex).cloned()
+    }
+
+    /// Gets the flash event signature for a specific DEX.
+    #[must_use]
+    pub fn get_dex_pool_flash_event_signature(&self, dex: &DexType) -> Option<String> {
+        self.pool_flash_event_encoded.get(dex).cloned()
+    }
+
+    /// Gets the fee-protocol update event signature for a specific DEX.
+    #[must_use]
+    pub fn get_dex_pool_fee_protocol_update_event_signature(
+        &self,
+        dex: &DexType,
+    ) -> Option<String> {
+        self.pool_fee_protocol_update_event_encoded
+            .get(dex)
+            .cloned()
+    }
+
+    /// Gets the fee-protocol collect event signature for a specific DEX.
+    #[must_use]
+    pub fn get_dex_pool_fee_protocol_collect_event_signature(
+        &self,
+        dex: &DexType,
+    ) -> Option<String> {
+        self.pool_fee_protocol_collect_event_encoded
+            .get(dex)
+            .cloned()
     }
 
     /// Normalizes an event signature to a consistent format.
@@ -180,35 +419,88 @@ impl DefiDataSubscriptionManager {
         collect_event_signature: &str,
         flash_event_signature: Option<&str>,
     ) {
-        self.subscribed_pool_swaps.insert(dex, AHashSet::new());
+        self.subscribed_pool_swaps
+            .insert(dex, PoolEventDemand::new());
         self.pool_swap_event_encoded
             .insert(dex, Self::normalize_topic(swap_event_signature));
 
-        self.subscribed_pool_mints.insert(dex, AHashSet::new());
+        self.subscribed_pool_mints
+            .insert(dex, PoolEventDemand::new());
         self.pool_mint_event_encoded
             .insert(dex, Self::normalize_topic(mint_event_signature));
 
-        self.subscribed_pool_burns.insert(dex, AHashSet::new());
+        self.subscribed_pool_burns
+            .insert(dex, PoolEventDemand::new());
         self.pool_burn_event_encoded
             .insert(dex, Self::normalize_topic(burn_event_signature));
 
-        self.subscribed_pool_collects.insert(dex, AHashSet::new());
+        self.subscribed_pool_collects
+            .insert(dex, PoolEventDemand::new());
         self.pool_collect_event_encoded
             .insert(dex, Self::normalize_topic(collect_event_signature));
 
         if let Some(flash_event_signature) = flash_event_signature {
-            self.subscribed_pool_flashes.insert(dex, AHashSet::new());
+            self.subscribed_pool_flashes
+                .insert(dex, PoolEventDemand::new());
             self.pool_flash_event_encoded
                 .insert(dex, Self::normalize_topic(flash_event_signature));
         }
 
-        log::info!("Registered DEX for subscriptions: {dex:?}");
+        log::debug!("Registered DEX for subscriptions: {dex:?}");
+    }
+
+    /// Registers optional fee-protocol event signatures for subscription management.
+    pub fn register_dex_fee_protocol_events(
+        &mut self,
+        dex: DexType,
+        fee_protocol_update_event_signature: Option<&str>,
+        fee_protocol_collect_event_signature: Option<&str>,
+    ) {
+        if let Some(fee_protocol_update_event_signature) = fee_protocol_update_event_signature {
+            self.subscribed_pool_fee_protocol_updates
+                .insert(dex, PoolEventDemand::new());
+            self.pool_fee_protocol_update_event_encoded.insert(
+                dex,
+                Self::normalize_topic(fee_protocol_update_event_signature),
+            );
+        }
+
+        if let Some(fee_protocol_collect_event_signature) = fee_protocol_collect_event_signature {
+            self.subscribed_pool_fee_protocol_collects
+                .insert(dex, PoolEventDemand::new());
+            self.pool_fee_protocol_collect_event_encoded.insert(
+                dex,
+                Self::normalize_topic(fee_protocol_collect_event_signature),
+            );
+        }
+    }
+
+    /// Subscribes to every event type of a specific pool address on a DEX.
+    pub fn subscribe_pool(&mut self, dex: DexType, address: Address) {
+        self.subscribe_swaps(dex, address);
+        self.subscribe_mints(dex, address);
+        self.subscribe_burns(dex, address);
+        self.subscribe_collects(dex, address);
+        self.subscribe_flashes(dex, address);
+        self.subscribe_fee_protocol_updates(dex, address);
+        self.subscribe_fee_protocol_collects(dex, address);
+    }
+
+    /// Unsubscribes from every event type of a specific pool address on a DEX.
+    pub fn unsubscribe_pool(&mut self, dex: DexType, address: Address) {
+        self.unsubscribe_swaps(dex, address);
+        self.unsubscribe_mints(dex, address);
+        self.unsubscribe_burns(dex, address);
+        self.unsubscribe_collects(dex, address);
+        self.unsubscribe_flashes(dex, address);
+        self.unsubscribe_fee_protocol_updates(dex, address);
+        self.unsubscribe_fee_protocol_collects(dex, address);
     }
 
     /// Subscribes to swap events for a specific pool address on a DEX.
     pub fn subscribe_swaps(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_swaps.get_mut(&dex) {
-            pool_set.insert(address);
+            acquire_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for swap subscriptions: {dex:?}");
         }
@@ -217,7 +509,7 @@ impl DefiDataSubscriptionManager {
     /// Subscribes to mint events for a specific pool address on a DEX.
     pub fn subscribe_mints(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_mints.get_mut(&dex) {
-            pool_set.insert(address);
+            acquire_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for mint subscriptions: {dex:?}");
         }
@@ -226,7 +518,7 @@ impl DefiDataSubscriptionManager {
     /// Subscribes to burn events for a specific pool address on a DEX.
     pub fn subscribe_burns(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_burns.get_mut(&dex) {
-            pool_set.insert(address);
+            acquire_pool_event(pool_set, address);
         } else {
             log::warn!("DEX not registered for burn subscriptions: {dex:?}");
         }
@@ -235,7 +527,7 @@ impl DefiDataSubscriptionManager {
     /// Unsubscribes from swap events for a specific pool address on a DEX.
     pub fn unsubscribe_swaps(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_swaps.get_mut(&dex) {
-            pool_set.remove(&address);
+            release_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for swap subscriptions: {dex:?}");
         }
@@ -244,7 +536,7 @@ impl DefiDataSubscriptionManager {
     /// Unsubscribes from mint events for a specific pool address on a DEX.
     pub fn unsubscribe_mints(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_mints.get_mut(&dex) {
-            pool_set.remove(&address);
+            release_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for mint subscriptions: {dex:?}");
         }
@@ -253,7 +545,7 @@ impl DefiDataSubscriptionManager {
     /// Unsubscribes from burn events for a specific pool address on a DEX.
     pub fn unsubscribe_burns(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_burns.get_mut(&dex) {
-            pool_set.remove(&address);
+            release_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for burn subscriptions: {dex:?}");
         }
@@ -262,7 +554,7 @@ impl DefiDataSubscriptionManager {
     /// Subscribes to collect events for a specific pool address on a DEX.
     pub fn subscribe_collects(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_collects.get_mut(&dex) {
-            pool_set.insert(address);
+            acquire_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for collect subscriptions: {dex:?}");
         }
@@ -271,7 +563,7 @@ impl DefiDataSubscriptionManager {
     /// Unsubscribes from collect events for a specific pool address on a DEX.
     pub fn unsubscribe_collects(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_collects.get_mut(&dex) {
-            pool_set.remove(&address);
+            release_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for collect subscriptions: {dex:?}");
         }
@@ -280,7 +572,7 @@ impl DefiDataSubscriptionManager {
     /// Subscribes to flash events for a specific pool address on a DEX.
     pub fn subscribe_flashes(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_flashes.get_mut(&dex) {
-            pool_set.insert(address);
+            acquire_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for flash subscriptions: {dex:?}");
         }
@@ -289,11 +581,67 @@ impl DefiDataSubscriptionManager {
     /// Unsubscribes from flash events for a specific pool address on a DEX.
     pub fn unsubscribe_flashes(&mut self, dex: DexType, address: Address) {
         if let Some(pool_set) = self.subscribed_pool_flashes.get_mut(&dex) {
-            pool_set.remove(&address);
+            release_pool_event(pool_set, address);
         } else {
             log::error!("DEX not registered for flash subscriptions: {dex:?}");
         }
     }
+
+    /// Subscribes to fee-protocol update events for a specific pool address on a DEX.
+    pub fn subscribe_fee_protocol_updates(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_updates.get_mut(&dex) {
+            acquire_pool_event(pool_set, address);
+        }
+    }
+
+    /// Unsubscribes from fee-protocol update events for a specific pool address on a DEX.
+    pub fn unsubscribe_fee_protocol_updates(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_updates.get_mut(&dex) {
+            release_pool_event(pool_set, address);
+        }
+    }
+
+    /// Subscribes to fee-protocol collect events for a specific pool address on a DEX.
+    pub fn subscribe_fee_protocol_collects(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_collects.get_mut(&dex) {
+            acquire_pool_event(pool_set, address);
+        }
+    }
+
+    /// Unsubscribes from fee-protocol collect events for a specific pool address on a DEX.
+    pub fn unsubscribe_fee_protocol_collects(&mut self, dex: DexType, address: Address) {
+        if let Some(pool_set) = self.subscribed_pool_fee_protocol_collects.get_mut(&dex) {
+            release_pool_event(pool_set, address);
+        }
+    }
+}
+
+/// Owner count per pool address for one event kind; an address is present only while owned.
+type PoolEventDemand = AHashMap<Address, usize>;
+
+fn acquire_pool_event(demand: &mut PoolEventDemand, address: Address) {
+    *demand.entry(address).or_default() += 1;
+}
+
+fn release_pool_event(demand: &mut PoolEventDemand, address: Address) {
+    if let Some(owners) = demand.get_mut(&address) {
+        *owners -= 1;
+        if *owners == 0 {
+            demand.remove(&address);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockFeedBackend {
+    Rpc,
+    HyperSync,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockFeedOwner {
+    Explicit,
+    PoolEvents,
 }
 
 #[cfg(test)]
@@ -320,6 +668,199 @@ mod tests {
             Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
         );
         manager
+    }
+
+    #[rstest]
+    #[case(BlockFeedBackend::Rpc)]
+    #[case(BlockFeedBackend::HyperSync)]
+    fn block_feed_pool_only_stops_with_final_owner(#[case] backend: BlockFeedBackend) {
+        let mut manager = DefiDataSubscriptionManager::new();
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            Some(backend)
+        );
+        manager.block_feed_started(backend);
+
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::PoolEvents),
+            Some(backend)
+        );
+        manager.block_feed_stopped(backend);
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            Some(backend)
+        );
+    }
+
+    #[rstest]
+    #[case(BlockFeedBackend::Rpc)]
+    #[case(BlockFeedBackend::HyperSync)]
+    fn block_feed_repeated_commands_are_idempotent(#[case] backend: BlockFeedBackend) {
+        let mut manager = DefiDataSubscriptionManager::new();
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, backend),
+            Some(backend)
+        );
+        manager.block_feed_started(backend);
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, backend),
+            None
+        );
+
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::Explicit),
+            Some(backend)
+        );
+        manager.block_feed_stopped(backend);
+        assert_eq!(manager.remove_block_demand(BlockFeedOwner::Explicit), None);
+    }
+
+    #[rstest]
+    #[case(BlockFeedBackend::Rpc)]
+    #[case(BlockFeedBackend::HyperSync)]
+    fn block_feed_explicit_demand_survives_pool_unsubscribe(#[case] backend: BlockFeedBackend) {
+        let mut manager = DefiDataSubscriptionManager::new();
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, backend),
+            Some(backend)
+        );
+        manager.block_feed_started(backend);
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            None
+        );
+
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::PoolEvents),
+            None
+        );
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::Explicit),
+            Some(backend)
+        );
+    }
+
+    #[rstest]
+    #[case(BlockFeedBackend::Rpc)]
+    #[case(BlockFeedBackend::HyperSync)]
+    fn block_feed_pool_demand_survives_explicit_unsubscribe(#[case] backend: BlockFeedBackend) {
+        let mut manager = DefiDataSubscriptionManager::new();
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            Some(backend)
+        );
+        manager.block_feed_started(backend);
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, backend),
+            None
+        );
+
+        assert_eq!(manager.remove_block_demand(BlockFeedOwner::Explicit), None);
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::PoolEvents),
+            Some(backend)
+        );
+    }
+
+    #[rstest]
+    #[case(BlockFeedBackend::Rpc)]
+    #[case(BlockFeedBackend::HyperSync)]
+    fn block_feed_pool_demand_spans_dexes_addresses_and_events(#[case] backend: BlockFeedBackend) {
+        let mut manager = DefiDataSubscriptionManager::new();
+        let pool1 = address!("1111111111111111111111111111111111111111");
+        let pool2 = address!("2222222222222222222222222222222222222222");
+        let pool3 = address!("3333333333333333333333333333333333333333");
+
+        for dex in [DexType::UniswapV3, DexType::PancakeSwapV3] {
+            manager.register_dex_for_subscriptions(
+                dex,
+                "Swap(address,address,int256,int256,uint160,uint128,int24)",
+                "Mint(address,address,int24,int24,uint128,uint256,uint256)",
+                "Burn(address,int24,int24,uint128,uint256,uint256)",
+                "Collect(address,address,int24,int24,uint128,uint128)",
+                Some("Flash(address,address,uint256,uint256,uint256,uint256)"),
+            );
+        }
+
+        manager.subscribe_swaps(DexType::UniswapV3, pool1);
+        manager.subscribe_mints(DexType::UniswapV3, pool2);
+        manager.subscribe_flashes(DexType::PancakeSwapV3, pool3);
+
+        assert!(manager.has_pool_event_subscriptions());
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            Some(backend)
+        );
+        manager.block_feed_started(backend);
+
+        manager.unsubscribe_swaps(DexType::UniswapV3, pool1);
+        assert!(manager.has_pool_event_subscriptions());
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            None
+        );
+
+        manager.unsubscribe_mints(DexType::UniswapV3, pool2);
+        assert!(manager.has_pool_event_subscriptions());
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            None
+        );
+
+        manager.unsubscribe_flashes(DexType::PancakeSwapV3, pool3);
+        assert!(!manager.has_pool_event_subscriptions());
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::PoolEvents),
+            Some(backend)
+        );
+    }
+
+    #[rstest]
+    #[case(BlockFeedBackend::Rpc)]
+    #[case(BlockFeedBackend::HyperSync)]
+    fn block_feed_disconnect_clears_owners_and_backend(#[case] backend: BlockFeedBackend) {
+        let mut manager = DefiDataSubscriptionManager::new();
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, backend),
+            Some(backend)
+        );
+        manager.block_feed_started(backend);
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::PoolEvents, backend),
+            None
+        );
+
+        manager.clear_block_demand();
+
+        assert!(!manager.block_demand_explicit);
+        assert!(!manager.block_demand_pool_events);
+        assert_eq!(manager.block_feed_backend, None);
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, backend),
+            Some(backend)
+        );
+    }
+
+    #[rstest]
+    fn block_feed_rpc_fallback_stops_hypersync_backend() {
+        let mut manager = DefiDataSubscriptionManager::new();
+
+        assert_eq!(
+            manager.add_block_demand(BlockFeedOwner::Explicit, BlockFeedBackend::Rpc),
+            Some(BlockFeedBackend::Rpc)
+        );
+        manager.block_feed_started(BlockFeedBackend::HyperSync);
+
+        assert_eq!(
+            manager.remove_block_demand(BlockFeedOwner::Explicit),
+            Some(BlockFeedBackend::HyperSync)
+        );
     }
 
     #[rstest]
@@ -445,17 +986,220 @@ mod tests {
     }
 
     #[rstest]
-    fn test_multiple_subscriptions_same_pool(mut registered_manager: DefiDataSubscriptionManager) {
+    fn test_active_event_signatures_only_include_subscribed_event_types(
+        mut registered_manager: DefiDataSubscriptionManager,
+    ) {
         let pool_address = address!("1234567890123456789012345678901234567890");
+        let swap_sig = registered_manager
+            .get_dex_pool_swap_event_signature(&DexType::UniswapV3)
+            .unwrap();
+        let collect_sig = registered_manager
+            .get_dex_pool_collect_event_signature(&DexType::UniswapV3)
+            .unwrap();
 
-        // Subscribe same address multiple times to same event type
-        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
-        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
+        assert!(
+            registered_manager
+                .get_active_subscribed_dex_event_signatures(&DexType::UniswapV3)
+                .is_empty()
+        );
 
-        // Should only appear once (HashSet behavior)
+        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
+        assert_eq!(
+            registered_manager.get_active_subscribed_dex_event_signatures(&DexType::UniswapV3),
+            vec![swap_sig]
+        );
+
+        registered_manager.subscribe_collects(DexType::UniswapV3, pool_address);
+        let active_signatures =
+            registered_manager.get_active_subscribed_dex_event_signatures(&DexType::UniswapV3);
+
+        assert_eq!(active_signatures.len(), 2);
+        assert!(active_signatures.contains(&collect_sig));
+    }
+
+    #[rstest]
+    fn test_fee_protocol_events_are_active_only_when_subscribed(
+        mut registered_manager: DefiDataSubscriptionManager,
+    ) {
+        let pool_address = address!("1234567890123456789012345678901234567890");
+        registered_manager.register_dex_fee_protocol_events(
+            DexType::UniswapV3,
+            Some("SetFeeProtocol(uint8,uint8,uint8,uint8)"),
+            Some("CollectProtocol(address,address,uint128,uint128)"),
+        );
+
+        let update_sig = registered_manager
+            .get_dex_pool_fee_protocol_update_event_signature(&DexType::UniswapV3)
+            .unwrap();
+        let collect_sig = registered_manager
+            .get_dex_pool_fee_protocol_collect_event_signature(&DexType::UniswapV3)
+            .unwrap();
+
+        registered_manager.subscribe_fee_protocol_updates(DexType::UniswapV3, pool_address);
+        registered_manager.subscribe_fee_protocol_collects(DexType::UniswapV3, pool_address);
+
+        let active_signatures =
+            registered_manager.get_active_subscribed_dex_event_signatures(&DexType::UniswapV3);
         let addresses =
             registered_manager.get_subscribed_dex_contract_addresses(&DexType::UniswapV3);
+
         assert_eq!(addresses.len(), 1);
+        assert!(addresses.contains(&pool_address));
+        assert!(active_signatures.contains(&update_sig));
+        assert!(active_signatures.contains(&collect_sig));
+    }
+
+    #[rstest]
+    fn test_same_event_demand_releases_with_final_owner(
+        mut registered_manager: DefiDataSubscriptionManager,
+    ) {
+        let pool_address = address!("1234567890123456789012345678901234567890");
+        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
+        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
+
+        registered_manager.unsubscribe_swaps(DexType::UniswapV3, pool_address);
+        let after_first =
+            registered_manager.get_subscribed_pool_swap_addresses(&DexType::UniswapV3);
+        registered_manager.unsubscribe_swaps(DexType::UniswapV3, pool_address);
+
+        assert_eq!(after_first, vec![pool_address]);
+        assert!(
+            registered_manager
+                .get_subscribed_pool_swap_addresses(&DexType::UniswapV3)
+                .is_empty()
+        );
+        assert!(!registered_manager.has_pool_event_subscriptions());
+    }
+
+    #[rstest]
+    fn test_unsubscribe_without_demand_is_ignored(
+        mut registered_manager: DefiDataSubscriptionManager,
+    ) {
+        let pool_address = address!("1234567890123456789012345678901234567890");
+        registered_manager.unsubscribe_swaps(DexType::UniswapV3, pool_address);
+        registered_manager.subscribe_swaps(DexType::UniswapV3, pool_address);
+
+        assert_eq!(
+            registered_manager.get_subscribed_pool_swap_addresses(&DexType::UniswapV3),
+            vec![pool_address]
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum NarrowShape {
+        Swaps,
+        LiquidityUpdates,
+        FeeCollects,
+        FlashEvents,
+    }
+
+    impl NarrowShape {
+        fn subscribe(self, manager: &mut DefiDataSubscriptionManager, address: Address) {
+            match self {
+                Self::Swaps => manager.subscribe_swaps(DexType::UniswapV3, address),
+                Self::LiquidityUpdates => {
+                    manager.subscribe_mints(DexType::UniswapV3, address);
+                    manager.subscribe_burns(DexType::UniswapV3, address);
+                }
+                Self::FeeCollects => manager.subscribe_collects(DexType::UniswapV3, address),
+                Self::FlashEvents => manager.subscribe_flashes(DexType::UniswapV3, address),
+            }
+        }
+
+        fn unsubscribe(self, manager: &mut DefiDataSubscriptionManager, address: Address) {
+            match self {
+                Self::Swaps => manager.unsubscribe_swaps(DexType::UniswapV3, address),
+                Self::LiquidityUpdates => {
+                    manager.unsubscribe_mints(DexType::UniswapV3, address);
+                    manager.unsubscribe_burns(DexType::UniswapV3, address);
+                }
+                Self::FeeCollects => manager.unsubscribe_collects(DexType::UniswapV3, address),
+                Self::FlashEvents => manager.unsubscribe_flashes(DexType::UniswapV3, address),
+            }
+        }
+
+        fn signatures(self, manager: &DefiDataSubscriptionManager) -> Vec<String> {
+            let dex = DexType::UniswapV3;
+
+            let signatures = match self {
+                Self::Swaps => vec![manager.get_dex_pool_swap_event_signature(&dex)],
+                Self::LiquidityUpdates => vec![
+                    manager.get_dex_pool_mint_event_signature(&dex),
+                    manager.get_dex_pool_burn_event_signature(&dex),
+                ],
+                Self::FeeCollects => vec![manager.get_dex_pool_collect_event_signature(&dex)],
+                Self::FlashEvents => vec![manager.get_dex_pool_flash_event_signature(&dex)],
+            };
+
+            signatures.into_iter().map(Option::unwrap).collect()
+        }
+    }
+
+    fn sorted(mut values: Vec<String>) -> Vec<String> {
+        values.sort();
+        values
+    }
+
+    #[rstest]
+    fn test_complete_pool_overlaps_narrow_shape(
+        mut registered_manager: DefiDataSubscriptionManager,
+        #[values(
+            NarrowShape::Swaps,
+            NarrowShape::LiquidityUpdates,
+            NarrowShape::FeeCollects,
+            NarrowShape::FlashEvents
+        )]
+        narrow: NarrowShape,
+        #[values(true, false)] pool_first: bool,
+    ) {
+        let dex = DexType::UniswapV3;
+        let pool_address = address!("1234567890123456789012345678901234567890");
+        registered_manager.register_dex_fee_protocol_events(
+            dex,
+            Some("SetFeeProtocol(uint8,uint8,uint8,uint8)"),
+            Some("CollectProtocol(address,address,uint128,uint128)"),
+        );
+        let all_signatures = sorted(registered_manager.get_subscribed_dex_event_signatures(&dex));
+        let narrow_signatures = sorted(narrow.signatures(&registered_manager));
+        registered_manager.subscribe_pool(dex, pool_address);
+        narrow.subscribe(&mut registered_manager, pool_address);
+
+        if pool_first {
+            registered_manager.unsubscribe_pool(dex, pool_address);
+        } else {
+            narrow.unsubscribe(&mut registered_manager, pool_address);
+        }
+
+        let addresses_after_first = registered_manager.get_subscribed_dex_contract_addresses(&dex);
+        let signatures_after_first =
+            sorted(registered_manager.get_active_subscribed_dex_event_signatures(&dex));
+
+        if pool_first {
+            narrow.unsubscribe(&mut registered_manager, pool_address);
+        } else {
+            registered_manager.unsubscribe_pool(dex, pool_address);
+        }
+
+        assert_eq!(all_signatures.len(), 7);
+        assert_eq!(addresses_after_first, vec![pool_address]);
+
+        if pool_first {
+            assert_eq!(signatures_after_first, narrow_signatures);
+        } else {
+            assert_eq!(signatures_after_first, all_signatures);
+        }
+
+        assert!(
+            registered_manager
+                .get_subscribed_dex_contract_addresses(&dex)
+                .is_empty()
+        );
+        assert!(
+            registered_manager
+                .get_active_subscribed_dex_event_signatures(&dex)
+                .is_empty()
+        );
+        assert!(!registered_manager.has_pool_event_subscriptions());
     }
 
     #[rstest]

@@ -13,11 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 use pyo3::prelude::*;
 
 use crate::{
-    average::MovingAverageType, indicator::Indicator, volatility::rvi::RelativeVolatilityIndex,
+    average::MovingAverageType, indicator::Indicator, python::float_precision,
+    volatility::rvi::RelativeVolatilityIndex,
 };
 
 #[pymethods]
@@ -26,16 +28,25 @@ impl RelativeVolatilityIndex {
     /// An indicator which calculates a Relative Volatility Index (RVI) across a rolling window.
     #[new]
     #[pyo3(signature = (period, scalar=None, ma_type=None))]
-    #[must_use]
-    pub fn py_new(period: usize, scalar: Option<f64>, ma_type: Option<MovingAverageType>) -> Self {
-        Self::new(period, scalar, ma_type)
+    pub fn py_new(
+        period: usize,
+        scalar: Option<f64>,
+        ma_type: Option<MovingAverageType>,
+    ) -> PyResult<Self> {
+        Self::new_checked(period, scalar, ma_type).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "RelativeVolatilityIndex({},{},{},{})",
-            self.period, self.ma_type, self.scalar, self.ma_type,
+            "RelativeVolatilityIndex({},{},{})",
+            self.period, self.scalar, self.ma_type,
         )
+    }
+
+    #[getter]
+    #[pyo3(name = "ma_type")]
+    const fn py_ma_type(&self) -> MovingAverageType {
+        self.ma_type
     }
 
     #[getter]
@@ -80,18 +91,20 @@ impl RelativeVolatilityIndex {
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    const fn py_handle_quote_tick(&mut self, _quote: &QuoteTick) {
-        // Function body intentionally left blank.
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "handle_trade_tick")]
-    const fn py_handle_trade_tick(&mut self, _trade: &TradeTick) {
-        // Function body intentionally left blank.
+    fn py_handle_trade_tick(&mut self, trade: &TradeTick) {
+        self.handle_trade(trade);
     }
 
     #[pyo3(name = "handle_bar")]
-    fn py_handle_bar(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into());
+    fn py_handle_bar(&mut self, bar: &Bar) -> PyResult<()> {
+        float_precision::check_bar(bar)?;
+        self.handle_bar(bar);
+        Ok(())
     }
 
     #[pyo3(name = "reset")]

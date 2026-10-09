@@ -26,6 +26,10 @@ use crate::{
 pub(crate) mod analyze;
 pub(crate) mod sync;
 
+mod help;
+
+pub(crate) use help::augment_blockchain_help;
+
 /// Runs blockchain commands based on the provided options.
 ///
 /// # Errors
@@ -65,6 +69,10 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
             to_block,
             rpc_url,
             reset,
+            require_existing_snapshot,
+            checkpoint_blocks,
+            skip_validation,
+            snapshot_from_rpc,
             database,
             multicall_calls_per_rpc_request,
         } => {
@@ -77,6 +85,10 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
                 rpc_url,
                 database,
                 reset,
+                require_existing_snapshot,
+                checkpoint_blocks,
+                skip_validation,
+                snapshot_from_rpc,
                 multicall_calls_per_rpc_request,
             )
             .await
@@ -90,6 +102,11 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
             to_block,
             rpc_url,
             reset,
+            require_existing_snapshot,
+            checkpoint_blocks,
+            skip_validation,
+            snapshot_from_rpc,
+            concurrency,
             database,
             multicall_calls_per_rpc_request,
         } => {
@@ -103,6 +120,11 @@ pub(crate) async fn run_blockchain_command(opt: BlockchainOpt) -> anyhow::Result
                 rpc_url,
                 database,
                 reset,
+                require_existing_snapshot,
+                checkpoint_blocks,
+                skip_validation,
+                snapshot_from_rpc,
+                concurrency,
                 multicall_calls_per_rpc_request,
             )
             .await

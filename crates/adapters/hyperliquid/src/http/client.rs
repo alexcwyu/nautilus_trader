@@ -23,15 +23,17 @@
 use std::{
     collections::HashMap,
     num::NonZeroU32,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
 use ahash::AHashMap;
 use anyhow::Context;
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
-    AtomicMap, MUTEX_POISONED, UUID4, UnixNanos,
-    consts::NAUTILUS_USER_AGENT,
+    AtomicMap, UUID4, UnixNanos,
+    datetime::datetime_to_unix_nanos,
+    string::secret::SecretString,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
@@ -48,9 +50,13 @@ use nautilus_model::{
     types::{AccountBalance, Currency, Price, Quantity},
 };
 use nautilus_network::{
-    http::{HttpClient, HttpClientError, HttpResponse, Method, USER_AGENT},
+    http::{
+        HttpClient, HttpClientError, HttpRedirectPolicy, HttpResponse, Method,
+        create_standard_nautilus_headers,
+    },
     ratelimiter::quota::Quota,
 };
+use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use serde_json::Value;
 use ustr::Ustr;
@@ -58,48 +64,57 @@ use ustr::Ustr;
 use crate::{
     account::resolve_execution_account_address,
     common::{
-        consts::{HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS, exchange_url, info_url},
+        consts::{
+            ASSET_INDEX_INFO_KEY, HYPERLIQUID_REST_WEIGHT_PER_MINUTE, HYPERLIQUID_VENUE,
+            NAUTILUS_BUILDER_ADDRESS, exchange_url, info_url,
+        },
         credential::{Secrets, VaultAddress, credential_env_vars},
         enums::{
-            HyperliquidBarInterval, HyperliquidEnvironment,
+            HyperliquidAccountAbstraction, HyperliquidBarInterval, HyperliquidEnvironment,
             HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidProductType,
         },
         parse::{
             bar_type_to_interval, cache_alias_for_symbol, clamp_price_to_precision,
             derive_limit_from_trigger, determine_order_list_grouping, extract_inner_error,
-            normalize_price, order_to_hyperliquid_request_with_asset_and_cloid,
-            parse_combined_account_balances_and_margins, parse_spot_account_balances,
+            normalize_or_validate_wire_price, order_to_hyperliquid_request_with_optional_decimals,
+            parse_combined_account_balances_and_margins, parse_outcome_symbol,
+            parse_spot_account_balances, parse_trigger_order_type, parse_trigger_order_type_label,
             round_to_sig_figs, time_in_force_to_hyperliquid_tif,
         },
     },
     data::candle_to_bar,
+    data_types::HyperliquidPublicTrade,
     http::{
         error::{Error, Result},
         models::{
-            ClearinghouseState, Cloid, HyperliquidCandleSnapshot, HyperliquidExchangeRequest,
-            HyperliquidExchangeResponse, HyperliquidExecAction, HyperliquidExecBuilderFee,
-            HyperliquidExecCancelByCloidRequest, HyperliquidExecCancelOrderRequest,
-            HyperliquidExecGrouping, HyperliquidExecLimitParams, HyperliquidExecMergeOutcomeParams,
-            HyperliquidExecMergeQuestionParams, HyperliquidExecModifyOrderRequest,
-            HyperliquidExecNegateOutcomeParams, HyperliquidExecOrderKind,
-            HyperliquidExecOrderResponseData, HyperliquidExecOrderStatus,
-            HyperliquidExecPlaceOrderRequest, HyperliquidExecSplitOutcomeParams,
-            HyperliquidExecTif, HyperliquidExecTpSl, HyperliquidExecTriggerParams,
-            HyperliquidExecUserOutcomeOp, HyperliquidFills, HyperliquidFundingHistoryEntry,
-            HyperliquidL2Book, HyperliquidMeta, HyperliquidOrderStatus, OutcomeMeta, PerpDex,
-            PerpMeta, PerpMetaAndCtxs, RESPONSE_STATUS_OK, SpotClearinghouseState, SpotMeta,
-            SpotMetaAndCtxs,
+            ClearinghouseState, Cloid, HyperliquidCandleSnapshot, HyperliquidExchangeAction,
+            HyperliquidExchangeBuilderFee, HyperliquidExchangeCancelByCloidRequest,
+            HyperliquidExchangeCancelOrderRequest, HyperliquidExchangeGrouping,
+            HyperliquidExchangeLimitParams, HyperliquidExchangeMergeOutcomeParams,
+            HyperliquidExchangeMergeQuestionParams, HyperliquidExchangeModifyOrderRequest,
+            HyperliquidExchangeModifyTarget, HyperliquidExchangeNegateOutcomeParams,
+            HyperliquidExchangeOrderKind, HyperliquidExchangeOrderResponseData,
+            HyperliquidExchangeOrderStatus, HyperliquidExchangePlaceOrderRequest,
+            HyperliquidExchangeRequest, HyperliquidExchangeResponse,
+            HyperliquidExchangeSplitOutcomeParams, HyperliquidExchangeTif, HyperliquidExchangeTpSl,
+            HyperliquidExchangeTriggerParams, HyperliquidExchangeUserOutcomeOp, HyperliquidFills,
+            HyperliquidFundingHistoryEntry, HyperliquidL2Book, HyperliquidMeta,
+            HyperliquidOrderStatus, HyperliquidOrderStatusEntry, HyperliquidRecentTrade,
+            OutcomeMeta, PerpDex, PerpMeta, PerpMetaAndCtxs, RESPONSE_STATUS_OK,
+            SpotClearinghouseState, SpotMeta, SpotMetaAndCtxs,
         },
         parse::{
-            HyperliquidInstrumentDef, instruments_from_defs_owned, parse_fill_report,
-            parse_order_status_report_from_basic, parse_outcome_instruments,
-            parse_perp_instruments, parse_position_status_report, parse_spot_instruments,
-            parse_spot_position_status_report,
+            DEFAULT_OUTCOME_QUOTE_CURRENCY, HyperliquidInstrumentDef, create_instrument_from_def,
+            filter_recent_public_trades, get_outcome_currency, instruments_from_defs_owned,
+            parse_fill_report, parse_order_status_report_from_basic, parse_outcome_instruments,
+            parse_perp_instruments_with_settlement, parse_position_status_report,
+            parse_recent_public_trade, parse_spot_instruments, parse_spot_position_status_report,
+            parse_unlisted_outcome_instrument, resolve_perp_settlement_currency,
         },
         query::{ExchangeAction, InfoRequest},
         rate_limits::{
             RateLimitSnapshot, WeightedLimiter, backoff_full_jitter, exchange_weight,
-            exec_action_weight, info_base_weight, info_extra_weight,
+            exec_action_weight, info_base_weight, info_extra_weight, shared_rest_limiter,
         },
     },
     signing::{
@@ -108,9 +123,113 @@ use crate::{
     websocket::messages::WsBasicOrderData,
 };
 
-// https://hyperliquid.xyz/docs/api#rate-limits
-pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> =
-    LazyLock::new(|| Quota::per_minute(NonZeroU32::new(1200).unwrap()));
+fn deduplicate_historical_order_reports(reports: Vec<OrderStatusReport>) -> Vec<OrderStatusReport> {
+    let mut best_by_venue_order_id = AHashMap::new();
+
+    for candidate in reports {
+        let Some(current) = best_by_venue_order_id.remove(&candidate.venue_order_id) else {
+            best_by_venue_order_id.insert(candidate.venue_order_id, candidate);
+            continue;
+        };
+        let (mut best, other) = if historical_report_is_more_advanced(&candidate, &current) {
+            (candidate, current)
+        } else {
+            (current, candidate)
+        };
+
+        if matches!(
+            best.order_type,
+            OrderType::Limit | OrderType::StopLimit | OrderType::LimitIfTouched
+        ) {
+            best.price = best.price.or(other.price);
+        }
+        best.trigger_price = best.trigger_price.or(other.trigger_price);
+        best.trigger_type = best.trigger_type.or(other.trigger_type);
+        best_by_venue_order_id.insert(best.venue_order_id, best);
+    }
+
+    best_by_venue_order_id
+        .into_values()
+        .map(untrigger_closed_report_without_trigger_price)
+        .collect()
+}
+
+// The venue zeroes `triggerPx` on the final row of a triggered order that has filled, so when no
+// earlier row survives the order's trigger cannot be rebuilt and a conditional order type would
+// fail initialization. A closed order no longer needs its trigger: report it as the limit order it
+// executed as when a limit price survived, otherwise as a market order, so its fills reconcile.
+fn untrigger_closed_report_without_trigger_price(
+    mut report: OrderStatusReport,
+) -> OrderStatusReport {
+    let is_trigger_type = matches!(
+        report.order_type,
+        OrderType::StopMarket
+            | OrderType::StopLimit
+            | OrderType::MarketIfTouched
+            | OrderType::LimitIfTouched
+    );
+
+    if !is_trigger_type || report.trigger_price.is_some() || !report.order_status.is_closed() {
+        return report;
+    }
+
+    let order_type = match report.order_type {
+        OrderType::StopLimit | OrderType::LimitIfTouched if report.price.is_some() => {
+            OrderType::Limit
+        }
+        _ => {
+            // A market order has no price; a leftover limit price would be used to infer fills
+            report.price = None;
+            OrderType::Market
+        }
+    };
+    log::debug!(
+        "Historical {} order {} has no trigger price, reconciling as {order_type}",
+        report.order_type,
+        report.venue_order_id,
+    );
+    report.order_type = order_type;
+    report
+}
+
+fn historical_report_is_more_advanced(
+    candidate: &OrderStatusReport,
+    current: &OrderStatusReport,
+) -> bool {
+    candidate.filled_qty > current.filled_qty
+        || (candidate.filled_qty == current.filled_qty
+            && (historical_status_priority(candidate.order_status)
+                > historical_status_priority(current.order_status)
+                || (candidate.order_status == current.order_status
+                    && candidate.ts_last > current.ts_last)))
+}
+
+const fn historical_status_priority(status: OrderStatus) -> u8 {
+    match status {
+        OrderStatus::Initialized | OrderStatus::Submitted | OrderStatus::Emulated => 0,
+        OrderStatus::Released | OrderStatus::Denied => 1,
+        OrderStatus::Accepted | OrderStatus::PendingUpdate | OrderStatus::PendingCancel => 2,
+        OrderStatus::Triggered => 3,
+        OrderStatus::PartiallyFilled => 4,
+        OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => 5,
+        OrderStatus::Filled | OrderStatus::Voided => 6,
+    }
+}
+
+/// Unweighted REST quota retained for compatibility with existing callers.
+///
+/// Adapter clients use a shared weighted limiter because Hyperliquid aggregates request weights
+/// across `/info` and `/exchange`.
+pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
+    Quota::per_minute(NonZeroU32::new(HYPERLIQUID_REST_WEIGHT_PER_MINUTE).unwrap())
+});
+
+pub(crate) const HYPERLIQUID_RECENT_HISTORY_LIMIT: usize = 2_000;
+const RATE_LIMIT_BACKOFF_BASE: Duration = Duration::from_millis(125);
+const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(5);
+const RATE_LIMIT_INFO_RETRIES_MAX: u32 = 3;
+const RETRY_AFTER_HEADER: &str = "retry-after";
+const VAULT_TOKEN_PREFIX: &str = "vntls:";
 
 /// Provides a raw HTTP client for low-level Hyperliquid REST API operations.
 ///
@@ -119,14 +238,7 @@ pub static HYPERLIQUID_REST_QUOTA: LazyLock<Quota> =
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
-)]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.hyperliquid")
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 pub struct HyperliquidRawHttpClient {
     client: HttpClient,
@@ -136,10 +248,9 @@ pub struct HyperliquidRawHttpClient {
     signer: Option<HyperliquidEip712Signer>,
     nonce_manager: Option<Arc<NonceManager>>,
     vault_address: Option<VaultAddress>,
-    rest_limiter: Arc<WeightedLimiter>,
-    rate_limit_backoff_base: Duration,
-    rate_limit_backoff_cap: Duration,
-    rate_limit_max_attempts_info: u32,
+    proxy_url: Option<SecretString>,
+    info_limiter: Arc<WeightedLimiter>,
+    exchange_limiter: Arc<WeightedLimiter>,
 }
 
 impl HyperliquidRawHttpClient {
@@ -153,25 +264,23 @@ impl HyperliquidRawHttpClient {
         timeout_secs: u64,
         proxy_url: Option<String>,
     ) -> std::result::Result<Self, HttpClientError> {
+        let base_info = info_url(environment).to_string();
+        let base_exchange = exchange_url(environment).to_string();
+        let info_limiter = shared_rest_limiter(environment, &base_info, proxy_url.as_deref());
+        let exchange_limiter =
+            shared_rest_limiter(environment, &base_exchange, proxy_url.as_deref());
+
         Ok(Self {
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            client: Self::build_http_client(timeout_secs, proxy_url.clone())?,
             environment,
-            base_info: info_url(environment).to_string(),
-            base_exchange: exchange_url(environment).to_string(),
+            base_info,
+            base_exchange,
             signer: None,
             nonce_manager: None,
             vault_address: None,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
-            rate_limit_backoff_base: Duration::from_millis(125),
-            rate_limit_backoff_cap: Duration::from_secs(5),
-            rate_limit_max_attempts_info: 3,
+            proxy_url: proxy_url.map(SecretString::from),
+            info_limiter,
+            exchange_limiter,
         })
     }
 
@@ -189,36 +298,44 @@ impl HyperliquidRawHttpClient {
         let signer = HyperliquidEip712Signer::new(&secrets.private_key)
             .map_err(|e| HttpClientError::from(e.to_string()))?;
         let nonce_manager = Arc::new(NonceManager::new());
+        let base_info = info_url(secrets.environment).to_string();
+        let base_exchange = exchange_url(secrets.environment).to_string();
+        let info_limiter =
+            shared_rest_limiter(secrets.environment, &base_info, proxy_url.as_deref());
+        let exchange_limiter =
+            shared_rest_limiter(secrets.environment, &base_exchange, proxy_url.as_deref());
 
         Ok(Self {
-            client: HttpClient::new(
-                Self::default_headers(),
-                vec![],
-                vec![],
-                Some(*HYPERLIQUID_REST_QUOTA),
-                Some(timeout_secs),
-                proxy_url,
-            )?,
+            client: Self::build_http_client(timeout_secs, proxy_url.clone())?,
             environment: secrets.environment,
-            base_info: info_url(secrets.environment).to_string(),
-            base_exchange: exchange_url(secrets.environment).to_string(),
+            base_info,
+            base_exchange,
             signer: Some(signer),
             nonce_manager: Some(nonce_manager),
             vault_address: secrets.vault_address,
-            rest_limiter: Arc::new(WeightedLimiter::per_minute(1200)),
-            rate_limit_backoff_base: Duration::from_millis(125),
-            rate_limit_backoff_cap: Duration::from_secs(5),
-            rate_limit_max_attempts_info: 3,
+            proxy_url: proxy_url.map(SecretString::from),
+            info_limiter,
+            exchange_limiter,
         })
     }
 
     /// Overrides the base info URL (for testing with mock servers).
     pub fn set_base_info_url(&mut self, url: String) {
+        self.info_limiter = shared_rest_limiter(
+            self.environment,
+            &url,
+            self.proxy_url.as_ref().map(|value| value.expose_secret()),
+        );
         self.base_info = url;
     }
 
     /// Overrides the base exchange URL (for testing with mock servers).
     pub fn set_base_exchange_url(&mut self, url: String) {
+        self.exchange_limiter = shared_rest_limiter(
+            self.environment,
+            &url,
+            self.proxy_url.as_ref().map(|value| value.expose_secret()),
+        );
         self.base_exchange = url;
     }
 
@@ -252,13 +369,13 @@ impl HyperliquidRawHttpClient {
             .map_err(|e| Error::auth(format!("Failed to create HTTP client: {e}")))
     }
 
-    /// Configure rate limiting parameters (chainable).
+    /// Rebinds the client to the shared rate limits for its configured routes.
     #[must_use]
     pub fn with_rate_limits(mut self) -> Self {
-        self.rest_limiter = Arc::new(WeightedLimiter::per_minute(1200));
-        self.rate_limit_backoff_base = Duration::from_millis(125);
-        self.rate_limit_backoff_cap = Duration::from_secs(5);
-        self.rate_limit_max_attempts_info = 3;
+        let proxy_url = self.proxy_url.as_ref().map(|value| value.expose_secret());
+        self.info_limiter = shared_rest_limiter(self.environment, &self.base_info, proxy_url);
+        self.exchange_limiter =
+            shared_rest_limiter(self.environment, &self.base_exchange, proxy_url);
         self
     }
 
@@ -306,20 +423,37 @@ impl HyperliquidRawHttpClient {
         }
     }
 
+    fn build_http_client(
+        timeout_secs: u64,
+        proxy_url: Option<String>,
+    ) -> std::result::Result<HttpClient, HttpClientError> {
+        HttpClient::builder()
+            .redirect_policy(HttpRedirectPolicy::Reject)
+            .headers(Self::default_headers())
+            .header_keys(vec![RETRY_AFTER_HEADER.to_string()])
+            .rate_limiters(Vec::new())
+            .timeout_secs(timeout_secs)
+            .maybe_proxy_url(proxy_url)
+            .build()
+    }
+
     fn default_headers() -> HashMap<String, String> {
-        HashMap::from([
-            (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ])
+        let mut headers: HashMap<String, String> =
+            create_standard_nautilus_headers().into_iter().collect();
+        headers.insert("Content-Type".to_string(), "application/json".to_string());
+        headers
     }
 
     fn signer_id(&self) -> SignerId {
         SignerId("hyperliquid:default".into())
     }
 
-    fn parse_retry_after_simple(&self, headers: &HashMap<String, String>) -> Option<u64> {
-        let retry_after = headers.get("retry-after")?;
-        retry_after.parse::<u64>().ok().map(|s| s * 1000) // convert seconds to ms
+    fn retry_after_ms(headers: &HashMap<String, String>) -> Option<u64> {
+        let retry_after = headers.get(RETRY_AFTER_HEADER)?;
+        retry_after
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| seconds.saturating_mul(1_000))
     }
 
     /// Get metadata about available markets.
@@ -384,6 +518,16 @@ impl HyperliquidRawHttpClient {
         serde_json::from_value(response).map_err(Error::Serde)
     }
 
+    /// Get recent public trades for a coin.
+    ///
+    /// Returns a recent snapshot (newest first) with no time range. Depends on the
+    /// Hyperliquid indexer: self-hosted `/info` nodes return HTTP 422.
+    pub async fn info_recent_trades(&self, coin: &str) -> Result<Vec<HyperliquidRecentTrade>> {
+        let request = InfoRequest::recent_trades(coin);
+        let response = self.send_info_request(&request).await?;
+        serde_json::from_value(response).map_err(Error::Serde)
+    }
+
     /// Get user fills (trading history).
     pub async fn info_user_fills(&self, user: &str) -> Result<HyperliquidFills> {
         let request = InfoRequest::user_fills(user);
@@ -406,19 +550,51 @@ impl HyperliquidRawHttpClient {
 
     /// Get frontend open orders (includes more detail) for a user.
     pub async fn info_frontend_open_orders(&self, user: &str) -> Result<Value> {
-        let request = InfoRequest::frontend_open_orders(user);
+        self.info_frontend_open_orders_for_dex(user, None).await
+    }
+
+    async fn info_frontend_open_orders_for_dex(
+        &self,
+        user: &str,
+        dex: Option<&str>,
+    ) -> Result<Value> {
+        let request = InfoRequest::frontend_open_orders_for_dex(user, dex);
         self.send_info_request(&request).await
+    }
+
+    /// Get the most recent historical orders for a user.
+    pub async fn info_historical_orders(
+        &self,
+        user: &str,
+    ) -> Result<Vec<HyperliquidOrderStatusEntry>> {
+        let request = InfoRequest::historical_orders(user);
+        let response = self.send_info_request(&request).await?;
+        serde_json::from_value(response).map_err(Error::Serde)
     }
 
     /// Get clearinghouse state (balances, positions, margin) for a user.
     pub async fn info_clearinghouse_state(&self, user: &str) -> Result<Value> {
-        let request = InfoRequest::clearinghouse_state(user);
+        self.info_clearinghouse_state_for_dex(user, None).await
+    }
+
+    async fn info_clearinghouse_state_for_dex(
+        &self,
+        user: &str,
+        dex: Option<&str>,
+    ) -> Result<Value> {
+        let request = InfoRequest::clearinghouse_state_for_dex(user, dex);
         self.send_info_request(&request).await
     }
 
     /// Get spot clearinghouse state (per-token spot balances) for a user.
     pub async fn info_spot_clearinghouse_state(&self, user: &str) -> Result<Value> {
         let request = InfoRequest::spot_clearinghouse_state(user);
+        self.send_info_request(&request).await
+    }
+
+    /// Get the account abstraction mode for a user.
+    pub async fn info_user_abstraction(&self, user: &str) -> Result<Value> {
+        let request = InfoRequest::user_abstraction(user);
         self.send_info_request(&request).await
     }
 
@@ -470,11 +646,10 @@ impl HyperliquidRawHttpClient {
 
     async fn send_info_request(&self, request: &InfoRequest) -> Result<Value> {
         let base_w = info_base_weight(request);
-        self.rest_limiter.acquire(base_w).await;
-
         let mut attempt = 0u32;
 
         loop {
+            self.info_limiter.acquire(base_w).await;
             let response = self.http_roundtrip_info(request).await?;
 
             if response.status.is_success() {
@@ -482,7 +657,7 @@ impl HyperliquidRawHttpClient {
                 let val: Value = serde_json::from_slice(&response.body).map_err(Error::Serde)?;
                 let extra = info_extra_weight(request, &val);
                 if extra > 0 {
-                    self.rest_limiter.debit_extra(extra).await;
+                    self.info_limiter.debit_extra(extra).await;
                     log::debug!(
                         "Info debited extra weight: endpoint={request:?}, base_w={base_w}, extra={extra}"
                     );
@@ -490,45 +665,38 @@ impl HyperliquidRawHttpClient {
                 return Ok(val);
             }
 
-            // 429 → respect Retry-After; else jittered backoff. Retry Info only.
+            // Retry Info requests after 429 responses, honoring Retry-After when present
             if response.status.as_u16() == 429 {
-                if attempt >= self.rate_limit_max_attempts_info {
-                    let ra = self.parse_retry_after_simple(&response.headers);
+                if attempt >= RATE_LIMIT_INFO_RETRIES_MAX {
+                    let ra = Self::retry_after_ms(&response.headers);
                     return Err(Error::rate_limit("info", base_w, ra));
                 }
-                let delay = self
-                    .parse_retry_after_simple(&response.headers)
-                    .map_or_else(
-                        || {
-                            backoff_full_jitter(
-                                attempt,
-                                self.rate_limit_backoff_base,
-                                self.rate_limit_backoff_cap,
-                            )
-                        },
-                        Duration::from_millis,
-                    );
+                let delay = Self::retry_after_ms(&response.headers).map_or_else(
+                    || {
+                        backoff_full_jitter(
+                            attempt,
+                            RATE_LIMIT_BACKOFF_BASE,
+                            RATE_LIMIT_BACKOFF_CAP,
+                        )
+                    },
+                    Duration::from_millis,
+                );
                 log::warn!(
                     "429 Too Many Requests; backing off: endpoint={request:?}, attempt={attempt}, wait_ms={:?}",
                     delay.as_millis()
                 );
                 attempt += 1;
                 tokio::time::sleep(delay).await;
-                // tiny re-acquire to avoid stampede exactly on minute boundary
-                self.rest_limiter.acquire(1).await;
                 continue;
             }
 
             // transient 5xx: treat like retryable Info (bounded)
             if (response.status.is_server_error() || response.status.as_u16() == 408)
-                && attempt < self.rate_limit_max_attempts_info
+                && attempt < RATE_LIMIT_INFO_RETRIES_MAX
             {
-                let delay = backoff_full_jitter(
-                    attempt,
-                    self.rate_limit_backoff_base,
-                    self.rate_limit_backoff_cap,
-                );
-                log::warn!(
+                let delay =
+                    backoff_full_jitter(attempt, RATE_LIMIT_BACKOFF_BASE, RATE_LIMIT_BACKOFF_CAP);
+                log::debug!(
                     "Transient error; retrying: endpoint={request:?}, attempt={attempt}, status={:?}, wait_ms={:?}",
                     response.status.as_u16(),
                     delay.as_millis()
@@ -574,7 +742,7 @@ impl HyperliquidRawHttpClient {
         action: &ExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exchange_weight(action);
-        self.rest_limiter.acquire(w).await;
+        self.exchange_limiter.acquire(w).await;
 
         let signer = self
             .signer
@@ -644,7 +812,7 @@ impl HyperliquidRawHttpClient {
                 _ => Ok(parsed_response),
             }
         } else if response.status.as_u16() == 429 {
-            let ra = self.parse_retry_after_simple(&response.headers);
+            let ra = Self::retry_after_ms(&response.headers);
             Err(Error::rate_limit("exchange", w, ra))
         } else {
             let error_body = String::from_utf8_lossy(&response.body);
@@ -660,12 +828,12 @@ impl HyperliquidRawHttpClient {
         }
     }
 
-    /// Build a signed exchange request using the typed HyperliquidExecAction enum.
+    /// Build a signed exchange request using the typed HyperliquidExchangeAction enum.
     pub fn sign_action_exec_request(
         &self,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
         expires_after: Option<u64>,
-    ) -> Result<HyperliquidExchangeRequest<HyperliquidExecAction>> {
+    ) -> Result<HyperliquidExchangeRequest<HyperliquidExchangeAction>> {
         let signer = self
             .signer
             .as_ref()
@@ -711,16 +879,16 @@ impl HyperliquidRawHttpClient {
         Ok(request)
     }
 
-    /// Send a signed action to the exchange using the typed HyperliquidExecAction enum.
+    /// Send a signed action to the exchange using the typed HyperliquidExchangeAction enum.
     ///
     /// This is the preferred method for placing orders as it uses properly typed
     /// structures that match Hyperliquid's API expectations exactly.
     pub async fn post_action_exec(
         &self,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         let w = exec_action_weight(action);
-        self.rest_limiter.acquire(w).await;
+        self.exchange_limiter.acquire(w).await;
 
         let request = self.sign_action_exec_request(action, None)?;
 
@@ -749,7 +917,7 @@ impl HyperliquidRawHttpClient {
                 _ => Ok(parsed_response),
             }
         } else if response.status.as_u16() == 429 {
-            let ra = self.parse_retry_after_simple(&response.headers);
+            let ra = Self::retry_after_ms(&response.headers);
             Err(Error::rate_limit("exchange", w, ra))
         } else {
             let error_body = String::from_utf8_lossy(&response.body);
@@ -760,11 +928,11 @@ impl HyperliquidRawHttpClient {
         }
     }
 
-    /// Submit a single order to the Hyperliquid exchange.
-    ///
+    /// Returns the current rate-limit state for the info endpoint route.
     pub async fn rest_limiter_snapshot(&self) -> RateLimitSnapshot {
-        self.rest_limiter.snapshot().await
+        self.info_limiter.snapshot().await
     }
+
     async fn http_roundtrip_exchange<T>(
         &self,
         request: &HyperliquidExchangeRequest<T>,
@@ -802,10 +970,7 @@ impl HyperliquidRawHttpClient {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.hyperliquid",
-        from_py_object
-    )
+    pyo3::pyclass(module = "nautilus_trader.adapters.hyperliquid", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -828,6 +993,7 @@ pub struct HyperliquidHttpClient {
     account_address: Option<String>,
     normalize_prices: bool,
     market_order_slippage_bps: u32,
+    include_builder_attribution: bool,
 }
 
 impl Default for HyperliquidHttpClient {
@@ -880,66 +1046,56 @@ impl HyperliquidHttpClient {
             account_address: None,
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
+            include_builder_attribution: true,
         }
     }
 
     /// Returns the cached CLOID for a client order ID, or derives and caches it.
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     #[must_use]
     pub fn get_or_generate_client_order_id_cloid(&self, client_order_id: ClientOrderId) -> Cloid {
-        let mut cloids = self.client_order_id_cloids.lock().expect(MUTEX_POISONED);
+        let mut cloids = self.client_order_id_cloids.lock();
         *cloids
             .entry(client_order_id)
             .or_insert_with(|| Cloid::from_client_order_id(client_order_id))
     }
 
     /// Caches a CLOID for a client order ID if one is not already cached.
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn cache_client_order_id_cloid(&self, client_order_id: ClientOrderId, cloid: Cloid) {
         self.client_order_id_cloids
             .lock()
-            .expect(MUTEX_POISONED)
             .entry(client_order_id)
             .or_insert(cloid);
     }
 
-    fn replace_client_order_id_cloid(&self, client_order_id: ClientOrderId, cloid: Cloid) {
-        self.client_order_id_cloids
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(client_order_id, cloid);
-    }
-
     /// Returns the cached CLOID for a client order ID.
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     #[must_use]
     pub fn cached_client_order_id_cloid(&self, client_order_id: &ClientOrderId) -> Option<Cloid> {
         self.client_order_id_cloids
             .lock()
-            .expect(MUTEX_POISONED)
             .get(client_order_id)
             .copied()
     }
 
+    /// Returns the cached CLOID for a client order ID when no other client
+    /// order ID maps to the same CLOID.
+    #[must_use]
+    pub(crate) fn unique_cached_client_order_id_cloid(
+        &self,
+        client_order_id: &ClientOrderId,
+    ) -> Option<Cloid> {
+        let cloids = self.client_order_id_cloids.lock();
+        let cloid = cloids.get(client_order_id).copied()?;
+        let mapping_count = cloids
+            .values()
+            .filter(|cached_cloid| **cached_cloid == cloid)
+            .count();
+
+        (mapping_count == 1).then_some(cloid)
+    }
+
     /// Removes the cached CLOID for a client order ID.
-    #[allow(
-        clippy::missing_panics_doc,
-        reason = "cloid cache mutex poisoning is not expected"
-    )]
     pub fn remove_client_order_id_cloid(&self, client_order_id: &ClientOrderId) -> Option<Cloid> {
-        self.client_order_id_cloids
-            .lock()
-            .expect(MUTEX_POISONED)
-            .remove(client_order_id)
+        self.client_order_id_cloids.lock().remove(client_order_id)
     }
 
     /// Overrides the base info URL (for testing with mock servers).
@@ -983,6 +1139,7 @@ impl HyperliquidHttpClient {
             account_address: None,
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
+            include_builder_attribution: true,
         })
     }
 
@@ -1060,6 +1217,7 @@ impl HyperliquidHttpClient {
                     account_address,
                     normalize_prices: true,
                     market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
+                    include_builder_attribution: true,
                 })
             }
             None => {
@@ -1103,6 +1261,7 @@ impl HyperliquidHttpClient {
             account_address: None,
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
+            include_builder_attribution: true,
         })
     }
 
@@ -1134,6 +1293,17 @@ impl HyperliquidHttpClient {
         self.market_order_slippage_bps = value;
     }
 
+    /// Returns whether eligible mainnet orders include builder attribution.
+    #[must_use]
+    pub fn include_builder_attribution(&self) -> bool {
+        self.include_builder_attribution
+    }
+
+    /// Sets whether eligible mainnet orders include builder attribution.
+    pub fn set_include_builder_attribution(&mut self, value: bool) {
+        self.include_builder_attribution = value;
+    }
+
     /// Gets the user address derived from the private key (if client has credentials).
     ///
     /// # Errors
@@ -1149,14 +1319,16 @@ impl HyperliquidHttpClient {
         self.inner.has_vault_address()
     }
 
-    /// Returns the builder-attribution fee to attach to outgoing orders, or
-    /// `None` when attribution must be omitted (vault orders and testnet).
+    /// Returns the builder-attribution fee to attach to outgoing orders.
+    ///
+    /// Returns `None` when attribution is disabled, or when Hyperliquid does
+    /// not support it for the current request context (vault orders and testnet).
     #[must_use]
-    pub fn builder_attribution(&self) -> Option<HyperliquidExecBuilderFee> {
-        if self.has_vault_address() || self.is_testnet() {
+    pub fn builder_attribution(&self) -> Option<HyperliquidExchangeBuilderFee> {
+        if !self.include_builder_attribution || self.has_vault_address() || self.is_testnet() {
             None
         } else {
-            Some(HyperliquidExecBuilderFee {
+            Some(HyperliquidExchangeBuilderFee {
                 address: NAUTILUS_BUILDER_ADDRESS.to_string(),
                 fee_tenths_bp: 0,
             })
@@ -1186,9 +1358,38 @@ impl HyperliquidHttpClient {
     ///
     /// This is required for parsing orders, fills, and positions into reports.
     /// Any existing instrument with the same symbol will be replaced.
+    ///
+    /// The venue asset index is taken from the instrument's `info` map so an
+    /// instrument arriving on the message bus becomes submittable without
+    /// refetching venue metadata. An instrument without the key keeps its
+    /// existing asset index, if any, because guessing one would route orders to
+    /// the wrong asset.
     pub fn cache_instrument(&self, instrument: &InstrumentAny) {
         let full_symbol = instrument.symbol().inner();
         let coin = instrument.raw_symbol().inner();
+
+        match instrument
+            .info()
+            .and_then(|info| info.get_u64(ASSET_INDEX_INFO_KEY))
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            Some(asset_index) => self.asset_indices.rcu(|m| {
+                m.insert(full_symbol, asset_index);
+            }),
+            // vault tokens are synthesized locally to value balances and are never
+            // submitted, so the venue assigns them no asset index to carry
+            None if coin.starts_with(VAULT_TOKEN_PREFIX) => {}
+            // without an index we cannot address the asset on the wire, so a market we
+            // have never indexed is untradable rather than merely stale
+            None if self.asset_indices.get_cloned(&full_symbol).is_none() => log::warn!(
+                "Instrument '{full_symbol}' carries no '{ASSET_INDEX_INFO_KEY}' info value \
+                 and has no cached asset index; orders for it will be rejected"
+            ),
+            None => log::warn!(
+                "Instrument '{full_symbol}' carries no '{ASSET_INDEX_INFO_KEY}' info value; \
+                 leaving the cached asset index unchanged"
+            ),
+        }
 
         self.instruments.rcu(|m| {
             m.insert(full_symbol, instrument.clone());
@@ -1270,7 +1471,7 @@ impl HyperliquidHttpClient {
         }
 
         // Spot fills use @{pair_index} format, translate to full symbol and look up
-        if coin.as_str().starts_with('@')
+        if coin.starts_with('@')
             && let Some(symbol) = self.spot_fill_coins.load().get(coin)
         {
             // Look up by full symbol in instruments map (not instruments_by_coin
@@ -1280,9 +1481,20 @@ impl HyperliquidHttpClient {
             }
         }
 
+        // Settled HIP-4 outcomes drop out of `outcomeMeta`, so uncached
+        // instruments default to USDC because the encoding lacks a quote token.
+        if let Ok(asset_id) = parse_outcome_symbol(coin)
+            && let Ok(def) = parse_unlisted_outcome_instrument(asset_id)
+            && let Some(instrument) = create_instrument_from_def(&def, self.clock.get_time_ns())
+        {
+            log::debug!("Creating instrument for unlisted outcome coin: {coin}");
+            self.cache_instrument(&instrument);
+            return Some(instrument);
+        }
+
         // Vault tokens aren't in standard API, create synthetic instruments
-        if coin.as_str().starts_with("vntls:") {
-            log::info!("Creating synthetic instrument for vault token: {coin}");
+        if coin.starts_with(VAULT_TOKEN_PREFIX) {
+            log::debug!("Creating synthetic instrument for vault token: {coin}");
 
             let ts_event = self.clock.get_time_ns();
 
@@ -1312,31 +1524,21 @@ impl HyperliquidHttpClient {
             let price_increment = Price::from("0.00000001");
             let size_increment = Quantity::from("0.00000001");
 
-            let instrument = InstrumentAny::CurrencyPair(CurrencyPair::new(
-                instrument_id,
-                symbol,
-                base_currency,
-                quote_currency,
-                8, // price_precision
-                8, // size_precision
-                price_increment,
-                size_increment,
-                None, // multiplier
-                None, // lot_size
-                None, // max_quantity
-                None, // min_quantity
-                None, // max_notional
-                None, // min_notional
-                None, // max_price
-                None, // min_price
-                None, // margin_init
-                None, // margin_maint
-                None, // maker_fee
-                None, // taker_fee
-                None, // info
-                ts_event,
-                ts_event,
-            ));
+            let instrument = InstrumentAny::CurrencyPair(
+                CurrencyPair::builder()
+                    .instrument_id(instrument_id)
+                    .raw_symbol(symbol)
+                    .base_currency(base_currency)
+                    .quote_currency(quote_currency)
+                    .price_precision(8)
+                    .size_precision(8)
+                    .price_increment(price_increment)
+                    .size_increment(size_increment)
+                    .ts_event(ts_event)
+                    .ts_init(ts_event)
+                    .build()
+                    .unwrap(),
+            );
 
             self.cache_instrument(&instrument);
 
@@ -1358,43 +1560,68 @@ impl HyperliquidHttpClient {
     /// Fetch and parse all instrument definitions, populating the asset indices cache.
     pub async fn request_instrument_defs(&self) -> Result<Vec<HyperliquidInstrumentDef>> {
         let mut defs: Vec<HyperliquidInstrumentDef> = Vec::new();
+        let spot_meta = match self.inner.get_spot_meta().await {
+            Ok(spot_meta) => Some(spot_meta),
+            Err(e) => {
+                log::warn!("Failed to load Hyperliquid spot metadata: {e}");
+                None
+            }
+        };
 
         // Load all perp dexes: index 0 = standard, index 1+ = HIP-3
         match self.inner.load_all_perp_metas().await {
             Ok(all_metas) => {
                 for (dex_index, meta) in all_metas.iter().enumerate() {
                     let base = perp_dex_asset_index_base(dex_index);
-
-                    match parse_perp_instruments(meta, base) {
-                        Ok(perp_defs) => {
-                            log::debug!(
-                                "Loaded Hyperliquid perp defs: dex_index={dex_index}, count={}",
-                                perp_defs.len(),
-                            );
-                            defs.extend(perp_defs);
-                        }
+                    let settlement_currency = match resolve_perp_settlement_currency(
+                        meta,
+                        spot_meta.as_ref(),
+                    ) {
+                        Ok(settlement_currency) => settlement_currency,
                         Err(e) => {
-                            log::warn!("Failed to parse perp instruments for dex {dex_index}: {e}");
+                            return Err(Error::decode(format!(
+                                "failed to resolve perp settlement currency for dex {dex_index}: {e}",
+                            )));
                         }
-                    }
+                    };
+
+                    let perp_defs = parse_perp_instruments_with_settlement(
+                        meta,
+                        base,
+                        settlement_currency.as_str(),
+                    );
+                    log::debug!(
+                        "Loaded Hyperliquid perp defs: dex_index={dex_index}, count={}",
+                        perp_defs.len(),
+                    );
+                    defs.extend(perp_defs);
                 }
             }
             Err(e) => {
                 log::warn!("Failed to load allPerpMetas, falling back to meta: {e}");
 
                 match self.inner.load_perp_meta().await {
-                    Ok(perp_meta) => match parse_perp_instruments(&perp_meta, 0) {
-                        Ok(perp_defs) => {
-                            log::debug!(
-                                "Loaded Hyperliquid perp defs via fallback: count={}",
-                                perp_defs.len(),
-                            );
-                            defs.extend(perp_defs);
+                    Ok(perp_meta) => {
+                        match resolve_perp_settlement_currency(&perp_meta, spot_meta.as_ref()) {
+                            Ok(settlement_currency) => {
+                                let perp_defs = parse_perp_instruments_with_settlement(
+                                    &perp_meta,
+                                    0,
+                                    settlement_currency.as_str(),
+                                );
+                                log::debug!(
+                                    "Loaded Hyperliquid perp defs via fallback: count={}",
+                                    perp_defs.len(),
+                                );
+                                defs.extend(perp_defs);
+                            }
+                            Err(e) => {
+                                return Err(Error::decode(format!(
+                                    "failed to resolve fallback perp settlement currency: {e}",
+                                )));
+                            }
                         }
-                        Err(e) => {
-                            log::warn!("Failed to parse perp instruments: {e}");
-                        }
-                    },
+                    }
                     Err(e) => {
                         log::warn!("Failed to load Hyperliquid perp metadata: {e}");
                     }
@@ -1402,8 +1629,8 @@ impl HyperliquidHttpClient {
             }
         }
 
-        match self.inner.get_spot_meta().await {
-            Ok(spot_meta) => match parse_spot_instruments(&spot_meta) {
+        if let Some(spot_meta) = spot_meta.as_ref() {
+            match parse_spot_instruments(spot_meta) {
                 Ok(spot_defs) => {
                     log::debug!(
                         "Loaded Hyperliquid spot definitions: count={}",
@@ -1414,9 +1641,6 @@ impl HyperliquidHttpClient {
                 Err(e) => {
                     log::warn!("Failed to parse Hyperliquid spot instruments: {e}");
                 }
-            },
-            Err(e) => {
-                log::warn!("Failed to load Hyperliquid spot metadata: {e}");
             }
         }
 
@@ -1607,7 +1831,7 @@ impl HyperliquidHttpClient {
         mapping
     }
 
-    /// Get perpetuals metadata (internal helper).
+    /// Gets perpetuals metadata for internal use.
     #[allow(dead_code)]
     pub(crate) async fn load_perp_meta(&self) -> Result<PerpMeta> {
         self.inner.load_perp_meta().await
@@ -1619,20 +1843,44 @@ impl HyperliquidHttpClient {
         self.inner.load_all_perp_metas().await
     }
 
-    /// Get spot metadata (internal helper).
+    /// Gets spot metadata for internal use.
     #[allow(dead_code)]
     pub(crate) async fn get_spot_meta(&self) -> Result<SpotMeta> {
         self.inner.get_spot_meta().await
     }
 
-    /// Get outcome metadata (internal helper).
+    /// Gets outcome metadata for internal use.
     pub(crate) async fn get_outcome_meta(&self) -> Result<OutcomeMeta> {
         self.inner.get_outcome_meta().await
+    }
+
+    pub(crate) fn outcome_quote_currency(
+        &self,
+        instrument_id: InstrumentId,
+        outcome_index: u32,
+        meta: &OutcomeMeta,
+    ) -> Currency {
+        if let Some(instrument) = self.instruments.load().get(&instrument_id.symbol.inner()) {
+            return instrument.quote_currency();
+        }
+
+        let code = meta
+            .outcomes
+            .iter()
+            .find(|market| market.outcome == outcome_index)
+            .and_then(|market| market.quote_token.as_deref())
+            .unwrap_or(DEFAULT_OUTCOME_QUOTE_CURRENCY);
+        get_outcome_currency(code)
     }
 
     /// Get L2 order book for a coin.
     pub async fn info_l2_book(&self, coin: &str) -> Result<HyperliquidL2Book> {
         self.inner.info_l2_book(coin).await
+    }
+
+    /// Get recent public trades for a coin.
+    pub async fn info_recent_trades(&self, coin: &str) -> Result<Vec<HyperliquidRecentTrade>> {
+        self.inner.info_recent_trades(coin).await
     }
 
     /// Get user fills (trading history).
@@ -1655,14 +1903,75 @@ impl HyperliquidHttpClient {
         self.inner.info_frontend_open_orders(user).await
     }
 
+    async fn info_frontend_open_orders_for_dex(
+        &self,
+        user: &str,
+        dex: Option<&str>,
+    ) -> Result<Value> {
+        self.inner
+            .info_frontend_open_orders_for_dex(user, dex)
+            .await
+    }
+
+    /// Get the most recent historical orders for a user.
+    pub async fn info_historical_orders(
+        &self,
+        user: &str,
+    ) -> Result<Vec<HyperliquidOrderStatusEntry>> {
+        self.inner.info_historical_orders(user).await
+    }
+
     /// Get clearinghouse state (balances, positions, margin) for a user.
     pub async fn info_clearinghouse_state(&self, user: &str) -> Result<Value> {
         self.inner.info_clearinghouse_state(user).await
     }
 
+    async fn info_clearinghouse_state_for_dex(
+        &self,
+        user: &str,
+        dex: Option<&str>,
+    ) -> Result<Value> {
+        self.inner.info_clearinghouse_state_for_dex(user, dex).await
+    }
+
     /// Get spot clearinghouse state (per-token spot balances) for a user.
     pub async fn info_spot_clearinghouse_state(&self, user: &str) -> Result<Value> {
         self.inner.info_spot_clearinghouse_state(user).await
+    }
+
+    /// Get the account abstraction mode for a user.
+    ///
+    /// A mode string this adapter does not recognize maps to
+    /// [`HyperliquidAccountAbstraction::Unknown`] and is logged as a warning; such accounts keep
+    /// the perp-summary balance logic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is not a JSON string.
+    pub async fn info_user_abstraction(&self, user: &str) -> Result<HyperliquidAccountAbstraction> {
+        let response = self.inner.info_user_abstraction(user).await?;
+
+        // Serde reads a single-key object like `{"mode": null}` as a unit variant, which
+        // `#[serde(other)]` would map to `Unknown`, so only a bare string is accepted. Any
+        // string decodes, to a known mode or to `Unknown`
+        let abstraction = response
+            .as_str()
+            .and_then(|_| serde_json::from_value(response.clone()).ok())
+            .ok_or_else(|| {
+                Error::decode(format!(
+                    "Failed to parse user abstraction: expected a mode string, was {response}"
+                ))
+            })?;
+
+        if abstraction == HyperliquidAccountAbstraction::Unknown {
+            log::warn!(
+                "Unrecognized Hyperliquid account abstraction {response}, using perp clearinghouse balances"
+            );
+        } else {
+            log::debug!("Hyperliquid account abstraction: {abstraction}");
+        }
+
+        Ok(abstraction)
     }
 
     /// Get user fee schedule and effective rates.
@@ -1706,7 +2015,7 @@ impl HyperliquidHttpClient {
     /// Post an execution action (low-level delegation).
     pub async fn post_action_exec(
         &self,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
     ) -> Result<HyperliquidExchangeResponse> {
         self.inner.post_action_exec(action).await
     }
@@ -1714,9 +2023,9 @@ impl HyperliquidHttpClient {
     /// Build the signed exchange request used by both HTTP and WebSocket post transports.
     pub fn sign_action_exec_request(
         &self,
-        action: &HyperliquidExecAction,
+        action: &HyperliquidExchangeAction,
         expires_after: Option<u64>,
-    ) -> Result<HyperliquidExchangeRequest<HyperliquidExecAction>> {
+    ) -> Result<HyperliquidExchangeRequest<HyperliquidExchangeAction>> {
         self.inner.sign_action_exec_request(action, expires_after)
     }
 
@@ -1750,30 +2059,33 @@ impl HyperliquidHttpClient {
 
         let action = if let Some(client_order_id) = client_order_id {
             if let Some(cloid) = self.cached_client_order_id_cloid(&client_order_id) {
-                HyperliquidExecAction::CancelByCloid {
-                    cancels: vec![HyperliquidExecCancelByCloidRequest {
+                HyperliquidExchangeAction::CancelByCloid {
+                    cancels: vec![HyperliquidExchangeCancelByCloidRequest {
                         asset: asset_id,
                         cloid,
                     }],
+                    fast: None,
                 }
             } else if let Some(oid) = venue_order_id {
                 let oid_u64 = oid
                     .as_str()
                     .parse::<u64>()
                     .map_err(|_| Error::bad_request("Invalid venue order ID format"))?;
-                HyperliquidExecAction::Cancel {
-                    cancels: vec![HyperliquidExecCancelOrderRequest {
+                HyperliquidExchangeAction::Cancel {
+                    cancels: vec![HyperliquidExchangeCancelOrderRequest {
                         asset: asset_id,
                         oid: oid_u64,
                     }],
+                    fast: None,
                 }
             } else {
                 let cloid = self.get_or_generate_client_order_id_cloid(client_order_id);
-                HyperliquidExecAction::CancelByCloid {
-                    cancels: vec![HyperliquidExecCancelByCloidRequest {
+                HyperliquidExchangeAction::CancelByCloid {
+                    cancels: vec![HyperliquidExchangeCancelByCloidRequest {
                         asset: asset_id,
                         cloid,
                     }],
+                    fast: None,
                 }
             }
         } else if let Some(oid) = venue_order_id {
@@ -1781,11 +2093,12 @@ impl HyperliquidHttpClient {
                 .as_str()
                 .parse::<u64>()
                 .map_err(|_| Error::bad_request("Invalid venue order ID format"))?;
-            HyperliquidExecAction::Cancel {
-                cancels: vec![HyperliquidExecCancelOrderRequest {
+            HyperliquidExchangeAction::Cancel {
+                cancels: vec![HyperliquidExchangeCancelOrderRequest {
                     asset: asset_id,
                     oid: oid_u64,
                 }],
+                fast: None,
             }
         } else {
             return Err(Error::bad_request(
@@ -1813,18 +2126,18 @@ impl HyperliquidHttpClient {
 
     /// Modify an order on the Hyperliquid exchange.
     ///
-    /// The HL modify API requires a full replacement order spec plus the
-    /// venue order ID. The caller must provide all order fields.
+    /// The HL modify API requires a full replacement order spec plus a venue
+    /// order ID or cached CLOID target. The caller must provide all order fields.
     ///
     /// # Errors
     ///
-    /// Returns an error if the asset index is not found, the venue order ID
-    /// is invalid, or the API returns an error.
+    /// Returns an error if the asset index is not found, no safe modify target
+    /// exists, the venue order ID is invalid, or the API returns an error.
     #[expect(clippy::too_many_arguments)]
     pub async fn modify_order(
         &self,
         instrument_id: InstrumentId,
-        venue_order_id: VenueOrderId,
+        venue_order_id: Option<VenueOrderId>,
         order_side: OrderSide,
         order_type: OrderType,
         price: Price,
@@ -1842,33 +2155,46 @@ impl HyperliquidHttpClient {
             ))
         })?;
 
-        let oid: u64 = venue_order_id
-            .as_str()
-            .parse()
-            .map_err(|_| Error::bad_request("Invalid venue order ID format"))?;
+        let oid = match client_order_id
+            .as_ref()
+            .and_then(|id| self.unique_cached_client_order_id_cloid(id))
+        {
+            Some(cloid) => HyperliquidExchangeModifyTarget::Cloid(cloid),
+            None => {
+                let Some(venue_order_id) = venue_order_id.as_ref() else {
+                    return Err(Error::bad_request(
+                        "venue_order_id or unique cached CLOID is required for modify",
+                    ));
+                };
+                HyperliquidExchangeModifyTarget::from_venue_order_id(venue_order_id)
+                    .map_err(|_| Error::bad_request("Invalid venue order ID format"))?
+            }
+        };
 
         let is_buy = matches!(order_side, OrderSide::Buy);
-        let decimals = self.get_price_precision_for_symbol(symbol).unwrap_or(2);
+        let decimals = self.get_price_precision_for_symbol(symbol);
 
-        let normalized_price = if self.normalize_prices {
-            normalize_price(price.as_decimal(), decimals).normalize()
-        } else {
-            price.as_decimal().normalize()
-        };
+        let normalized_price = normalize_or_validate_wire_price(
+            price.as_decimal(),
+            "Price",
+            decimals,
+            self.normalize_prices,
+        )
+        .map_err(|e| Error::bad_request(format!("{e}")))?;
 
         let size = quantity.as_decimal().normalize();
 
         let kind = match order_type {
-            OrderType::Market => HyperliquidExecOrderKind::Limit {
-                limit: HyperliquidExecLimitParams {
-                    tif: HyperliquidExecTif::Ioc,
+            OrderType::Market => HyperliquidExchangeOrderKind::Limit {
+                limit: HyperliquidExchangeLimitParams {
+                    tif: HyperliquidExchangeTif::Ioc,
                 },
             },
             OrderType::Limit => {
                 let tif = time_in_force_to_hyperliquid_tif(time_in_force, post_only)
                     .map_err(|e| Error::bad_request(format!("{e}")))?;
-                HyperliquidExecOrderKind::Limit {
-                    limit: HyperliquidExecLimitParams { tif },
+                HyperliquidExchangeOrderKind::Limit {
+                    limit: HyperliquidExchangeLimitParams { tif },
                 }
             }
             OrderType::StopMarket
@@ -1876,21 +2202,23 @@ impl HyperliquidHttpClient {
             | OrderType::MarketIfTouched
             | OrderType::LimitIfTouched => {
                 if let Some(trig_px) = trigger_price {
-                    let trigger_price_decimal = if self.normalize_prices {
-                        normalize_price(trig_px.as_decimal(), decimals).normalize()
-                    } else {
-                        trig_px.as_decimal().normalize()
-                    };
+                    let trigger_price_decimal = normalize_or_validate_wire_price(
+                        trig_px.as_decimal(),
+                        "Trigger price",
+                        decimals,
+                        self.normalize_prices,
+                    )
+                    .map_err(|e| Error::bad_request(format!("{e}")))?;
                     let tpsl = match order_type {
-                        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExecTpSl::Sl,
-                        _ => HyperliquidExecTpSl::Tp,
+                        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExchangeTpSl::Sl,
+                        _ => HyperliquidExchangeTpSl::Tp,
                     };
                     let is_market = matches!(
                         order_type,
                         OrderType::StopMarket | OrderType::MarketIfTouched
                     );
-                    HyperliquidExecOrderKind::Trigger {
-                        trigger: HyperliquidExecTriggerParams {
+                    HyperliquidExchangeOrderKind::Trigger {
+                        trigger: HyperliquidExchangeTriggerParams {
                             is_market,
                             trigger_px: trigger_price_decimal,
                             tpsl,
@@ -1908,7 +2236,7 @@ impl HyperliquidHttpClient {
         };
         let cloid = client_order_id.map(|id| self.get_or_generate_client_order_id_cloid(id));
 
-        let order = HyperliquidExecPlaceOrderRequest {
+        let order = HyperliquidExchangePlaceOrderRequest {
             asset: asset_id,
             is_buy,
             price: normalized_price,
@@ -1918,8 +2246,8 @@ impl HyperliquidHttpClient {
             cloid,
         };
 
-        let action = HyperliquidExecAction::Modify {
-            modify: HyperliquidExecModifyOrderRequest { oid, order },
+        let action = HyperliquidExchangeAction::Modify {
+            modify: HyperliquidExchangeModifyOrderRequest { oid, order },
         };
 
         let response = self.inner.post_action_exec(&action).await?;
@@ -1949,7 +2277,7 @@ impl HyperliquidHttpClient {
     /// Split an HIP-4 outcome's quote tokens into matched Yes and No side tokens.
     ///
     /// Submits a `userOutcome` exchange action with the `splitOutcome` operation:
-    /// debits `amount` quote tokens (USDH) and credits `amount` Yes plus `amount`
+    /// debits `amount` quote tokens and credits `amount` Yes plus `amount`
     /// No side tokens for the given `outcome` index. Ordinary directional
     /// buys and sells on outcome instruments go through the standard order path
     /// without calling this; the action is for dual-side market making and
@@ -1964,11 +2292,10 @@ impl HyperliquidHttpClient {
         outcome: u32,
         amount: Decimal,
     ) -> Result<HyperliquidExchangeResponse> {
-        let action = HyperliquidExecAction::UserOutcome {
-            op: HyperliquidExecUserOutcomeOp::SplitOutcome(HyperliquidExecSplitOutcomeParams {
-                outcome,
-                amount,
-            }),
+        let action = HyperliquidExchangeAction::UserOutcome {
+            op: HyperliquidExchangeUserOutcomeOp::SplitOutcome(
+                HyperliquidExchangeSplitOutcomeParams { outcome, amount },
+            ),
         };
         self.inner.post_action_exec(&action).await
     }
@@ -1988,11 +2315,10 @@ impl HyperliquidHttpClient {
         outcome: u32,
         amount: Option<Decimal>,
     ) -> Result<HyperliquidExchangeResponse> {
-        let action = HyperliquidExecAction::UserOutcome {
-            op: HyperliquidExecUserOutcomeOp::MergeOutcome(HyperliquidExecMergeOutcomeParams {
-                outcome,
-                amount,
-            }),
+        let action = HyperliquidExchangeAction::UserOutcome {
+            op: HyperliquidExchangeUserOutcomeOp::MergeOutcome(
+                HyperliquidExchangeMergeOutcomeParams { outcome, amount },
+            ),
         };
         self.inner.post_action_exec(&action).await
     }
@@ -2011,11 +2337,10 @@ impl HyperliquidHttpClient {
         question: u32,
         amount: Option<Decimal>,
     ) -> Result<HyperliquidExchangeResponse> {
-        let action = HyperliquidExecAction::UserOutcome {
-            op: HyperliquidExecUserOutcomeOp::MergeQuestion(HyperliquidExecMergeQuestionParams {
-                question,
-                amount,
-            }),
+        let action = HyperliquidExchangeAction::UserOutcome {
+            op: HyperliquidExchangeUserOutcomeOp::MergeQuestion(
+                HyperliquidExchangeMergeQuestionParams { question, amount },
+            ),
         };
         self.inner.post_action_exec(&action).await
     }
@@ -2035,19 +2360,22 @@ impl HyperliquidHttpClient {
         outcome: u32,
         amount: Decimal,
     ) -> Result<HyperliquidExchangeResponse> {
-        let action = HyperliquidExecAction::UserOutcome {
-            op: HyperliquidExecUserOutcomeOp::NegateOutcome(HyperliquidExecNegateOutcomeParams {
-                question,
-                outcome,
-                amount,
-            }),
+        let action = HyperliquidExchangeAction::UserOutcome {
+            op: HyperliquidExchangeUserOutcomeOp::NegateOutcome(
+                HyperliquidExchangeNegateOutcomeParams {
+                    question,
+                    outcome,
+                    amount,
+                },
+            ),
         };
         self.inner.post_action_exec(&action).await
     }
 
     /// Request order status reports for a user.
     ///
-    /// Fetches open orders via `info_frontend_open_orders` and parses them into OrderStatusReports.
+    /// Fetches frontend open orders from the default and all cached builder dexes when unfiltered,
+    /// or from the dex selected by an instrument filter, then parses them into OrderStatusReports.
     /// This method requires instruments to be added to the client cache via `cache_instrument()`.
     ///
     /// For vault tokens (starting with "vntls:") that are not in the cache, synthetic instruments
@@ -2055,64 +2383,197 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the API request fails or parsing fails.
+    /// Returns an error if the API request fails, parsing fails, or a venue row cannot be resolved
+    /// to an instrument or converted into a report (the snapshot is then incomplete and must not be
+    /// treated as authoritative).
     pub async fn request_order_status_reports(
         &self,
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<OrderStatusReport>> {
+        let dexes = self.reconciliation_dexes(instrument_id);
+        let sweep = self
+            .request_order_status_reports_for_dexes(user, instrument_id, &dexes)
+            .await?;
+
+        if !sweep.complete {
+            return Err(Error::bad_request(
+                "Open-order snapshot incomplete: at least one venue row could not be decoded, resolved to an instrument, or converted into a report",
+            ));
+        }
+
+        Ok(sweep.reports)
+    }
+
+    pub(crate) async fn request_order_status_reports_for_dexes(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+        dexes: &[Option<Ustr>],
+    ) -> Result<ReportSweep<OrderStatusReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let response = self.info_frontend_open_orders(user).await?;
-
-        // Parse the JSON response into a vector of orders
-        let orders: Vec<serde_json::Value> = serde_json::from_value(response)
-            .map_err(|e| Error::bad_request(format!("Failed to parse orders: {e}")))?;
-
         let mut reports = Vec::new();
+        let mut complete = true;
         let ts_init = self.clock.get_time_ns();
 
-        for order_value in orders {
-            // Parse the order data
-            let order: WsBasicOrderData = match serde_json::from_value(order_value.clone()) {
-                Ok(o) => o,
-                Err(e) => {
-                    log::warn!("Failed to parse order: {e}");
+        for dex in dexes {
+            let response = self
+                .info_frontend_open_orders_for_dex(user, dex.as_deref())
+                .await?;
+            let orders: Vec<serde_json::Value> = serde_json::from_value(response)
+                .map_err(|e| Error::bad_request(format!("Failed to parse orders: {e}")))?;
+
+            for order_value in orders {
+                let order: WsBasicOrderData = match serde_json::from_value(order_value) {
+                    Ok(order) => order,
+                    Err(e) => {
+                        log::warn!("Failed to parse order: {e}");
+                        complete = false;
+                        continue;
+                    }
+                };
+
+                let instrument = match self.get_or_create_instrument(&order.coin, None) {
+                    Some(instrument) => instrument,
+                    // get_or_create_instrument warns with the coin
+                    None => {
+                        complete = false;
+                        continue;
+                    }
+                };
+
+                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                    continue;
+                }
+
+                match parse_order_status_report_from_basic(
+                    &order,
+                    &HyperliquidOrderStatusEnum::Open,
+                    &instrument,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(report) => reports.push(report),
+                    Err(e) => {
+                        log::error!("Failed to parse order status report: {e}");
+                        complete = false;
+                    }
+                }
+            }
+        }
+
+        Ok(ReportSweep { reports, complete })
+    }
+
+    /// Request historical order status reports for a user.
+    ///
+    /// The venue bounds this endpoint to its 2,000 most recent historical
+    /// orders. Mass-status reconciliation narrows these reports to venue order
+    /// IDs represented by the retained fill window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the API request fails or a venue row cannot be resolved to an
+    /// instrument or converted into a report (the snapshot is then incomplete and must not be
+    /// treated as authoritative).
+    pub async fn request_historical_order_status_reports(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<Vec<OrderStatusReport>> {
+        let entries = self.info_historical_orders(user).await?;
+        let sweep = self.historical_order_status_reports_from_response(entries, instrument_id)?;
+
+        if !sweep.complete {
+            return Err(Error::bad_request(
+                "Historical-order snapshot incomplete: at least one venue row could not be decoded, resolved to an instrument, or converted into a report",
+            ));
+        }
+
+        Ok(sweep.reports)
+    }
+
+    pub(crate) fn historical_order_status_reports_from_response(
+        &self,
+        entries: Vec<HyperliquidOrderStatusEntry>,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<ReportSweep<OrderStatusReport>> {
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let mut reports = Vec::new();
+        let mut complete = true;
+        let ts_init = self.clock.get_time_ns();
+
+        for entry in entries {
+            let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
+                // get_or_create_instrument warns with the coin
+                Some(instrument) => instrument,
+                None => {
+                    complete = false;
                     continue;
                 }
             };
 
-            // Get instrument from cache or create synthetic for vault tokens
-            let instrument = match self.get_or_create_instrument(&order.coin, None) {
-                Some(inst) => inst,
-                None => continue, // Skip if instrument not found
-            };
-
-            // Filter by instrument_id if specified
-            if let Some(filter_id) = instrument_id
-                && instrument.id() != filter_id
-            {
+            if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
                 continue;
             }
 
-            // Determine status from order data - orders from frontend_open_orders are open
-            let status = HyperliquidOrderStatusEnum::Open;
+            let label = entry.order.order_type.as_deref().unwrap_or_default();
+            let tpsl = parse_trigger_order_type_label(label).map(|(tpsl, _)| tpsl);
+            let is_market = label.ends_with("Market");
+            let historical_order_type = match tpsl.as_ref() {
+                Some(tpsl) => parse_trigger_order_type(is_market, tpsl),
+                None if is_market => OrderType::Market,
+                None => OrderType::Limit,
+            };
+            let order = WsBasicOrderData {
+                coin: entry.order.coin,
+                side: entry.order.side,
+                limit_px: entry.order.limit_px,
+                sz: entry.order.sz,
+                oid: entry.order.oid,
+                timestamp: entry.order.timestamp,
+                orig_sz: entry.order.orig_sz,
+                cloid: entry.order.cloid,
+                tif: entry.order.tif,
+                reduce_only: entry.order.reduce_only,
+                trigger_px: entry
+                    .order
+                    .trigger_px
+                    .filter(|price| *price != Decimal::ZERO),
+                is_market: tpsl.is_some().then_some(is_market),
+                tpsl,
+                trigger_activated: None,
+                trailing_stop: None,
+                order_type: None,
+            };
 
-            // Parse to OrderStatusReport
             match parse_order_status_report_from_basic(
                 &order,
-                &status,
+                &entry.status,
                 &instrument,
                 account_id,
                 ts_init,
             ) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse order status report: {e}"),
+                Ok(mut report) => {
+                    report.order_type = historical_order_type;
+                    report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
+                    reports.push(report);
+                }
+                Err(e) => {
+                    log::error!("Failed to parse historical order status report: {e}");
+                    complete = false;
+                }
             }
         }
 
-        Ok(reports)
+        Ok(ReportSweep {
+            reports: deduplicate_historical_order_reports(reports),
+            complete,
+        })
     }
 
     /// Request a single order status report by venue order ID.
@@ -2123,7 +2584,9 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the API request fails or parsing fails.
+    /// Returns an error if the API request fails, parsing fails, or the matched venue row cannot be
+    /// resolved to an instrument or converted into a report. A genuinely absent order returns
+    /// `Ok(None)`.
     pub async fn request_order_status_report(
         &self,
         user: &str,
@@ -2158,7 +2621,12 @@ impl HyperliquidHttpClient {
         if let Some(order) = orders.into_iter().find(|o| o.oid == oid) {
             let instrument = match self.get_or_create_instrument(&order.coin, None) {
                 Some(inst) => inst,
-                None => return Ok(None),
+                None => {
+                    return Err(Error::bad_request(format!(
+                        "Failed to resolve instrument for open order oid {oid} with coin {}",
+                        order.coin,
+                    )));
+                }
             };
 
             let status = if order.trigger_activated == Some(true) {
@@ -2167,19 +2635,19 @@ impl HyperliquidHttpClient {
                 HyperliquidOrderStatusEnum::Open
             };
 
-            return match parse_order_status_report_from_basic(
+            return parse_order_status_report_from_basic(
                 &order,
                 &status,
                 &instrument,
                 account_id,
                 ts_init,
-            ) {
-                Ok(report) => Ok(Some(report)),
-                Err(e) => {
-                    log::error!("Failed to parse order status report for oid {oid}: {e}");
-                    Ok(None)
-                }
-            };
+            )
+            .map(Some)
+            .map_err(|e| {
+                Error::bad_request(format!(
+                    "Failed to parse order status report for oid {oid}: {e}"
+                ))
+            });
         }
 
         // Order not in open set: query by oid (returns limited HyperliquidOrderInfo)
@@ -2191,13 +2659,20 @@ impl HyperliquidHttpClient {
 
         let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
             Some(inst) => inst,
-            None => return Ok(None),
+            None => {
+                return Err(Error::bad_request(format!(
+                    "Failed to resolve instrument for order oid {oid} with coin {}",
+                    entry.order.coin,
+                )));
+            }
         };
 
         // The info_order_status endpoint returns limited HyperliquidOrderInfo
         // without trigger fields (trigger_px, tpsl, is_market, trailing_stop).
         // Closed trigger orders will report as Limit type. This is an exchange
         // API limitation: trigger metadata is only available on open orders.
+        // The reduce-only flag is carried through so reconciliation can clamp a
+        // reduce-only fill to its fills.
         let basic = WsBasicOrderData {
             coin: entry.order.coin,
             side: entry.order.side,
@@ -2208,45 +2683,47 @@ impl HyperliquidHttpClient {
             orig_sz: entry.order.orig_sz,
             cloid: entry.order.cloid,
             tif: None,
-            reduce_only: None,
+            reduce_only: entry.order.reduce_only,
             trigger_px: None,
             is_market: None,
             tpsl: None,
             trigger_activated: None,
             trailing_stop: None,
+            order_type: None,
         };
 
-        match parse_order_status_report_from_basic(
+        let mut report = parse_order_status_report_from_basic(
             &basic,
             &entry.status,
             &instrument,
             account_id,
             ts_init,
-        ) {
-            Ok(mut report) => {
-                // Use status_timestamp for ts_last when available (more accurate
-                // than the order creation timestamp for filled/canceled orders)
-                if entry.status_timestamp > 0 {
-                    report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
-                }
-                Ok(Some(report))
-            }
-            Err(e) => {
-                log::error!("Failed to parse order status report for oid {oid}: {e}");
-                Ok(None)
-            }
+        )
+        .map_err(|e| {
+            Error::bad_request(format!(
+                "Failed to parse order status report for oid {oid}: {e}"
+            ))
+        })?;
+
+        // Use status_timestamp for ts_last when available (more accurate
+        // than the order creation timestamp for filled/canceled orders)
+        if entry.status_timestamp > 0 {
+            report.ts_last = UnixNanos::from(entry.status_timestamp * 1_000_000);
         }
+
+        Ok(Some(report))
     }
 
     /// Request a single order status report by client order ID.
     ///
     /// Searches `info_frontend_open_orders` for an order whose cloid matches the
-    /// deterministic CLOID for the given client order ID, falling back to the
-    /// legacy unmarked CLOID. Only finds open orders.
+    /// cached CLOID or the generated CLOID. Only finds open orders.
     ///
     /// # Errors
     ///
-    /// Returns an error if the API request fails or parsing fails.
+    /// Returns an error if the API request fails, the response cannot be decoded, or the matched
+    /// venue row cannot be resolved to an instrument or converted into a report. A genuinely
+    /// absent order returns `Ok(None)`.
     pub async fn request_order_status_report_by_client_order_id(
         &self,
         user: &str,
@@ -2258,38 +2735,35 @@ impl HyperliquidHttpClient {
 
         let ts_init = self.clock.get_time_ns();
 
-        let cloid = self
+        let cached_cloid_hex = self
             .cached_client_order_id_cloid(client_order_id)
-            .unwrap_or_else(|| Cloid::from_client_order_id(*client_order_id));
+            .map(|cloid| cloid.to_hex());
+        let cloid = Cloid::from_client_order_id(*client_order_id);
         let cloid_hex = cloid.to_hex();
-        let legacy_cloid = Cloid::from_legacy_client_order_id(*client_order_id);
-        let legacy_cloid_hex = legacy_cloid.to_hex();
 
         let response = self.info_frontend_open_orders(user).await?;
-        let orders: Vec<WsBasicOrderData> = match serde_json::from_value(response) {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("Failed to parse frontend open orders response: {e}");
-                return Ok(None);
-            }
-        };
+
+        let orders: Vec<WsBasicOrderData> = serde_json::from_value(response).map_err(|e| {
+            Error::bad_request(format!("Failed to parse open orders response: {e}"))
+        })?;
 
         let order = match orders.into_iter().find(|o| {
             o.cloid
                 .as_ref()
-                .is_some_and(|c| c == &cloid_hex || c == &legacy_cloid_hex)
+                .is_some_and(|c| cached_cloid_hex.as_ref() == Some(c) || c == &cloid_hex)
         }) {
             Some(o) => o,
             None => return Ok(None),
         };
 
-        if order.cloid.as_ref() == Some(&legacy_cloid_hex) {
-            self.replace_client_order_id_cloid(*client_order_id, legacy_cloid);
-        }
-
         let instrument = match self.get_or_create_instrument(&order.coin, None) {
             Some(inst) => inst,
-            None => return Ok(None),
+            None => {
+                return Err(Error::bad_request(format!(
+                    "Failed to resolve instrument for open order with cloid {cloid_hex} and coin {}",
+                    order.coin,
+                )));
+            }
         };
 
         let status = if order.trigger_activated == Some(true) {
@@ -2298,22 +2772,16 @@ impl HyperliquidHttpClient {
             HyperliquidOrderStatusEnum::Open
         };
 
-        match parse_order_status_report_from_basic(
-            &order,
-            &status,
-            &instrument,
-            account_id,
-            ts_init,
-        ) {
-            Ok(mut report) => {
-                report.client_order_id = Some(*client_order_id);
-                Ok(Some(report))
-            }
-            Err(e) => {
-                log::error!("Failed to parse order status report for cloid {cloid_hex}: {e}");
-                Ok(None)
-            }
-        }
+        let mut report =
+            parse_order_status_report_from_basic(&order, &status, &instrument, account_id, ts_init)
+                .map_err(|e| {
+                    Error::bad_request(format!(
+                        "Failed to parse order status report for cloid {cloid_hex}: {e}"
+                    ))
+                })?;
+
+        report.client_order_id = Some(*client_order_id);
+        Ok(Some(report))
     }
 
     /// Request fill reports for a user.
@@ -2326,7 +2794,9 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the API request fails or parsing fails.
+    /// Returns an error if the API request fails, parsing fails, or a venue row cannot be resolved
+    /// to an instrument or converted into a report (the snapshot is then incomplete and must not be
+    /// treated as authoritative).
     ///
     /// Returns an error if `account_id` is not set on the client.
     pub async fn request_fill_reports(
@@ -2334,19 +2804,40 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<FillReport>> {
+        let fills_response = self.info_user_fills(user).await?;
+        let sweep = self.fill_reports_from_response(fills_response, instrument_id)?;
+
+        if !sweep.complete {
+            return Err(Error::bad_request(
+                "Fill snapshot incomplete: at least one venue row could not be decoded, resolved to an instrument, or converted into a report",
+            ));
+        }
+
+        Ok(sweep.reports)
+    }
+
+    pub(crate) fn fill_reports_from_response(
+        &self,
+        fills_response: HyperliquidFills,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<ReportSweep<FillReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let fills_response = self.info_user_fills(user).await?;
 
         let mut reports = Vec::new();
+        let mut complete = true;
         let ts_init = self.clock.get_time_ns();
 
         for fill in fills_response {
             // Get instrument from cache or create synthetic for vault tokens
             let instrument = match self.get_or_create_instrument(&fill.coin, None) {
                 Some(inst) => inst,
-                None => continue, // Skip if instrument not found
+                // get_or_create_instrument warns with the coin
+                None => {
+                    complete = false;
+                    continue;
+                }
             };
 
             // Filter by instrument_id if specified
@@ -2359,19 +2850,22 @@ impl HyperliquidHttpClient {
             // Parse to FillReport
             match parse_fill_report(&fill, &instrument, account_id, ts_init) {
                 Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse fill report: {e}"),
+                Err(e) => {
+                    log::error!("Failed to parse fill report: {e}");
+                    complete = false;
+                }
             }
         }
 
-        Ok(reports)
+        Ok(ReportSweep { reports, complete })
     }
 
     /// Request position status reports for a user.
     ///
-    /// Fetches perp clearinghouse state and spot clearinghouse state, then returns
-    /// the union of perp asset positions (short/long with PnL) and spot holdings
-    /// (long only). This method requires instruments to be added to the client
-    /// cache via `cache_instrument()`.
+    /// Fetches clearinghouse state from the default and all cached builder dexes when unfiltered,
+    /// plus spot clearinghouse state, then returns the union of perp asset positions (short/long
+    /// with PnL) and spot holdings (long only). This method requires instruments to be added to the
+    /// client cache via `cache_instrument()`.
     ///
     /// When `instrument_id` resolves to a specific product type, the opposite
     /// product's endpoint is skipped to avoid wasted round trips and make
@@ -2380,13 +2874,13 @@ impl HyperliquidHttpClient {
     /// is routed like a spot filter (perp leg skipped).
     ///
     /// For vault tokens (starting with "vntls:") that are not in the cache,
-    /// synthetic instruments will be created automatically. Spot balances whose
-    /// base token has no cached instrument are skipped with a debug log.
+    /// synthetic instruments will be created automatically.
     ///
     /// # Errors
     ///
-    /// Returns an error if either clearinghouse request fails (when that
-    /// product is in scope) or parsing fails.
+    /// Returns an error if any clearinghouse request fails (when that product or dex is in scope),
+    /// parsing fails, or a venue row cannot be resolved to an instrument or converted into a
+    /// report (the snapshot is then incomplete and must not be treated as authoritative).
     ///
     /// Returns an error if `account_id` has not been set on the client.
     pub async fn request_position_status_reports(
@@ -2394,6 +2888,26 @@ impl HyperliquidHttpClient {
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<PositionStatusReport>> {
+        let dexes = self.reconciliation_dexes(instrument_id);
+        let sweep = self
+            .request_position_status_reports_for_dexes(user, instrument_id, &dexes)
+            .await?;
+
+        if !sweep.complete {
+            return Err(Error::bad_request(
+                "Position snapshot incomplete: at least one venue row could not be decoded, resolved to an instrument, or converted into a report",
+            ));
+        }
+
+        Ok(sweep.reports)
+    }
+
+    pub(crate) async fn request_position_status_reports_for_dexes(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+        dexes: &[Option<Ustr>],
+    ) -> Result<ReportSweep<PositionStatusReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
@@ -2408,78 +2922,93 @@ impl HyperliquidHttpClient {
         let fetch_spot = filter_product != Some(HyperliquidProductType::Perp);
 
         let mut reports = Vec::new();
+        let mut complete = true;
         let ts_init = self.clock.get_time_ns();
 
         if !fetch_perp {
-            let spot_reports = self
-                .request_spot_position_status_reports(user, instrument_id)
-                .await?;
-            reports.extend(spot_reports);
-            return Ok(reports);
+            return self
+                .request_spot_position_status_reports_sweep(user, instrument_id)
+                .await;
         }
 
-        let state_response = self.info_clearinghouse_state(user).await?;
+        for dex in dexes {
+            let state_response = self
+                .info_clearinghouse_state_for_dex(user, dex.as_deref())
+                .await?;
+            let asset_positions: Vec<serde_json::Value> = state_response
+                .get("assetPositions")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| {
+                    Error::bad_request("assetPositions not found in clearinghouse state")
+                })?
+                .clone();
 
-        // Extract asset positions from the clearinghouse state
-        let asset_positions: Vec<serde_json::Value> = state_response
-            .get("assetPositions")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| Error::bad_request("assetPositions not found in clearinghouse state"))?
-            .clone();
+            for position_value in asset_positions {
+                let coin = position_value
+                    .get("position")
+                    .and_then(|position| position.get("coin"))
+                    .and_then(|coin| coin.as_str())
+                    .ok_or_else(|| Error::bad_request("coin not found in position"))?;
 
-        for position_value in asset_positions {
-            // Extract coin from position data
-            let coin = position_value
-                .get("position")
-                .and_then(|p| p.get("coin"))
-                .and_then(|c| c.as_str())
-                .ok_or_else(|| Error::bad_request("coin not found in position"))?;
+                let instrument = match self.get_or_create_instrument(&Ustr::from(coin), None) {
+                    Some(instrument) => instrument,
+                    // get_or_create_instrument warns with the coin
+                    None => {
+                        complete = false;
+                        continue;
+                    }
+                };
 
-            // Get instrument from cache - convert &str to Ustr for lookup
-            let coin_ustr = Ustr::from(coin);
-            let instrument = match self.get_or_create_instrument(&coin_ustr, None) {
-                Some(inst) => inst,
-                None => continue, // Skip if instrument not found
-            };
+                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                    continue;
+                }
 
-            // Filter by instrument_id if specified
-            if let Some(filter_id) = instrument_id
-                && instrument.id() != filter_id
-            {
-                continue;
-            }
-
-            // Parse to PositionStatusReport
-            match parse_position_status_report(&position_value, &instrument, account_id, ts_init) {
-                Ok(report) => reports.push(report),
-                Err(e) => log::error!("Failed to parse position status report: {e}"),
+                match parse_position_status_report(
+                    &position_value,
+                    &instrument,
+                    account_id,
+                    ts_init,
+                ) {
+                    Ok(report) => reports.push(report),
+                    Err(e) => {
+                        log::error!("Failed to parse position status report: {e}");
+                        complete = false;
+                    }
+                }
             }
         }
 
         // Spot positions are part of the report truth; propagate fetch errors
         // rather than silently omitting spot holdings from reconciliation.
         if fetch_spot {
-            let spot_reports = self
-                .request_spot_position_status_reports(user, instrument_id)
+            let spot_sweep = self
+                .request_spot_position_status_reports_sweep(user, instrument_id)
                 .await?;
-            reports.extend(spot_reports);
+            reports.extend(spot_sweep.reports);
+            complete &= spot_sweep.complete;
         }
 
-        Ok(reports)
+        Ok(ReportSweep { reports, complete })
     }
 
     /// Request account state (balances and margins) for a user.
     ///
-    /// Fetches perp and spot clearinghouse state from Hyperliquid and merges them
-    /// into a single [`AccountState`]. USDC is taken from the perp margin summary
-    /// when present (to avoid double-counting combined `withdrawable`); non-USDC
-    /// tokens are appended from the spot balances.
+    /// Fetches perp and spot clearinghouse state and the account abstraction mode from
+    /// Hyperliquid and merges them into a single [`AccountState`]. For unified and portfolio
+    /// margin accounts, balances come from the spot state alone and spot USDC `hold` is the
+    /// account-wide margin. Otherwise USDC comes from the perp margin summary only when that
+    /// summary reflects non-zero collateral, margin used, or withdrawable balance; if the
+    /// summary is absent or zeroed, spot USDC is used instead. Non-USDC tokens are always
+    /// appended from the spot balances. Spot tokens the venue lists at zero are reported at
+    /// zero, and USDC is reported at zero when there is no USDC balance, so a previous balance
+    /// is cleared. On accounts without spot collateral this needs a perp summary in the response.
     ///
     /// # Errors
     ///
-    /// Returns an error if `account_id` is not set, or if either the perp or
-    /// spot clearinghouse request fails. Spot failures are propagated so the
-    /// caller sees real API errors instead of a silently truncated snapshot.
+    /// Returns an error if `account_id` is not set, or if the perp clearinghouse, spot
+    /// clearinghouse, or user abstraction request fails. Spot and abstraction failures are
+    /// propagated so the caller sees real API errors instead of a silently truncated or
+    /// misread snapshot.
     pub async fn request_account_state(&self, user: &str) -> Result<AccountState> {
         let account_id = self
             .account_id
@@ -2506,8 +3035,11 @@ impl HyperliquidHttpClient {
                 Error::bad_request(format!("Failed to parse spot clearinghouse state: {e}"))
             })?;
 
+        // Without the mode a unified account would be read from the default-dex perp summary.
+        let abstraction = self.info_user_abstraction(user).await?;
+
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state)
+            parse_combined_account_balances_and_margins(&perp_state, &spot_state, abstraction)
                 .map_err(|e| Error::decode(e.to_string()))?;
 
         Ok(AccountState::new(
@@ -2555,18 +3087,37 @@ impl HyperliquidHttpClient {
     /// this same endpoint with `coin` set to the `+<encoding>` token form;
     /// those balances are resolved against the matching Outcome instrument so
     /// outcome holdings surface as positions through the standard reconcile
-    /// path. Balances whose base token has no matching instrument in the
-    /// cache are skipped with a debug log (callers should ensure
-    /// [`request_instruments`](Self::request_instruments) has run first).
+    /// path.
     ///
     /// # Errors
     ///
-    /// Returns an error if `account_id` has not been set or the API request fails.
+    /// Returns an error if `account_id` has not been set, the API request fails,
+    /// or a non-zero balance cannot be resolved to an instrument or converted
+    /// into a report (the snapshot is then incomplete and must not be treated
+    /// as authoritative).
     pub async fn request_spot_position_status_reports(
         &self,
         user: &str,
         instrument_id: Option<InstrumentId>,
     ) -> Result<Vec<PositionStatusReport>> {
+        let sweep = self
+            .request_spot_position_status_reports_sweep(user, instrument_id)
+            .await?;
+
+        if !sweep.complete {
+            return Err(Error::bad_request(
+                "Spot position snapshot incomplete: at least one venue row could not be decoded, resolved to an instrument, or converted into a report",
+            ));
+        }
+
+        Ok(sweep.reports)
+    }
+
+    pub(crate) async fn request_spot_position_status_reports_sweep(
+        &self,
+        user: &str,
+        instrument_id: Option<InstrumentId>,
+    ) -> Result<ReportSweep<PositionStatusReport>> {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
@@ -2579,6 +3130,7 @@ impl HyperliquidHttpClient {
 
         let ts_init = self.clock.get_time_ns();
         let mut reports = Vec::with_capacity(state.balances.len());
+        let mut complete = true;
 
         for balance in &state.balances {
             if balance.total.is_zero() {
@@ -2589,7 +3141,7 @@ impl HyperliquidHttpClient {
             // pair and has no `USDC-*-SPOT` instrument. Skip it so the loop
             // does not trigger a misleading cache-miss WARN. Revisit if
             // Hyperliquid ever introduces a USDC-base spot pair.
-            if balance.coin.as_str() == "USDC" {
+            if balance.coin == "USDC" {
                 continue;
             }
 
@@ -2601,7 +3153,11 @@ impl HyperliquidHttpClient {
             let instrument = match self.get_or_create_instrument(&balance.coin, Some(product_type))
             {
                 Some(inst) => inst,
-                None => continue,
+                // get_or_create_instrument warns with the coin
+                None => {
+                    complete = false;
+                    continue;
+                }
             };
 
             if let Some(filter_id) = instrument_id
@@ -2612,14 +3168,17 @@ impl HyperliquidHttpClient {
 
             match parse_spot_position_status_report(balance, &instrument, account_id, ts_init) {
                 Ok(report) => reports.push(report),
-                Err(e) => log::error!(
-                    "Failed to parse spot position status report for {}: {e}",
-                    balance.coin,
-                ),
+                Err(e) => {
+                    log::error!(
+                        "Failed to parse spot position status report for {}: {e}",
+                        balance.coin,
+                    );
+                    complete = false;
+                }
             }
         }
 
-        Ok(reports)
+        Ok(ReportSweep { reports, complete })
     }
 
     /// Request historical bars for an instrument.
@@ -2641,8 +3200,8 @@ impl HyperliquidHttpClient {
     pub async fn request_bars(
         &self,
         bar_type: BarType,
-        start: Option<chrono::DateTime<chrono::Utc>>,
-        end: Option<chrono::DateTime<chrono::Utc>>,
+        start: Option<jiff::Timestamp>,
+        end: Option<jiff::Timestamp>,
         limit: Option<u32>,
     ) -> Result<Vec<Bar>> {
         let instrument_id = bar_type.instrument_id();
@@ -2660,7 +3219,7 @@ impl HyperliquidHttpClient {
         let instrument = self
             .get_or_create_instrument(&alias, product_type)
             .ok_or_else(|| {
-                Error::bad_request(format!("Instrument not found in cache: {instrument_id}"))
+                Error::bad_request(InstrumentLookupError::not_found(instrument_id).to_string())
             })?;
 
         // Use raw_symbol which has the correct Hyperliquid API format:
@@ -2676,10 +3235,10 @@ impl HyperliquidHttpClient {
             bar_type_to_interval(&bar_type).map_err(|e| Error::bad_request(e.to_string()))?;
 
         // Hyperliquid uses millisecond timestamps
-        let now = chrono::Utc::now();
-        let end_time = end.unwrap_or(now).timestamp_millis() as u64;
+        let now = jiff::Timestamp::now();
+        let end_time = end.unwrap_or(now).as_millisecond() as u64;
         let start_time = if let Some(start) = start {
-            start.timestamp_millis() as u64
+            start.as_millisecond() as u64
         } else {
             // Default to 1000 bars before end_time
             let spec = bar_type.spec();
@@ -2699,7 +3258,7 @@ impl HyperliquidHttpClient {
             .await?;
 
         // Filter out incomplete bars where end_timestamp >= current time
-        let now_ms = now.timestamp_millis() as u64;
+        let now_ms = now.as_millisecond() as u64;
 
         let mut bars: Vec<Bar> = candles
             .iter()
@@ -2732,6 +3291,68 @@ impl HyperliquidHttpClient {
         Ok(bars)
     }
 
+    /// Request the recent public trade snapshot for an instrument.
+    ///
+    /// Hyperliquid's `recentTrades` endpoint is a bounded newest-first snapshot,
+    /// rather than a range-query endpoint. The returned trades are normalized to
+    /// ascending event time and then constrained to the requested window.
+    ///
+    /// A self-hosted node without the indexer responds with HTTP 422. This is
+    /// treated as no available coverage so requests can still complete.
+    pub async fn request_public_trades(
+        &self,
+        instrument_id: InstrumentId,
+        start: Option<jiff::Timestamp>,
+        end: Option<jiff::Timestamp>,
+        limit: Option<usize>,
+    ) -> Result<Vec<HyperliquidPublicTrade>> {
+        let symbol = instrument_id.symbol;
+        let product_type = HyperliquidProductType::from_symbol(symbol.as_str()).ok();
+        let alias = cache_alias_for_symbol(symbol.as_str())
+            .map(|alias| Ustr::from(alias.as_str()))
+            .ok_or_else(|| Error::bad_request("Invalid instrument symbol"))?;
+        let instrument = self
+            .get_or_create_instrument(&alias, product_type)
+            .ok_or_else(|| {
+                Error::bad_request(InstrumentLookupError::not_found(instrument_id).to_string())
+            })?;
+
+        let raw_trades = match self
+            .info_recent_trades(instrument.raw_symbol().as_ref())
+            .await
+        {
+            Ok(trades) => trades,
+            Err(e) if e.is_unprocessable_entity() => {
+                log::warn!(
+                    "Recent public trades endpoint unavailable for {instrument_id} \
+                     (requires the Hyperliquid indexer); returning empty response"
+                );
+                Vec::new()
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut trades: Vec<HyperliquidPublicTrade> = raw_trades
+            .iter()
+            .filter_map(|raw| match parse_recent_public_trade(raw, &instrument) {
+                Ok(trade) => Some(trade),
+                Err(e) => {
+                    log::warn!("Skipping recent public trade for {instrument_id}: {e}");
+                    None
+                }
+            })
+            .collect();
+        trades.sort_by_key(|trade| trade.ts_event);
+
+        Ok(filter_recent_public_trades(
+            trades,
+            datetime_to_unix_nanos(start),
+            datetime_to_unix_nanos(end),
+            limit.filter(|limit| *limit > 0),
+            instrument_id,
+        ))
+    }
+
     /// Submits an order to the exchange.
     ///
     /// # Errors
@@ -2760,13 +3381,16 @@ impl HyperliquidHttpClient {
         })?;
 
         let is_buy = matches!(order_side, OrderSide::Buy);
-        let price_precision = self.get_price_precision_for_symbol(symbol).unwrap_or(2);
+        let price_precision = self.get_price_precision_for_symbol(symbol);
 
         let price_decimal = match price {
-            Some(px) if self.normalize_prices => {
-                normalize_price(px.as_decimal(), price_precision).normalize()
-            }
-            Some(px) => px.as_decimal().normalize(),
+            Some(px) => normalize_or_validate_wire_price(
+                px.as_decimal(),
+                "Price",
+                price_precision,
+                self.normalize_prices,
+            )
+            .map_err(|e| Error::bad_request(format!("{e}")))?,
             None if matches!(order_type, OrderType::Market) => Decimal::ZERO,
             None if matches!(
                 order_type,
@@ -2781,7 +3405,8 @@ impl HyperliquidHttpClient {
                             self.market_order_slippage_bps,
                         );
                         let sig_rounded = round_to_sig_figs(derived, 5);
-                        clamp_price_to_precision(sig_rounded, price_precision, is_buy).normalize()
+                        clamp_price_to_precision(sig_rounded, price_precision.unwrap_or(2), is_buy)
+                            .normalize()
                     }
                     None => Decimal::ZERO,
                 }
@@ -2792,18 +3417,18 @@ impl HyperliquidHttpClient {
         let size_decimal = quantity.as_decimal().normalize();
 
         let kind = match order_type {
-            OrderType::Market => HyperliquidExecOrderKind::Limit {
-                limit: HyperliquidExecLimitParams {
-                    tif: HyperliquidExecTif::Ioc,
+            OrderType::Market => HyperliquidExchangeOrderKind::Limit {
+                limit: HyperliquidExchangeLimitParams {
+                    tif: HyperliquidExchangeTif::Ioc,
                 },
             },
             OrderType::Limit => {
                 let tif = if post_only {
-                    HyperliquidExecTif::Alo
+                    HyperliquidExchangeTif::Alo
                 } else {
                     match time_in_force {
-                        TimeInForce::Gtc => HyperliquidExecTif::Gtc,
-                        TimeInForce::Ioc => HyperliquidExecTif::Ioc,
+                        TimeInForce::Gtc => HyperliquidExchangeTif::Gtc,
+                        TimeInForce::Ioc => HyperliquidExchangeTif::Ioc,
                         TimeInForce::Fok
                         | TimeInForce::Day
                         | TimeInForce::Gtd
@@ -2815,8 +3440,8 @@ impl HyperliquidHttpClient {
                         }
                     }
                 };
-                HyperliquidExecOrderKind::Limit {
-                    limit: HyperliquidExecLimitParams { tif },
+                HyperliquidExchangeOrderKind::Limit {
+                    limit: HyperliquidExchangeLimitParams { tif },
                 }
             }
             OrderType::StopMarket
@@ -2824,19 +3449,21 @@ impl HyperliquidHttpClient {
             | OrderType::MarketIfTouched
             | OrderType::LimitIfTouched => {
                 if let Some(trig_px) = trigger_price {
-                    let trigger_price_decimal = if self.normalize_prices {
-                        normalize_price(trig_px.as_decimal(), price_precision).normalize()
-                    } else {
-                        trig_px.as_decimal().normalize()
-                    };
+                    let trigger_price_decimal = normalize_or_validate_wire_price(
+                        trig_px.as_decimal(),
+                        "Trigger price",
+                        price_precision,
+                        self.normalize_prices,
+                    )
+                    .map_err(|e| Error::bad_request(format!("{e}")))?;
 
                     // Determine TP/SL type based on order type
                     // StopMarket/StopLimit are always Sl (protective stops)
                     // MarketIfTouched/LimitIfTouched are always Tp (profit-taking/entry)
                     let tpsl = match order_type {
-                        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExecTpSl::Sl,
+                        OrderType::StopMarket | OrderType::StopLimit => HyperliquidExchangeTpSl::Sl,
                         OrderType::MarketIfTouched | OrderType::LimitIfTouched => {
-                            HyperliquidExecTpSl::Tp
+                            HyperliquidExchangeTpSl::Tp
                         }
                         _ => unreachable!(),
                     };
@@ -2846,8 +3473,8 @@ impl HyperliquidHttpClient {
                         OrderType::StopMarket | OrderType::MarketIfTouched
                     );
 
-                    HyperliquidExecOrderKind::Trigger {
-                        trigger: HyperliquidExecTriggerParams {
+                    HyperliquidExchangeOrderKind::Trigger {
+                        trigger: HyperliquidExchangeTriggerParams {
                             is_market,
                             trigger_px: trigger_price_decimal,
                             tpsl,
@@ -2865,7 +3492,7 @@ impl HyperliquidHttpClient {
         };
 
         let cloid = self.get_or_generate_client_order_id_cloid(client_order_id);
-        let hyperliquid_order = HyperliquidExecPlaceOrderRequest {
+        let hyperliquid_order = HyperliquidExchangePlaceOrderRequest {
             asset,
             is_buy,
             price: price_decimal,
@@ -2877,110 +3504,51 @@ impl HyperliquidHttpClient {
 
         let builder = self.builder_attribution();
 
-        let action = HyperliquidExecAction::Order {
+        let action = HyperliquidExchangeAction::Order {
             orders: vec![hyperliquid_order],
-            grouping: HyperliquidExecGrouping::Na,
+            grouping: HyperliquidExchangeGrouping::Na,
             builder,
         };
 
         let response = self.inner.post_action_exec(&action).await?;
 
-        match response {
-            HyperliquidExchangeResponse::Status {
-                status,
-                response: response_data,
-            } if status == RESPONSE_STATUS_OK => {
-                let data_value = if let Some(data) = response_data.get("data") {
-                    data.clone()
-                } else {
-                    response_data
-                };
-
-                let order_response: HyperliquidExecOrderResponseData =
-                    serde_json::from_value(data_value).map_err(|e| {
-                        Error::bad_request(format!("Failed to parse order response: {e}"))
-                    })?;
-
-                let order_status = order_response
-                    .statuses
-                    .first()
-                    .ok_or_else(|| Error::bad_request("No order status in response"))?;
-
-                let symbol_str = instrument_id.symbol.as_str();
-                let product_type = HyperliquidProductType::from_symbol(symbol_str).ok();
-
-                // Mirror the alias `cache_instrument` stored (token form for
-                // outcomes, leading segment for perps / spots) so the lookup
-                // succeeds after the venue accepts an outcome order.
-                let asset_alias =
-                    cache_alias_for_symbol(symbol_str).unwrap_or_else(|| symbol_str.to_string());
-                let instrument = self
-                    .get_or_create_instrument(&Ustr::from(asset_alias.as_str()), product_type)
-                    .ok_or_else(|| {
-                        Error::bad_request(format!("Instrument not found for {asset_alias}"))
-                    })?;
-
-                let account_id = self
-                    .account_id
-                    .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-                let ts_init = self.clock.get_time_ns();
-
-                match order_status {
-                    HyperliquidExecOrderStatus::Resting { resting } => Ok(self
-                        .create_order_status_report(
-                            instrument_id,
-                            Some(client_order_id),
-                            VenueOrderId::new(resting.oid.to_string()),
-                            order_side,
-                            order_type,
-                            quantity,
-                            time_in_force,
-                            price,
-                            trigger_price,
-                            OrderStatus::Accepted,
-                            Quantity::new(0.0, instrument.size_precision()),
-                            &instrument,
-                            account_id,
-                            ts_init,
-                        )),
-                    HyperliquidExecOrderStatus::Filled { filled } => {
-                        let filled_qty = Quantity::new(
-                            filled.total_sz.to_string().parse::<f64>().unwrap_or(0.0),
-                            instrument.size_precision(),
-                        );
-                        Ok(self.create_order_status_report(
-                            instrument_id,
-                            Some(client_order_id),
-                            VenueOrderId::new(filled.oid.to_string()),
-                            order_side,
-                            order_type,
-                            quantity,
-                            time_in_force,
-                            price,
-                            trigger_price,
-                            OrderStatus::Filled,
-                            filled_qty,
-                            &instrument,
-                            account_id,
-                            ts_init,
-                        ))
-                    }
-                    HyperliquidExecOrderStatus::Error { error } => {
-                        Err(Error::bad_request(format!("Order rejected: {error}")))
-                    }
-                }
-            }
-            HyperliquidExchangeResponse::Error { error } => Err(Error::bad_request(format!(
-                "Order submission failed: {error}"
-            ))),
-            _ => Err(Error::bad_request("Unexpected response format")),
-        }
+        // A single (non-bracket) order should return an actionable status;
+        // `None` (a deferred `Tag` child) is unexpected on this HTTP path.
+        self.build_submit_order_report(
+            instrument_id,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            time_in_force,
+            price,
+            trigger_price,
+            response,
+        )?
+        .ok_or_else(|| {
+            Error::bad_request(
+                "Single-order submission returned no actionable status (deferred trigger child)",
+            )
+        })
     }
 
     /// Submit an order using an OrderAny object.
     ///
     /// This is a convenience method that wraps submit_order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for quote-denominated quantities: this raw path has no
+    /// cached market data for a quote-to-base conversion, so the order must be
+    /// submitted through the execution client instead.
     pub async fn submit_order_from_order_any(&self, order: &OrderAny) -> Result<OrderStatusReport> {
+        if order.is_quote_quantity() {
+            return Err(Error::bad_request(
+                "Quote-denominated quantity orders must submit through the execution client \
+                 for quote-to-base conversion",
+            ));
+        }
+
         self.submit_order(
             order.instrument_id(),
             order.client_order_id(),
@@ -3023,7 +3591,7 @@ impl HyperliquidHttpClient {
             instrument_id,
             client_order_id,
             venue_order_id,
-            order_side,
+            order_side.into(),
             order_type,
             time_in_force,
             order_status,
@@ -3053,13 +3621,23 @@ impl HyperliquidHttpClient {
     /// # Errors
     ///
     /// Returns an error if credentials are missing, order validation fails, serialization fails,
-    /// or the API returns an error.
+    /// or the API returns an error. Also returns an error for any quote-denominated quantity:
+    /// this raw path has no cached market data for a quote-to-base conversion, so such orders
+    /// must be submitted through the execution client instead.
     pub async fn submit_orders(&self, orders: &[&OrderAny]) -> Result<Vec<OrderStatusReport>> {
         // Convert orders using asset indices from the cached map
         let mut hyperliquid_orders = Vec::with_capacity(orders.len());
         let mut client_order_ids = Vec::with_capacity(orders.len());
 
         for order in orders {
+            if order.is_quote_quantity() {
+                return Err(Error::bad_request(format!(
+                    "Quote-denominated quantity order {} must submit through the execution \
+                     client for quote-to-base conversion",
+                    order.client_order_id()
+                )));
+            }
+
             let instrument_id = order.instrument_id();
             let symbol = instrument_id.symbol.inner();
             let asset = self.get_asset_index_for_symbol(symbol).ok_or_else(|| {
@@ -3067,8 +3645,8 @@ impl HyperliquidHttpClient {
                     "Asset index not found for symbol: {symbol}. Ensure instruments are loaded."
                 ))
             })?;
-            let price_decimals = self.get_price_precision_for_symbol(symbol).unwrap_or(2);
-            let request = order_to_hyperliquid_request_with_asset_and_cloid(
+            let price_decimals = self.get_price_precision_for_symbol(symbol);
+            let request = order_to_hyperliquid_request_with_optional_decimals(
                 order,
                 asset,
                 price_decimals,
@@ -3090,7 +3668,7 @@ impl HyperliquidHttpClient {
         let grouping =
             determine_order_list_grouping(&orders.iter().copied().cloned().collect::<Vec<_>>());
 
-        let action = HyperliquidExecAction::Order {
+        let action = HyperliquidExchangeAction::Order {
             orders: hyperliquid_orders,
             grouping,
             builder,
@@ -3099,127 +3677,329 @@ impl HyperliquidHttpClient {
         // Submit to exchange using the typed exec endpoint
         let response = self.inner.post_action_exec(&action).await?;
 
-        // Parse the response to extract order statuses
-        match response {
-            HyperliquidExchangeResponse::Status {
-                status,
-                response: response_data,
-            } if status == RESPONSE_STATUS_OK => {
-                // Extract the 'data' field from the response if it exists (new format)
-                // Otherwise use response_data directly (old format)
-                let data_value = if let Some(data) = response_data.get("data") {
-                    data.clone()
-                } else {
-                    response_data
-                };
-
-                // Parse the response data to extract order statuses
-                let order_response: HyperliquidExecOrderResponseData =
-                    serde_json::from_value(data_value).map_err(|e| {
-                        Error::bad_request(format!("Failed to parse order response: {e}"))
-                    })?;
-
-                let account_id = self
-                    .account_id
-                    .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-                let ts_init = self.clock.get_time_ns();
-
-                // For grouped orders (NormalTpsl/PositionTpsl), the exchange
-                // returns a single status for the whole group. Only enforce
-                // 1:1 matching for ungrouped (Na) submissions.
-                if grouping == HyperliquidExecGrouping::Na
-                    && order_response.statuses.len() != orders.len()
-                {
-                    return Err(Error::bad_request(format!(
-                        "Mismatch between submitted orders ({}) and response statuses ({})",
-                        orders.len(),
-                        order_response.statuses.len()
-                    )));
-                }
-
-                let mut reports = Vec::new();
-
-                // Create OrderStatusReport for each order with a matching
-                // status. For grouped submissions the exchange may return
-                // fewer statuses; remaining orders are confirmed via WS.
-                for (order, order_status) in orders.iter().zip(order_response.statuses.iter()) {
-                    let instrument_id = order.instrument_id();
-                    let symbol = instrument_id.symbol.as_str();
-                    let product_type = HyperliquidProductType::from_symbol(symbol).ok();
-
-                    // Mirror the alias `cache_instrument` stored (token form
-                    // for outcomes, leading segment for perps / spots).
-                    let asset =
-                        cache_alias_for_symbol(symbol).unwrap_or_else(|| symbol.to_string());
-                    let instrument = self
-                        .get_or_create_instrument(&Ustr::from(asset.as_str()), product_type)
-                        .ok_or_else(|| {
-                            Error::bad_request(format!("Instrument not found for {asset}"))
-                        })?;
-
-                    // Create OrderStatusReport based on the order status
-                    let report = match order_status {
-                        HyperliquidExecOrderStatus::Resting { resting } => {
-                            // Order is resting on the order book
-                            self.create_order_status_report(
-                                order.instrument_id(),
-                                Some(order.client_order_id()),
-                                VenueOrderId::new(resting.oid.to_string()),
-                                order.order_side(),
-                                order.order_type(),
-                                order.quantity(),
-                                order.time_in_force(),
-                                order.price(),
-                                order.trigger_price(),
-                                OrderStatus::Accepted,
-                                Quantity::new(0.0, instrument.size_precision()),
-                                &instrument,
-                                account_id,
-                                ts_init,
-                            )
-                        }
-                        HyperliquidExecOrderStatus::Filled { filled } => {
-                            // Order was filled immediately
-                            let filled_qty = Quantity::new(
-                                filled.total_sz.to_string().parse::<f64>().unwrap_or(0.0),
-                                instrument.size_precision(),
-                            );
-                            self.create_order_status_report(
-                                order.instrument_id(),
-                                Some(order.client_order_id()),
-                                VenueOrderId::new(filled.oid.to_string()),
-                                order.order_side(),
-                                order.order_type(),
-                                order.quantity(),
-                                order.time_in_force(),
-                                order.price(),
-                                order.trigger_price(),
-                                OrderStatus::Filled,
-                                filled_qty,
-                                &instrument,
-                                account_id,
-                                ts_init,
-                            )
-                        }
-                        HyperliquidExecOrderStatus::Error { error } => {
-                            return Err(Error::bad_request(format!(
-                                "Order {} rejected: {error}",
-                                order.client_order_id()
-                            )));
-                        }
-                    };
-
-                    reports.push(report);
-                }
-
-                Ok(reports)
-            }
-            HyperliquidExchangeResponse::Error { error } => Err(Error::bad_request(format!(
-                "Order submission failed: {error}"
-            ))),
-            _ => Err(Error::bad_request("Unexpected response format")),
-        }
+        self.build_submit_orders_reports(orders, grouping, response)
     }
+
+    /// Parses a Hyperliquid exchange order response for a single-order submit
+    /// into an [`OrderStatusReport`].
+    ///
+    /// Returns `Ok(None)` when the venue returned an empty `statuses` array or
+    /// when the only status is a deferred `Tag` child (for example
+    /// `waitingForFill`): the venue accepted the order but has not assigned an
+    /// oid yet, so the order stays `SUBMITTED` until the user-events stream
+    /// drives the first `OrderAccepted` with the real oid.
+    ///
+    /// Shared by the HTTP and WebSocket single-submit paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if account credentials are missing, the response is
+    /// malformed, or the order returned an `error` status.
+    #[expect(clippy::too_many_arguments)]
+    pub fn build_submit_order_report(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        response: HyperliquidExchangeResponse,
+    ) -> Result<Option<OrderStatusReport>> {
+        let order_response = parse_order_response(response)?;
+
+        let Some(order_status) = order_response.statuses.first() else {
+            return Ok(None);
+        };
+
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let ts_init = self.clock.get_time_ns();
+
+        self.build_status_report(
+            instrument_id,
+            client_order_id,
+            order_side,
+            order_type,
+            quantity,
+            time_in_force,
+            price,
+            trigger_price,
+            order_status,
+            account_id,
+            ts_init,
+        )
+    }
+
+    /// Parses a Hyperliquid exchange order response into per-order
+    /// [`OrderStatusReport`]s, paired positionally with `orders`.
+    ///
+    /// Shared by the HTTP and WebSocket batch-submit paths since the response
+    /// envelope is identical regardless of transport. Deferred `Tag` children
+    /// (for example `waitingForFill`) are elided from the result; those orders
+    /// stay `SUBMITTED` until the user-events stream delivers an `OrderAccepted`
+    /// with the real oid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if account credentials are missing, the response is
+    /// malformed, an order returned an `error` status, or, for ungrouped
+    /// submissions, the response status count diverges from the order count.
+    pub fn build_submit_orders_reports(
+        &self,
+        orders: &[&OrderAny],
+        grouping: HyperliquidExchangeGrouping,
+        response: HyperliquidExchangeResponse,
+    ) -> Result<Vec<OrderStatusReport>> {
+        let order_response = parse_order_response(response)?;
+
+        let account_id = self
+            .account_id
+            .ok_or_else(|| Error::bad_request("Account ID not set"))?;
+        let ts_init = self.clock.get_time_ns();
+
+        // For grouped orders (NormalTpsl/PositionTpsl) the exchange returns a
+        // single status for the whole group, so only enforce 1:1 matching for
+        // ungrouped (Na) submissions.
+        if grouping == HyperliquidExchangeGrouping::Na
+            && order_response.statuses.len() != orders.len()
+        {
+            return Err(Error::bad_request(format!(
+                "Mismatch between submitted orders ({}) and response statuses ({})",
+                orders.len(),
+                order_response.statuses.len()
+            )));
+        }
+
+        // The exchange returns statuses in submission order, so pair each order
+        // with its status positionally.
+        let mut reports = Vec::with_capacity(order_response.statuses.len());
+        for (order, order_status) in orders.iter().zip(order_response.statuses.iter()) {
+            if let Some(report) = self.build_status_report(
+                order.instrument_id(),
+                order.client_order_id(),
+                order.order_side(),
+                order.order_type(),
+                order.quantity(),
+                order.time_in_force(),
+                order.price(),
+                order.trigger_price(),
+                order_status,
+                account_id,
+                ts_init,
+            )? {
+                reports.push(report);
+            }
+        }
+
+        Ok(reports)
+    }
+
+    /// Builds an [`OrderStatusReport`] from a single venue status, or `Ok(None)`
+    /// for a deferred `Tag` child that has no oid yet.
+    ///
+    /// `Tag` rows are elided rather than given a synthetic placeholder venue id:
+    /// an earlier placeholder accept was deduped against the later real accept,
+    /// so the cache never picked up the real oid and cancel/modify by venue id
+    /// broke on bracket children.
+    #[expect(clippy::too_many_arguments)]
+    fn build_status_report(
+        &self,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        order_side: OrderSide,
+        order_type: OrderType,
+        quantity: Quantity,
+        time_in_force: TimeInForce,
+        price: Option<Price>,
+        trigger_price: Option<Price>,
+        order_status: &HyperliquidExchangeOrderStatus,
+        account_id: AccountId,
+        ts_init: UnixNanos,
+    ) -> Result<Option<OrderStatusReport>> {
+        if matches!(order_status, HyperliquidExchangeOrderStatus::Tag(_)) {
+            return Ok(None);
+        }
+
+        let symbol = instrument_id.symbol.as_str();
+        let product_type = HyperliquidProductType::from_symbol(symbol).ok();
+
+        // Mirror the alias `cache_instrument` stored (token form for outcomes,
+        // leading segment for perps / spots).
+        let asset = cache_alias_for_symbol(symbol).unwrap_or_else(|| symbol.to_string());
+        let instrument = self
+            .get_or_create_instrument(&Ustr::from(asset.as_str()), product_type)
+            .ok_or_else(|| {
+                Error::bad_request(InstrumentLookupError::not_found(instrument_id).to_string())
+            })?;
+
+        let report = match order_status {
+            HyperliquidExchangeOrderStatus::Resting { resting } => self.create_order_status_report(
+                instrument_id,
+                Some(client_order_id),
+                VenueOrderId::new(resting.oid.to_string()),
+                order_side,
+                order_type,
+                quantity,
+                time_in_force,
+                price,
+                trigger_price,
+                OrderStatus::Accepted,
+                Quantity::zero(instrument.size_precision()),
+                &instrument,
+                account_id,
+                ts_init,
+            ),
+            HyperliquidExchangeOrderStatus::Filled { filled } => {
+                let filled_qty =
+                    Quantity::from_decimal_dp(filled.total_sz, instrument.size_precision())
+                        .map_err(|e| {
+                            Error::bad_request(format!(
+                                "Invalid filled size {}: {e}",
+                                filled.total_sz
+                            ))
+                        })?;
+                self.create_order_status_report(
+                    instrument_id,
+                    Some(client_order_id),
+                    VenueOrderId::new(filled.oid.to_string()),
+                    order_side,
+                    order_type,
+                    quantity,
+                    time_in_force,
+                    price,
+                    trigger_price,
+                    OrderStatus::Filled,
+                    filled_qty,
+                    &instrument,
+                    account_id,
+                    ts_init,
+                )
+            }
+            HyperliquidExchangeOrderStatus::Error { error } => {
+                return Err(Error::bad_request(format!(
+                    "Order {client_order_id} rejected: {error}"
+                )));
+            }
+            HyperliquidExchangeOrderStatus::Tag(_) => unreachable!("handled above"),
+        };
+
+        Ok(Some(report))
+    }
+
+    fn reconciliation_dexes(&self, instrument_id: Option<InstrumentId>) -> Vec<Option<Ustr>> {
+        if let Some(instrument_id) = instrument_id {
+            return vec![perp_dex_from_symbol(instrument_id.symbol.as_str())];
+        }
+
+        let cached = self.instruments.load();
+        reconciliation_dexes_from_builders(
+            cached
+                .keys()
+                .filter_map(|symbol| perp_dex_from_symbol(symbol.as_str())),
+        )
+    }
+
+    pub(crate) async fn reconciliation_dexes_from_activity(
+        &self,
+        historical_orders: &[HyperliquidOrderStatusEntry],
+        fills: &HyperliquidFills,
+    ) -> Result<Vec<Option<Ustr>>> {
+        if historical_orders.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
+            || fills.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
+        {
+            let builder_dexes = self
+                .inner
+                .load_perp_dexs()
+                .await?
+                .into_iter()
+                .flatten()
+                .filter(|dex| !dex.name.is_empty())
+                .map(|dex| Ustr::from(dex.name.as_str()));
+            return Ok(reconciliation_dexes_from_builders(builder_dexes));
+        }
+
+        let builder_dexes = historical_orders
+            .iter()
+            .map(|entry| entry.order.coin.as_str())
+            .chain(fills.iter().map(|fill| fill.coin.as_str()))
+            .filter_map(perp_dex_from_activity_coin);
+
+        Ok(reconciliation_dexes_from_builders(builder_dexes))
+    }
+}
+
+// A reconciliation snapshot with its completeness flag: `complete` is false when
+// at least one venue row could not be decoded, resolved to an instrument, or
+// converted into a report. Callers whose contract cannot carry the flag fail
+// closed; mass-status reconciliation preserves the valid rows and reports the
+// incompleteness via `ExecutionMassStatus::set_report_window`.
+#[derive(Debug)]
+pub(crate) struct ReportSweep<T> {
+    pub reports: Vec<T>,
+    pub complete: bool,
+}
+
+fn reconciliation_dexes_from_builders(
+    builder_dexes: impl IntoIterator<Item = Ustr>,
+) -> Vec<Option<Ustr>> {
+    let mut builder_dexes = builder_dexes.into_iter().collect::<Vec<_>>();
+    builder_dexes.sort_unstable();
+    builder_dexes.dedup();
+
+    let mut dexes = Vec::with_capacity(builder_dexes.len() + 1);
+    dexes.push(None);
+    dexes.extend(builder_dexes.into_iter().map(Some));
+    dexes
+}
+
+fn perp_dex_from_activity_coin(coin: &str) -> Option<Ustr> {
+    if coin.starts_with(VAULT_TOKEN_PREFIX) {
+        return None;
+    }
+
+    let (dex, _) = coin.split_once(':')?;
+    (!dex.is_empty()).then(|| Ustr::from(dex))
+}
+
+fn perp_dex_from_symbol(symbol: &str) -> Option<Ustr> {
+    symbol
+        .strip_suffix("-PERP")?
+        .split_once(':')
+        .map(|(dex, _)| Ustr::from(dex))
+}
+
+/// Extracts the order-status payload from an exchange response.
+///
+/// The newer response format nests the statuses under `data`; the older format
+/// places them directly in the response body.
+fn parse_order_response(
+    response: HyperliquidExchangeResponse,
+) -> Result<HyperliquidExchangeOrderResponseData> {
+    let response_data = match response {
+        HyperliquidExchangeResponse::Status {
+            status,
+            response: response_data,
+        } if status == RESPONSE_STATUS_OK => response_data,
+        HyperliquidExchangeResponse::Error { error } => {
+            return Err(Error::bad_request(format!(
+                "Order submission failed: {error}"
+            )));
+        }
+        _ => return Err(Error::bad_request("Unexpected response format")),
+    };
+
+    let data_value = if let Some(data) = response_data.get("data") {
+        data.clone()
+    } else {
+        response_data
+    };
+
+    serde_json::from_value(data_value)
+        .map_err(|e| Error::bad_request(format!("Failed to parse order response: {e}")))
 }
 
 fn resolve_perp_dex_name(
@@ -3259,7 +4039,7 @@ fn perp_dex_asset_index_base(dex_index: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, sync::Arc};
+    use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
     use axum::{
         Router,
@@ -3268,32 +4048,80 @@ mod tests {
         response::{IntoResponse, Json, Response},
         routing::post,
     };
-    use nautilus_core::{MUTEX_POISONED, time::get_atomic_clock_realtime};
+    use nautilus_core::{Params, UUID4, UnixNanos, time::get_atomic_clock_realtime};
     use nautilus_model::{
         currencies::CURRENCY_MAP,
-        enums::CurrencyType,
-        identifiers::{ClientOrderId, InstrumentId, Symbol},
+        enums::{CurrencyType, OrderSide, OrderStatus, OrderType, TimeInForce, TriggerType},
+        events::{OrderEventAny, OrderInitialized},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, StrategyId, Symbol, TraderId, VenueOrderId,
+        },
         instruments::{CryptoPerpetual, CurrencyPair, Instrument, InstrumentAny},
+        orders::OrderAny,
+        reports::OrderStatusReport,
         types::{Currency, Price, Quantity},
     };
+    use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
     use serde_json::{Value, json};
     use ustr::Ustr;
 
-    use super::{HyperliquidHttpClient, resolve_perp_dex_name};
+    use super::{
+        HyperliquidHttpClient, HyperliquidRawHttpClient, RETRY_AFTER_HEADER, resolve_perp_dex_name,
+    };
     use crate::{
         common::{
-            consts::HYPERLIQUID_VENUE,
+            consts::{ASSET_INDEX_INFO_KEY, HYPERLIQUID_VENUE, NAUTILUS_BUILDER_ADDRESS},
             enums::{HyperliquidEnvironment, HyperliquidProductType},
         },
         http::{
-            models::{Cloid, PerpAsset, PerpDex, PerpMeta},
+            models::{
+                Cloid, HyperliquidExchangeResponse, HyperliquidOrderStatusEntry, PerpAsset,
+                PerpDex, PerpMeta,
+            },
             query::InfoRequest,
         },
     };
 
     const TEST_PRIVATE_KEY: &str =
         "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    #[tokio::test]
+    async fn test_authenticated_client_rejects_redirects() {
+        let client = HyperliquidRawHttpClient::build_http_client(3, None).unwrap();
+        assert_http_redirect_rejected(|url| async move {
+            client
+                .get(url, None, None, Some(3), None)
+                .await
+                .unwrap()
+                .status
+                .as_u16()
+        })
+        .await;
+    }
+
+    #[rstest]
+    fn raw_clients_share_rest_limit_for_one_route() {
+        let mut first =
+            HyperliquidRawHttpClient::new(HyperliquidEnvironment::Testnet, 60, None).unwrap();
+        let mut second =
+            HyperliquidRawHttpClient::new(HyperliquidEnvironment::Testnet, 60, None).unwrap();
+        first.set_base_info_url("https://shared-http-limit.test/info".to_string());
+        second.set_base_exchange_url("https://shared-http-limit.test/exchange".to_string());
+
+        assert!(Arc::ptr_eq(&first.info_limiter, &second.exchange_limiter));
+    }
+
+    #[rstest]
+    fn retry_after_ms_parses_integer_seconds() {
+        let headers = HashMap::from([(RETRY_AFTER_HEADER.to_string(), "3".to_string())]);
+
+        assert_eq!(
+            HyperliquidRawHttpClient::retry_after_ms(&headers),
+            Some(3_000)
+        );
+    }
 
     fn perp_meta_with_assets(names: &[&str]) -> PerpMeta {
         PerpMeta {
@@ -3305,6 +4133,7 @@ mod tests {
                 })
                 .collect(),
             margin_tables: Vec::new(),
+            collateral_token: None,
         }
     }
 
@@ -3330,6 +4159,115 @@ mod tests {
     fn resolve_perp_dex_name_infers_from_asset_name_when_perp_dexs_missing() {
         let meta = perp_meta_with_assets(&["abc:TSLA", "abc:NVDA"]);
         assert_eq!(resolve_perp_dex_name(1, &meta, None), "abc");
+    }
+
+    #[rstest]
+    fn test_build_submit_order_report_elides_waiting_for_fill_tag() {
+        // A `Tag` status (for example the `waitingForFill` trigger child of a
+        // `normalTpsl` bracket) must surface as `Ok(None)` so the caller leaves
+        // the order SUBMITTED until the user-events stream confirms a real oid.
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_account_id(AccountId::from("HYPERLIQUID-001"));
+
+        let response: HyperliquidExchangeResponse = serde_json::from_value(json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": ["waitingForFill"]
+                }
+            }
+        }))
+        .unwrap();
+
+        let result = client
+            .build_submit_order_report(
+                InstrumentId::from("ARB-USD-PERP.HYPERLIQUID"),
+                ClientOrderId::from("O-WAITING-CHILD"),
+                OrderSide::Buy,
+                OrderType::StopMarket,
+                Quantity::from("100"),
+                TimeInForce::Gtc,
+                None,
+                Some(Price::from("0.16136")),
+                response,
+            )
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "Tag status must elide so the order stays SUBMITTED, was {result:?}"
+        );
+    }
+
+    #[rstest]
+    fn test_build_submit_order_report_filled_uses_total_sz_decimal() {
+        // An atomic `filled` submit response must surface as a FILLED report
+        // carrying the venue oid and the total filled size built from the
+        // Decimal `totalSz` at the instrument's size precision.
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_account_id(AccountId::from("HYPERLIQUID-001"));
+
+        let base = Currency::new("ARB", 8, 0, "ARB", CurrencyType::Crypto);
+        let usd = Currency::new("USD", 8, 0, "USD", CurrencyType::Crypto);
+        let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let clock = get_atomic_clock_realtime();
+        let ts = clock.get_time_ns();
+        let perp = InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("ARB-USD-PERP"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("ARB"))
+                .base_currency(base)
+                .quote_currency(usd)
+                .settlement_currency(usdc)
+                .is_inverse(false)
+                .price_precision(5)
+                .size_precision(2)
+                .price_increment(Price::from("0.00001"))
+                .size_increment(Quantity::from("0.01"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
+        client.cache_instrument(&perp);
+
+        let response: HyperliquidExchangeResponse = serde_json::from_value(json!({
+            "status": "ok",
+            "response": {
+                "type": "order",
+                "data": {
+                    "statuses": [{
+                        "filled": {"totalSz": "0.5", "avgPx": "1.2345", "oid": 778899}
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let report = client
+            .build_submit_order_report(
+                InstrumentId::from("ARB-USD-PERP.HYPERLIQUID"),
+                ClientOrderId::from("O-FILLED-001"),
+                OrderSide::Buy,
+                OrderType::Market,
+                Quantity::from("0.5"),
+                TimeInForce::Ioc,
+                None,
+                None,
+                response,
+            )
+            .unwrap()
+            .expect("filled status must produce a report");
+
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.venue_order_id.as_str(), "778899");
+        assert_eq!(report.filled_qty.as_decimal(), dec!(0.5));
     }
 
     #[derive(Clone, Default)]
@@ -3363,6 +4301,7 @@ mod tests {
             "outcomes": [
                 {
                     "outcome": 123,
+                    "quoteToken": "USDC",
                     "name": "Recurring",
                     "description": "class:priceBinary|underlying:HYPE|expiry:20260310-1100|targetPrice:34.5|period:3m",
                     "sideSpecs": [
@@ -3381,6 +4320,51 @@ mod tests {
         let router = Router::new()
             .route("/info", post(handle_outcome_meta_info))
             .with_state(state);
+
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        addr
+    }
+
+    async fn handle_unresolved_collateral_info(body: axum::body::Bytes) -> Response {
+        let Ok(request_body): Result<Value, _> = serde_json::from_slice(&body) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid JSON body"})),
+            )
+                .into_response();
+        };
+
+        match request_body.get("type").and_then(|value| value.as_str()) {
+            Some("spotMeta") => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "spot metadata unavailable"})),
+            )
+                .into_response(),
+            Some("allPerpMetas") => Json(json!([
+                {
+                    "collateralToken": 360,
+                    "marginTables": [],
+                    "universe": [
+                        {
+                            "maxLeverage": 20,
+                            "name": "km:US500",
+                            "szDecimals": 3
+                        }
+                    ]
+                }
+            ]))
+            .into_response(),
+            _ => Json(json!({"universe": [], "marginTables": []})).into_response(),
+        }
+    }
+
+    async fn start_unresolved_collateral_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = Router::new().route("/info", post(handle_unresolved_collateral_info));
 
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -3414,12 +4398,14 @@ mod tests {
         let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
         let client_order_id = ClientOrderId::new("O-CLOID-CACHE");
         let other_client_order_id = ClientOrderId::new("O-CLOID-CACHE-OTHER");
+        let duplicate_client_order_id = ClientOrderId::new("O-CLOID-CACHE-DUPLICATE");
         let explicit_cloid = Cloid::from_hex("0x1234567890abcdef1234567890abcdef").unwrap();
 
         let first = client.get_or_generate_client_order_id_cloid(client_order_id);
         let second = client.get_or_generate_client_order_id_cloid(client_order_id);
         client.cache_client_order_id_cloid(client_order_id, explicit_cloid);
         client.cache_client_order_id_cloid(other_client_order_id, explicit_cloid);
+        client.cache_client_order_id_cloid(duplicate_client_order_id, explicit_cloid);
 
         assert_eq!(first, Cloid::from_client_order_id(client_order_id));
         assert_eq!(first, second);
@@ -3429,14 +4415,53 @@ mod tests {
             "cache insert must not overwrite an existing generated CLOID",
         );
         assert_eq!(
+            client.unique_cached_client_order_id_cloid(&client_order_id),
+            Some(first),
+        );
+        assert_eq!(
             client.cached_client_order_id_cloid(&other_client_order_id),
             Some(explicit_cloid),
+        );
+        assert_eq!(
+            client.unique_cached_client_order_id_cloid(&other_client_order_id),
+            None,
+            "duplicate CLOID mappings are not safe modify targets",
         );
         assert_eq!(
             client.remove_client_order_id_cloid(&client_order_id),
             Some(first),
         );
         assert_eq!(client.cached_client_order_id_cloid(&client_order_id), None);
+    }
+
+    #[rstest]
+    fn test_builder_attribution_defaults_to_mainnet_builder() {
+        let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        let builder = client
+            .builder_attribution()
+            .expect("mainnet client should include builder attribution by default");
+
+        assert!(client.include_builder_attribution());
+        assert_eq!(builder.address, NAUTILUS_BUILDER_ADDRESS);
+        assert_eq!(builder.fee_tenths_bp, 0);
+    }
+
+    #[rstest]
+    fn test_builder_attribution_disabled_returns_none() {
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_include_builder_attribution(false);
+
+        assert!(!client.include_builder_attribution());
+        assert!(client.builder_attribution().is_none());
+    }
+
+    #[rstest]
+    fn test_builder_attribution_omitted_on_testnet() {
+        let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Testnet, 60, None).unwrap();
+
+        assert!(client.include_builder_attribution());
+        assert!(client.builder_attribution().is_none());
     }
 
     #[rstest]
@@ -3454,10 +4479,28 @@ mod tests {
         assert_eq!(request_body, json!({"type": "outcomeMeta"}));
         assert_eq!(meta.outcomes.len(), 1);
         assert_eq!(meta.outcomes[0].outcome, 123);
+        assert_eq!(meta.outcomes[0].quote_token.as_deref(), Some("USDC"));
         assert_eq!(meta.outcomes[0].name, "Recurring");
         assert_eq!(meta.outcomes[0].side_specs.len(), 2);
         assert_eq!(meta.outcomes[0].side_specs[0].name, "Yes");
         assert_eq!(meta.outcomes[0].side_specs[1].name, "No");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_request_instrument_defs_errors_when_non_usdc_collateral_unresolved() {
+        let addr = start_unresolved_collateral_server().await;
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_base_info_url(format!("http://{addr}/info"));
+
+        let err = client.request_instrument_defs().await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "decode error: failed to resolve perp settlement currency for dex 0: \
+             Spot metadata required to resolve perp collateral token 360",
+        );
     }
 
     #[rstest]
@@ -3502,7 +4545,7 @@ mod tests {
 
         // Register the custom currency
         {
-            let mut currency_map = CURRENCY_MAP.lock().expect(MUTEX_POISONED);
+            let mut currency_map = CURRENCY_MAP.lock();
             if !currency_map.contains_key(base_code) {
                 currency_map.insert(
                     base_code.to_string(),
@@ -3525,31 +4568,21 @@ mod tests {
         let clock = get_atomic_clock_realtime();
         let ts = clock.get_time_ns();
 
-        let instrument = InstrumentAny::CurrencyPair(CurrencyPair::new(
-            instrument_id,
-            raw_symbol,
-            base_currency,
-            quote_currency,
-            8,
-            8,
-            Price::from("0.00000001"),
-            Quantity::from("0.00000001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None, // taker_fee
-            None, // info
-            ts,
-            ts,
-        ));
+        let instrument = InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(raw_symbol)
+                .base_currency(base_currency)
+                .quote_currency(quote_currency)
+                .price_precision(8)
+                .size_precision(8)
+                .price_increment(Price::from("0.00000001"))
+                .size_increment(Quantity::from("0.00000001"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
 
         // Cache the instrument
         client.cache_instrument(&instrument);
@@ -3626,50 +4659,80 @@ mod tests {
         let clock = get_atomic_clock_realtime();
         let ts = clock.get_time_ns();
 
-        let binary = InstrumentAny::BinaryOption(BinaryOption::new(
-            instrument_id,
-            raw_symbol,
-            AssetClass::Alternative,
-            usdh,
-            Default::default(),
-            Default::default(),
-            4,
-            2,
-            Price::from("0.0001"),
-            Quantity::from("0.01"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ts,
-            ts,
-        ));
+        let binary = InstrumentAny::BinaryOption(
+            BinaryOption::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(raw_symbol)
+                .asset_class(AssetClass::Alternative)
+                .currency(usdh)
+                .activation_ns(Default::default())
+                .expiration_ns(Default::default())
+                .price_precision(4)
+                .size_precision(2)
+                .price_increment(Price::from("0.0001"))
+                .size_increment(Quantity::from("0.01"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
 
         client.cache_instrument(&binary);
 
         let with_type = client
             .get_or_create_instrument(&Ustr::from(coin), Some(HyperliquidProductType::Outcome));
         assert!(with_type.is_some());
-        assert_eq!(with_type.unwrap().id(), instrument_id);
+        let with_type = with_type.unwrap();
+        assert_eq!(with_type.id(), instrument_id);
+        assert_eq!(with_type.quote_currency(), usdh);
 
         let no_type = client.get_or_create_instrument(&Ustr::from(coin), None);
         assert!(
             no_type.is_some(),
             "Outcome coin must resolve through the no-product fallback",
         );
-        assert_eq!(no_type.unwrap().id(), instrument_id);
+        let no_type = no_type.unwrap();
+        assert_eq!(no_type.id(), instrument_id);
+        assert_eq!(no_type.quote_currency(), usdh);
 
         let missing = client.get_or_create_instrument(&Ustr::from("#9999"), None);
         assert!(missing.is_none());
+    }
+
+    #[rstest]
+    #[case::coin_form("#200", None, "20-YES-OUTCOME", "#200", 100_000_200)]
+    #[case::token_form(
+        "+201",
+        Some(HyperliquidProductType::Outcome),
+        "20-NO-OUTCOME",
+        "#201",
+        100_000_201
+    )]
+    fn test_get_or_create_instrument_resolves_unlisted_outcome(
+        #[case] coin: &str,
+        #[case] product_type: Option<HyperliquidProductType>,
+        #[case] symbol: &str,
+        #[case] raw_symbol: &str,
+        #[case] asset_index: u32,
+    ) {
+        // Settled outcomes drop out of `outcomeMeta`, so fills carry `#E` coins
+        // and spot balances carry `+E` tokens for markets never loaded
+        let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+
+        let instrument = client
+            .get_or_create_instrument(&Ustr::from(coin), product_type)
+            .expect("unlisted outcome coin must resolve from its encoding");
+
+        assert_eq!(
+            instrument.id(),
+            InstrumentId::new(Symbol::new(symbol), *HYPERLIQUID_VENUE)
+        );
+        assert_eq!(instrument.raw_symbol(), Symbol::new(raw_symbol));
+        assert_eq!(instrument.price_precision(), 5);
+        assert_eq!(instrument.size_precision(), 0);
+        assert_eq!(instrument.quote_currency(), Currency::USDC());
+        assert_eq!(instrument.settlement_currency(), Currency::USDC());
+        assert_eq!(client.get_asset_index(symbol), Some(asset_index));
     }
 
     #[rstest]
@@ -3685,57 +4748,43 @@ mod tests {
         let clock = get_atomic_clock_realtime();
         let ts = clock.get_time_ns();
 
-        let canonical = InstrumentAny::CurrencyPair(CurrencyPair::new(
-            InstrumentId::new(Symbol::new("HYPE-USDC-SPOT"), *HYPERLIQUID_VENUE),
-            Symbol::new("@107"),
-            hype,
-            usdc,
-            5,
-            2,
-            Price::from("0.00001"),
-            Quantity::from("0.01"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ts,
-            ts,
-        ));
+        let canonical = InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("HYPE-USDC-SPOT"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("@107"))
+                .base_currency(hype)
+                .quote_currency(usdc)
+                .price_precision(5)
+                .size_precision(2)
+                .price_increment(Price::from("0.00001"))
+                .size_increment(Quantity::from("0.01"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
 
-        let non_canonical = InstrumentAny::CurrencyPair(CurrencyPair::new(
-            InstrumentId::new(Symbol::new("HYPE-USDC-SPOT"), *HYPERLIQUID_VENUE),
-            Symbol::new("@999"),
-            hype,
-            usdc,
-            5,
-            2,
-            Price::from("0.00001"),
-            Quantity::from("0.01"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ts,
-            ts,
-        ));
+        let non_canonical = InstrumentAny::CurrencyPair(
+            CurrencyPair::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("HYPE-USDC-SPOT"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("@999"))
+                .base_currency(hype)
+                .quote_currency(usdc)
+                .price_precision(5)
+                .size_precision(2)
+                .price_increment(Price::from("0.00001"))
+                .size_increment(Quantity::from("0.01"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
 
         client.cache_instrument(&canonical);
         client.cache_instrument(&non_canonical);
@@ -3772,36 +4821,26 @@ mod tests {
         let clock = get_atomic_clock_realtime();
         let ts = clock.get_time_ns();
 
-        let hip3 = InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
-            InstrumentId::new(
-                Symbol::new("dex:STREAMABCDxxxx-USD-PERP"),
-                *HYPERLIQUID_VENUE,
-            ),
-            Symbol::new("dex:STREAMABCD****"),
-            base_currency,
-            usd,
-            usdc,
-            false,
-            6,
-            3,
-            Price::from("0.000001"),
-            Quantity::from("0.001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            ts,
-            ts,
-        ));
+        let hip3 = InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("dex:STREAMABCDxxxx-USD-PERP"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("dex:STREAMABCD****"))
+                .base_currency(base_currency)
+                .quote_currency(usd)
+                .settlement_currency(usdc)
+                .is_inverse(false)
+                .price_precision(6)
+                .size_precision(3)
+                .price_increment(Price::from("0.000001"))
+                .size_increment(Quantity::from("0.001"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
 
         client.cache_instrument(&hip3);
 
@@ -3831,5 +4870,344 @@ mod tests {
             )
             .expect("get_or_create_instrument must resolve sanitized base for HIP-3");
         assert_eq!(resolved.id(), hip3.id());
+    }
+
+    fn perp_with_asset_index(symbol: &str, asset_index: Option<u32>) -> InstrumentAny {
+        let base_currency = Currency::new("NEW", 8, 0, "NEW", CurrencyType::Crypto);
+        let usd = Currency::new("USD", 8, 0, "USD", CurrencyType::Crypto);
+        let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let ts = get_atomic_clock_realtime().get_time_ns();
+        let info = asset_index.map(|asset_index| {
+            let mut info = Params::new();
+            info.insert(ASSET_INDEX_INFO_KEY.to_string(), asset_index.into());
+            info
+        });
+
+        InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::new(Symbol::new(symbol), *HYPERLIQUID_VENUE))
+                .raw_symbol(Symbol::new("NEW"))
+                .base_currency(base_currency)
+                .quote_currency(usd)
+                .settlement_currency(usdc)
+                .is_inverse(false)
+                .price_precision(6)
+                .size_precision(3)
+                .price_increment(Price::from("0.000001"))
+                .size_increment(Quantity::from("0.001"))
+                .maybe_info(info)
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        )
+    }
+
+    #[rstest]
+    fn test_cache_instrument_registers_asset_index_from_info() {
+        let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+
+        client.cache_instrument(&perp_with_asset_index("NEW-USD-PERP", Some(42)));
+
+        assert_eq!(client.get_asset_index("NEW-USD-PERP"), Some(42));
+    }
+
+    #[rstest]
+    fn test_cache_instrument_without_asset_index_info_retains_existing_index() {
+        // Guessing an index would route orders to the wrong asset, so an
+        // instrument missing the info key must leave the map untouched.
+        let client = HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+
+        client.cache_instrument(&perp_with_asset_index("NEW-USD-PERP", Some(42)));
+        client.cache_instrument(&perp_with_asset_index("NEW-USD-PERP", None));
+        client.cache_instrument(&perp_with_asset_index("OTHER-USD-PERP", None));
+
+        assert_eq!(client.get_asset_index("NEW-USD-PERP"), Some(42));
+        assert_eq!(client.get_asset_index("OTHER-USD-PERP"), None);
+    }
+
+    fn btc_history_client() -> HyperliquidHttpClient {
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        client.set_account_id(AccountId::from("HYPERLIQUID-001"));
+
+        let base = Currency::new("BTC", 8, 0, "BTC", CurrencyType::Crypto);
+        let usd = Currency::new("USD", 8, 0, "USD", CurrencyType::Crypto);
+        let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let ts = get_atomic_clock_realtime().get_time_ns();
+        let perp = InstrumentAny::CryptoPerpetual(
+            CryptoPerpetual::builder()
+                .instrument_id(InstrumentId::new(
+                    Symbol::new("BTC-USD-PERP"),
+                    *HYPERLIQUID_VENUE,
+                ))
+                .raw_symbol(Symbol::new("BTC"))
+                .base_currency(base)
+                .quote_currency(usd)
+                .settlement_currency(usdc)
+                .is_inverse(false)
+                .price_precision(1)
+                .size_precision(5)
+                .price_increment(Price::from("0.1"))
+                .size_increment(Quantity::from("0.00001"))
+                .ts_event(ts)
+                .ts_init(ts)
+                .build()
+                .unwrap(),
+        );
+        client.cache_instrument(&perp);
+        client
+    }
+
+    fn history_rows(rows: Value) -> Vec<HyperliquidOrderStatusEntry> {
+        serde_json::from_value(rows).unwrap()
+    }
+
+    // Builds an order from the report the way reconciliation does for an external order
+    fn assert_initializes_order(report: &OrderStatusReport) -> OrderAny {
+        let initialized = OrderInitialized::new_checked(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("EXTERNAL"),
+            report.instrument_id,
+            ClientOrderId::from(report.venue_order_id.as_str()),
+            report.order_side.expect("report has an order side"),
+            report.order_type,
+            report.quantity,
+            report.time_in_force,
+            report.post_only,
+            report.reduce_only,
+            false,
+            true,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            report.price,
+            report.activation_price,
+            report.trigger_price,
+            report.trigger_type,
+            report.limit_offset,
+            report.trailing_offset,
+            report.trailing_offset_type,
+            report.expire_time,
+            report.display_qty,
+            None,
+            None,
+            report.contingency_type,
+            report.order_list_id,
+            report.linked_order_ids.clone(),
+            report.parent_order_id,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("report must initialize an order");
+        OrderAny::from_events(vec![OrderEventAny::Initialized(initialized)])
+            .expect("order must replay from its initialization")
+    }
+
+    // `historicalOrders` rows for a position stop that triggered and filled: once filled, the
+    // venue zeroes `triggerPx` and clears `isTrigger`, so only the earlier rows carry the trigger
+    fn triggered_stop_rows() -> Value {
+        let trigger_row = |status: &str, ts: u64| {
+            json!({
+                "order": {
+                    "coin": "BTC", "side": "A", "limitPx": "58800.0", "sz": "0.0",
+                    "oid": 900000001_u64, "timestamp": 1700000000000_u64,
+                    "triggerCondition": "Price below 59500", "isTrigger": true,
+                    "triggerPx": "59500.0", "children": [], "isPositionTpsl": true,
+                    "reduceOnly": true, "orderType": "Stop Market", "origSz": "0.0", "tif": null,
+                    "cloid": "0x00000000000000000000000000000a01"
+                },
+                "status": status,
+                "statusTimestamp": ts
+            })
+        };
+        json!([
+            filled_stop_row(),
+            trigger_row("triggered", 1700000600000),
+            trigger_row("open", 1700000000000),
+        ])
+    }
+
+    fn filled_stop_row() -> Value {
+        json!({
+            "order": {
+                "coin": "BTC", "side": "A", "limitPx": "58200.0", "sz": "0.0",
+                "oid": 900000001_u64, "timestamp": 1700000600000_u64,
+                "triggerCondition": "Triggered", "isTrigger": false, "triggerPx": "0.0",
+                "children": [], "isPositionTpsl": true, "reduceOnly": true,
+                "orderType": "Stop Market", "origSz": "0.02", "tif": "Gtc",
+                "cloid": "0x00000000000000000000000000000a01"
+            },
+            "status": "filled",
+            "statusTimestamp": 1700000600000_u64
+        })
+    }
+
+    #[rstest]
+    fn test_historical_reports_triggered_stop_keeps_trigger_from_earlier_rows() {
+        let client = btc_history_client();
+
+        let sweep = client
+            .historical_order_status_reports_from_response(
+                history_rows(triggered_stop_rows()),
+                None,
+            )
+            .unwrap();
+
+        assert!(sweep.complete);
+        assert_eq!(sweep.reports.len(), 1);
+        let report = &sweep.reports[0];
+        assert_eq!(report.venue_order_id, VenueOrderId::new("900000001"));
+        assert_eq!(report.order_type, OrderType::StopMarket);
+        assert_eq!(report.order_status, OrderStatus::Filled);
+        assert_eq!(report.filled_qty, Quantity::from("0.02"));
+        assert_eq!(report.trigger_price, Some(Price::from("59500.0")));
+        assert_eq!(report.trigger_type, Some(TriggerType::Default));
+        assert_initializes_order(report);
+    }
+
+    #[rstest]
+    fn test_historical_reports_triggered_stop_limit_keeps_trigger_and_price() {
+        let client = btc_history_client();
+        let mut rows = triggered_stop_rows();
+        for row in rows.as_array_mut().unwrap() {
+            row["order"]["orderType"] = json!("Stop Limit");
+        }
+
+        let sweep = client
+            .historical_order_status_reports_from_response(history_rows(rows), None)
+            .unwrap();
+
+        assert_eq!(sweep.reports.len(), 1);
+        let report = &sweep.reports[0];
+        assert_eq!(report.order_type, OrderType::StopLimit);
+        // The filled row carries no price; the merge takes it from the earlier rows
+        assert_eq!(report.price, Some(Price::from("58800.0")));
+        assert_eq!(report.trigger_price, Some(Price::from("59500.0")));
+        assert_eq!(report.trigger_type, Some(TriggerType::Default));
+        assert_initializes_order(report);
+    }
+
+    #[rstest]
+    #[case("Stop Market", "filled", OrderType::Market)]
+    #[case("Take Profit Market", "filled", OrderType::Market)]
+    #[case("Stop Limit", "filled", OrderType::Market)]
+    #[case("Take Profit Limit", "filled", OrderType::Market)]
+    #[case("Stop Market", "canceled", OrderType::Market)]
+    #[case("Take Profit Market", "canceled", OrderType::Market)]
+    #[case("Stop Limit", "canceled", OrderType::Limit)]
+    #[case("Take Profit Limit", "canceled", OrderType::Limit)]
+    fn test_historical_reports_closed_trigger_without_trigger_rows_is_untriggered(
+        #[case] label: &str,
+        #[case] status: &str,
+        #[case] expected: OrderType,
+    ) {
+        // Only the zeroed final row survives (older rows aged out of the history window). A
+        // filled row carries no price, so only a canceled limit-style row can stay a limit order.
+        let client = btc_history_client();
+        let mut row = filled_stop_row();
+        row["order"]["orderType"] = json!(label);
+        row["status"] = json!(status);
+        // A canceled order's `sz` holds its unfilled size
+        let expected_filled = if status == "canceled" {
+            row["order"]["sz"] = json!("0.02");
+            "0"
+        } else {
+            "0.02"
+        };
+
+        let sweep = client
+            .historical_order_status_reports_from_response(history_rows(json!([row])), None)
+            .unwrap();
+
+        assert_eq!(sweep.reports.len(), 1);
+        let report = &sweep.reports[0];
+        assert_eq!(report.order_type, expected);
+        assert_eq!(report.filled_qty, Quantity::from(expected_filled));
+        assert!(report.trigger_price.is_none());
+        assert!(report.trigger_type.is_none());
+        assert_eq!(report.price.is_some(), expected == OrderType::Limit);
+        assert!(report.reduce_only);
+        assert_initializes_order(report);
+    }
+
+    #[rstest]
+    fn test_historical_reports_triggered_stop_filled_with_remainder() {
+        // Both fixes on one row: a triggered stop's zeroed final row that also left a remainder
+        let client = btc_history_client();
+        let mut row = filled_stop_row();
+        row["order"]["sz"] = json!("0.0008");
+
+        let sweep = client
+            .historical_order_status_reports_from_response(history_rows(json!([row])), None)
+            .unwrap();
+
+        assert_eq!(sweep.reports.len(), 1);
+        let report = &sweep.reports[0];
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.order_type, OrderType::Market);
+        assert_eq!(report.filled_qty, Quantity::from("0.0192"));
+        assert!(report.price.is_none());
+        assert_initializes_order(report);
+    }
+
+    #[rstest]
+    fn test_historical_reports_open_trigger_without_trigger_price_keeps_order_type() {
+        // An order that is still working keeps its trigger type even when its row lacks a
+        // trigger price
+        let client = btc_history_client();
+        let mut row = filled_stop_row();
+        row["status"] = json!("triggered");
+
+        let sweep = client
+            .historical_order_status_reports_from_response(history_rows(json!([row])), None)
+            .unwrap();
+
+        assert_eq!(sweep.reports.len(), 1);
+        assert_eq!(sweep.reports[0].order_type, OrderType::StopMarket);
+    }
+
+    // An IOC order the venue marks `filled` although 0.0005 of 0.015 went unfilled: `sz`
+    // carries the canceled remainder
+    #[rstest]
+    fn test_historical_reports_partially_filled_ioc_is_canceled() {
+        let client = btc_history_client();
+        let row = |status: &str, sz: &str| {
+            json!({
+                "order": {
+                    "coin": "BTC", "side": "A", "limitPx": "60100.0", "sz": sz,
+                    "oid": 900000002_u64, "timestamp": 1700001000000_u64,
+                    "triggerCondition": "N/A", "isTrigger": false, "triggerPx": "0.0",
+                    "children": [], "isPositionTpsl": false, "reduceOnly": false,
+                    "orderType": "Limit", "origSz": "0.015", "tif": "Ioc",
+                    "cloid": "0x00000000000000000000000000000a02"
+                },
+                "status": status,
+                "statusTimestamp": 1700001000000_u64
+            })
+        };
+
+        let sweep = client
+            .historical_order_status_reports_from_response(
+                history_rows(json!([row("filled", "0.0005"), row("open", "0.015")])),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(sweep.reports.len(), 1);
+        let report = &sweep.reports[0];
+        assert_eq!(report.order_status, OrderStatus::Canceled);
+        assert_eq!(report.order_type, OrderType::Limit);
+        assert_eq!(report.quantity, Quantity::from("0.015"));
+        assert_eq!(report.filled_qty, Quantity::from("0.0145"));
+        // The filled row carries no price; the merge takes the limit price from the open row
+        assert_eq!(report.price, Some(Price::from("60100.0")));
+        assert_eq!(
+            report.cancel_reason.as_deref(),
+            Some("Unfilled remainder canceled")
+        );
+        assert_initializes_order(report);
     }
 }

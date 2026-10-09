@@ -20,7 +20,8 @@
     reason = "errors documented on underlying Rust methods"
 )]
 
-use pyo3::prelude::*;
+use nautilus_core::python::to_pyvalue_err;
+use pyo3::{PyErr, prelude::*};
 
 pub mod account;
 pub mod common;
@@ -39,12 +40,46 @@ pub mod types;
 #[cfg(feature = "defi")]
 pub mod defi;
 
-/// Loaded as `nautilus_pyo3.model`.
+use crate::{
+    identifiers::{InstrumentIdError, OptionSeriesIdError},
+    types::CurrencyLookupError,
+};
+
+/// Converts an instrument ID validation failure to a Python `ValueError`.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err passes owned errors to conversion functions"
+)]
+pub fn instrument_id_error_to_pyvalue_err(e: InstrumentIdError) -> PyErr {
+    to_pyvalue_err(e)
+}
+
+/// Converts an option series ID validation failure to a Python `ValueError`.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err passes owned errors to conversion functions"
+)]
+pub fn option_series_id_error_to_pyvalue_err(e: OptionSeriesIdError) -> PyErr {
+    to_pyvalue_err(e)
+}
+
+/// Converts a currency lookup failure to a Python `ValueError`.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err passes owned errors to conversion functions"
+)]
+pub fn currency_lookup_error_to_pyvalue_err(e: CurrencyLookupError) -> PyErr {
+    to_pyvalue_err(e)
+}
+
+/// Exposed through `nautilus_trader.model`.
 ///
 /// # Errors
 ///
 /// Returns a `PyErr` if registering any module components fails.
-///
 #[pymodule]
 pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Types
@@ -58,8 +93,29 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::types::quantity::Quantity>()?;
     m.add_class::<crate::types::balance::AccountBalance>()?;
     m.add_class::<crate::types::balance::MarginBalance>()?;
+    m.add_class::<crate::python::common::EnumIterator>()?;
     // Data
-    m.add_function(wrap_pyfunction!(data::drop_cvec_pycapsule, m)?)?;
+    m.add_class::<data::PyNautilusDataType>()?;
+    m.add_class::<data::PyNautilusRecordType>()?;
+    m.add_class::<instruments::PyNautilusInstrumentType>()?;
+    for record_type in <crate::data::NautilusRecordType as strum::IntoEnumIterator>::iter() {
+        m.getattr("NautilusRecordType")?.setattr(
+            record_type.to_string(),
+            Py::new(m.py(), data::PyNautilusRecordType::new(record_type))?,
+        )?;
+    }
+
+    for instrument_type in
+        <crate::instruments::NautilusInstrumentType as strum::IntoEnumIterator>::iter()
+    {
+        m.getattr("NautilusInstrumentType")?.setattr(
+            instrument_type.to_string(),
+            Py::new(
+                m.py(),
+                instruments::PyNautilusInstrumentType::new(instrument_type),
+            )?,
+        )?;
+    }
     m.add_class::<crate::data::DataType>()?;
     m.add_class::<crate::data::CustomData>()?;
     m.add_function(pyo3::wrap_pyfunction!(
@@ -84,7 +140,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::data::prices::IndexPriceUpdate>()?;
     m.add_class::<crate::data::delta::OrderBookDelta>()?;
     m.add_class::<crate::data::deltas::OrderBookDeltas>()?;
-    m.add_class::<crate::data::depth::OrderBookDepth10>()?;
+    m.add_class::<crate::data::depth::OrderBookDepth>()?;
     m.add_class::<crate::data::quote::QuoteTick>()?;
     m.add_class::<crate::data::status::InstrumentStatus>()?;
     m.add_class::<crate::data::trade::TradeTick>()?;
@@ -98,7 +154,6 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::data::option_chain::OptionChainSlice>()?;
     m.add_class::<crate::data::option_chain::OptionStrikeData>()?;
     m.add_class::<crate::python::data::option_chain::PyStrikeRange>()?;
-    m.add_class::<crate::data::forward::ForwardPrice>()?;
     m.add_function(wrap_pyfunction!(
         crate::python::data::greeks::py_black_scholes_greeks,
         m
@@ -120,6 +175,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::AggregationSource>()?;
     m.add_class::<crate::enums::AggressorSide>()?;
     m.add_class::<crate::enums::AssetClass>()?;
+    m.add_class::<crate::enums::AvgPxReconciliation>()?;
     m.add_class::<crate::enums::BarAggregation>()?;
     m.add_class::<crate::enums::BarIntervalType>()?;
     m.add_class::<crate::enums::BetSide>()?;
@@ -136,6 +192,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::MarketStatusAction>()?;
     m.add_class::<crate::enums::OmsType>()?;
     m.add_class::<crate::enums::OptionKind>()?;
+    m.add_class::<crate::enums::OptionSideFilter>()?;
     m.add_class::<crate::enums::OtoTriggerMode>()?;
     m.add_class::<crate::enums::OrderSide>()?;
     m.add_class::<crate::enums::OrderStatus>()?;
@@ -143,6 +200,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::PositionAdjustmentType>()?;
     m.add_class::<crate::enums::PositionSide>()?;
     m.add_class::<crate::enums::PriceType>()?;
+    m.add_class::<crate::enums::RecordFlag>()?;
     m.add_class::<crate::enums::TimeInForce>()?;
     m.add_class::<crate::enums::TradingState>()?;
     m.add_class::<crate::enums::TrailingOffsetType>()?;
@@ -164,12 +222,21 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::identifiers::Venue>()?;
     m.add_class::<crate::identifiers::VenueOrderId>()?;
     m.add_class::<crate::identifiers::OptionSeriesId>()?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::identifiers::py_new_generic_spread_id,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::identifiers::py_generic_spread_id_to_list,
+        m
+    )?)?;
     // Orders
     m.add_class::<crate::orders::LimitOrder>()?;
     m.add_class::<crate::orders::LimitIfTouchedOrder>()?;
     m.add_class::<crate::orders::MarketIfTouchedOrder>()?;
     m.add_class::<crate::orders::MarketOrder>()?;
     m.add_class::<crate::orders::MarketToLimitOrder>()?;
+    m.add_class::<crate::orders::OrderList>()?;
     m.add_class::<crate::orders::StopLimitOrder>()?;
     m.add_class::<crate::orders::StopMarketOrder>()?;
     m.add_class::<crate::orders::TrailingStopLimitOrder>()?;
@@ -186,6 +253,20 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     // Instruments
+    m.add_class::<instruments::tick_scheme::PyFixedTickScheme>()?;
+    m.add_class::<instruments::tick_scheme::PyTieredTickScheme>()?;
+    m.add_function(wrap_pyfunction!(
+        instruments::tick_scheme::py_register_tick_scheme,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        instruments::tick_scheme::py_get_tick_scheme,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        instruments::tick_scheme::py_list_tick_schemes,
+        m
+    )?)?;
     m.add_class::<crate::instruments::BettingInstrument>()?;
     m.add_class::<crate::instruments::BinaryOption>()?;
     m.add_class::<crate::instruments::Cfd>()?;
@@ -222,6 +303,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::events::AccountState>()?;
     m.add_class::<crate::events::OrderDenied>()?;
     m.add_class::<crate::events::OrderFilled>()?;
+    m.add_class::<crate::events::OrderFillVoided>()?;
     m.add_class::<crate::events::OrderInitialized>()?;
     m.add_class::<crate::events::OrderRejected>()?;
     m.add_class::<crate::events::OrderTriggered>()?;
@@ -247,6 +329,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::accounts::BettingAccount>()?;
     m.add_class::<crate::accounts::CashAccount>()?;
     m.add_class::<crate::accounts::MarginAccount>()?;
+    m.add_class::<crate::accounts::WalletAccount>()?;
     m.add_class::<crate::accounts::margin_model::StandardMarginModel>()?;
     m.add_class::<crate::accounts::margin_model::LeveragedMarginModel>()?;
     m.add_function(wrap_pyfunction!(
@@ -259,6 +342,10 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         crate::python::account::transformer::margin_account_from_account_events,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        crate::python::account::transformer::wallet_account_from_account_events,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -286,6 +373,8 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<crate::defi::data::PoolLiquidityUpdateType>()?;
         m.add_class::<crate::defi::data::PoolLiquidityUpdate>()?;
         m.add_class::<crate::defi::data::PoolFeeCollect>()?;
+        m.add_class::<crate::defi::data::PoolFeeProtocolUpdate>()?;
+        m.add_class::<crate::defi::data::PoolFeeProtocolCollect>()?;
         m.add_class::<crate::defi::data::PoolFlash>()?;
         m.add_class::<crate::defi::data::Transaction>()?;
         m.add_class::<crate::defi::data::Block>()?;
@@ -293,6 +382,86 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<crate::defi::dex::DexType>()?;
         m.add_class::<crate::defi::pool_analysis::PoolSnapshot>()?;
         m.add_class::<crate::defi::pool_analysis::PoolProfiler>()?;
+        m.add_class::<crate::defi::pool_analysis::position::PoolPosition>()?;
+        m.add_class::<crate::defi::pool_analysis::quote::SwapQuote>()?;
+        m.add_class::<crate::defi::pool_analysis::size_estimator::SizeForImpactResult>()?;
+        m.add_class::<crate::defi::pool_analysis::snapshot::PoolAnalytics>()?;
+        m.add_class::<crate::defi::pool_analysis::snapshot::PoolState>()?;
+        m.add_class::<crate::defi::tick_map::tick::PoolTick>()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use pyo3::{Python, exceptions::PyValueError};
+    use rstest::rstest;
+
+    use super::*;
+
+    fn ensure_python_initialized() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            Python::initialize();
+        });
+    }
+
+    #[rstest]
+    fn test_instrument_id_error_to_pyvalue_err_preserves_display_text() {
+        ensure_python_initialized();
+
+        let error = "BTCUSDT"
+            .parse::<crate::identifiers::InstrumentId>()
+            .unwrap_err();
+
+        Python::attach(|py| {
+            let py_err = instrument_id_error_to_pyvalue_err(error);
+
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                py_err.value(py).to_string(),
+                "invalid `InstrumentId` value 'BTCUSDT': missing '.' separator between symbol and venue components"
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_option_series_id_error_to_pyvalue_err_preserves_display_text() {
+        ensure_python_initialized();
+
+        let error = "DERIBIT:BTC:USD"
+            .parse::<crate::identifiers::OptionSeriesId>()
+            .unwrap_err();
+
+        Python::attach(|py| {
+            let py_err = option_series_id_error_to_pyvalue_err(error);
+
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                py_err.value(py).to_string(),
+                "invalid `OptionSeriesId` value 'DERIBIT:BTC:USD': expected format 'VENUE:UNDERLYING:[REFERENCE:]SETTLEMENT:EXPIRY'"
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_currency_lookup_error_to_pyvalue_err_preserves_display_text() {
+        ensure_python_initialized();
+
+        let error = "UNKNOWN_CURRENCY"
+            .parse::<crate::types::Currency>()
+            .unwrap_err();
+
+        Python::attach(|py| {
+            let py_err = currency_lookup_error_to_pyvalue_err(error);
+
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                py_err.value(py).to_string(),
+                "Unknown currency: UNKNOWN_CURRENCY"
+            );
+        });
+    }
 }

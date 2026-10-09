@@ -24,12 +24,15 @@ use std::{
 };
 
 use ahash::AHashMap;
+use nautilus_live::book::snapshot::SnapshotGate;
 use nautilus_network::websocket::{SubscriptionState, WebSocketClient};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
+use super::{AxMdSubscriptionSpec, AxWsClientError};
 use crate::{
-    common::enums::{AxCandleWidth, AxMarketDataLevel, AxMdRequestType},
+    common::enums::{AxCandleWidth, AxMdRequestType},
     websocket::{
         messages::{
             AxDataWsMessage, AxMdMessage, AxMdSubscribe, AxMdSubscribeCandles, AxMdUnsubscribe,
@@ -54,8 +57,30 @@ pub enum HandlerCommand {
         request_id: i64,
         /// Instrument symbol.
         symbol: Ustr,
-        /// Market data level.
-        level: AxMarketDataLevel,
+        /// Market data subscription options.
+        spec: AxMdSubscriptionSpec,
+    },
+    /// Writes a book subscription on the current connection, opening `gate` once written.
+    ///
+    /// With an unsubscribe request ID, first unsubscribes the symbol so the venue restarts its
+    /// stream with a snapshot. That acknowledgement stays untracked, keeping the topic desired for
+    /// reconnect replay. The write always runs, since the subscription state already counts it;
+    /// `cancel` only keeps the gate closed.
+    WriteBook {
+        /// Request ID for correlation.
+        request_id: i64,
+        /// Request ID of the unsubscribe that replaces an open stream.
+        unsubscribe_request_id: Option<i64>,
+        /// Instrument symbol.
+        symbol: Ustr,
+        /// Market data subscription options.
+        spec: AxMdSubscriptionSpec,
+        /// Keeps the gate closed once cancelled.
+        cancel: CancellationToken,
+        /// Snapshot gate opened once the write completes.
+        gate: SnapshotGate,
+        /// Receives the write result.
+        completion: tokio::sync::oneshot::Sender<Result<(), AxWsClientError>>,
     },
     /// Unsubscribe from market data for a symbol.
     Unsubscribe {
@@ -63,6 +88,8 @@ pub enum HandlerCommand {
         request_id: i64,
         /// Instrument symbol.
         symbol: Ustr,
+        /// Subscription topic for state tracking.
+        topic: String,
     },
     /// Subscribe to candle data for a symbol.
     SubscribeCandles {
@@ -81,6 +108,8 @@ pub enum HandlerCommand {
         symbol: Ustr,
         /// Candle width/interval.
         width: AxCandleWidth,
+        /// Subscription topic for state tracking.
+        topic: String,
     },
 }
 
@@ -97,7 +126,7 @@ pub(crate) struct AxMdWsFeedHandler {
     message_queue: VecDeque<AxDataWsMessage>,
     replay_request_id: i64,
     needs_subscription_replay: bool,
-    pending_subscribe_requests: AHashMap<i64, String>,
+    pending_subscription_requests: AHashMap<i64, PendingSubscriptionRequest>,
 }
 
 impl AxMdWsFeedHandler {
@@ -118,7 +147,7 @@ impl AxMdWsFeedHandler {
             message_queue: VecDeque::new(),
             replay_request_id: -1,
             needs_subscription_replay: false,
-            pending_subscribe_requests: AHashMap::new(),
+            pending_subscription_requests: AHashMap::new(),
         }
     }
 
@@ -128,24 +157,27 @@ impl AxMdWsFeedHandler {
     }
 
     async fn replay_subscriptions(&mut self) {
-        let topics = self.subscriptions.all_topics();
+        self.pending_subscription_requests.clear();
+        let topics = self.subscriptions.reset_after_reconnect();
         if topics.is_empty() {
             log::debug!("No subscriptions to replay after reconnect");
             return;
         }
 
-        log::info!("Replaying {} subscriptions after reconnect", topics.len());
+        log::debug!("Replaying {} subscriptions after reconnect", topics.len());
 
         for topic in topics {
-            self.subscriptions.mark_subscribe(&topic);
-
-            // Topic format: "symbol:Level" or "candles:symbol:Width"
+            // Topic format: "symbol:Level:trades:ticker" or "candles:symbol:Width"
             if let Some(rest) = topic.strip_prefix("candles:") {
                 if let Some((symbol, width_str)) = rest.rsplit_once(':') {
                     if let Some(width) = Self::parse_candle_width(width_str) {
                         let request_id = self.next_replay_request_id();
                         log::debug!(
                             "Replaying candle subscription: symbol={symbol}, width={width:?}"
+                        );
+                        self.pending_subscription_requests.insert(
+                            request_id,
+                            PendingSubscriptionRequest::Subscribe(topic.clone()),
                         );
                         self.send_subscribe_candles(request_id, Ustr::from(symbol), width)
                             .await;
@@ -155,32 +187,18 @@ impl AxMdWsFeedHandler {
                 } else {
                     log::warn!("Invalid candle topic format: {topic}");
                 }
-            } else if let Some((symbol, level_str)) = topic.rsplit_once(':') {
-                if let Some(level) = Self::parse_market_data_level(level_str) {
-                    let request_id = self.next_replay_request_id();
-                    log::debug!(
-                        "Replaying market data subscription: symbol={symbol}, level={level:?}"
-                    );
-                    self.send_subscribe(request_id, Ustr::from(symbol), level)
-                        .await;
-                } else {
-                    log::warn!("Failed to parse market data level from topic: {topic}");
-                }
+            } else if let Some((symbol, spec)) = AxMdSubscriptionSpec::parse_topic(&topic) {
+                let request_id = self.next_replay_request_id();
+                log::debug!("Replaying market data subscription: symbol={symbol}, spec={spec:?}");
+                self.pending_subscription_requests
+                    .insert(request_id, PendingSubscriptionRequest::Subscribe(topic));
+                self.send_subscribe(request_id, symbol, spec).await;
             } else {
-                log::warn!("Unknown topic format: {topic}");
+                log::warn!("Failed to parse market data subscription topic: {topic}");
             }
         }
 
-        log::info!("Subscription replay completed");
-    }
-
-    fn parse_market_data_level(s: &str) -> Option<AxMarketDataLevel> {
-        match s {
-            "Level1" => Some(AxMarketDataLevel::Level1),
-            "Level2" => Some(AxMarketDataLevel::Level2),
-            "Level3" => Some(AxMarketDataLevel::Level3),
-            _ => None,
-        }
+        log::debug!("Subscription replay completed");
     }
 
     fn parse_candle_width(s: &str) -> Option<AxCandleWidth> {
@@ -275,19 +293,48 @@ impl AxMdWsFeedHandler {
             HandlerCommand::Subscribe {
                 request_id,
                 symbol,
-                level,
+                spec,
             } => {
                 log::debug!(
-                    "Subscribe command received: request_id={request_id}, symbol={symbol}, level={level:?}"
+                    "Subscribe command received: request_id={request_id}, symbol={symbol}, spec={spec:?}"
                 );
-                let topic = format!("{symbol}:{level:?}");
-                self.pending_subscribe_requests.insert(request_id, topic);
-                self.send_subscribe(request_id, symbol, level).await;
+                let topic = spec.topic(symbol.as_str());
+                self.pending_subscription_requests
+                    .insert(request_id, PendingSubscriptionRequest::Subscribe(topic));
+                self.send_subscribe(request_id, symbol, spec).await;
             }
-            HandlerCommand::Unsubscribe { request_id, symbol } => {
+            HandlerCommand::WriteBook {
+                request_id,
+                unsubscribe_request_id,
+                symbol,
+                spec,
+                cancel,
+                gate,
+                completion,
+            } => {
+                log::debug!(
+                    "WriteBook command received: request_id={request_id}, symbol={symbol}, spec={spec:?}"
+                );
+                let result = self
+                    .write_book(request_id, unsubscribe_request_id, symbol, spec)
+                    .await;
+
+                if result.is_ok() && !cancel.is_cancelled() {
+                    gate.open();
+                }
+
+                let _ = completion.send(result);
+            }
+            HandlerCommand::Unsubscribe {
+                request_id,
+                symbol,
+                topic,
+            } => {
                 log::debug!(
                     "Unsubscribe command received: request_id={request_id}, symbol={symbol}"
                 );
+                self.pending_subscription_requests
+                    .insert(request_id, PendingSubscriptionRequest::Unsubscribe(topic));
                 self.send_unsubscribe(request_id, symbol).await;
             }
             HandlerCommand::SubscribeCandles {
@@ -299,17 +346,21 @@ impl AxMdWsFeedHandler {
                     "SubscribeCandles command received: request_id={request_id}, symbol={symbol}, width={width:?}"
                 );
                 let topic = format!("candles:{symbol}:{width:?}");
-                self.pending_subscribe_requests.insert(request_id, topic);
+                self.pending_subscription_requests
+                    .insert(request_id, PendingSubscriptionRequest::Subscribe(topic));
                 self.send_subscribe_candles(request_id, symbol, width).await;
             }
             HandlerCommand::UnsubscribeCandles {
                 request_id,
                 symbol,
                 width,
+                topic,
             } => {
                 log::debug!(
                     "UnsubscribeCandles command received: request_id={request_id}, symbol={symbol}, width={width:?}"
                 );
+                self.pending_subscription_requests
+                    .insert(request_id, PendingSubscriptionRequest::Unsubscribe(topic));
                 self.message_queue
                     .push_back(AxDataWsMessage::CandleUnsubscribed { symbol, width });
                 self.send_unsubscribe_candles(request_id, symbol, width)
@@ -318,21 +369,72 @@ impl AxMdWsFeedHandler {
         }
     }
 
-    async fn send_subscribe(&mut self, request_id: i64, symbol: Ustr, level: AxMarketDataLevel) {
+    async fn send_subscribe(&mut self, request_id: i64, symbol: Ustr, spec: AxMdSubscriptionSpec) {
         let msg = AxMdSubscribe {
             rid: request_id,
             msg_type: AxMdRequestType::Subscribe,
             symbol,
-            level,
+            level: spec.level,
+            trades: spec.trades,
+            ticker: spec.ticker,
         };
 
         if let Err(e) = self.send_json(&msg).await {
-            self.pending_subscribe_requests.remove(&request_id);
+            self.pending_subscription_requests.remove(&request_id);
             log::error!("Failed to send subscribe message: {e}");
         }
     }
 
-    async fn send_unsubscribe(&self, request_id: i64, symbol: Ustr) {
+    async fn write_book(
+        &mut self,
+        request_id: i64,
+        unsubscribe_request_id: Option<i64>,
+        symbol: Ustr,
+        spec: AxMdSubscriptionSpec,
+    ) -> Result<(), AxWsClientError> {
+        let Some(client) = self.inner.as_ref() else {
+            return Err(AxWsClientError::Transport(
+                "No WebSocket client available".to_string(),
+            ));
+        };
+
+        let epoch = client.connection_epoch();
+        let topic = spec.topic(symbol.as_str());
+
+        if let Some(rid) = unsubscribe_request_id {
+            // Keeps the topic desired for reconnect replay, so its subscribe ack confirms it again
+            self.subscriptions.mark_failure(&topic);
+
+            let msg = AxMdUnsubscribe {
+                rid,
+                msg_type: AxMdRequestType::Unsubscribe,
+                symbol,
+            };
+
+            send_json_on_connection(client, &msg, epoch).await?;
+        }
+
+        let msg = AxMdSubscribe {
+            rid: request_id,
+            msg_type: AxMdRequestType::Subscribe,
+            symbol,
+            level: spec.level,
+            trades: spec.trades,
+            ticker: spec.ticker,
+        };
+
+        self.pending_subscription_requests
+            .insert(request_id, PendingSubscriptionRequest::Subscribe(topic));
+
+        if let Err(e) = send_json_on_connection(client, &msg, epoch).await {
+            self.pending_subscription_requests.remove(&request_id);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    async fn send_unsubscribe(&mut self, request_id: i64, symbol: Ustr) {
         let msg = AxMdUnsubscribe {
             rid: request_id,
             msg_type: AxMdRequestType::Unsubscribe,
@@ -340,6 +442,7 @@ impl AxMdWsFeedHandler {
         };
 
         if let Err(e) = self.send_json(&msg).await {
+            self.pending_subscription_requests.remove(&request_id);
             log::error!("Failed to send unsubscribe message: {e}");
         }
     }
@@ -358,12 +461,17 @@ impl AxMdWsFeedHandler {
         };
 
         if let Err(e) = self.send_json(&msg).await {
-            self.pending_subscribe_requests.remove(&request_id);
+            self.pending_subscription_requests.remove(&request_id);
             log::error!("Failed to send subscribe_candles message: {e}");
         }
     }
 
-    async fn send_unsubscribe_candles(&self, request_id: i64, symbol: Ustr, width: AxCandleWidth) {
+    async fn send_unsubscribe_candles(
+        &mut self,
+        request_id: i64,
+        symbol: Ustr,
+        width: AxCandleWidth,
+    ) {
         let msg = AxMdUnsubscribeCandles {
             rid: request_id,
             msg_type: AxMdRequestType::UnsubscribeCandles,
@@ -372,6 +480,7 @@ impl AxMdWsFeedHandler {
         };
 
         if let Err(e) = self.send_json(&msg).await {
+            self.pending_subscription_requests.remove(&request_id);
             log::error!("Failed to send unsubscribe_candles message: {e}");
         }
     }
@@ -382,7 +491,7 @@ impl AxMdWsFeedHandler {
         };
 
         let payload = serde_json::to_string(msg).map_err(|e| e.to_string())?;
-        log::trace!("Sending: {payload}");
+        log::trace!("Sending WebSocket payload ({} bytes)", payload.len());
 
         inner
             .send_text(payload, None)
@@ -427,27 +536,47 @@ impl AxMdWsFeedHandler {
                 let is_benign = error.message.contains("already subscribed")
                     || error.message.contains("not subscribed");
 
-                if is_benign {
-                    if let Some(rid) = error.request_id {
-                        self.pending_subscribe_requests.remove(&rid);
+                if let Some(rid) = error.request_id
+                    && let Some(request) = self.pending_subscription_requests.remove(&rid)
+                {
+                    match request {
+                        PendingSubscriptionRequest::Subscribe(topic) => {
+                            self.subscriptions.mark_failure(&topic);
+                        }
+                        PendingSubscriptionRequest::Unsubscribe(topic) => {
+                            self.subscriptions.confirm_unsubscribe(&topic);
+                        }
                     }
+                }
+
+                if is_benign {
                     log::warn!("Subscription state: {}", error.message);
                 } else {
-                    if let Some(rid) = error.request_id
-                        && let Some(topic) = self.pending_subscribe_requests.remove(&rid)
-                    {
-                        log::warn!(
-                            "Rolling back subscription for topic '{topic}' \
-                             due to error: {}",
-                            error.message
-                        );
-                        self.subscriptions.mark_unsubscribe(&topic);
-                    }
                     log::error!("Received error from exchange: {}", error.message);
                 }
             }
             AxMdMessage::SubscriptionResponse(response) => {
-                self.pending_subscribe_requests.remove(&response.rid);
+                let is_subscribe = response.result.subscribed.is_some()
+                    || response.result.subscribed_candle.is_some();
+                let is_unsubscribe = response.result.unsubscribed.is_some()
+                    || response.result.unsubscribed_candle.is_some();
+
+                if let Some(request) = self.pending_subscription_requests.remove(&response.rid) {
+                    match request {
+                        PendingSubscriptionRequest::Subscribe(topic) if is_subscribe => {
+                            self.subscriptions.confirm_subscribe(&topic);
+                        }
+                        PendingSubscriptionRequest::Unsubscribe(topic) if is_unsubscribe => {
+                            self.subscriptions.confirm_unsubscribe(&topic);
+                        }
+                        request => {
+                            log::warn!(
+                                "Unexpected subscription response for request: {request:?}, \
+                                 response={response:?}"
+                            );
+                        }
+                    }
+                }
 
                 if let Some(symbol) = &response.result.subscribed {
                     log::debug!("Subscription confirmed for symbol: {symbol}");
@@ -464,5 +593,236 @@ impl AxMdWsFeedHandler {
         }
 
         Some(AxDataWsMessage::MdMessage(message))
+    }
+}
+
+#[derive(Debug)]
+enum PendingSubscriptionRequest {
+    Subscribe(String),
+    Unsubscribe(String),
+}
+
+// Sends once on the connection identified by `epoch`, never replaying on a replacement
+async fn send_json_on_connection<T: serde::Serialize>(
+    client: &WebSocketClient,
+    msg: &T,
+    epoch: u64,
+) -> Result<(), AxWsClientError> {
+    let payload =
+        serde_json::to_string(msg).map_err(|e| AxWsClientError::ClientError(e.to_string()))?;
+
+    client
+        .send_text_on_connection(payload, None, epoch)
+        .await
+        .map_err(|e| AxWsClientError::Transport(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_network::websocket::SubscriptionState;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{
+        common::enums::AxMarketDataLevel,
+        websocket::messages::{AxMdSubscriptionResponse, AxMdSubscriptionResult, AxWsError},
+    };
+
+    const TOPIC: &str = "EURUSD-PERP:Level2:false:false";
+
+    #[rstest]
+    fn test_subscription_response_confirms_subscribe() {
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe(TOPIC);
+        let mut handler = create_handler(subscriptions.clone());
+        handler
+            .pending_subscription_requests
+            .insert(1, PendingSubscriptionRequest::Subscribe(TOPIC.to_string()));
+
+        handler.handle_message(AxMdMessage::SubscriptionResponse(
+            AxMdSubscriptionResponse {
+                rid: 1,
+                result: AxMdSubscriptionResult {
+                    subscribed: Some(Ustr::from("EURUSD-PERP")),
+                    subscribed_candle: None,
+                    unsubscribed: None,
+                    unsubscribed_candle: None,
+                },
+            },
+        ));
+
+        assert_eq!(subscriptions.len(), 1);
+        assert!(subscriptions.pending_subscribe_topics().is_empty());
+        assert!(subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    fn test_subscription_error_keeps_topic_pending_for_replay() {
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe(TOPIC);
+        subscriptions.confirm_subscribe(TOPIC);
+        let mut handler = create_handler(subscriptions.clone());
+        handler
+            .pending_subscription_requests
+            .insert(2, PendingSubscriptionRequest::Subscribe(TOPIC.to_string()));
+
+        handler.handle_message(AxMdMessage::Error(AxWsError {
+            code: Some("400".to_string()),
+            message: "subscription failed".to_string(),
+            request_id: Some(2),
+        }));
+
+        assert_eq!(subscriptions.len(), 0);
+        assert_eq!(
+            subscriptions.pending_subscribe_topics(),
+            vec![TOPIC.to_string()]
+        );
+        assert!(subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    fn test_already_subscribed_keeps_topic_pending_for_replay() {
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe(TOPIC);
+        let mut handler = create_handler(subscriptions.clone());
+        handler
+            .pending_subscription_requests
+            .insert(3, PendingSubscriptionRequest::Subscribe(TOPIC.to_string()));
+
+        handler.handle_message(AxMdMessage::Error(AxWsError {
+            code: Some("400".to_string()),
+            message: "already subscribed".to_string(),
+            request_id: Some(3),
+        }));
+
+        assert_eq!(subscriptions.len(), 0);
+        assert_eq!(
+            subscriptions.pending_subscribe_topics(),
+            vec![TOPIC.to_string()]
+        );
+        assert!(subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    #[case("not subscribed")]
+    #[case("subscription failed")]
+    fn test_unsubscribe_error_confirms_removal(#[case] message: &str) {
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe(TOPIC);
+        subscriptions.confirm_subscribe(TOPIC);
+        subscriptions.mark_unsubscribe(TOPIC);
+        let mut handler = create_handler(subscriptions.clone());
+        handler.pending_subscription_requests.insert(
+            4,
+            PendingSubscriptionRequest::Unsubscribe(TOPIC.to_string()),
+        );
+
+        handler.handle_message(AxMdMessage::Error(AxWsError {
+            code: Some("400".to_string()),
+            message: message.to_string(),
+            request_id: Some(4),
+        }));
+
+        assert_eq!(subscriptions.len(), 0);
+        assert!(subscriptions.pending_subscribe_topics().is_empty());
+        assert!(subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    fn test_subscription_response_confirms_unsubscribe() {
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe(TOPIC);
+        subscriptions.confirm_subscribe(TOPIC);
+        subscriptions.mark_unsubscribe(TOPIC);
+        let mut handler = create_handler(subscriptions.clone());
+        handler.pending_subscription_requests.insert(
+            5,
+            PendingSubscriptionRequest::Unsubscribe(TOPIC.to_string()),
+        );
+
+        handler.handle_message(AxMdMessage::SubscriptionResponse(
+            AxMdSubscriptionResponse {
+                rid: 5,
+                result: AxMdSubscriptionResult {
+                    subscribed: None,
+                    subscribed_candle: None,
+                    unsubscribed: Some(Ustr::from("EURUSD-PERP")),
+                    unsubscribed_candle: None,
+                },
+            },
+        ));
+
+        assert_eq!(subscriptions.len(), 0);
+        assert!(subscriptions.pending_subscribe_topics().is_empty());
+        assert!(subscriptions.pending_unsubscribe_topics().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_replay_clears_stale_requests_and_pending_unsubscribes() {
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe(TOPIC);
+        subscriptions.confirm_subscribe(TOPIC);
+        subscriptions.mark_unsubscribe(TOPIC);
+        let mut handler = create_handler(subscriptions.clone());
+        handler.pending_subscription_requests.insert(
+            6,
+            PendingSubscriptionRequest::Unsubscribe(TOPIC.to_string()),
+        );
+
+        handler.replay_subscriptions().await;
+
+        assert_eq!(subscriptions.len(), 0);
+        assert!(subscriptions.all_topics().is_empty());
+        assert!(subscriptions.pending_subscribe_topics().is_empty());
+        assert!(subscriptions.pending_unsubscribe_topics().is_empty());
+        assert!(handler.pending_subscription_requests.is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_write_book_failure_keeps_gate_closed() {
+        let mut handler = create_handler(SubscriptionState::new(':'));
+        let gate = SnapshotGate::default();
+        gate.lock().close();
+        let (completion, receiver) = tokio::sync::oneshot::channel();
+
+        // No client is set, so the write fails before any send
+        handler
+            .handle_command(HandlerCommand::WriteBook {
+                request_id: 7,
+                unsubscribe_request_id: Some(8),
+                symbol: Ustr::from("EURUSD-PERP"),
+                spec: AxMdSubscriptionSpec::new(
+                    AxMarketDataLevel::Level2,
+                    Some(false),
+                    Some(false),
+                ),
+                cancel: CancellationToken::new(),
+                gate: gate.clone(),
+                completion,
+            })
+            .await;
+
+        let result = receiver.await.unwrap();
+
+        assert!(matches!(
+            result,
+            Err(AxWsClientError::Transport(message)) if message == "No WebSocket client available"
+        ));
+        assert!(gate.lock().is_closed());
+        assert!(handler.pending_subscription_requests.is_empty());
+    }
+
+    fn create_handler(subscriptions: SubscriptionState) -> AxMdWsFeedHandler {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        AxMdWsFeedHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            subscriptions,
+        )
     }
 }

@@ -17,13 +17,13 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
+    correctness::{CorrectnessResult, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -40,7 +40,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -79,10 +79,6 @@ pub struct CryptoFuture {
     pub margin_init: Decimal,
     /// The maintenance (position) margin in percentage of position value.
     pub margin_maint: Decimal,
-    /// The fee rate for liquidity makers as a percentage of order value.
-    pub maker_fee: Decimal,
-    /// The fee rate for liquidity takers as a percentage of order value.
-    pub taker_fee: Decimal,
     /// The maximum allowable order quantity.
     pub max_quantity: Option<Quantity>,
     /// The minimum allowable order quantity.
@@ -95,6 +91,8 @@ pub struct CryptoFuture {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -103,17 +101,10 @@ pub struct CryptoFuture {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl CryptoFuture {
-    /// Creates a new [`CryptoFuture`] instance with correctness checking.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails.
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         underlying: Currency,
@@ -136,8 +127,7 @@ impl CryptoFuture {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -156,6 +146,15 @@ impl CryptoFuture {
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+        check_tick_scheme(tick_scheme)?;
+
+        if let Some(multiplier) = multiplier {
+            check_positive_quantity(multiplier, stringify!(multiplier))?;
+        }
+
+        if let Some(lot_size) = lot_size {
+            check_positive_quantity(lot_size, stringify!(lot_size))?;
+        }
 
         Ok(Self {
             id: instrument_id,
@@ -174,28 +173,29 @@ impl CryptoFuture {
             lot_size: lot_size.unwrap_or(Quantity::from(1)),
             margin_init: margin_init.unwrap_or_default(),
             margin_maint: margin_maint.unwrap_or_default(),
-            maker_fee: maker_fee.unwrap_or_default(),
-            taker_fee: taker_fee.unwrap_or_default(),
             max_quantity,
             min_quantity,
             max_notional,
             min_notional,
             max_price,
             min_price,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`CryptoFuture`] instance.
+    /// Returns a fluent builder for a [`CryptoFuture`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if any parameter is invalid (see `new_checked`).
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         underlying: Currency,
@@ -218,12 +218,11 @@ impl CryptoFuture {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -247,13 +246,11 @@ impl CryptoFuture {
             min_price,
             margin_init,
             margin_maint,
-            maker_fee,
-            taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect_display(FAILED)
     }
 }
 
@@ -364,6 +361,14 @@ impl Instrument for CryptoFuture {
         self.min_price
     }
 
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
+
+    fn info(&self) -> Option<&Params> {
+        self.info.as_ref()
+    }
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -378,14 +383,6 @@ impl Instrument for CryptoFuture {
 
     fn margin_maint(&self) -> Decimal {
         self.margin_maint
-    }
-
-    fn maker_fee(&self) -> Decimal {
-        self.maker_fee
-    }
-
-    fn taker_fee(&self) -> Decimal {
-        self.taker_fee
     }
 
     fn strike_price(&self) -> Option<Price> {
@@ -412,12 +409,13 @@ impl Instrument for CryptoFuture {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use crate::{
         enums::{AssetClass, InstrumentClass},
         identifiers::{InstrumentId, Symbol},
         instruments::{CryptoFuture, Instrument, stubs::*},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
 
     #[rstest]
@@ -473,7 +471,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             0.into(),
             0.into(),
         );
@@ -481,9 +478,114 @@ mod tests {
     }
 
     #[rstest]
+    #[case::zero_multiplier(Some(Quantity::from("0")), None)]
+    #[case::zero_lot_size(None, Some(Quantity::from("0")))]
+    fn test_new_checked_rejects_non_positive_sizing(
+        #[case] multiplier: Option<Quantity>,
+        #[case] lot_size: Option<Quantity>,
+    ) {
+        let result = CryptoFuture::new_checked(
+            InstrumentId::from("TEST.BINANCE"),
+            Symbol::from("TEST"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDT(),
+            false,
+            0.into(),
+            0.into(),
+            2,
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+            multiplier,
+            lot_size,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            0.into(),
+            0.into(),
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("not positive"), "{error}");
+    }
+
+    #[rstest]
     fn test_serialization_roundtrip(crypto_future_btcusdt: CryptoFuture) {
         let json = serde_json::to_string(&crypto_future_btcusdt).unwrap();
         let deserialized: CryptoFuture = serde_json::from_str(&json).unwrap();
-        assert_eq!(crypto_future_btcusdt, deserialized);
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = CryptoFuture::new_checked(
+            InstrumentId::from("ETHUSDT-123.BINANCE"),
+            Symbol::from("BTCUSDT"),
+            Currency::BTC(),
+            Currency::USDT(),
+            Currency::USDC(),
+            false,
+            1.into(),
+            2.into(),
+            2,
+            6,
+            Price::from("0.01"),
+            Quantity::from("0.000001"),
+            Some(Quantity::from("10")),
+            Some(Quantity::from("1")),
+            Some(Quantity::from("9000.0")),
+            Some(Quantity::from("0.000001")),
+            Some(Money::new(5_000_000.0, Currency::USDT())),
+            Some(Money::new(10.0, Currency::USDT())),
+            Some(Price::from("1000000.00")),
+            Some(Price::from("0.01")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            None,
+            None,
+            10.into(),
+            20.into(),
+        )
+        .unwrap();
+
+        let built = CryptoFuture::builder()
+            .instrument_id(InstrumentId::from("ETHUSDT-123.BINANCE"))
+            .raw_symbol(Symbol::from("BTCUSDT"))
+            .underlying(Currency::BTC())
+            .quote_currency(Currency::USDT())
+            .settlement_currency(Currency::USDC())
+            .is_inverse(false)
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .price_precision(2)
+            .size_precision(6)
+            .price_increment(Price::from("0.01"))
+            .size_increment(Quantity::from("0.000001"))
+            .multiplier(Quantity::from("10"))
+            .lot_size(Quantity::from("1"))
+            .max_quantity(Quantity::from("9000.0"))
+            .min_quantity(Quantity::from("0.000001"))
+            .max_notional(Money::new(5_000_000.0, Currency::USDT()))
+            .min_notional(Money::new(10.0, Currency::USDT()))
+            .max_price(Price::from("1000000.00"))
+            .min_price(Price::from("0.01"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .ts_event(10.into())
+            .ts_init(20.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

@@ -43,17 +43,20 @@
 //! or as part of a Rust only build.
 //!
 //! - `arrow`: Enables Apache Arrow schema definitions and RecordBatch encoding/decoding.
-//! - `display`: Enables display-friendly Arrow encoders for market data (requires `arrow`).
+//! - `arrow-display`: Enables display-friendly Arrow encoders for market data and requires `arrow`.
+//! - `capnp`: Enables [Cap'n Proto](https://capnproto.org) serialization support.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `high-precision`: Enables
+//!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
+//!   to use 128-bit value types.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
-//! - `high-precision`: Enables [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation#precision-mode) to use 128-bit value types.
-//! - `extension-module`: Builds the crate as a Python extension module.
-//! - `capnp`: Enables [Cap'n Proto](https://capnproto.org/) serialization support.
 //! - `sbe`: Enables generic SBE (Simple Binary Encoding) decode utilities.
 //!
 //! **Warning:** SBE and Cap'n Proto schemas are not yet stable and may break between releases.
 
 #![warn(rustc::all)]
 #![warn(clippy::pedantic)]
+#![warn(clippy::clone_on_ref_ptr)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -71,7 +74,7 @@
 )]
 #![allow(
     clippy::implicit_hasher,
-    reason = "serialization metadata uses a standardized HashMap<String, String> shape across traits and helpers"
+    reason = "serialization metadata uses a standardized HashMap<String, String> shape across traits and codecs"
 )]
 #![allow(
     clippy::similar_names,
@@ -84,6 +87,10 @@
     clippy::cast_sign_loss,
     clippy::cast_lossless,
     reason = "wire-format and fixed-point conversions in serialization code require explicit numeric casts"
+)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
 )]
 #![cfg_attr(
     test,
@@ -99,7 +106,7 @@ pub mod arrow;
 /// Re-export custom data registration for use by persistence and tests.
 #[cfg(feature = "arrow")]
 pub use arrow::custom::ensure_custom_data_registered;
-/// Re-export MsgPack serialization helpers for consumers expecting to configure codecs via this crate.
+/// Re-exports MsgPack codecs for consumers configuring serialization through this crate.
 pub use nautilus_core::serialization::msgpack;
 
 #[cfg(feature = "capnp")]
@@ -107,6 +114,9 @@ pub mod capnp;
 
 #[cfg(feature = "sbe")]
 pub mod sbe;
+
+#[cfg(any(feature = "capnp", feature = "sbe"))]
+mod numeric;
 
 #[cfg(feature = "capnp")]
 macro_rules! include_capnp_module {
@@ -163,6 +173,12 @@ include_capnp_module!(position_capnp, "/events/position_capnp.rs");
 include_capnp_module!(account_capnp, "/events/account_capnp.rs");
 #[cfg(feature = "capnp")]
 include_capnp_module!(market_capnp, "/data/market_capnp.rs");
+#[cfg(feature = "capnp")]
+include_capnp_module!(instruments_capnp, "/data/instruments_capnp.rs");
 
 #[cfg(feature = "python")]
 pub mod python;
+
+/// Generates typed Arrow encoding for custom data.
+#[cfg(feature = "arrow")]
+pub use nautilus_macros::arrow_custom_data;

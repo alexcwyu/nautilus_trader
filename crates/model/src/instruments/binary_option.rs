@@ -17,13 +17,13 @@ use std::hash::{Hash, Hasher};
 
 use nautilus_core::{
     Params, UnixNanos,
-    correctness::{CorrectnessResult, CorrectnessResultExt, FAILED, check_equal_u8},
+    correctness::{CorrectnessResult, check_equal_u8},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
-use super::{Instrument, any::InstrumentAny};
+use super::{Instrument, any::InstrumentAny, tick_scheme::check_tick_scheme};
 use crate::{
     enums::{AssetClass, InstrumentClass, OptionKind},
     identifiers::{InstrumentId, Symbol},
@@ -40,7 +40,7 @@ use crate::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -71,10 +71,9 @@ pub struct BinaryOption {
     pub margin_init: Decimal,
     /// The maintenance (position) margin in percentage of position value.
     pub margin_maint: Decimal,
-    /// The fee rate for liquidity makers as a percentage of order value.
-    pub maker_fee: Decimal,
-    /// The fee rate for liquidity takers as a percentage of order value.
-    pub taker_fee: Decimal,
+    /// The venue-assigned identifier of the event containing the instrument's market.
+    #[serde(default)]
+    pub event_id: Option<Ustr>,
     /// The binary outcome of the market.
     pub outcome: Option<Ustr>,
     /// The market description.
@@ -91,6 +90,8 @@ pub struct BinaryOption {
     pub max_price: Option<Price>,
     /// The minimum allowable quoted price.
     pub min_price: Option<Price>,
+    /// The registered variable tick scheme name.
+    pub tick_scheme: Option<Ustr>,
     /// Additional instrument metadata as a JSON-serializable dictionary.
     pub info: Option<Params>,
     /// UNIX timestamp (nanoseconds) when the data event occurred.
@@ -99,17 +100,10 @@ pub struct BinaryOption {
     pub ts_init: UnixNanos,
 }
 
+#[bon::bon]
 impl BinaryOption {
-    /// Creates a new [`BinaryOption`] instance with correctness checking.
-    ///
-    /// # Notes
-    ///
-    /// PyO3 requires a `Result` type for proper error handling and stacktrace printing in Python.
-    /// # Errors
-    ///
-    /// Returns an error if any input validation fails (e.g., invalid precision or increments).
     #[expect(clippy::too_many_arguments)]
-    pub fn new_checked(
+    fn new_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -120,6 +114,7 @@ impl BinaryOption {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        event_id: Option<Ustr>,
         outcome: Option<Ustr>,
         description: Option<Ustr>,
         max_quantity: Option<Quantity>,
@@ -130,8 +125,7 @@ impl BinaryOption {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
@@ -150,6 +144,7 @@ impl BinaryOption {
         )?;
         check_positive_price(price_increment, stringify!(price_increment))?;
         check_positive_quantity(size_increment, stringify!(size_increment))?;
+        check_tick_scheme(tick_scheme)?;
 
         Ok(Self {
             id: instrument_id,
@@ -164,8 +159,7 @@ impl BinaryOption {
             size_increment,
             margin_init: margin_init.unwrap_or_default(),
             margin_maint: margin_maint.unwrap_or_default(),
-            maker_fee: maker_fee.unwrap_or_default(),
-            taker_fee: taker_fee.unwrap_or_default(),
+            event_id,
             outcome,
             description,
             max_quantity,
@@ -174,20 +168,23 @@ impl BinaryOption {
             min_notional,
             max_price,
             min_price,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         })
     }
 
-    /// Creates a new [`BinaryOption`] instance by validating parameters.
+    /// Returns a fluent builder for a [`BinaryOption`] instance.
     ///
-    /// # Panics
+    /// Required fields are enforced at compile time; optional fields can be omitted and use the
+    /// same defaults as checked construction. The same correctness checks run on `build`.
     ///
-    /// Panics if parameter validation fails during `new_checked`.
-    #[expect(clippy::too_many_arguments)]
-    #[must_use]
-    pub fn new(
+    /// # Errors
+    ///
+    /// Returns an error if any input validation fails.
+    #[builder(start_fn = builder, finish_fn = build)]
+    pub fn build_checked(
         instrument_id: InstrumentId,
         raw_symbol: Symbol,
         asset_class: AssetClass,
@@ -198,6 +195,7 @@ impl BinaryOption {
         size_precision: u8,
         price_increment: Price,
         size_increment: Quantity,
+        event_id: Option<Ustr>,
         outcome: Option<Ustr>,
         description: Option<Ustr>,
         max_quantity: Option<Quantity>,
@@ -208,12 +206,11 @@ impl BinaryOption {
         min_price: Option<Price>,
         margin_init: Option<Decimal>,
         margin_maint: Option<Decimal>,
-        maker_fee: Option<Decimal>,
-        taker_fee: Option<Decimal>,
+        tick_scheme: Option<Ustr>,
         info: Option<Params>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
-    ) -> Self {
+    ) -> CorrectnessResult<Self> {
         Self::new_checked(
             instrument_id,
             raw_symbol,
@@ -225,6 +222,7 @@ impl BinaryOption {
             size_precision,
             price_increment,
             size_increment,
+            event_id,
             outcome,
             description,
             max_quantity,
@@ -235,13 +233,11 @@ impl BinaryOption {
             min_price,
             margin_init,
             margin_maint,
-            maker_fee,
-            taker_fee,
+            tick_scheme,
             info,
             ts_event,
             ts_init,
         )
-        .expect_display(FAILED)
     }
 }
 
@@ -352,6 +348,14 @@ impl Instrument for BinaryOption {
         self.min_price
     }
 
+    fn tick_scheme(&self) -> Option<Ustr> {
+        self.tick_scheme
+    }
+
+    fn info(&self) -> Option<&Params> {
+        self.info.as_ref()
+    }
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -366,14 +370,6 @@ impl Instrument for BinaryOption {
 
     fn margin_maint(&self) -> Decimal {
         self.margin_maint
-    }
-
-    fn maker_fee(&self) -> Decimal {
-        self.maker_fee
-    }
-
-    fn taker_fee(&self) -> Decimal {
-        self.taker_fee
     }
 
     fn strike_price(&self) -> Option<Price> {
@@ -400,12 +396,13 @@ impl Instrument for BinaryOption {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use crate::{
         enums::{AssetClass, InstrumentClass},
         identifiers::{InstrumentId, Symbol},
         instruments::{BinaryOption, Instrument, stubs::*},
-        types::{Currency, Price, Quantity},
+        types::{Currency, Money, Price, Quantity},
     };
 
     #[rstest]
@@ -456,9 +453,84 @@ mod tests {
     }
 
     #[rstest]
+    fn test_event_id_serialization_and_legacy_default(mut binary_option: BinaryOption) {
+        binary_option.event_id = Some("event-123".into());
+        let mut value = serde_json::to_value(&binary_option).unwrap();
+        let restored: BinaryOption = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(restored.event_id, binary_option.event_id);
+        value.as_object_mut().unwrap().remove("event_id");
+        let restored: BinaryOption = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.event_id, None);
+    }
+
+    #[rstest]
     fn test_serialization_roundtrip(binary_option: BinaryOption) {
         let json = serde_json::to_string(&binary_option).unwrap();
         let deserialized: BinaryOption = serde_json::from_str(&json).unwrap();
-        assert_eq!(binary_option, deserialized);
+        assert_eq!(json, serde_json::to_string(&deserialized).unwrap());
+    }
+
+    #[rstest]
+    fn test_builder_matches_new_checked() {
+        let positional = BinaryOption::new_checked(
+            InstrumentId::from("TEST.POLYMARKET"),
+            Symbol::from("TEST"),
+            AssetClass::Alternative,
+            Currency::USDC(),
+            1.into(),
+            2.into(),
+            3,
+            2,
+            Price::from("0.001"),
+            Quantity::from("0.01"),
+            Some("event-123".into()),
+            Some("Yes".into()),
+            Some("Will it happen?".into()),
+            Some(Quantity::from("10000.00")),
+            Some(Quantity::from("5.00")),
+            Some(Money::from("100000 USDC")),
+            Some(Money::from("10 USDC")),
+            Some(Price::from("0.999")),
+            Some(Price::from("0.001")),
+            Some(dec!(0.01)),
+            Some(dec!(0.02)),
+            None,
+            None,
+            3.into(),
+            4.into(),
+        )
+        .unwrap();
+
+        let built = BinaryOption::builder()
+            .instrument_id(InstrumentId::from("TEST.POLYMARKET"))
+            .raw_symbol(Symbol::from("TEST"))
+            .asset_class(AssetClass::Alternative)
+            .currency(Currency::USDC())
+            .activation_ns(1.into())
+            .expiration_ns(2.into())
+            .price_precision(3)
+            .size_precision(2)
+            .price_increment(Price::from("0.001"))
+            .size_increment(Quantity::from("0.01"))
+            .event_id("event-123".into())
+            .outcome("Yes".into())
+            .description("Will it happen?".into())
+            .max_quantity(Quantity::from("10000.00"))
+            .min_quantity(Quantity::from("5.00"))
+            .max_notional(Money::from("100000 USDC"))
+            .min_notional(Money::from("10 USDC"))
+            .max_price(Price::from("0.999"))
+            .min_price(Price::from("0.001"))
+            .margin_init(dec!(0.01))
+            .margin_maint(dec!(0.02))
+            .ts_event(3.into())
+            .ts_init(4.into())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&positional).unwrap(),
+            serde_json::to_value(&built).unwrap(),
+        );
     }
 }

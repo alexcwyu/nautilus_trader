@@ -16,7 +16,7 @@
 //! Python bindings for the Interactive Brokers gateway management.
 
 #[cfg(feature = "gateway")]
-use nautilus_common::live::get_runtime;
+use nautilus_common::live::block_on_nautilus_with;
 #[cfg(feature = "gateway")]
 use nautilus_core::python::to_pyruntime_err;
 #[cfg(feature = "gateway")]
@@ -25,35 +25,11 @@ use pyo3::prelude::*;
 #[cfg(feature = "gateway")]
 use crate::config::DockerizedIBGatewayConfig;
 #[cfg(feature = "gateway")]
-use crate::gateway::dockerized::{ContainerStatus, DockerizedIBGateway};
+use crate::gateway::dockerized::DockerizedIBGateway;
 
 #[cfg(feature = "gateway")]
 #[pymethods]
-impl ContainerStatus {
-    #[classattr]
-    const NO_CONTAINER: Self = Self::NoContainer;
-
-    #[classattr]
-    const CONTAINER_CREATED: Self = Self::ContainerCreated;
-
-    #[classattr]
-    const CONTAINER_STARTING: Self = Self::ContainerStarting;
-
-    #[classattr]
-    const CONTAINER_STOPPED: Self = Self::ContainerStopped;
-
-    #[classattr]
-    const NOT_LOGGED_IN: Self = Self::NotLoggedIn;
-
-    #[classattr]
-    const READY: Self = Self::Ready;
-
-    #[classattr]
-    const UNKNOWN: Self = Self::Unknown;
-}
-
-#[cfg(feature = "gateway")]
-#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl DockerizedIBGateway {
     #[new]
     fn py_new(config: DockerizedIBGatewayConfig) -> PyResult<Self> {
@@ -88,10 +64,6 @@ impl DockerizedIBGateway {
     }
 
     /// Start the gateway.
-    ///
-    /// # Arguments
-    ///
-    /// * `wait` - Optional wait time in seconds
     #[pyo3(name = "start")]
     fn py_start<'py>(&self, py: Python<'py>, wait: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
         let mut gateway = self.clone();
@@ -106,16 +78,11 @@ impl DockerizedIBGateway {
     #[pyo3(name = "start_blocking")]
     fn py_start_blocking(&self, wait: Option<u64>) -> PyResult<()> {
         let mut gateway = self.clone();
-        get_runtime()
-            .block_on(async move { gateway.start(wait).await })
+        block_on_nautilus_with(move || async move { gateway.start(wait).await })
             .map_err(|e| to_pyruntime_err(format!("{e}")))
     }
 
     /// Safely start the gateway.
-    ///
-    /// # Arguments
-    ///
-    /// * `wait` - Optional wait time in seconds
     #[pyo3(name = "safe_start")]
     fn py_safe_start<'py>(
         &self,
@@ -134,8 +101,7 @@ impl DockerizedIBGateway {
     #[pyo3(name = "safe_start_blocking")]
     fn py_safe_start_blocking(&self, wait: Option<u64>) -> PyResult<()> {
         let mut gateway = self.clone();
-        get_runtime()
-            .block_on(async move { gateway.safe_start(wait).await })
+        block_on_nautilus_with(move || async move { gateway.safe_start(wait).await })
             .map_err(|e| to_pyruntime_err(format!("{e}")))
     }
 
@@ -154,8 +120,7 @@ impl DockerizedIBGateway {
     #[pyo3(name = "stop_blocking")]
     fn py_stop_blocking(&self) -> PyResult<()> {
         let gateway = self.clone();
-        get_runtime()
-            .block_on(async move { gateway.stop().await })
+        block_on_nautilus_with(move || async move { gateway.stop().await })
             .map_err(|e| to_pyruntime_err(format!("{e}")))
     }
 

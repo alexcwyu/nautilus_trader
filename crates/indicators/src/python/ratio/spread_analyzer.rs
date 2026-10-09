@@ -13,21 +13,23 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::{data::QuoteTick, identifiers::InstrumentId};
 use pyo3::prelude::*;
 
-use crate::{indicator::Indicator, ratio::spread_analyzer::SpreadAnalyzer};
+use crate::{
+    indicator::Indicator, python::float_precision, ratio::spread_analyzer::SpreadAnalyzer,
+};
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl SpreadAnalyzer {
-    /// An indicator which calculates the efficiency ratio across a rolling window.
+    /// Calculates the current bid-ask spread and its average across a rolling window.
     ///
-    /// The Kaufman Efficiency measures the ratio of the relative market speed in
-    /// relation to the volatility, this could be thought of as a proxy for noise.
+    /// A zero capacity is accepted.
     #[new]
-    fn py_new(instrument_id: InstrumentId, capacity: usize) -> Self {
-        Self::new(capacity, instrument_id)
+    fn py_new(instrument_id: InstrumentId, capacity: usize) -> PyResult<Self> {
+        Self::new_checked(capacity, instrument_id).map_err(to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -44,6 +46,12 @@ impl SpreadAnalyzer {
     #[pyo3(name = "capacity")]
     const fn py_capacity(&self) -> usize {
         self.capacity
+    }
+
+    #[getter]
+    #[pyo3(name = "instrument_id")]
+    const fn py_instrument_id(&self) -> InstrumentId {
+        self.instrument_id
     }
 
     #[getter]
@@ -71,8 +79,13 @@ impl SpreadAnalyzer {
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) {
-        self.handle_quote(quote);
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        // The analyzer ignores quotes for other instruments without converting them
+        if quote.instrument_id == self.instrument_id {
+            float_precision::check_quote(quote)?;
+        }
+
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "reset")]

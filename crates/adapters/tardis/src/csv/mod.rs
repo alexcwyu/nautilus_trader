@@ -14,8 +14,12 @@
 // -------------------------------------------------------------------------------------------------
 
 pub mod load;
-mod record;
 pub mod stream;
+
+#[cfg(feature = "arrow")]
+pub mod convert;
+
+mod record;
 
 use std::{
     ffi::OsStr,
@@ -28,27 +32,31 @@ use std::{
 use csv::{Reader, ReaderBuilder};
 use flate2::read::GzDecoder;
 pub use load::{
-    load_deltas, load_depth10_from_snapshot5, load_depth10_from_snapshot25, load_funding_rates,
-    load_quotes, load_trades,
+    load_deltas, load_depth_from_snapshot5, load_depth_from_snapshot25, load_funding_rates,
+    load_options_chain, load_quotes, load_trades,
 };
 use nautilus_model::{
-    data::{BookOrder, FundingRateUpdate, NULL_ORDER, OrderBookDelta, QuoteTick, TradeTick},
-    enums::{BookAction, OrderSide},
+    data::{
+        BookOrder, FundingRateUpdate, NULL_ORDER, OptionGreekValues, OptionGreeks, OrderBookDelta,
+        QuoteTick, TradeTick,
+    },
+    enums::{BookAction, GreeksConvention, OrderSide},
     identifiers::{InstrumentId, TradeId},
-    types::Quantity,
+    types::{Price, Quantity},
 };
 use rust_decimal::Decimal;
 pub use stream::{
-    stream_deltas, stream_depth10_from_snapshot5, stream_depth10_from_snapshot25,
-    stream_funding_rates, stream_quotes, stream_trades,
+    stream_deltas, stream_depth_from_snapshot5, stream_depth_from_snapshot25, stream_funding_rates,
+    stream_options_chain, stream_quotes, stream_trades,
 };
 
 use super::csv::record::{
-    TardisBookUpdateRecord, TardisDerivativeTickerRecord, TardisQuoteRecord, TardisTradeRecord,
+    TardisBookUpdateRecord, TardisDerivativeTickerRecord, TardisOptionsChainRecord,
+    TardisQuoteRecord, TardisTradeRecord,
 };
 use crate::common::parse::{
     derive_trade_id, parse_aggressor_side, parse_book_action, parse_instrument_id,
-    parse_order_side, parse_price, parse_timestamp,
+    parse_order_side, parse_price, parse_timestamp, validate_non_zero_amount,
 };
 
 fn infer_precision(value: f64) -> u8 {
@@ -84,7 +92,8 @@ fn create_csv_reader<P: AsRef<Path>>(
                             path_ref.display()
                         );
                     }
-                    log::warn!(
+
+                    log::debug!(
                         "Attempt {attempt}/{max_retries} failed to open file '{}': {e}. Retrying after {delay_ms}ms...",
                         path_ref.display()
                     );
@@ -127,7 +136,8 @@ fn create_csv_reader<P: AsRef<Path>>(
                         filepath_ref.display()
                     );
                 }
-                log::warn!(
+
+                log::debug!(
                     "Attempt {attempt}/{MAX_RETRIES} failed to read header from '{}': {e}. Retrying after {DELAY_MS}ms...",
                     filepath_ref.display()
                 );
@@ -153,7 +163,8 @@ fn create_csv_reader<P: AsRef<Path>>(
                         filepath_ref.display()
                     );
                 }
-                log::warn!(
+
+                log::debug!(
                     "Attempt {attempt}/{MAX_RETRIES} failed to seek in '{}': {e}. Retrying after {DELAY_MS}ms...",
                     filepath_ref.display()
                 );
@@ -279,8 +290,8 @@ fn parse_trade_record(
         derive_trade_id(
             data.symbol,
             ts_event.as_u64(),
-            data.price,
-            data.amount,
+            &data.price.to_string(),
+            &data.amount.to_string(),
             &data.side,
         )
     } else {
@@ -311,11 +322,7 @@ fn parse_derivative_ticker_record(
     };
 
     let rate = Decimal::try_from(funding_rate).ok()?;
-    let next_funding_ns = if data.predicted_funding_rate.is_some() {
-        data.funding_timestamp.map(parse_timestamp)
-    } else {
-        None
-    };
+    let next_funding_ns = data.funding_timestamp.map(parse_timestamp);
     let ts_event = parse_timestamp(data.timestamp);
     let ts_init = parse_timestamp(data.local_timestamp);
 
@@ -327,4 +334,77 @@ fn parse_derivative_ticker_record(
         ts_event,
         ts_init,
     ))
+}
+
+fn parse_options_chain_record(
+    data: &TardisOptionsChainRecord,
+    instrument_id: InstrumentId,
+) -> OptionGreeks {
+    OptionGreeks {
+        instrument_id,
+        convention: GreeksConvention::BlackScholes,
+        greeks: OptionGreekValues {
+            delta: data.delta.unwrap_or(0.0),
+            gamma: data.gamma.unwrap_or(0.0),
+            vega: data.vega.unwrap_or(0.0),
+            theta: data.theta.unwrap_or(0.0),
+            rho: data.rho.unwrap_or(0.0),
+        },
+        mark_iv: data.mark_iv,
+        bid_iv: data.bid_iv,
+        ask_iv: data.ask_iv,
+        underlying_price: data.underlying_price,
+        open_interest: data.open_interest,
+        ts_event: parse_timestamp(data.timestamp),
+        ts_init: parse_timestamp(data.local_timestamp),
+    }
+}
+
+fn parse_options_chain_record_as_quote(
+    data: &TardisOptionsChainRecord,
+    price_precision: u8,
+    size_precision: u8,
+    instrument_id: InstrumentId,
+) -> anyhow::Result<Option<QuoteTick>> {
+    let (Some(bid_price), Some(bid_amount), Some(ask_price), Some(ask_amount)) = (
+        data.bid_price,
+        data.bid_amount,
+        data.ask_price,
+        data.ask_amount,
+    ) else {
+        return Ok(None);
+    };
+
+    let bid_price = Price::new_checked(bid_price, price_precision)?;
+    let ask_price = Price::new_checked(ask_price, price_precision)?;
+    validate_non_zero_amount(bid_amount, size_precision)?;
+    let bid_size = Quantity::new_checked(bid_amount, size_precision)?;
+    validate_non_zero_amount(ask_amount, size_precision)?;
+    let ask_size = Quantity::new_checked(ask_amount, size_precision)?;
+
+    Ok(Some(QuoteTick::new(
+        instrument_id,
+        bid_price,
+        ask_price,
+        bid_size,
+        ask_size,
+        parse_timestamp(data.timestamp),
+        parse_timestamp(data.local_timestamp),
+    )))
+}
+
+fn matches_underlying_filter(symbol: &str, underlyings: Option<&[String]>) -> bool {
+    underlyings.is_none_or(|underlyings| underlyings.iter().any(|u| symbol.starts_with(u)))
+}
+
+fn normalize_underlying_filters(underlyings: Option<Vec<String>>) -> Option<Vec<String>> {
+    underlyings
+        .map(|values| {
+            values
+                .into_iter()
+                .map(|value| value.trim().to_uppercase())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
 }

@@ -29,7 +29,7 @@ use crate::{
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -111,7 +111,7 @@ impl PositionChanged {
             avg_px_close: position.avg_px_close,
             realized_return: position.realized_return,
             realized_pnl: position.realized_pnl,
-            unrealized_pnl: Money::new(0.0, position.quote_currency),
+            unrealized_pnl: Money::zero(position.quote_currency),
             event_id,
             ts_opened: position.ts_opened,
             ts_event: fill.ts_event,

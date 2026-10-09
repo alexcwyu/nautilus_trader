@@ -15,7 +15,7 @@
 
 //! Binance venue constants and API endpoints.
 
-use std::{num::NonZeroU32, sync::LazyLock};
+use std::{num::NonZeroU32, sync::LazyLock, time::Duration};
 
 use nautilus_model::identifiers::{ClientId, Venue};
 use nautilus_network::ratelimiter::quota::Quota;
@@ -46,11 +46,20 @@ pub const BINANCE_NAUTILUS_FUTURES_BROKER_ID: &str = "aHRE4BCj";
 /// Binance Spot API base URL (live exchange).
 pub const BINANCE_SPOT_HTTP_URL: &str = "https://api.binance.com";
 
+/// Binance US Spot API base URL.
+pub const BINANCE_US_SPOT_HTTP_URL: &str = "https://api.binance.us";
+
 /// Binance USD-M Futures API base URL (live exchange).
 pub const BINANCE_FUTURES_USD_HTTP_URL: &str = "https://fapi.binance.com";
 
 /// Binance COIN-M Futures API base URL (live exchange).
 pub const BINANCE_FUTURES_COIN_HTTP_URL: &str = "https://dapi.binance.com";
+
+/// Default WebSocket heartbeat interval in seconds.
+///
+/// Binance caps ping/pong frames at 5 per second, so this sits well inside the limit while keeping
+/// the derived liveness window tight.
+pub const BINANCE_WS_HEARTBEAT_SECS: u64 = 20;
 
 /// Binance European Options API base URL (live exchange).
 pub const BINANCE_OPTIONS_HTTP_URL: &str = "https://eapi.binance.com";
@@ -62,7 +71,7 @@ pub const BINANCE_OPTIONS_TESTNET_HTTP_URL: &str = "https://testnet.binancefutur
 pub const BINANCE_SPOT_TESTNET_HTTP_URL: &str = "https://testnet.binance.vision";
 
 /// Binance USD-M Futures API base URL (testnet).
-pub const BINANCE_FUTURES_USD_TESTNET_HTTP_URL: &str = "https://demo-fapi.binance.com";
+pub const BINANCE_FUTURES_USD_TESTNET_HTTP_URL: &str = "https://testnet.binancefuture.com";
 
 /// Binance COIN-M Futures API base URL (testnet).
 pub const BINANCE_FUTURES_COIN_TESTNET_HTTP_URL: &str = "https://testnet.binancefuture.com";
@@ -78,6 +87,12 @@ pub const BINANCE_FUTURES_COIN_DEMO_HTTP_URL: &str = "https://demo-dapi.binance.
 
 /// Binance Spot WebSocket base URL (live exchange).
 pub const BINANCE_SPOT_WS_URL: &str = "wss://stream.binance.com:9443/ws";
+
+/// Binance US Spot public WebSocket base URL.
+pub const BINANCE_US_SPOT_WS_URL: &str = "wss://stream.binance.us:9443/ws";
+
+/// Binance US Spot user data WebSocket root URL.
+pub const BINANCE_US_SPOT_USER_WS_URL: &str = "wss://stream.binance.us:443";
 
 /// Binance USD-M Futures WebSocket base URL (live exchange).
 pub const BINANCE_FUTURES_USD_WS_URL: &str = "wss://fstream.binance.com/market/ws";
@@ -109,7 +124,7 @@ pub const BINANCE_SPOT_SBE_WS_URL: &str = "wss://stream-sbe.binance.com/ws";
 
 /// Binance Spot SBE WebSocket API URL (live exchange).
 pub const BINANCE_SPOT_SBE_WS_API_URL: &str =
-    "wss://ws-api.binance.com:443/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=3";
+    "wss://ws-api.binance.com:443/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=5";
 
 /// Binance USD-M Futures WebSocket Trading API URL (live exchange).
 pub const BINANCE_FUTURES_USD_WS_API_URL: &str = "wss://ws-fapi.binance.com/ws-fapi/v1";
@@ -119,11 +134,11 @@ pub const BINANCE_FUTURES_USD_WS_API_TESTNET_URL: &str =
     "wss://testnet.binancefuture.com/ws-fapi/v1";
 
 /// Binance Spot SBE WebSocket API URL (testnet).
-pub const BINANCE_SPOT_SBE_WS_API_TESTNET_URL: &str = "wss://ws-api.testnet.binance.vision/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=3";
+pub const BINANCE_SPOT_SBE_WS_API_TESTNET_URL: &str = "wss://ws-api.testnet.binance.vision/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=5";
 
 /// Binance Spot SBE WebSocket API URL (demo).
 pub const BINANCE_SPOT_SBE_WS_API_DEMO_URL: &str =
-    "wss://demo-ws-api.binance.com/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=3";
+    "wss://demo-ws-api.binance.com/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=5";
 
 /// Binance Spot WebSocket base URL (testnet).
 pub const BINANCE_SPOT_TESTNET_WS_URL: &str = "wss://stream.testnet.binance.vision/ws";
@@ -146,6 +161,9 @@ pub const BINANCE_FUTURES_COIN_TESTNET_WS_URL: &str = "wss://dstream.binancefutu
 /// HTTP header name for the Binance API key.
 pub const BINANCE_API_KEY_HEADER: &str = "X-MBX-APIKEY";
 
+/// HTTP response header carrying the venue's minimum retry delay on HTTP 429 and 418 responses.
+pub const BINANCE_RETRY_AFTER_HEADER: &str = "Retry-After";
+
 /// Binance Spot API version path.
 pub const BINANCE_SPOT_API_PATH: &str = "/api/v3";
 
@@ -157,6 +175,9 @@ pub const BINANCE_DAPI_PATH: &str = "/dapi/v1";
 
 /// Binance European Options API version path.
 pub const BINANCE_EAPI_PATH: &str = "/eapi/v1";
+
+/// Binance SAPI version path for wallet, margin, and other account management endpoints.
+pub const BINANCE_SAPI_PATH: &str = "/sapi/v1";
 
 /// Describes a static rate limit quota for a product type.
 #[derive(Clone, Copy, Debug)]
@@ -210,8 +231,8 @@ pub const BINANCE_FAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
         interval: BinanceRateLimitInterval::Second,
-        interval_num: 1,
-        limit: 50,
+        interval_num: 10,
+        limit: 300,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
@@ -221,22 +242,22 @@ pub const BINANCE_FAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     },
 ];
 
-/// COIN-M Futures REST limits (default IP weights).
+/// COIN-M Futures REST limits (shared with USD-M Futures).
 ///
 /// References:
-/// - <https://developers.binance.com/docs/derivatives/coin-margined-futures/general-info#limits>
+/// - <https://developers.binance.com/docs/derivatives/coin-margined-futures/Important-CM-UM-Integration-Notice#a3-um-and-cm-share-the-same-rate-limit-pools>
 pub const BINANCE_DAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::RequestWeight,
         interval: BinanceRateLimitInterval::Minute,
         interval_num: 1,
-        limit: 1_200,
+        limit: 2_400,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
         interval: BinanceRateLimitInterval::Second,
-        interval_num: 1,
-        limit: 20,
+        interval_num: 10,
+        limit: 300,
     },
     BinanceRateLimitQuota {
         rate_limit_type: BinanceRateLimitType::Orders,
@@ -271,12 +292,16 @@ pub const BINANCE_EAPI_RATE_LIMITS: &[BinanceRateLimitQuota] = &[
     },
 ];
 
-/// WebSocket subscription rate limit: 5 messages per second.
+/// WebSocket subscription rate limit: one message per 300 ms with no burst.
 ///
-/// Binance limits incoming WebSocket messages (subscribe/unsubscribe) to 5 per second.
-pub static BINANCE_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
-    Quota::per_second(NonZeroU32::new(5).expect("non-zero")).expect("valid constant")
-});
+/// Binance limits incoming WebSocket messages (subscribe/unsubscribe) to 5 per second and
+/// closes the connection with code 1008 ("Too many requests") when that is exceeded. A
+/// `Quota::per_second(5)` token bucket allows a burst of 5 followed by one refill every
+/// 200 ms, so up to 9 messages can land within the first rolling second and trip the
+/// limit. A fixed 300 ms period (about 3.3 messages per second) spaces every message
+/// evenly and stays under the venue limit with headroom.
+pub static BINANCE_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> =
+    LazyLock::new(|| Quota::with_period(Duration::from_millis(300)).expect("valid constant"));
 
 /// WebSocket connection rate limit: 1 per second (conservative).
 ///
@@ -304,6 +329,12 @@ pub const BINANCE_NEW_ORDER_REJECTED_CODE: i64 = -2010;
 /// Binance error code returned when an order is not found.
 pub const BINANCE_NO_SUCH_ORDER_CODE: i64 = -2013;
 
+/// Binance error code returned when order execution status is unknown.
+pub const BINANCE_UNEXPECTED_RESPONSE_CODE: i64 = -1006;
+
+/// Binance error code returned when order execution status is unknown.
+pub const BINANCE_STATUS_UNKNOWN_CODE: i64 = -1007;
+
 /// Binance USD-M Futures error code for `dualSidePosition` sync rejection between
 /// UM (USDM) and CM (Coin-M) accounts on Portfolio Margin.
 ///
@@ -330,6 +361,23 @@ mod tests {
         assert_eq!(BINANCE_GTX_ORDER_REJECT_CODE, -5022);
         assert_eq!(BINANCE_NEW_ORDER_REJECTED_CODE, -2010);
         assert_eq!(BINANCE_NO_SUCH_ORDER_CODE, -2013);
+        assert_eq!(BINANCE_UNEXPECTED_RESPONSE_CODE, -1006);
+        assert_eq!(BINANCE_STATUS_UNKNOWN_CODE, -1007);
         assert_eq!(BINANCE_FUTURES_DUAL_SIDE_SYNC_REJECT_CODE, -4531);
+    }
+
+    #[rstest]
+    #[case(BINANCE_SPOT_SBE_WS_API_URL)]
+    #[case(BINANCE_SPOT_SBE_WS_API_TESTNET_URL)]
+    #[case(BINANCE_SPOT_SBE_WS_API_DEMO_URL)]
+    fn test_spot_sbe_ws_api_urls_use_current_schema(#[case] url: &str) {
+        assert!(url.ends_with("sbeSchemaId=3&sbeSchemaVersion=5"));
+    }
+
+    #[rstest]
+    fn test_ws_subscription_quota_paces_one_message_per_period() {
+        let quota = *BINANCE_WS_SUBSCRIPTION_QUOTA;
+        assert_eq!(quota.burst_size().get(), 1);
+        assert_eq!(quota.replenish_interval(), Duration::from_millis(300));
     }
 }

@@ -63,17 +63,32 @@ CREATE TABLE IF NOT EXISTS "instrument" (
     min_price TEXT,
     margin_init TEXT NOT NULL,
     margin_maint TEXT NOT NULL,
-    maker_fee TEXT NULL,
-    taker_fee TEXT NULL,
+    info JSON,
     ts_event TEXT NOT NULL,
     ts_init TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS info JSON;
+-- Maker/taker fee rates are account-owned; drop the retired instrument columns from
+-- databases created before that change. Dropping is metadata-only and idempotent.
+ALTER TABLE "instrument" DROP COLUMN IF EXISTS maker_fee;
+ALTER TABLE "instrument" DROP COLUMN IF EXISTS taker_fee;
+
+-- Instrument closes are stored independently of instrument metadata.
+CREATE TABLE IF NOT EXISTS "instrument_close" (
+    instrument_id TEXT PRIMARY KEY NOT NULL,
+    close_price TEXT NOT NULL,
+    close_type TEXT NOT NULL,
+    ts_event TEXT NOT NULL,
+    ts_init TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS "order" (
-    id TEXT PRIMARY KEY NOT NULL,
-    trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    trader_id TEXT NOT NULL REFERENCES trader(id) ON DELETE CASCADE,
     strategy_id TEXT NOT NULL,
     instrument_id TEXT REFERENCES instrument(id) ON DELETE CASCADE,
     client_order_id TEXT NOT NULL,
@@ -85,6 +100,7 @@ CREATE TABLE IF NOT EXISTS "order" (
     order_side TEXT NOT NULL,
     quantity TEXT NOT NULL,
     price TEXT,
+    activation_price TEXT,
     trigger_price TEXT,
     trigger_type TEXT,
     limit_offset TEXT,
@@ -94,8 +110,8 @@ CREATE TABLE IF NOT EXISTS "order" (
     expire_time TEXT,
     filled_qty TEXT DEFAULT '0',
     liquidity_side TEXT,
-    avg_px DOUBLE PRECISION,
-    slippage DOUBLE PRECISION,
+    avg_px NUMERIC,
+    slippage NUMERIC,
     commissions TEXT[],
     status TEXT NOT NULL,
     is_post_only BOOLEAN,
@@ -116,8 +132,37 @@ CREATE TABLE IF NOT EXISTS "order" (
     ts_init TEXT NOT NULL,
     ts_last TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trader_id, id)
 );
+-- Bring databases created before trailing-stop activation-price persistence forward
+ALTER TABLE "order" ADD COLUMN IF NOT EXISTS activation_price TEXT;
+-- Widen the order average-price columns from DOUBLE PRECISION to unconstrained NUMERIC.
+--
+-- Guarded because `ALTER COLUMN ... TYPE ... USING` takes ACCESS EXCLUSIVE and rewrites the whole
+-- table, and this file is re-issued on every `nautilus database init`.
+--
+-- Cast through `text` rather than directly: a direct `double precision::numeric` rounds to 15
+-- significant digits, so 1.2345678901234567 would land as 1.23456789012346. Going via `text`
+-- takes float8's shortest round-trip output and keeps the stored value.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'order' AND column_name = 'avg_px' AND data_type = 'double precision'
+    ) THEN
+        ALTER TABLE "order" ALTER COLUMN avg_px TYPE NUMERIC USING avg_px::text::NUMERIC;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'order' AND column_name = 'slippage' AND data_type = 'double precision'
+    ) THEN
+        ALTER TABLE "order" ALTER COLUMN slippage TYPE NUMERIC USING slippage::text::NUMERIC;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS "order_event" (
     id TEXT PRIMARY KEY NOT NULL,
@@ -142,6 +187,7 @@ CREATE TABLE IF NOT EXISTS "order_event" (
     price TEXT,
     last_px TEXT,
     last_qty TEXT,
+    activation_price TEXT,
     trigger_price TEXT,
     trigger_type TEXT,
     limit_offset TEXT,
@@ -163,15 +209,83 @@ CREATE TABLE IF NOT EXISTS "order_event" (
     position_id TEXT,
     commission TEXT,
     tags TEXT[],
+    released_price TEXT,
+    protection_price TEXT,
+    due_post_only BOOLEAN DEFAULT FALSE,
+    correction_id TEXT,
+    is_reopened BOOLEAN DEFAULT FALSE,
+    info JSONB,
+    causation_id TEXT,
     ts_event TEXT NOT NULL,
     ts_init TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+-- Bring databases created before trailing-stop activation-price persistence forward
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS activation_price TEXT;
+-- Bring databases created before per-event field persistence forward. Without these columns an
+-- order event round trip silently drops the field, so a restored order differs from the one that
+-- was persisted.
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS released_price TEXT;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS protection_price TEXT;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS due_post_only BOOLEAN DEFAULT FALSE;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS correction_id TEXT;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS is_reopened BOOLEAN DEFAULT FALSE;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS info JSONB;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS causation_id TEXT;
+
+CREATE TABLE IF NOT EXISTS "order_position_index" (
+    trader_id TEXT NOT NULL REFERENCES trader(id) ON DELETE CASCADE,
+    client_order_id TEXT NOT NULL,
+    position_id TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trader_id, client_order_id)
+);
+-- Bring databases created before trader-qualified index keys forward; the keys themselves are
+-- migrated with the snapshot tables below.
+ALTER TABLE "order_position_index" ADD COLUMN IF NOT EXISTS trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE;
+
+CREATE TABLE IF NOT EXISTS "position_event" (
+    event_sequence BIGSERIAL PRIMARY KEY NOT NULL,
+    id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE,
+    strategy_id TEXT NOT NULL,
+    instrument_id TEXT REFERENCES instrument(id) ON DELETE CASCADE,
+    client_order_id TEXT NOT NULL,
+    venue_order_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    trade_id TEXT NOT NULL,
+    currency TEXT REFERENCES currency(id),
+    order_type TEXT NOT NULL,
+    order_side TEXT NOT NULL,
+    last_px TEXT NOT NULL,
+    last_qty TEXT NOT NULL,
+    liquidity_side TEXT NOT NULL,
+    position_id TEXT NOT NULL,
+    commission TEXT,
+    reconciliation BOOLEAN DEFAULT FALSE,
+    info JSONB,
+    causation_id TEXT,
+    ts_event TEXT NOT NULL,
+    ts_init TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+-- Bring databases created before fill field persistence forward. `position_event` stores
+-- `OrderFilled` and is decoded by the same row mapping as `order_event`, so both tables carry
+-- the same fill columns.
+ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS reconciliation BOOLEAN DEFAULT FALSE;
+ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS info JSONB;
+ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS causation_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_position_event_position_id
+    ON position_event(position_id, event_sequence);
 
 CREATE TABLE IF NOT EXISTS "position"(
-    id TEXT PRIMARY KEY NOT NULL,
-    trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    trader_id TEXT NOT NULL REFERENCES trader(id) ON DELETE CASCADE,
     strategy_id TEXT NOT NULL,
     instrument_id TEXT REFERENCES instrument(id) ON DELETE CASCADE,
     account_id TEXT NOT NULL,
@@ -196,14 +310,18 @@ CREATE TABLE IF NOT EXISTS "position"(
     ts_closed TEXT,
     ts_init TEXT NOT NULL,
     ts_last TEXT NOT NULL,
+    replay_state JSONB,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (trader_id, id)
 );
+ALTER TABLE "position" ADD COLUMN IF NOT EXISTS replay_state JSONB;
 
 CREATE TABLE IF NOT EXISTS "account_event"(
     id TEXT PRIMARY KEY NOT NULL,
     kind TEXT NOT NULL,
     account_id TEXT REFERENCES account(id) ON DELETE CASCADE,
+    trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE,
     base_currency TEXT REFERENCES currency(id),
     balances JSONB,
     margins JSONB,
@@ -213,6 +331,99 @@ CREATE TABLE IF NOT EXISTS "account_event"(
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
+-- Bring databases created before trader-scoped account loads forward. `AccountState` carries no
+-- trader, so the cache stamps the writing node's trader on each event. Earlier events stay without
+-- a trader until assigned with `nautilus database assign-account`.
+ALTER TABLE "account_event" ADD COLUMN IF NOT EXISTS trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE;
+
+-- Qualify the order and position snapshot keys and the order position index key with the trader.
+-- Client order and position IDs are only unique per trader: NETTING position IDs are
+-- `{instrument_id}-{strategy_id}`, and generated IDs embed only the trader tag.
+--
+-- Guarded so it runs once, and fails with the offending rows rather than guessing an owner.
+-- Index rows are attributed from the fill that linked the order to the position, then from the
+-- order's own events; any row neither resolves must be assigned or deleted by hand.
+DO $$
+DECLARE
+    unresolved TEXT;
+    key_table TEXT;
+    key_columns TEXT;
+    key_name TEXT;
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints AS constraints
+        WHERE constraints.table_schema = current_schema()
+          AND constraints.constraint_type = 'PRIMARY KEY'
+          AND constraints.table_name IN ('order', 'position', 'order_position_index')
+          AND NOT EXISTS (
+            SELECT 1 FROM information_schema.key_column_usage AS keys
+            WHERE keys.constraint_schema = constraints.constraint_schema
+              AND keys.constraint_name = constraints.constraint_name
+              AND keys.column_name = 'trader_id'
+          )
+    ) THEN
+        SELECT string_agg(DISTINCT id, ', ') INTO unresolved
+        FROM (
+            SELECT id FROM "order" WHERE trader_id IS NULL
+            UNION ALL
+            SELECT id FROM "position" WHERE trader_id IS NULL
+        ) AS snapshot;
+
+        IF unresolved IS NOT NULL THEN
+            RAISE EXCEPTION 'Order or position snapshots have no trader, assign or delete them before migrating: %', unresolved;
+        END IF;
+
+        UPDATE "order_position_index" AS entry
+        SET trader_id = owner.trader_id
+        FROM (
+            SELECT client_order_id, position_id, MIN(trader_id) AS trader_id
+            FROM "position_event"
+            WHERE trader_id IS NOT NULL
+            GROUP BY client_order_id, position_id
+            HAVING COUNT(DISTINCT trader_id) = 1
+        ) AS owner
+        WHERE entry.trader_id IS NULL
+          AND entry.client_order_id = owner.client_order_id
+          AND entry.position_id = owner.position_id;
+
+        UPDATE "order_position_index" AS entry
+        SET trader_id = owner.trader_id
+        FROM (
+            SELECT client_order_id, MIN(trader_id) AS trader_id
+            FROM "order_event"
+            WHERE trader_id IS NOT NULL
+            GROUP BY client_order_id
+            HAVING COUNT(DISTINCT trader_id) = 1
+        ) AS owner
+        WHERE entry.trader_id IS NULL
+          AND entry.client_order_id = owner.client_order_id;
+
+        SELECT string_agg(client_order_id, ', ' ORDER BY client_order_id) INTO unresolved
+        FROM "order_position_index"
+        WHERE trader_id IS NULL;
+
+        IF unresolved IS NOT NULL THEN
+            RAISE EXCEPTION 'Order position index entries have no resolvable trader, assign or delete them before migrating: %', unresolved;
+        END IF;
+
+        FOR key_table, key_columns IN
+            VALUES ('order', 'trader_id, id'),
+                   ('position', 'trader_id, id'),
+                   ('order_position_index', 'trader_id, client_order_id')
+        LOOP
+            SELECT conname INTO key_name
+            FROM pg_constraint
+            WHERE conrelid = format('%I', key_table)::regclass AND contype = 'p';
+
+            IF key_name IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE %I DROP CONSTRAINT %I', key_table, key_name);
+            END IF;
+
+            EXECUTE format('ALTER TABLE %I ALTER COLUMN trader_id SET NOT NULL', key_table);
+            EXECUTE format('ALTER TABLE %I ADD PRIMARY KEY (%s)', key_table, key_columns);
+        END LOOP;
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS "trade" (
     id BIGSERIAL PRIMARY KEY NOT NULL,
@@ -309,9 +520,11 @@ CREATE TABLE IF NOT EXISTS "block_default" PARTITION OF "block" DEFAULT;
 CREATE TABLE IF NOT EXISTS "pool_event_block" (
     chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
     number BIGINT NOT NULL,
+    hash TEXT,
     timestamp TEXT NOT NULL,
     PRIMARY KEY (chain_id, number)
 );
+ALTER TABLE "pool_event_block" ADD COLUMN IF NOT EXISTS hash TEXT;
 
 CREATE TABLE IF NOT EXISTS "token"(
     chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
@@ -354,6 +567,18 @@ CREATE TABLE IF NOT EXISTS "pool" (
     FOREIGN KEY (token0_chain, token0_address) REFERENCES token(chain_id, address),
     FOREIGN KEY (token1_chain, token1_address) REFERENCES token(chain_id, address),
     FOREIGN KEY (chain_id, dex_name) REFERENCES dex(chain_id, name)
+);
+ALTER TABLE "pool" ADD COLUMN IF NOT EXISTS event_sync_version INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS "pool_event_sync" (
+    chain_id INTEGER NOT NULL,
+    dex_name TEXT NOT NULL,
+    pool_identifier TEXT NOT NULL,
+    event_family TEXT NOT NULL,
+    last_full_sync_block_number BIGINT NOT NULL,
+    PRIMARY KEY (chain_id, dex_name, pool_identifier, event_family),
+    FOREIGN KEY (chain_id, dex_name, pool_identifier)
+        REFERENCES pool(chain_id, dex_name, pool_identifier) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS "pool_swap_event" (
@@ -429,6 +654,46 @@ CREATE TABLE IF NOT EXISTS "pool_collect_event" (
 CREATE INDEX IF NOT EXISTS idx_pool_collect_event_lookup
     ON pool_collect_event(chain_id, pool_identifier, block, transaction_index, log_index);
 
+CREATE TABLE IF NOT EXISTS "pool_fee_protocol_update_event" (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
+    pool_identifier TEXT NOT NULL,
+    dex_name TEXT NOT NULL,
+    block BIGINT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    transaction_index INTEGER NOT NULL,
+    log_index INTEGER NOT NULL,
+    fee_protocol0_new INTEGER NOT NULL,
+    fee_protocol1_new INTEGER NOT NULL,
+    FOREIGN KEY (chain_id, dex_name, pool_identifier) REFERENCES pool(chain_id, dex_name, pool_identifier),
+--     FOREIGN KEY (chain_id, block) REFERENCES block(chain_id, number),  // TODO temporarily disabled not to be blocked by full block sync
+    UNIQUE(chain_id, transaction_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_pool_fee_protocol_update_event_lookup
+    ON pool_fee_protocol_update_event(chain_id, pool_identifier, block, transaction_index, log_index);
+ALTER TABLE "pool_fee_protocol_update_event" ALTER COLUMN fee_protocol0_new TYPE INTEGER;
+ALTER TABLE "pool_fee_protocol_update_event" ALTER COLUMN fee_protocol1_new TYPE INTEGER;
+
+CREATE TABLE IF NOT EXISTS "pool_fee_protocol_collect_event" (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
+    pool_identifier TEXT NOT NULL,
+    dex_name TEXT NOT NULL,
+    block BIGINT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    transaction_index INTEGER NOT NULL,
+    log_index INTEGER NOT NULL,
+    sender TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    amount0 U256 NOT NULL,
+    amount1 U256 NOT NULL,
+    FOREIGN KEY (chain_id, dex_name, pool_identifier) REFERENCES pool(chain_id, dex_name, pool_identifier),
+--     FOREIGN KEY (chain_id, block) REFERENCES block(chain_id, number),  // TODO temporarily disabled not to be blocked by full block sync
+    UNIQUE(chain_id, transaction_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_pool_fee_protocol_collect_event_lookup
+    ON pool_fee_protocol_collect_event(chain_id, pool_identifier, block, transaction_index, log_index);
+
 CREATE TABLE IF NOT EXISTS "pool_flash_event" (
     id BIGSERIAL PRIMARY KEY,
     chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
@@ -465,6 +730,8 @@ CREATE TABLE IF NOT EXISTS "pool_snapshot" (
     protocol_fees_token0 U256 NOT NULL,
     protocol_fees_token1 U256 NOT NULL,
     fee_protocol SMALLINT NOT NULL,
+    fee_protocol0_basis_points INTEGER,
+    fee_protocol1_basis_points INTEGER,
     fee_growth_global_0 U256 NOT NULL,
     fee_growth_global_1 U256 NOT NULL,
     total_amount0_deposited U256 NOT NULL,
@@ -477,11 +744,16 @@ CREATE TABLE IF NOT EXISTS "pool_snapshot" (
     total_flashes INTEGER NOT NULL DEFAULT 0,
     total_fee_collects INTEGER NOT NULL,
     liquidity_utilization_rate  DOUBLE PRECISION DEFAULT 0,
-    is_valid BOOLEAN DEFAULT FALSE,
+    validation_state TEXT NOT NULL DEFAULT 'replay' CHECK (validation_state IN ('on_chain', 'replay', 'invalid')),
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (chain_id, pool_identifier, block, transaction_index, log_index),
     FOREIGN KEY (chain_id, dex_name, pool_identifier) REFERENCES pool(chain_id, dex_name, pool_identifier)
 );
+-- Bring databases created before snapshot validation states forward. Existing rows become 'replay'
+-- (usable as replay start points) until a later analyze-pool run re-validates them to 'on_chain' or 'invalid'.
+ALTER TABLE "pool_snapshot" ADD COLUMN IF NOT EXISTS validation_state TEXT NOT NULL DEFAULT 'replay';
+ALTER TABLE "pool_snapshot" ADD COLUMN IF NOT EXISTS fee_protocol0_basis_points INTEGER;
+ALTER TABLE "pool_snapshot" ADD COLUMN IF NOT EXISTS fee_protocol1_basis_points INTEGER;
 
 CREATE TABLE IF NOT EXISTS "pool_position" (
     chain_id INTEGER NOT NULL,
@@ -524,3 +796,156 @@ CREATE TABLE IF NOT EXISTS "pool_tick" (
     FOREIGN KEY (chain_id, pool_identifier, snapshot_block, snapshot_transaction_index, snapshot_log_index)
         REFERENCES pool_snapshot(chain_id, pool_identifier, block, transaction_index, log_index) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS "execution_transaction" (
+    id BIGSERIAL PRIMARY KEY,
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE CASCADE,
+    wallet_address TEXT,
+    nonce BIGINT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL,
+    client_order_id TEXT,
+    UNIQUE (chain_id, transaction_hash)
+);
+ALTER TABLE "execution_transaction" ADD COLUMN IF NOT EXISTS client_order_id TEXT;
+ALTER TABLE "execution_transaction" ADD COLUMN IF NOT EXISTS wallet_address TEXT;
+ALTER TABLE "execution_transaction" ALTER COLUMN wallet_address DROP NOT NULL;
+
+CREATE TABLE IF NOT EXISTS "execution_schema_version" (
+    component TEXT PRIMARY KEY,
+    version SMALLINT NOT NULL CHECK (version > 0)
+);
+
+CREATE TABLE IF NOT EXISTS "execution_intent" (
+    id BIGSERIAL PRIMARY KEY,
+    schema_version SMALLINT NOT NULL CHECK (schema_version = 2),
+    chain_id INTEGER NOT NULL REFERENCES chain(chain_id) ON DELETE RESTRICT,
+    wallet_address TEXT NOT NULL,
+    nonce BIGINT CHECK (nonce IS NULL OR nonce >= 0),
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'prepared', 'signed', 'broadcast', 'included', 'finalized',
+        'reverted', 'replaced', 'dropped', 'reorged', 'recoverable'
+    )),
+    client_order_id TEXT,
+    trader_id TEXT,
+    strategy_id TEXT,
+    account_id TEXT,
+    instrument_id TEXT,
+    pool_address TEXT,
+    transaction_to TEXT NOT NULL,
+    transaction_input TEXT NOT NULL,
+    transaction_value TEXT NOT NULL,
+    amount_in TEXT,
+    created_block BIGINT NOT NULL CHECK (created_block >= 0),
+    acknowledgement_emitted BOOLEAN NOT NULL DEFAULT FALSE,
+    fill_emitted BOOLEAN NOT NULL DEFAULT FALSE,
+    terminal_emitted BOOLEAN NOT NULL DEFAULT FALSE,
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT execution_intent_active_check CHECK (
+        NOT active
+        OR status NOT IN ('finalized', 'reverted', 'recoverable')
+        OR (
+            status IN ('finalized', 'reverted')
+            AND NOT (fill_emitted OR terminal_emitted)
+        )
+    ),
+    CHECK (NOT (fill_emitted AND terminal_emitted)),
+    CHECK (
+        purpose <> 'swap'
+        OR (
+            client_order_id IS NOT NULL
+            AND trader_id IS NOT NULL
+            AND strategy_id IS NOT NULL
+            AND account_id IS NOT NULL
+            AND instrument_id IS NOT NULL
+            AND pool_address IS NOT NULL
+            AND amount_in IS NOT NULL
+        )
+    ),
+    UNIQUE (id, chain_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS execution_intent_active_signer_key
+    ON "execution_intent" (chain_id, wallet_address) WHERE active;
+CREATE UNIQUE INDEX IF NOT EXISTS execution_intent_active_nonce_key
+    ON "execution_intent" (chain_id, wallet_address, nonce) WHERE active AND nonce IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS execution_intent_client_order_key
+    ON "execution_intent" (chain_id, wallet_address, client_order_id)
+    WHERE client_order_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS "execution_transaction_hash" (
+    id BIGSERIAL PRIMARY KEY,
+    intent_id BIGINT NOT NULL,
+    chain_id INTEGER NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    payload_expected BOOLEAN NOT NULL DEFAULT TRUE,
+    raw_transaction BYTEA,
+    sealed_transaction BYTEA,
+    status TEXT NOT NULL CHECK (status IN (
+        'signed', 'broadcast', 'included', 'finalized', 'reverted',
+        'replaced', 'dropped', 'reorged'
+    )),
+    block_number BIGINT CHECK (block_number IS NULL OR block_number >= 0),
+    block_hash TEXT,
+    receipt_success BOOLEAN,
+    gas_used BIGINT CHECK (gas_used IS NULL OR gas_used >= 0),
+    effective_gas_price TEXT,
+    current BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (intent_id, chain_id)
+        REFERENCES execution_intent(id, chain_id) ON DELETE RESTRICT,
+    CONSTRAINT execution_transaction_raw_size_check
+        CHECK (raw_transaction IS NULL OR octet_length(raw_transaction) <= 131072),
+    CONSTRAINT execution_transaction_sealed_size_check
+        CHECK (sealed_transaction IS NULL OR octet_length(sealed_transaction) <= 131133),
+    UNIQUE (chain_id, transaction_hash),
+    UNIQUE (intent_id, transaction_hash)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS execution_transaction_hash_current_key
+    ON "execution_transaction_hash" (intent_id) WHERE current;
+
+CREATE TABLE IF NOT EXISTS "execution_payload_state" (
+    component TEXT PRIMARY KEY CHECK (component = 'signed_transactions'),
+    deployment_id TEXT NOT NULL CHECK (deployment_id <> ''),
+    protocol_version SMALLINT NOT NULL CHECK (protocol_version = 1),
+    operation TEXT NOT NULL CHECK (operation IN ('migrate', 'ready', 'rewrap', 'rollback')),
+    active_key_id BYTEA NOT NULL CHECK (octet_length(active_key_id) = 32),
+    progress_id BIGINT NOT NULL DEFAULT 0 CHECK (progress_id >= 0),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS "execution_payload_key_state" (
+    key_id BYTEA PRIMARY KEY CHECK (octet_length(key_id) = 32),
+    seals BIGINT NOT NULL DEFAULT 0 CHECK (seals >= 0 AND seals < 4294967296)
+);
+
+CREATE TABLE IF NOT EXISTS "execution_transaction_transition" (
+    id BIGSERIAL PRIMARY KEY,
+    intent_id BIGINT NOT NULL REFERENCES execution_intent(id) ON DELETE RESTRICT,
+    transaction_hash_id BIGINT REFERENCES execution_transaction_hash(id) ON DELETE RESTRICT,
+    transition_key TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL CHECK (to_status IN (
+        'prepared', 'signed', 'broadcast', 'included', 'finalized',
+        'reverted', 'replaced', 'dropped', 'reorged', 'recoverable'
+    )),
+    block_number BIGINT CHECK (block_number IS NULL OR block_number >= 0),
+    block_hash TEXT,
+    observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (intent_id, transition_key)
+);
+
+CREATE OR REPLACE FUNCTION execution_transition_append_only()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'Execution transitions are append-only';
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS execution_transition_append_only ON "execution_transaction_transition";
+CREATE TRIGGER execution_transition_append_only
+    BEFORE UPDATE OR DELETE ON "execution_transaction_transition"
+    FOR EACH STATEMENT EXECUTE FUNCTION execution_transition_append_only();

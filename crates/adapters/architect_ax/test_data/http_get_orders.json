@@ -4,6 +4,7 @@
       "ts": 1704067200,
       "tn": 500000000,
       "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      "aid": "account-1",
       "u": "test_user@example.com",
       "s": "EURUSD-PERP",
       "p": "1.08400",
@@ -13,6 +14,8 @@
       "o": "PARTIALLY_FILLED",
       "d": "B",
       "tif": "GTC",
+      "po": true,
+      "rb": "rej",
       "cid": 12345,
       "r": null,
       "tag": "strategy-1",
@@ -22,6 +25,7 @@
       "ts": 1704067100,
       "tn": 0,
       "oid": "O-01ARZ3NDEKTSV4RRFFQ69G5FBW",
+      "aid": "account-1",
       "u": "test_user@example.com",
       "s": "GBPUSD-PERP",
       "p": "1.27200",
@@ -34,10 +38,11 @@
       "cid": null,
       "r": null,
       "tag": null,
-      "txt": null
+      "txt": null,
+      "po": false
     }
   ],
   "total_count": 2,
   "limit": 100,
-  "offset": 0
+  "next_cursor": null
 }

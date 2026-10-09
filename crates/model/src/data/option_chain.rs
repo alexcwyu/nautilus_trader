@@ -22,6 +22,7 @@ use std::{
 };
 
 use nautilus_core::{UnixNanos, serialization::Serializable};
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use super::HasTsInit;
@@ -38,6 +39,101 @@ use crate::{
 /// Number of strikes either side of ATM that [`StrikeRange::Delta`] selects as a
 /// fallback when Greeks are not yet available for delta resolution.
 pub(crate) const DEFAULT_DELTA_FALLBACK_STRIKES: usize = 5;
+
+/// An ordered set of strike grids and a bound on definition candidates per slot.
+///
+/// Increments express discovery preference. They do not prove that a strike is listed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StrikeSearchProfile {
+    increments: Vec<Decimal>,
+    origin: Decimal,
+    max_candidates_per_slot: usize,
+}
+
+impl StrikeSearchProfile {
+    /// Creates a checked strike-search profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The increments are empty, non-positive, or duplicated.
+    /// - The origin is negative.
+    /// - The candidate bound is zero.
+    pub fn new(
+        increments: Vec<Decimal>,
+        origin: Decimal,
+        max_candidates_per_slot: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !increments.is_empty(),
+            "strike search profile requires at least one increment"
+        );
+        anyhow::ensure!(
+            increments.iter().all(|value| *value > Decimal::ZERO),
+            "strike search profile increments must be positive"
+        );
+        let mut seen = HashSet::with_capacity(increments.len());
+        for increment in &increments {
+            anyhow::ensure!(
+                seen.insert(increment.normalize()),
+                "strike search profile increments must be unique (duplicate {increment})"
+            );
+        }
+
+        anyhow::ensure!(
+            origin >= Decimal::ZERO,
+            "strike search profile origin must be non-negative"
+        );
+        anyhow::ensure!(
+            max_candidates_per_slot > 0,
+            "strike search profile requires a positive candidate bound"
+        );
+        Ok(Self {
+            increments,
+            origin,
+            max_candidates_per_slot,
+        })
+    }
+
+    /// Returns strike increments in discovery preference order.
+    #[must_use]
+    pub fn increments(&self) -> &[Decimal] {
+        &self.increments
+    }
+
+    /// Returns the origin shared by the strike grids.
+    #[must_use]
+    pub const fn origin(&self) -> Decimal {
+        self.origin
+    }
+
+    /// Returns the maximum number of candidates probed per strike slot.
+    #[must_use]
+    pub const fn max_candidates_per_slot(&self) -> usize {
+        self.max_candidates_per_slot
+    }
+}
+
+impl<'de> Deserialize<'de> for StrikeSearchProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Fields {
+            increments: Vec<Decimal>,
+            origin: Decimal,
+            max_candidates_per_slot: usize,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(
+            fields.increments,
+            fields.origin,
+            fields.max_candidates_per_slot,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
 
 /// Defines which strikes to include in an option chain subscription.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -72,10 +168,6 @@ impl StrikeRange {
     ///
     /// If `atm_price` is `None` for ATM-based variants, returns an empty vec
     /// (subscriptions are deferred until ATM is known).
-    ///
-    /// # Panics
-    ///
-    /// Panics if a strike price comparison returns `None` (i.e. a NaN price value).
     #[must_use]
     pub fn resolve(&self, atm_price: Option<Price>, all_strikes: &[Price]) -> Vec<Price> {
         match self {
@@ -99,9 +191,7 @@ impl StrikeRange {
                     return vec![]; // Defer until ATM is known
                 };
                 // Find index of closest strike to ATM
-                let atm_idx = match all_strikes
-                    .binary_search_by(|s| s.as_f64().partial_cmp(&atm.as_f64()).unwrap())
-                {
+                let atm_idx = match all_strikes.binary_search(&atm) {
                     Ok(idx) => idx,
                     Err(idx) => {
                         if idx == 0 {
@@ -110,8 +200,8 @@ impl StrikeRange {
                             all_strikes.len() - 1
                         } else {
                             // Pick the closer of the two neighbors
-                            let diff_below = (all_strikes[idx - 1].as_f64() - atm.as_f64()).abs();
-                            let diff_above = (all_strikes[idx].as_f64() - atm.as_f64()).abs();
+                            let diff_below = all_strikes[idx - 1].raw().abs_diff(atm.raw());
+                            let diff_above = all_strikes[idx].raw().abs_diff(atm.raw());
                             if diff_below <= diff_above {
                                 idx - 1
                             } else {
@@ -121,22 +211,26 @@ impl StrikeRange {
                     }
                 };
                 let start = atm_idx.saturating_sub(*strikes_below);
-                let end = (atm_idx + strikes_above + 1).min(all_strikes.len());
+                let end = atm_idx
+                    .saturating_add(*strikes_above)
+                    .saturating_add(1)
+                    .min(all_strikes.len());
                 all_strikes[start..end].to_vec()
             }
             Self::AtmPercent { pct } => {
                 let Some(atm) = atm_price else {
                     return vec![]; // Defer until ATM is known
                 };
-                let atm_f = atm.as_f64();
-                if atm_f == 0.0 {
+                let atm_decimal = atm.as_decimal();
+                if atm_decimal.is_zero() {
                     return all_strikes.to_vec();
                 }
                 all_strikes
                     .iter()
                     .filter(|s| {
-                        let pct_diff = ((s.as_f64() - atm_f) / atm_f).abs();
-                        pct_diff <= *pct
+                        let distance = (s.as_decimal() - atm_decimal).abs();
+                        let pct_diff = distance / atm_decimal.abs();
+                        pct_diff.to_f64().is_some_and(|pct_diff| pct_diff <= *pct)
                     })
                     .copied()
                     .collect()
@@ -156,7 +250,7 @@ impl StrikeRange {
 #[serde(tag = "type")]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -243,7 +337,7 @@ impl Serializable for OptionGreeks {}
 #[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -260,7 +354,7 @@ pub struct OptionStrikeData {
 #[derive(Clone, Debug)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -404,7 +498,7 @@ mod tests {
     }
 
     fn make_series_id() -> OptionSeriesId {
-        OptionSeriesId::new(
+        OptionSeriesId::new_derived(
             Venue::new("DERIBIT"),
             ustr::Ustr::from("BTC"),
             ustr::Ustr::from("BTC"),
@@ -631,10 +725,42 @@ mod tests {
     // -- StrikeRange::resolve tests --
 
     #[rstest]
+    fn test_strike_range_preserves_subprecision_atm() {
+        let mut atm = Price::from("100.75");
+        atm.precision = 0;
+        let strikes = [Price::from("100"), Price::from("101")];
+
+        let range = StrikeRange::AtmRelative {
+            strikes_above: 0,
+            strikes_below: 0,
+        };
+
+        assert_eq!(range.resolve(Some(atm), &strikes), vec![strikes[1]]);
+    }
+
+    #[rstest]
     fn test_strike_range_resolve_fixed() {
         let range = StrikeRange::Fixed(vec![Price::from("50000"), Price::from("55000")]);
         let result = range.resolve(None, &[]);
         assert_eq!(result, vec![Price::from("50000"), Price::from("55000")]);
+    }
+
+    #[rstest]
+    fn test_strike_range_resolve_fixed_intersects_available_strikes() {
+        let range = StrikeRange::Fixed(vec![
+            Price::from("50000"),
+            Price::from("55000"),
+            Price::from("60000"),
+        ]);
+        let available = [
+            Price::from("45000"),
+            Price::from("50000"),
+            Price::from("60000"),
+        ];
+
+        let result = range.resolve(None, &available);
+
+        assert_eq!(result, vec![Price::from("50000"), Price::from("60000")]);
     }
 
     #[rstest]
@@ -653,6 +779,63 @@ mod tests {
         assert_eq!(result.len(), 5);
         assert_eq!(result[0], Price::from("45000"));
         assert_eq!(result[4], Price::from("55000"));
+    }
+
+    #[rstest]
+    #[case("49750", "50000")]
+    #[case("50250", "50000")]
+    #[case("51750", "52000")]
+    fn test_strike_range_resolve_atm_relative_selects_nearest_strike(
+        #[case] atm: &str,
+        #[case] expected: &str,
+    ) {
+        let range = StrikeRange::AtmRelative {
+            strikes_above: 0,
+            strikes_below: 0,
+        };
+        let strikes = [
+            Price::from("48000"),
+            Price::from("50000"),
+            Price::from("52000"),
+        ];
+
+        let result = range.resolve(Some(Price::from(atm)), &strikes);
+
+        assert_eq!(result, vec![Price::from(expected)]);
+    }
+
+    #[rstest]
+    fn test_strike_range_resolve_atm_relative_exact_high_value() {
+        let range = StrikeRange::AtmRelative {
+            strikes_above: 0,
+            strikes_below: 0,
+        };
+        let atm = Price::from("9007199253.999000000");
+        let collapsed = Price::from("9007199253.999000001");
+        let strikes = [atm, collapsed];
+        assert_eq!(collapsed.as_f64(), atm.as_f64());
+
+        let result = range.resolve(Some(atm), &strikes);
+
+        assert_eq!(result, vec![atm]);
+    }
+
+    #[rstest]
+    fn test_strike_range_resolve_atm_relative_saturates_extreme_window() {
+        // An extreme window must clamp to the available strikes without overflowing
+        let range = StrikeRange::AtmRelative {
+            strikes_above: usize::MAX,
+            strikes_below: usize::MAX,
+        };
+        let strikes: Vec<Price> = [45000, 50000, 55000]
+            .iter()
+            .map(|s| Price::from(&s.to_string()))
+            .collect();
+        let atm = Some(Price::from("50000"));
+
+        let result = range.resolve(atm, &strikes);
+
+        assert_eq!(result, strikes);
     }
 
     #[rstest]
@@ -683,6 +866,19 @@ mod tests {
         assert!(result.contains(&Price::from("50000")));
         assert!(result.contains(&Price::from("52000")));
         assert!(result.contains(&Price::from("55000")));
+    }
+
+    #[rstest]
+    fn test_strike_range_resolve_atm_percent_zero_exact_high_value() {
+        let range = StrikeRange::AtmPercent { pct: 0.0 };
+        let atm = Price::from("9007199253.999000000");
+        let collapsed = Price::from("9007199253.999000001");
+        let strikes = [atm, collapsed];
+        assert_eq!(atm.as_f64(), collapsed.as_f64());
+
+        let result = range.resolve(Some(atm), &strikes);
+
+        assert_eq!(result, vec![atm]);
     }
 
     #[rstest]
@@ -727,7 +923,44 @@ mod tests {
             tolerance: 0.05,
         };
         let strikes = vec![Price::from("50000"), Price::from("55000")];
-        // No ATM -> deferred (empty), matching ATM-relative behaviour.
+        // No ATM -> deferred (empty), matching ATM-relative behavior.
         assert!(delta.resolve(None, &strikes).is_empty());
+    }
+
+    #[rstest]
+    fn test_strike_search_profile_roundtrip() {
+        let profile = StrikeSearchProfile::new(
+            vec![Decimal::from(5), Decimal::from(25)],
+            Decimal::from(2),
+            7,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&profile).unwrap();
+        let restored: StrikeSearchProfile = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored, profile);
+        assert_eq!(profile.increments(), &[Decimal::from(5), Decimal::from(25)]);
+        assert_eq!(profile.origin(), Decimal::from(2));
+        assert_eq!(profile.max_candidates_per_slot(), 7);
+        assert_eq!(encoded["max_candidates_per_slot"], serde_json::json!(7));
+    }
+
+    #[rstest]
+    #[case(vec![], Decimal::ZERO, 7, "at least one increment")]
+    #[case(vec![Decimal::ZERO], Decimal::ZERO, 7, "increments must be positive")]
+    #[case(vec![Decimal::from(-1)], Decimal::ZERO, 7, "increments must be positive")]
+    #[case(vec![Decimal::from(5), Decimal::new(50, 1)], Decimal::ZERO, 7, "increments must be unique")]
+    #[case(vec![Decimal::from(5)], Decimal::from(-1), 7, "origin must be non-negative")]
+    #[case(vec![Decimal::from(5)], Decimal::ZERO, 0, "positive candidate bound")]
+    fn test_strike_search_profile_invalid(
+        #[case] increments: Vec<Decimal>,
+        #[case] origin: Decimal,
+        #[case] candidates: usize,
+        #[case] expected: &str,
+    ) {
+        let encoded = serde_json::json!({"increments": increments, "origin": origin, "max_candidates_per_slot": candidates});
+        let error = StrikeSearchProfile::new(increments, origin, candidates).unwrap_err();
+        let decoded_error = serde_json::from_value::<StrikeSearchProfile>(encoded).unwrap_err();
+        assert!(error.to_string().contains(expected));
+        assert!(decoded_error.to_string().contains(expected));
     }
 }

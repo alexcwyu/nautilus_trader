@@ -24,7 +24,7 @@
 //! **must** be a valid multiple of the scale factor for the given precision. Valid raw values
 //! should ideally come from:
 //!
-//! - Accessing the `.raw` field of an existing value (e.g., `price.raw`)
+//! - Calling the `raw()` accessor of an existing value (e.g., `price.raw()`)
 //! - Using the fixed-point conversion functions in this module
 //! - Values from Nautilus-produced Arrow data
 //!
@@ -58,11 +58,12 @@
 //! [`Price`]: crate::types::Price
 //! [`Quantity`]: crate::types::Quantity
 
-use std::fmt::Display;
+use std::{cmp::Ordering, fmt::Display};
 
 use nautilus_core::correctness::{
     CorrectnessError, CorrectnessResult, CorrectnessResultExt, FAILED,
 };
+use rust_decimal::Decimal;
 
 use crate::types::{price::PriceRaw, quantity::QuantityRaw};
 
@@ -85,9 +86,12 @@ pub static HIGH_PRECISION_MODE: u8 = cfg!(feature = "high-precision") as u8;
 /// The maximum fixed-point precision.
 pub const FIXED_PRECISION: u8 = 16;
 
+/// The maximum fixed-point precision used by standard-precision catalog data.
+pub const FIXED_PRECISION_STANDARD: u8 = 9;
+
 #[cfg(not(feature = "high-precision"))]
 /// The maximum fixed-point precision.
-pub const FIXED_PRECISION: u8 = 9;
+pub const FIXED_PRECISION: u8 = FIXED_PRECISION_STANDARD;
 
 // -----------------------------------------------------------------------------
 // PRECISION_BYTES (size of integer backing the fixed-point values)
@@ -101,21 +105,18 @@ pub const PRECISION_BYTES: i32 = 16;
 /// The width in bytes for fixed-point value types in standard-precision mode (64-bit).
 pub const PRECISION_BYTES: i32 = 8;
 
-// -----------------------------------------------------------------------------
-// FIXED_BINARY_SIZE
-// -----------------------------------------------------------------------------
-
-#[cfg(feature = "high-precision")]
-/// The data type name for the Arrow fixed-size binary representation.
-pub const FIXED_SIZE_BINARY: &str = "FixedSizeBinary(16)";
-
-#[cfg(not(feature = "high-precision"))]
-/// The data type name for the Arrow fixed-size binary representation.
-pub const FIXED_SIZE_BINARY: &str = "FixedSizeBinary(8)";
+/// The Arrow data type name for fixed-point value types.
+pub const FIXED_DECIMAL: &str = "Decimal128(38, 16)";
 
 // -----------------------------------------------------------------------------
 // FIXED_SCALAR
 // -----------------------------------------------------------------------------
+
+#[cfg(feature = "high-precision")]
+pub(crate) const FIXED_SCALAR_RAW: QuantityRaw = 10_000_000_000_000_000;
+
+#[cfg(not(feature = "high-precision"))]
+pub(crate) const FIXED_SCALAR_RAW: QuantityRaw = 1_000_000_000;
 
 #[cfg(feature = "high-precision")]
 /// The scalar value corresponding to the maximum precision (10^16).
@@ -189,8 +190,8 @@ pub const MAX_FLOAT_PRECISION: u8 = 16;
 /// # Errors
 ///
 /// Returns an error if `precision` exceeds the maximum allowed:
-/// - With `defi` feature: [`WEI_PRECISION`](crate::defi::WEI_PRECISION) (18)
-/// - Without `defi` feature: [`FIXED_PRECISION`]
+/// - With the `defi` feature: `WEI_PRECISION` (18)
+/// - Without the `defi` feature: [`FIXED_PRECISION`]
 pub fn check_fixed_precision(precision: u8) -> CorrectnessResult<()> {
     #[cfg(feature = "defi")]
     if precision > crate::defi::WEI_PRECISION {
@@ -211,6 +212,23 @@ pub fn check_fixed_precision(precision: u8) -> CorrectnessResult<()> {
     Ok(())
 }
 
+/// Checks that a value with the given `precision` can be converted to `f64`.
+///
+/// # Errors
+///
+/// Returns an error if `precision` exceeds [`MAX_FLOAT_PRECISION`].
+pub fn check_float_precision(precision: u8) -> CorrectnessResult<()> {
+    if precision > MAX_FLOAT_PRECISION {
+        return Err(CorrectnessError::PredicateViolation {
+            message: format!(
+                "Fixed-point precision {precision} exceeds maximum float precision {MAX_FLOAT_PRECISION}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// Returns `true` when two precisions encode their `raw` values at the same scale.
 ///
 /// The effective scale for a given precision is `max(precision, FIXED_PRECISION)`:
@@ -224,8 +242,210 @@ pub fn check_fixed_precision(precision: u8) -> CorrectnessResult<()> {
 #[inline]
 #[must_use]
 pub fn raw_scales_match(a: u8, b: u8) -> bool {
-    a.max(FIXED_PRECISION) == b.max(FIXED_PRECISION)
+    a == b || a.max(b) <= FIXED_PRECISION
 }
+
+/// Returns the effective integer scale for a raw fixed-point value.
+#[inline]
+#[must_use]
+pub(crate) fn raw_scale(precision: u8) -> u128 {
+    10_u128.pow(u32::from(precision.max(FIXED_PRECISION)))
+}
+
+// Removing only native-scale trailing zeros gives equal values identical hash inputs
+#[must_use]
+pub(crate) fn canonical_raw(raw: impl Into<u128>, precision: u8) -> (u128, u8) {
+    let mut raw = raw.into();
+    let mut precision = if raw == 0 {
+        FIXED_PRECISION
+    } else {
+        precision.max(FIXED_PRECISION)
+    };
+
+    while precision > FIXED_PRECISION && raw % 10 == 0 {
+        raw /= 10;
+        precision -= 1;
+    }
+
+    (raw, precision)
+}
+
+#[inline]
+#[must_use]
+pub(crate) fn compare_raw_signed(
+    lhs: PriceRaw,
+    lhs_precision: u8,
+    rhs: PriceRaw,
+    rhs_precision: u8,
+) -> Ordering {
+    if raw_scales_match(lhs_precision, rhs_precision) {
+        return lhs.cmp(&rhs);
+    }
+
+    lhs.signum().cmp(&rhs.signum()).then_with(|| {
+        let ordering = compare_raw(
+            lhs.unsigned_abs(),
+            lhs_precision,
+            rhs.unsigned_abs(),
+            rhs_precision,
+        );
+
+        if lhs < 0 {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    })
+}
+
+#[inline]
+#[must_use]
+pub(crate) fn compare_raw(
+    lhs: impl Into<u128>,
+    lhs_precision: u8,
+    rhs: impl Into<u128>,
+    rhs_precision: u8,
+) -> Ordering {
+    let lhs = lhs.into();
+    let rhs = rhs.into();
+
+    // The zero-valued ERROR_PRICE sentinel has precision 255, which is not a numeric scale
+    if (lhs == 0 && rhs == 0) || raw_scales_match(lhs_precision, rhs_precision) {
+        return lhs.cmp(&rhs);
+    }
+
+    let lhs_scale = raw_scale(lhs_precision);
+    let rhs_scale = raw_scale(rhs_precision);
+    let scale = lhs_scale.max(rhs_scale);
+
+    // Compare whole parts first so aligning fractional parts cannot overflow
+    (lhs / lhs_scale).cmp(&(rhs / rhs_scale)).then_with(|| {
+        let lhs_fraction = (lhs % lhs_scale) * (scale / lhs_scale);
+        let rhs_fraction = (rhs % rhs_scale) * (scale / rhs_scale);
+        lhs_fraction.cmp(&rhs_fraction)
+    })
+}
+
+/// Converts a raw value already rescaled to `10^precision` into a `Decimal`.
+///
+/// `Decimal` stores a 96-bit mantissa, so `Decimal::from_i128_with_scale` panics once the raw
+/// value exceeds `79_228_162_514_264_337_593_543_950_335`. Valid values reach that: under
+/// `high-precision` a precision-16 amount does so above roughly 7.92e12, and a `defi`
+/// precision-18 amount above roughly 7.92e10. Those values fall back to adding the whole and
+/// fractional parts, which keeps both operands small enough that `Decimal` drops scale rather
+/// than panicking. Every value the direct conversion accepts keeps its exact value and scale.
+#[must_use]
+pub(crate) fn scaled_raw_to_decimal(scaled_raw: i128, precision: u8) -> Decimal {
+    let scale = u32::from(precision);
+
+    Decimal::try_from_i128_with_scale(scaled_raw, scale).unwrap_or_else(|_| {
+        let divisor = 10_i128.pow(scale);
+
+        Decimal::from(scaled_raw / divisor)
+            + Decimal::from_i128_with_scale(scaled_raw % divisor, scale)
+    })
+}
+
+pub(crate) fn format_scaled_i128(raw: i128, precision: u8) -> String {
+    let sign = if raw < 0 { "-" } else { "" };
+    format!(
+        "{sign}{}",
+        format_scaled_u128(raw.unsigned_abs(), precision)
+    )
+}
+
+/// Parses a plain decimal string into its signed mantissa and fractional precision.
+pub(crate) fn parse_decimal_mantissa(value: &str) -> Result<(i128, u8), String> {
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map_or((false, value), |value| (true, value));
+    let unsigned = if negative {
+        unsigned
+    } else {
+        unsigned.strip_prefix('+').unwrap_or(unsigned)
+    };
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if fraction.contains('.') {
+        return Err(format!("Invalid decimal value '{value}'"));
+    }
+    let digits = format!("{whole}{fraction}");
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("Invalid decimal value '{value}'"));
+    }
+    let precision = u8::try_from(fraction.len())
+        .map_err(|_| format!("Decimal value '{value}' has too many fractional digits"))?;
+    let mut mantissa = 0_i128;
+    for digit in digits.bytes().map(|byte| i128::from(byte - b'0')) {
+        mantissa = if negative {
+            mantissa
+                .checked_mul(10)
+                .and_then(|value| value.checked_sub(digit))
+        } else {
+            mantissa
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(digit))
+        }
+        .ok_or_else(|| format!("Decimal value '{value}' exceeds i128 range"))?;
+    }
+    Ok((mantissa, precision))
+}
+
+pub(crate) fn format_scaled_u128(raw: u128, precision: u8) -> String {
+    if precision == 0 {
+        return raw.to_string();
+    }
+
+    let scale = 10_u128.pow(u32::from(precision));
+    format!(
+        "{}.{:0>width$}",
+        raw / scale,
+        raw % scale,
+        width = usize::from(precision),
+    )
+}
+
+/// Returns `lhs * rhs / FIXED_SCALAR`, truncated toward zero.
+///
+/// Returns `None` only when the scaled result exceeds [`QuantityRaw::MAX`].
+#[must_use]
+pub(crate) fn checked_mul_div_fixed(lhs: QuantityRaw, rhs: QuantityRaw) -> Option<QuantityRaw> {
+    checked_mul_div_raw(lhs, rhs, FIXED_SCALAR_RAW)
+}
+
+// Splitting both operands avoids intermediate overflow, the remainder product fits
+// QuantityRaw for every supported fixed-point scale (up to 10^18 with defi).
+#[must_use]
+pub(crate) fn checked_mul_div_raw(
+    lhs: QuantityRaw,
+    rhs: QuantityRaw,
+    scalar: QuantityRaw,
+) -> Option<QuantityRaw> {
+    let lhs_whole = lhs / scalar;
+    let lhs_remainder = lhs % scalar;
+    let rhs_whole = rhs / scalar;
+    let rhs_remainder = rhs % scalar;
+
+    lhs_whole
+        .checked_mul(rhs)
+        .and_then(|whole| {
+            lhs_remainder
+                .checked_mul(rhs_whole)
+                .and_then(|mixed| whole.checked_add(mixed))
+        })
+        .and_then(|whole_and_mixed| {
+            lhs_remainder
+                .checked_mul(rhs_remainder)
+                .map(|fractional| fractional / scalar)
+                .and_then(|fractional| whole_and_mixed.checked_add(fractional))
+        })
+}
+
+const _: () = {
+    assert!(FIXED_SCALAR_RAW > 0);
+    assert!((FIXED_SCALAR_RAW as f64).to_bits() == FIXED_SCALAR.to_bits());
+    let max_remainder = FIXED_SCALAR_RAW - 1;
+    assert!(max_remainder.checked_mul(max_remainder).is_some());
+};
 
 // -----------------------------------------------------------------------------
 // Raw value validation
@@ -238,22 +458,14 @@ pub fn raw_scales_match(a: u8, b: u8) -> bool {
 /// a debug assertion fires to surface potential misuse during development.
 #[inline(always)]
 fn should_skip_validation(precision: u8) -> bool {
-    if precision == FIXED_PRECISION {
-        return true;
-    }
+    #[cfg(not(feature = "defi"))]
+    debug_assert!(
+        precision <= FIXED_PRECISION,
+        "precision {precision} exceeds FIXED_PRECISION {FIXED_PRECISION}: \
+         raw value validation is not possible at this precision"
+    );
 
-    if precision > FIXED_PRECISION {
-        // Only assert when defi feature is disabled - with defi, 18dp is legitimate
-        #[cfg(not(feature = "defi"))]
-        debug_assert!(
-            false,
-            "precision {precision} exceeds FIXED_PRECISION {FIXED_PRECISION}: \
-             raw value validation is not possible at this precision"
-        );
-        return true;
-    }
-
-    false
+    precision >= FIXED_PRECISION
 }
 
 /// Builds the error for invalid fixed-point raw values (cold path).
@@ -404,7 +616,7 @@ pub fn check_fixed_raw_i64(raw: i64, precision: u8) -> anyhow::Result<()> {
     }
 
     let exp = usize::from(FIXED_PRECISION - precision);
-    let scale = POWERS_OF_10[exp] as i64;
+    let scale = POWERS_OF_10[exp].cast_signed();
     let remainder = raw % scale;
 
     if remainder != 0 {
@@ -427,6 +639,9 @@ pub fn check_fixed_raw_i64(raw: i64, precision: u8) -> anyhow::Result<()> {
 ///
 /// This corrects raw values that have spurious bits beyond the precision scale, which can occur
 /// from floating-point conversion errors during data creation.
+///
+/// Rounds half away from zero; when rounding away would overflow the integer range,
+/// rounds toward zero instead.
 #[must_use]
 pub fn correct_raw_u128(raw: u128, precision: u8) -> u128 {
     if precision >= FIXED_PRECISION {
@@ -439,7 +654,8 @@ pub fn correct_raw_u128(raw: u128, precision: u8) -> u128 {
     if remainder == 0 {
         raw
     } else if remainder >= half_scale {
-        raw + (scale - remainder)
+        raw.checked_add(scale - remainder)
+            .unwrap_or(raw - remainder)
     } else {
         raw - remainder
     }
@@ -449,6 +665,9 @@ pub fn correct_raw_u128(raw: u128, precision: u8) -> u128 {
 ///
 /// This corrects raw values that have spurious bits beyond the precision scale, which can occur
 /// from floating-point conversion errors during data creation.
+///
+/// Rounds half away from zero; when rounding away would overflow the integer range,
+/// rounds toward zero instead.
 #[must_use]
 pub fn correct_raw_u64(raw: u64, precision: u8) -> u64 {
     if precision >= FIXED_PRECISION {
@@ -461,7 +680,8 @@ pub fn correct_raw_u64(raw: u64, precision: u8) -> u64 {
     if remainder == 0 {
         raw
     } else if remainder >= half_scale {
-        raw + (scale - remainder)
+        raw.checked_add(scale - remainder)
+            .unwrap_or(raw - remainder)
     } else {
         raw - remainder
     }
@@ -471,6 +691,9 @@ pub fn correct_raw_u64(raw: u64, precision: u8) -> u64 {
 ///
 /// This corrects raw values that have spurious bits beyond the precision scale, which can occur
 /// from floating-point conversion errors during data creation.
+///
+/// Rounds half away from zero; when rounding away would overflow the integer range,
+/// rounds toward zero instead.
 #[must_use]
 pub fn correct_raw_i128(raw: i128, precision: u8) -> i128 {
     if precision >= FIXED_PRECISION {
@@ -484,14 +707,16 @@ pub fn correct_raw_i128(raw: i128, precision: u8) -> i128 {
         raw
     } else if raw >= 0 {
         if remainder >= half_scale {
-            raw + (scale - remainder)
+            raw.checked_add(scale - remainder)
+                .unwrap_or(raw - remainder)
         } else {
             raw - remainder
         }
     } else {
         // For negative values, remainder is negative
         if remainder.abs() >= half_scale {
-            raw - (scale + remainder)
+            raw.checked_sub(scale + remainder)
+                .unwrap_or(raw - remainder)
         } else {
             raw - remainder
         }
@@ -502,27 +727,32 @@ pub fn correct_raw_i128(raw: i128, precision: u8) -> i128 {
 ///
 /// This corrects raw values that have spurious bits beyond the precision scale, which can occur
 /// from floating-point conversion errors during data creation.
+///
+/// Rounds half away from zero; when rounding away would overflow the integer range,
+/// rounds toward zero instead.
 #[must_use]
 pub fn correct_raw_i64(raw: i64, precision: u8) -> i64 {
     if precision >= FIXED_PRECISION {
         return raw;
     }
     let exp = usize::from(FIXED_PRECISION - precision);
-    let scale = POWERS_OF_10[exp] as i64;
+    let scale = POWERS_OF_10[exp].cast_signed();
     let half_scale = scale / 2;
     let remainder = raw % scale;
     if remainder == 0 {
         raw
     } else if raw >= 0 {
         if remainder >= half_scale {
-            raw + (scale - remainder)
+            raw.checked_add(scale - remainder)
+                .unwrap_or(raw - remainder)
         } else {
             raw - remainder
         }
     } else {
         // For negative values, remainder is negative
         if remainder.abs() >= half_scale {
-            raw - (scale + remainder)
+            raw.checked_sub(scale + remainder)
+                .unwrap_or(raw - remainder)
         } else {
             raw - remainder
         }
@@ -619,7 +849,7 @@ pub fn mantissa_exponent_to_fixed_i128(
     let frac_digits = -i16::from(exponent);
 
     let mantissa = if frac_digits > precision_i16 {
-        let excess = (frac_digits - precision_i16) as u32;
+        let excess = u32::from((frac_digits - precision_i16).cast_unsigned());
         bankers_round(mantissa, excess)
     } else {
         mantissa
@@ -636,9 +866,9 @@ pub fn mantissa_exponent_to_fixed_i128(
     }
 
     if scale_exp >= 0 {
-        mantissa.checked_mul(10i128.pow(scale_exp as u32))
+        mantissa.checked_mul(10i128.pow(u32::from(scale_exp.cast_unsigned())))
     } else {
-        Some(mantissa / 10i128.pow((-scale_exp) as u32))
+        Some(mantissa / 10i128.pow(u32::from((-scale_exp).cast_unsigned())))
     }
     .ok_or_else(|| CorrectnessError::PredicateViolation {
         message: "Overflow when scaling mantissa to fixed precision".to_string(),
@@ -688,80 +918,142 @@ where
 /// at the user-specified precision level to ensure values are correctly represented
 /// without accumulating floating-point errors during scaling.
 ///
+/// Callers are expected to validate that `value` is finite and within range; non-finite
+/// values saturate at the integer bounds during the float-to-integer cast.
+///
 /// # Panics
 ///
-/// Panics if `precision` exceeds [`FIXED_PRECISION`].
+/// Panics if `precision` exceeds [`FIXED_PRECISION`], or if scaling the rounded value
+/// overflows the raw integer range.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "f64 to fixed-point conversion is inherently lossy; callers validate range and finiteness"
+)]
 pub fn f64_to_fixed_i64(value: f64, precision: u8) -> i64 {
     check_fixed_precision(precision).expect_display(FAILED);
     let pow1 = 10_i64.pow(u32::from(precision));
     let pow2 = 10_i64.pow(u32::from(FIXED_PRECISION - precision));
     let rounded = (value * pow1 as f64).round() as i64;
-    rounded * pow2
+    rounded
+        .checked_mul(pow2)
+        .expect("Overflow when scaling f64 to fixed-point i64")
 }
 
 /// Converts an `f64` value to a raw fixed-point `i128` representation with a specified precision.
 ///
+/// Callers are expected to validate that `value` is finite and within range; non-finite
+/// values saturate at the integer bounds during the float-to-integer cast.
+///
 /// # Panics
 ///
-/// Panics if `precision` exceeds [`FIXED_PRECISION`].
+/// Panics if `precision` exceeds [`FIXED_PRECISION`], or if scaling the rounded value
+/// overflows the raw integer range.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "f64 to fixed-point conversion is inherently lossy; callers validate range and finiteness"
+)]
 pub fn f64_to_fixed_i128(value: f64, precision: u8) -> i128 {
     check_fixed_precision(precision).expect_display(FAILED);
     let pow1 = 10_i128.pow(u32::from(precision));
     let pow2 = 10_i128.pow(u32::from(FIXED_PRECISION - precision));
     let rounded = (value * pow1 as f64).round() as i128;
-    rounded * pow2
+    rounded
+        .checked_mul(pow2)
+        .expect("Overflow when scaling f64 to fixed-point i128")
 }
 
 /// Converts an `f64` value to a raw fixed-point `u64` representation with a specified precision.
 ///
+/// Callers are expected to validate that `value` is finite and non-negative; non-finite
+/// and negative values saturate at the integer bounds during the float-to-integer cast.
+///
 /// # Panics
 ///
-/// Panics if `precision` exceeds [`FIXED_PRECISION`].
+/// Panics if `precision` exceeds [`FIXED_PRECISION`], or if scaling the rounded value
+/// overflows the raw integer range.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "f64 to fixed-point conversion is inherently lossy; callers validate range and finiteness"
+)]
 pub fn f64_to_fixed_u64(value: f64, precision: u8) -> u64 {
     check_fixed_precision(precision).expect_display(FAILED);
     let pow1 = 10_u64.pow(u32::from(precision));
     let pow2 = 10_u64.pow(u32::from(FIXED_PRECISION - precision));
     let rounded = (value * pow1 as f64).round() as u64;
-    rounded * pow2
+    rounded
+        .checked_mul(pow2)
+        .expect("Overflow when scaling f64 to fixed-point u64")
 }
 
 /// Converts an `f64` value to a raw fixed-point `u128` representation with a specified precision.
 ///
+/// Callers are expected to validate that `value` is finite and non-negative; non-finite
+/// and negative values saturate at the integer bounds during the float-to-integer cast.
+///
 /// # Panics
 ///
-/// Panics if `precision` exceeds [`FIXED_PRECISION`].
+/// Panics if `precision` exceeds [`FIXED_PRECISION`], or if scaling the rounded value
+/// overflows the raw integer range.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "f64 to fixed-point conversion is inherently lossy; callers validate range and finiteness"
+)]
 pub fn f64_to_fixed_u128(value: f64, precision: u8) -> u128 {
     check_fixed_precision(precision).expect_display(FAILED);
     let pow1 = 10_u128.pow(u32::from(precision));
     let pow2 = 10_u128.pow(u32::from(FIXED_PRECISION - precision));
     let rounded = (value * pow1 as f64).round() as u128;
-    rounded * pow2
+    rounded
+        .checked_mul(pow2)
+        .expect("Overflow when scaling f64 to fixed-point u128")
 }
 
 /// Converts a raw fixed-point `i64` value back to an `f64` value.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "i64 to f64 is inherently lossy above 2^53; accepted for float interop"
+)]
 pub fn fixed_i64_to_f64(value: i64) -> f64 {
     (value as f64) / FIXED_SCALAR
 }
 
 /// Converts a raw fixed-point `i128` value back to an `f64` value.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "i128 to f64 is inherently lossy above 2^53; accepted for float interop"
+)]
 pub fn fixed_i128_to_f64(value: i128) -> f64 {
     (value as f64) / FIXED_SCALAR
 }
 
 /// Converts a raw fixed-point `u64` value back to an `f64` value.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "u64 to f64 is inherently lossy above 2^53; accepted for float interop"
+)]
 pub fn fixed_u64_to_f64(value: u64) -> f64 {
     (value as f64) / FIXED_SCALAR
 }
 
 /// Converts a raw fixed-point `u128` value back to an `f64` value.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "u128 to f64 is inherently lossy above 2^53; accepted for float interop"
+)]
 pub fn fixed_u128_to_f64(value: u128) -> f64 {
     (value as f64) / FIXED_SCALAR
 }
@@ -774,7 +1066,257 @@ mod tests {
 
     use super::*;
 
-    #[cfg(not(feature = "high-precision"))]
+    #[rstest]
+    fn test_correct_raw_rounds_half_away_from_zero() {
+        let precision = FIXED_PRECISION - 1;
+
+        assert_eq!(correct_raw_u128(20, precision), 20);
+        assert_eq!(correct_raw_u128(14, precision), 10);
+        assert_eq!(correct_raw_u128(15, precision), 20);
+        assert_eq!(correct_raw_u64(14, precision), 10);
+        assert_eq!(correct_raw_u64(15, precision), 20);
+        assert_eq!(correct_raw_i128(15, precision), 20);
+        assert_eq!(correct_raw_i128(-14, precision), -10);
+        assert_eq!(correct_raw_i128(-15, precision), -20);
+        assert_eq!(correct_raw_i64(15, precision), 20);
+        assert_eq!(correct_raw_i64(-14, precision), -10);
+        assert_eq!(correct_raw_i64(-15, precision), -20);
+    }
+
+    #[rstest]
+    fn test_f64_fixed_u128_round_trip() {
+        let raw = f64_to_fixed_u128(1.5, 1);
+
+        assert_eq!(raw, 15 * 10_u128.pow(u32::from(FIXED_PRECISION - 1)));
+        assert_eq!(fixed_u128_to_f64(raw), 1.5);
+    }
+
+    #[rstest]
+    fn test_mantissa_exponent_to_fixed_i128_allows_max_scale_factor() {
+        let exponent = i8::try_from(38 - FIXED_PRECISION).unwrap();
+
+        assert_eq!(
+            mantissa_exponent_to_fixed_i128(1, exponent, 0).unwrap(),
+            10_i128.pow(38)
+        );
+        assert_eq!(
+            mantissa_exponent_to_fixed_i128(1, exponent + 1, 0)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Exponent {} produces scale factor 10^39 which exceeds i128 range",
+                exponent + 1
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_raw_scales_match_requires_equal_effective_scale() {
+        assert!(raw_scales_match(0, FIXED_PRECISION));
+        assert!(raw_scales_match(FIXED_PRECISION + 1, FIXED_PRECISION + 1));
+        assert!(!raw_scales_match(FIXED_PRECISION, FIXED_PRECISION + 1));
+    }
+
+    #[rstest]
+    fn test_canonical_raw_trims_native_scale_trailing_zeros() {
+        assert_eq!(
+            canonical_raw(0_u128, FIXED_PRECISION + 2),
+            (0, FIXED_PRECISION)
+        );
+        assert_eq!(
+            canonical_raw(1_200_u128, FIXED_PRECISION + 2),
+            (12, FIXED_PRECISION)
+        );
+        assert_eq!(
+            canonical_raw(12_000_u128, FIXED_PRECISION + 2),
+            (120, FIXED_PRECISION)
+        );
+        assert_eq!(
+            canonical_raw(1_205_u128, FIXED_PRECISION + 2),
+            (1_205, FIXED_PRECISION + 2)
+        );
+        assert_eq!(
+            canonical_raw(5_u128, FIXED_PRECISION - 1),
+            (5, FIXED_PRECISION)
+        );
+    }
+
+    #[rstest]
+    fn test_compare_raw_zero_operands_are_equal_across_scales() {
+        assert_eq!(compare_raw(0_u128, u8::MAX, 0_u128, 2), Ordering::Equal);
+    }
+
+    #[rstest]
+    #[case("1.00", 100, 2)]
+    #[case("+1.00", 100, 2)]
+    #[case("-1.00", -100, 2)]
+    #[case("-0.00", 0, 2)]
+    fn test_parse_decimal_mantissa_sign(
+        #[case] input: &str,
+        #[case] mantissa: i128,
+        #[case] precision: u8,
+    ) {
+        assert_eq!(parse_decimal_mantissa(input), Ok((mantissa, precision)));
+    }
+
+    #[rstest]
+    #[case("-+1.00")]
+    #[case("+-1.00")]
+    #[case("--1.00")]
+    #[case("++1.00")]
+    #[case("-+0.00")]
+    fn test_parse_decimal_mantissa_rejects_multiple_signs(#[case] input: &str) {
+        assert_eq!(
+            parse_decimal_mantissa(input),
+            Err(format!("Invalid decimal value '{input}'")),
+        );
+        assert!(input.parse::<crate::types::Price>().is_err());
+        assert!(input.parse::<crate::types::Quantity>().is_err());
+        assert!(
+            format!("{input} USD")
+                .parse::<crate::types::Money>()
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    #[case(i128::MIN)]
+    #[case(i128::MAX)]
+    fn test_parse_decimal_mantissa_integer_limits(#[case] value: i128) {
+        assert_eq!(parse_decimal_mantissa(&value.to_string()), Ok((value, 0)));
+    }
+
+    #[rstest]
+    #[case("170141183460469231731687303715884105728")]
+    #[case("-170141183460469231731687303715884105729")]
+    fn test_parse_decimal_mantissa_overflow(#[case] input: &str) {
+        assert_eq!(
+            parse_decimal_mantissa(input),
+            Err(format!("Decimal value '{input}' exceeds i128 range")),
+        );
+    }
+
+    #[rstest]
+    #[case(".5", 5, 1)]
+    #[case("-.5", -5, 1)]
+    #[case("1.", 1, 0)]
+    #[case("0001.0200", 10200, 4)]
+    fn test_parse_decimal_mantissa_syntax(
+        #[case] input: &str,
+        #[case] mantissa: i128,
+        #[case] precision: u8,
+    ) {
+        assert_eq!(parse_decimal_mantissa(input), Ok((mantissa, precision)));
+    }
+
+    #[rstest]
+    #[case("")]
+    #[case(".")]
+    #[case("+")]
+    #[case("-")]
+    #[case("1.2.3")]
+    #[case(" 1")]
+    #[case("1 ")]
+    #[case("1 2")]
+    #[case("１")]
+    fn test_parse_decimal_mantissa_invalid_syntax(#[case] input: &str) {
+        assert_eq!(
+            parse_decimal_mantissa(input),
+            Err(format!("Invalid decimal value '{input}'")),
+        );
+    }
+
+    #[rstest]
+    fn test_parse_decimal_mantissa_fraction_length_limit() {
+        let accepted = format!("0.{}", "0".repeat(255));
+        let rejected = format!("{accepted}0");
+
+        assert_eq!(parse_decimal_mantissa(&accepted), Ok((0, 255)));
+        assert_eq!(
+            parse_decimal_mantissa(&rejected),
+            Err(format!(
+                "Decimal value '{rejected}' has too many fractional digits"
+            )),
+        );
+    }
+
+    #[rstest]
+    fn test_decimal_string_domain_precision_limit() {
+        use crate::types::{Price, Quantity};
+
+        #[cfg(feature = "defi")]
+        let precision = crate::defi::WEI_PRECISION;
+        #[cfg(not(feature = "defi"))]
+        let precision = FIXED_PRECISION;
+        let accepted = format!("0.{}1", "0".repeat(usize::from(precision - 1)));
+        let rejected = format!("{accepted}0");
+        let price = accepted.parse::<Price>().unwrap();
+        let quantity = accepted.parse::<Quantity>().unwrap();
+
+        assert_eq!(price.raw, 1);
+        assert_eq!(price.precision, precision);
+        assert_eq!(quantity.raw, 1);
+        assert_eq!(quantity.precision, precision);
+        assert!(rejected.parse::<Price>().is_err());
+        assert!(rejected.parse::<Quantity>().is_err());
+    }
+
+    #[rstest]
+    #[case(0, 0, "0")]
+    #[case(125, 2, "1.25")]
+    #[case(-1234, 2, "-12.34")]
+    #[case(1, 16, "0.0000000000000001")]
+    #[case(-1, 16, "-0.0000000000000001")]
+    #[case(1_000_000_000_000_000_000, 18, "1.000000000000000000")]
+    fn test_scaled_raw_to_decimal_matches_plain_conversion(
+        #[case] raw: i128,
+        #[case] precision: u8,
+        #[case] expected: &str,
+    ) {
+        let plain = Decimal::from_i128_with_scale(raw, u32::from(precision));
+        let result = scaled_raw_to_decimal(raw, precision);
+
+        assert_eq!(result, plain);
+        assert_eq!(result.scale(), plain.scale());
+        assert_eq!(result.to_string(), expected);
+    }
+
+    #[rstest]
+    #[case(80_000_000_000_000_000_000_000_000_000, 16, "8000000000000")]
+    #[case(340_282_366_920_930_000_000_000_000_000, 16, "34028236692093")]
+    #[case(170_141_183_460_460_000_000_000_000_000, 16, "17014118346046")]
+    #[case(-170_141_183_460_460_000_000_000_000_000, 16, "-17014118346046")]
+    // Non-zero remainders exercise the fractional addition, including sign composition across
+    // the truncating division, and a precision beyond `FIXED_PRECISION`.
+    #[case(
+        80_000_000_000_000_005_000_000_000_000,
+        16,
+        "8000000000000.000500000000000"
+    )]
+    #[case(-80_000_000_000_000_005_000_000_000_000, 16, "-8000000000000.000500000000000")]
+    #[case(
+        80_000_000_000_000_000_000_000_000_001,
+        16,
+        "8000000000000.000000000000000"
+    )]
+    #[case(
+        80_000_000_000_000_000_250_000_000_000,
+        18,
+        "80000000000.00000025000000000"
+    )]
+    #[case(-80_000_000_000_000_000_250_000_000_000, 18, "-80000000000.00000025000000000")]
+    fn test_scaled_raw_to_decimal_beyond_mantissa_rounds_rather_than_panics(
+        #[case] raw: i128,
+        #[case] precision: u8,
+        #[case] expected: &str,
+    ) {
+        // `Decimal::from_i128_with_scale` panics on each of these raw values. Splitting the whole
+        // and fractional parts lets `Decimal` drop scale instead, which is the only representable
+        // outcome once the value needs more than a 96-bit mantissa.
+        assert_eq!(scaled_raw_to_decimal(raw, precision).to_string(), expected);
+    }
+
+    #[cfg(not(feature = "defi"))]
     #[rstest]
     fn test_precision_boundaries() {
         assert!(check_fixed_precision(0).is_ok());
@@ -875,6 +1417,33 @@ mod tests {
         let precision = WEI_PRECISION + 1;
         let result = check_fixed_precision(precision);
         assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_check_float_precision_matches_supported_range() {
+        for precision in 0..=u8::MAX {
+            let expected = if precision <= MAX_FLOAT_PRECISION {
+                Ok(())
+            } else {
+                Err(CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "Fixed-point precision {precision} exceeds maximum float precision 16"
+                    ),
+                })
+            };
+
+            assert_eq!(check_float_precision(precision), expected);
+        }
+    }
+
+    #[rstest]
+    fn test_check_float_precision_error_display() {
+        let error = check_float_precision(18).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Fixed-point precision 18 exceeds maximum float precision 16"
+        );
     }
 
     #[cfg(not(feature = "defi"))]
@@ -1171,6 +1740,18 @@ mod tests {
         assert!(check_fixed_raw_i128(i128::MAX, FIXED_PRECISION).is_ok());
         assert!(check_fixed_raw_i128(i128::MIN, FIXED_PRECISION).is_ok());
     }
+
+    #[rstest]
+    #[should_panic(expected = "Overflow when scaling f64 to fixed-point i128")]
+    fn test_f64_to_fixed_i128_overflow_panics() {
+        let _ = f64_to_fixed_i128(1e30, 0);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "Overflow when scaling f64 to fixed-point u128")]
+    fn test_f64_to_fixed_u128_overflow_panics() {
+        let _ = f64_to_fixed_u128(1e30, 0);
+    }
 }
 
 #[cfg(not(feature = "high-precision"))]
@@ -1180,6 +1761,86 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    fn test_correct_raw_rounds_half_away_from_zero() {
+        let precision = FIXED_PRECISION - 1;
+
+        assert_eq!(correct_raw_u128(20, precision), 20);
+        assert_eq!(correct_raw_u128(14, precision), 10);
+        assert_eq!(correct_raw_u128(15, precision), 20);
+        assert_eq!(correct_raw_u64(14, precision), 10);
+        assert_eq!(correct_raw_u64(15, precision), 20);
+        assert_eq!(correct_raw_i128(15, precision), 20);
+        assert_eq!(correct_raw_i128(-14, precision), -10);
+        assert_eq!(correct_raw_i128(-15, precision), -20);
+        assert_eq!(correct_raw_i64(15, precision), 20);
+        assert_eq!(correct_raw_i64(-14, precision), -10);
+        assert_eq!(correct_raw_i64(-15, precision), -20);
+    }
+
+    #[rstest]
+    fn test_f64_fixed_u128_round_trip() {
+        let raw = f64_to_fixed_u128(1.5, 1);
+
+        assert_eq!(raw, 15 * 10_u128.pow(u32::from(FIXED_PRECISION - 1)));
+        assert_eq!(fixed_u128_to_f64(raw), 1.5);
+    }
+
+    #[rstest]
+    fn test_mantissa_exponent_to_fixed_i128_allows_max_scale_factor() {
+        let exponent = i8::try_from(38 - FIXED_PRECISION).unwrap();
+
+        assert_eq!(
+            mantissa_exponent_to_fixed_i128(1, exponent, 0).unwrap(),
+            10_i128.pow(38)
+        );
+        assert_eq!(
+            mantissa_exponent_to_fixed_i128(1, exponent + 1, 0)
+                .unwrap_err()
+                .to_string(),
+            format!(
+                "Exponent {} produces scale factor 10^39 which exceeds i128 range",
+                exponent + 1
+            )
+        );
+    }
+
+    #[rstest]
+    fn test_raw_scales_match_requires_equal_effective_scale() {
+        assert!(raw_scales_match(0, FIXED_PRECISION));
+        assert!(raw_scales_match(FIXED_PRECISION + 1, FIXED_PRECISION + 1));
+        assert!(!raw_scales_match(FIXED_PRECISION, FIXED_PRECISION + 1));
+    }
+
+    #[rstest]
+    fn test_canonical_raw_trims_native_scale_trailing_zeros() {
+        assert_eq!(
+            canonical_raw(0_u128, FIXED_PRECISION + 2),
+            (0, FIXED_PRECISION)
+        );
+        assert_eq!(
+            canonical_raw(1_200_u128, FIXED_PRECISION + 2),
+            (12, FIXED_PRECISION)
+        );
+        assert_eq!(
+            canonical_raw(12_000_u128, FIXED_PRECISION + 2),
+            (120, FIXED_PRECISION)
+        );
+        assert_eq!(
+            canonical_raw(1_205_u128, FIXED_PRECISION + 2),
+            (1_205, FIXED_PRECISION + 2)
+        );
+        assert_eq!(
+            canonical_raw(5_u128, FIXED_PRECISION - 1),
+            (5, FIXED_PRECISION)
+        );
+    }
+
+    #[rstest]
+    fn test_compare_raw_zero_operands_are_equal_across_scales() {
+        assert_eq!(compare_raw(0_u128, u8::MAX, 0_u128, 2), Ordering::Equal);
+    }
 
     #[rstest]
     fn test_precision_boundaries() {
@@ -1201,8 +1862,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case(1000000.0)]
-    #[case(-1000000.0)]
+    #[case(1_000_000.0)]
+    #[case(-1_000_000.0)]
     fn test_large_value_roundtrip(#[case] value: f64) {
         for precision in 0..=FIXED_PRECISION {
             let fixed = f64_to_fixed_i64(value, precision);
@@ -1212,12 +1873,12 @@ mod tests {
     }
 
     #[rstest]
-    #[case(0, 123456.0, 123_456_000_000_000)]
-    #[case(0, 123456.7, 123_457_000_000_000)]
-    #[case(1, 123456.7, 123_456_700_000_000)]
-    #[case(2, 123456.78, 123_456_780_000_000)]
-    #[case(8, 123456.123_456_78, 123_456_123_456_780)]
-    #[case(9, 123456.123_456_789, 123_456_123_456_789)]
+    #[case(0, 123_456.0, 123_456_000_000_000)]
+    #[case(0, 123_456.7, 123_457_000_000_000)]
+    #[case(1, 123_456.7, 123_456_700_000_000)]
+    #[case(2, 123_456.78, 123_456_780_000_000)]
+    #[case(8, 123_456.123_456_78, 123_456_123_456_780)]
+    #[case(9, 123_456.123_456_789, 123_456_123_456_789)]
     fn test_precision_specific_values(
         #[case] precision: u8,
         #[case] value: f64,
@@ -1229,7 +1890,7 @@ mod tests {
     #[rstest]
     #[case(0.0)]
     #[case(1.0)]
-    #[case(1000000.0)]
+    #[case(1_000_000.0)]
     fn test_unsigned_basic_roundtrip(#[case] value: f64) {
         for precision in 0..=FIXED_PRECISION {
             let fixed = f64_to_fixed_u64(value, precision);
@@ -1317,14 +1978,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case(0, 123456.0, 123_456_000_000_000)]
-    #[case(0, 123456.7, 123_457_000_000_000)]
+    #[case(0, 123_456.0, 123_456_000_000_000)]
+    #[case(0, 123_456.7, 123_457_000_000_000)]
     #[case(0, 123_456.4, 123_456_000_000_000)]
-    #[case(1, 123456.0, 123_456_000_000_000)]
-    #[case(1, 123456.7, 123_456_700_000_000)]
+    #[case(1, 123_456.0, 123_456_000_000_000)]
+    #[case(1, 123_456.7, 123_456_700_000_000)]
     #[case(1, 123_456.4, 123_456_400_000_000)]
-    #[case(2, 123456.0, 123_456_000_000_000)]
-    #[case(2, 123456.7, 123_456_700_000_000)]
+    #[case(2, 123_456.0, 123_456_000_000_000)]
+    #[case(2, 123_456.7, 123_456_700_000_000)]
     #[case(2, 123_456.4, 123_456_400_000_000)]
     fn test_f64_to_fixed_i64_with_precision(
         #[case] precision: u8,
@@ -1466,6 +2127,18 @@ mod tests {
         assert!(check_fixed_raw_i64(-1, FIXED_PRECISION).is_ok());
         assert!(check_fixed_raw_i64(i64::MAX, FIXED_PRECISION).is_ok());
         assert!(check_fixed_raw_i64(i64::MIN, FIXED_PRECISION).is_ok());
+    }
+
+    #[rstest]
+    #[should_panic(expected = "Overflow when scaling f64 to fixed-point i64")]
+    fn test_f64_to_fixed_i64_overflow_panics() {
+        let _ = f64_to_fixed_i64(2e18, 0);
+    }
+
+    #[rstest]
+    #[should_panic(expected = "Overflow when scaling f64 to fixed-point u64")]
+    fn test_f64_to_fixed_u64_overflow_panics() {
+        let _ = f64_to_fixed_u64(2e19, 0);
     }
 }
 
@@ -1633,5 +2306,295 @@ mod bankers_round_tests {
                 "bankers_round disagrees with Decimal for {input} at precision {target_precision}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod correct_raw_tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    // All cases use precision = FIXED_PRECISION - 1 so the scale is 10 in both
+    // standard-precision and high-precision modes.
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(10, 10)] // Already a multiple
+    #[case(14, 10)] // Rounds down
+    #[case(15, 20)] // Half rounds up
+    #[case(16, 20)] // Rounds up
+    #[case(u64::MAX, u64::MAX - 5)] // Rounding up would overflow; rounds down instead
+    fn test_correct_raw_u64(#[case] raw: u64, #[case] expected: u64) {
+        assert_eq!(correct_raw_u64(raw, FIXED_PRECISION - 1), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(14, 10)]
+    #[case(15, 20)]
+    #[case(-14, -10)] // Rounds toward zero
+    #[case(-15, -20)] // Half rounds away from zero
+    #[case(-16, -20)] // Rounds away from zero
+    #[case(i64::MAX, i64::MAX - 7)] // Rounding up would overflow; rounds down instead
+    #[case(i64::MIN, i64::MIN + 8)] // Rounding down would overflow; rounds toward zero instead
+    fn test_correct_raw_i64(#[case] raw: i64, #[case] expected: i64) {
+        assert_eq!(correct_raw_i64(raw, FIXED_PRECISION - 1), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(14, 10)]
+    #[case(15, 20)]
+    #[case(u128::MAX, u128::MAX - 5)] // Rounding up would overflow; rounds down instead
+    fn test_correct_raw_u128(#[case] raw: u128, #[case] expected: u128) {
+        assert_eq!(correct_raw_u128(raw, FIXED_PRECISION - 1), expected);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(14, 10)]
+    #[case(15, 20)]
+    #[case(-15, -20)]
+    #[case(i128::MAX, i128::MAX - 7)] // Rounding up would overflow; rounds down instead
+    #[case(i128::MIN, i128::MIN + 8)] // Rounding down would overflow; rounds toward zero instead
+    fn test_correct_raw_i128(#[case] raw: i128, #[case] expected: i128) {
+        assert_eq!(correct_raw_i128(raw, FIXED_PRECISION - 1), expected);
+    }
+
+    #[rstest]
+    fn test_correct_raw_identity_at_max_precision() {
+        assert_eq!(correct_raw_u64(12_345, FIXED_PRECISION), 12_345);
+        assert_eq!(correct_raw_i64(-12_345, FIXED_PRECISION), -12_345);
+        assert_eq!(correct_raw_u128(12_345, FIXED_PRECISION), 12_345);
+        assert_eq!(correct_raw_i128(-12_345, FIXED_PRECISION), -12_345);
+    }
+}
+
+#[cfg(test)]
+mod checked_mul_div_tests {
+    #[cfg(feature = "defi")]
+    use alloy_primitives::U256;
+    use proptest::{prelude::*, test_runner::Config as ProptestConfig};
+    use rstest::rstest;
+
+    use super::{FIXED_SCALAR_RAW, checked_mul_div_fixed};
+    use crate::types::quantity::QuantityRaw;
+
+    #[rstest]
+    fn test_checked_mul_div_fixed_exact_boundaries() {
+        let scalar = FIXED_SCALAR_RAW;
+
+        assert_eq!(checked_mul_div_fixed(0, QuantityRaw::MAX), Some(0));
+        assert_eq!(checked_mul_div_fixed(QuantityRaw::MAX, 0), Some(0));
+        assert_eq!(checked_mul_div_fixed(scalar, scalar), Some(scalar));
+        assert_eq!(
+            checked_mul_div_fixed(scalar - 1, scalar - 1),
+            Some(scalar - 2)
+        );
+        assert_eq!(
+            checked_mul_div_fixed(scalar + 1, scalar + 1),
+            Some(scalar + 2)
+        );
+        assert_eq!(
+            checked_mul_div_fixed(QuantityRaw::MAX, scalar),
+            Some(QuantityRaw::MAX)
+        );
+        assert_eq!(
+            checked_mul_div_fixed(scalar, QuantityRaw::MAX),
+            Some(QuantityRaw::MAX)
+        );
+        assert_eq!(checked_mul_div_fixed(QuantityRaw::MAX, scalar + 1), None);
+        assert_eq!(checked_mul_div_fixed(scalar + 1, QuantityRaw::MAX), None);
+    }
+
+    #[cfg(not(feature = "high-precision"))]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_matches_u128_full_range(
+            lhs in any::<QuantityRaw>(),
+            rhs in any::<QuantityRaw>(),
+        ) {
+            let expected = u128::from(lhs)
+                .checked_mul(u128::from(rhs))
+                .map(|product| product / u128::from(FIXED_SCALAR_RAW))
+                .and_then(|result| QuantityRaw::try_from(result).ok());
+
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), expected);
+        }
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_matches_u128_final_fit(
+            (lhs, rhs) in standard_final_fit_strategy(),
+        ) {
+            let expected =
+                u128::from(lhs) * u128::from(rhs) / u128::from(FIXED_SCALAR_RAW);
+            let expected = QuantityRaw::try_from(expected).expect("strategy result fits u64");
+
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), Some(expected));
+        }
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_avoids_u64_phantom_overflow(
+            (lhs, rhs, expected) in standard_phantom_overflow_strategy(),
+        ) {
+            prop_assert!(lhs.checked_mul(rhs).is_none());
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), Some(expected));
+        }
+    }
+
+    #[cfg(feature = "high-precision")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_matches_u128_ordinary(
+            (lhs, rhs) in high_precision_ordinary_strategy(),
+        ) {
+            let expected = lhs
+                .checked_mul(rhs)
+                .expect("ordinary strategy product fits u128")
+                / FIXED_SCALAR_RAW;
+
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), Some(expected));
+        }
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_avoids_u128_phantom_overflow(
+            (lhs, rhs, expected) in high_precision_phantom_overflow_strategy(),
+        ) {
+            prop_assert!(lhs.checked_mul(rhs).is_none());
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), Some(expected));
+        }
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_handles_remainders_after_u128_overflow(
+            rhs in high_precision_remainder_overflow_strategy(),
+        ) {
+            let lhs = 2 * FIXED_SCALAR_RAW - 1;
+            let expected = 2 * rhs - rhs.div_ceil(FIXED_SCALAR_RAW);
+
+            prop_assert!(lhs.checked_mul(rhs).is_none());
+            prop_assert_ne!(lhs % FIXED_SCALAR_RAW, 0);
+            prop_assert_ne!(rhs % FIXED_SCALAR_RAW, 0);
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), Some(expected));
+            prop_assert_eq!(checked_mul_div_fixed(rhs, lhs), Some(expected));
+        }
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_is_commutative(
+            lhs in any::<QuantityRaw>(),
+            rhs in any::<QuantityRaw>(),
+        ) {
+            prop_assert_eq!(
+                checked_mul_div_fixed(lhs, rhs),
+                checked_mul_div_fixed(rhs, lhs)
+            );
+        }
+    }
+
+    #[cfg(feature = "defi")]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4_096))]
+
+        #[rstest]
+        fn prop_checked_mul_div_raw_matches_u256_full_range(
+            lhs in any::<QuantityRaw>(),
+            rhs in any::<QuantityRaw>(),
+            precision in 16_u32..=18,
+        ) {
+            let scalar = 10_u128.pow(precision);
+            let expected = U256::from(lhs) * U256::from(rhs) / U256::from(scalar);
+            let expected = QuantityRaw::try_from(expected).ok();
+            prop_assert_eq!(super::checked_mul_div_raw(lhs, rhs, scalar), expected);
+        }
+
+        #[rstest]
+        fn prop_checked_mul_div_fixed_matches_u256_full_range(
+            lhs in any::<QuantityRaw>(),
+            rhs in any::<QuantityRaw>(),
+        ) {
+            let expected = U256::from(lhs)
+                .checked_mul(U256::from(rhs))
+                .expect("u128 product fits U256")
+                / U256::from(FIXED_SCALAR_RAW);
+            let expected = QuantityRaw::try_from(expected).ok();
+
+            prop_assert_eq!(checked_mul_div_fixed(lhs, rhs), expected);
+        }
+    }
+
+    #[cfg(not(feature = "high-precision"))]
+    fn standard_final_fit_strategy() -> impl Strategy<Value = (QuantityRaw, QuantityRaw)> {
+        let scalar = FIXED_SCALAR_RAW;
+
+        (0_u64..=1_000, 0_u64..=1_000, 0_u64..scalar, 0_u64..scalar).prop_map(
+            move |(lhs_whole, rhs_whole, lhs_remainder, rhs_remainder)| {
+                (
+                    lhs_whole * scalar + lhs_remainder,
+                    rhs_whole * scalar + rhs_remainder,
+                )
+            },
+        )
+    }
+
+    #[cfg(not(feature = "high-precision"))]
+    fn standard_phantom_overflow_strategy()
+    -> impl Strategy<Value = (QuantityRaw, QuantityRaw, QuantityRaw)> {
+        let scalar = FIXED_SCALAR_RAW;
+
+        (8_000_000_000_u64..=9_000_000_000, 0_u64..scalar).prop_map(
+            move |(lhs_whole, rhs_remainder)| {
+                let lhs = lhs_whole * scalar;
+                let rhs = scalar + rhs_remainder;
+                (lhs, rhs, lhs_whole * rhs)
+            },
+        )
+    }
+
+    #[cfg(feature = "high-precision")]
+    fn high_precision_ordinary_strategy() -> impl Strategy<Value = (QuantityRaw, QuantityRaw)> {
+        let scalar = FIXED_SCALAR_RAW;
+
+        (
+            0_u128..=1_000,
+            0_u128..=1_000,
+            0_u128..scalar,
+            0_u128..scalar,
+        )
+            .prop_map(
+                move |(lhs_whole, rhs_whole, lhs_remainder, rhs_remainder)| {
+                    (
+                        lhs_whole * scalar + lhs_remainder,
+                        rhs_whole * scalar + rhs_remainder,
+                    )
+                },
+            )
+    }
+
+    #[cfg(feature = "high-precision")]
+    fn high_precision_phantom_overflow_strategy()
+    -> impl Strategy<Value = (QuantityRaw, QuantityRaw, QuantityRaw)> {
+        let scalar = FIXED_SCALAR_RAW;
+
+        (10_000_u128..=1_000_000, 1_000_u128..=10_000, 0_u128..scalar).prop_map(
+            move |(lhs_whole, rhs_whole, rhs_remainder)| {
+                let lhs = lhs_whole * scalar;
+                let rhs = rhs_whole * scalar + rhs_remainder;
+                (lhs, rhs, lhs_whole * rhs)
+            },
+        )
+    }
+
+    #[cfg(feature = "high-precision")]
+    fn high_precision_remainder_overflow_strategy() -> impl Strategy<Value = QuantityRaw> {
+        let lhs = 2 * FIXED_SCALAR_RAW - 1;
+        let min = QuantityRaw::MAX / lhs + 1;
+
+        (min..=QuantityRaw::MAX / 2).prop_filter("rhs remainder is nonzero", |rhs| {
+            rhs % FIXED_SCALAR_RAW != 0
+        })
     }
 }

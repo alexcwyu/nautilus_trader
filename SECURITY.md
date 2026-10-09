@@ -1,8 +1,10 @@
 # Security Policy
 
 Security is a priority for the NautilusTrader project, and we value the work of
-those who help identify and resolve vulnerabilities. If you have found a
-security issue, please follow the guidelines below.
+those who help identify and resolve vulnerabilities. We apply layered controls across the
+development and release lifecycle, with signed and attested releases, continuous vulnerability management, and
+transparent development practices. If you have found a security issue, please follow the guidelines
+below.
 
 For our full security policies, see <https://nautilustrader.io/security/>.
 
@@ -65,8 +67,7 @@ do our best to properly recognize and credit your contributions.
 
 ## Security Infrastructure
 
-NautilusTrader employs multiple layers of security across the development and
-release lifecycle:
+The sections below detail the controls at each layer of that lifecycle.
 
 ### Public posture
 
@@ -86,26 +87,32 @@ release lifecycle:
 ### Dependency intake controls
 
 - **Version pinning and lock files**: Rust dependencies are pinned in `Cargo.lock` with
-  cryptographic checksums. Python dependencies are pinned in `uv.lock` and `python/uv.lock` with
-  integrity hashes. Wildcard version requirements are prohibited.
-- **Dependency and tool cooldown**: Python dependency resolution excludes packages published
-  within the last 3 days via `exclude-newer` in `pyproject.toml`. Development tools are pinned to
-  explicit versions across `tools.toml`, `Cargo.toml`, and related manifests, and version bumps are
-  reviewed during security audits. Rust crate updates are reviewed through our cargo-vet audit
-  process and policy. The cooldown gives the community time to detect and quarantine compromised
-  releases.
+  cryptographic checksums. Python dependencies are pinned in `python/uv.lock` with integrity
+  hashes. Wildcard version requirements are prohibited.
+- **Dependency cooldowns**: Python dependency resolution excludes packages published within the
+  last 7 days through `exclude-newer` in `python/pyproject.toml`. Rust crate updates remain subject
+  to a 3-day cooldown and cargo-vet review, and every Make target that compiles Rust checks the
+  resolved lockfiles first. Resolved crates.io publication dates are committed in
+  `.supply-chain/crate-dates.json` so the check can run without registry access; dates a branch adds
+  beyond `origin/develop` are re-verified against crates.io, locally and in the CI pre-commit job.
+  A security fix or critical bug fix may bypass either cooldown after explicit review. These windows give the
+  community time to detect and quarantine compromised releases. Development tools are pinned to
+  explicit versions across `.nautilus-engineering/tools.toml`, `tools.toml`, `Cargo.toml`, and
+  related manifests, and version bumps are reviewed during security audits.
 - **Wheel-only Python installs**: The `no-build-package` list in `[tool.uv]` enumerates every
-  third-party package locked in `uv.lock` and forbids `uv` from building any of them from source.
+  third-party package locked in `python/uv.lock` and forbids `uv` from building any of them from source.
   In normal operation uv prefers wheels, so the setting is a no-op; it kicks in only if a listed
   upstream stops publishing wheels for the target platform, in which case `uv lock` fails instead
   of silently building from an sdist. The local workspace package is intentionally absent because it
   must be built by the workspace's own build backend. The `check-no-build-packages` pre-commit hook
-  verifies the list stays in lock-step with `uv.lock` on every commit that touches the lock or the
-  manifest.
-- **Toolchain pinning**: The uv package manager version is pinned via `required-version` in
-  `pyproject.toml` and enforced across CI, Docker, and local development. Release and audit tool
-  Python CLIs are pinned in `tools.toml`.
-- **License compliance**: Automated checks ensure LGPL-3.0-or-later compatibility.
+  verifies the list stays in lock-step with `python/uv.lock` on every commit that touches the lock
+  or the manifest.
+- **Toolchain pinning**: `python/pyproject.toml` limits local uv use to the supported minor series.
+  `.nautilus-engineering/tools.toml` pins the exact uv version used by CI, Docker, pre-commit, and
+  project install commands. It also pins shared release and audit tools; `tools.toml` retains
+  NautilusTrader-specific pins.
+- **License compliance**: Automated checks verify Rust dependencies against an allow list of
+  licenses compatible with NautilusTrader's `LGPL-3.0-only` license.
 
 ### Pre-merge and scheduled scanning
 
@@ -150,14 +157,18 @@ release lifecycle:
 
 ### Runtime cryptography
 
-- **Cryptography**: All TLS and cryptographic operations use
-  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC. The library runs in
+- **Cryptography**: TLS and most runtime cryptography use
+  [aws-lc-rs](https://github.com/aws/aws-lc-rs), the Rust binding for AWS-LC. Ed25519 signing uses
+  [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek). AWS-LC runs in
   non-FIPS mode because the FIPS 140-3 module (`aws-lc-fips-sys`) requires the Go toolchain as a
-  build dependency. The underlying cryptographic primitives (AES-GCM, SHA-2, ECDSA,
-  ChaCha20-Poly1305) are identical in both modes; the FIPS module adds runtime self-tests and
-  module boundary enforcement required for federal certification.
+  build dependency. The AWS-LC primitives used here (AES-GCM, SHA-2, ECDSA, ChaCha20-Poly1305)
+  are identical in both modes; the FIPS module adds runtime self-tests and module boundary
+  enforcement required for federal certification.
 
 For our full supply chain security policy, see <https://nautilustrader.io/security/supply-chain/>.
+
+For the end-to-end release supply chain model, see
+[Security Architecture](docs/developer_guide/security.md).
 
 For detailed CI/CD security practices, see [.github/OVERVIEW.md](.github/OVERVIEW.md#security).
 
@@ -182,9 +193,9 @@ the canonical repository.
 
 ## Advisories addressed
 
-Third-party security advisories we have addressed via dependency upgrades.
-Detection lag for each upgrade is gated by the `exclude-newer` cooldown described
-above; the cooldown can be bypassed when a CVE warrants immediate response.
+Third-party security advisories we have addressed via dependency upgrades. Security scanning is
+not delayed by the dependency cooldowns described above. When an advisory requires a newer
+package, a reviewed fix can bypass the applicable cooldown.
 
 - **1.227.0**:
   - [GHSA-mf9v-mfxr-j63j](https://github.com/urllib3/urllib3/security/advisories/GHSA-mf9v-mfxr-j63j):
@@ -200,8 +211,10 @@ above; the cooldown can be bypassed when a CVE warrants immediate response.
 Python release artifacts and Docker images are signed or attested via Sigstore-backed workflows.
 Cargo crates are published through crates.io Trusted Publishing. The release verifier records
 whether each crate version was published by the current release commit or already existed from an
-earlier trusted-published commit in this repository. You can independently verify artifacts before
-installing them.
+earlier trusted-published commit in this repository. Emergency token-publish recovery requires an
+explicit `CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS` `crate@version` entry, and the recovered crate
+version is recorded in `crates-manifest.json` with `release_status: "manual_token_publish"`. You
+can independently verify artifacts before installing them.
 
 ### Python wheels and sdist
 
@@ -219,7 +232,7 @@ After downloading from PyPI or the GitHub release, verify each artifact with the
 GitHub CLI. The `--cert-identity-regex` and `--cert-oidc-issuer` flags bind
 verification to the `build.yml` release workflow, not just the repository:
 
-```sh
+```bash
 ISSUER=https://token.actions.githubusercontent.com
 IDENTITY='^https://github\.com/nautechsystems/nautilus_trader/\.github/workflows/build\.yml@refs/heads/(master|nightly)$'
 
@@ -242,7 +255,7 @@ gh attestation verify nautilus_trader-*.tar.gz \
 Resolve the mutable tag to an immutable digest first so every check, the
 subsequent `docker pull`, and the `docker run` operate on the same image:
 
-```sh
+```bash
 # Use crane (or `docker buildx imagetools inspect <ref> --format '{{.Manifest.Digest}}'`)
 DIGEST=$(crane digest ghcr.io/nautechsystems/nautilus_trader:latest)
 IMAGE=ghcr.io/nautechsystems/nautilus_trader@${DIGEST}
@@ -253,7 +266,7 @@ IDENTITY='^https://github\.com/nautechsystems/nautilus_trader/\.github/workflows
 Verify the cosign signature, which proves the image was produced by the
 NautilusTrader CI workflow:
 
-```sh
+```bash
 cosign verify "$IMAGE" \
   --certificate-identity-regexp "$IDENTITY" \
   --certificate-oidc-issuer "$ISSUER"
@@ -261,7 +274,7 @@ cosign verify "$IMAGE" \
 
 Verify the SPDX SBOM attestation is bound to the same image digest:
 
-```sh
+```bash
 cosign verify-attestation --type https://spdx.dev/Document/v2.3 "$IMAGE" \
   --certificate-identity-regexp "$IDENTITY" \
   --certificate-oidc-issuer "$ISSUER"
@@ -270,7 +283,7 @@ cosign verify-attestation --type https://spdx.dev/Document/v2.3 "$IMAGE" \
 The GitHub CLI can also verify the SBOM attestation, but does not check the
 cosign image signature, so use it in addition to `cosign verify` above:
 
-```sh
+```bash
 gh attestation verify "oci://${IMAGE}" \
   --repo nautechsystems/nautilus_trader \
   --predicate-type https://spdx.dev/Document/v2.3 \

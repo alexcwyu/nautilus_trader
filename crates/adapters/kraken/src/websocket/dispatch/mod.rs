@@ -16,7 +16,7 @@
 //! WebSocket execution dispatch for the Kraken Spot and Futures clients.
 //!
 //! Implements the two-tier execution dispatch contract from
-//! `docs/developer_guide/adapters.md` (lines 1232-1296):
+//! `docs/developer_guide/adapters.md#tracked-and-external-execution-updates`:
 //!
 //! 1. The execution client registers an [`OrderIdentity`] in [`WsDispatchState`]
 //!    when it submits an order.
@@ -37,7 +37,7 @@ pub mod spot;
 pub mod spot_orders;
 
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -54,8 +54,27 @@ use nautilus_model::{
     reports::FillReport,
     types::{Currency, Quantity},
 };
+use parking_lot::Mutex;
+use rust_decimal::Decimal;
 
 const DEDUP_CAPACITY: usize = 10_000;
+
+/// A terminal open-orders removal whose fills have not all arrived yet.
+///
+/// An `is_cancel=true` delta with reason `partial_fill` removes an order from
+/// the book with its remainder discarded (a converted Maker Protection hold
+/// or an IOC-style order). The venue's cumulative filled at the removal is
+/// parked here until the fills feed accounts it, so the closing cancel can
+/// never overtake the fill it belongs with.
+#[derive(Debug, Clone)]
+pub struct PendingRemoval {
+    /// Cumulative filled quantity reported by the venue on the removal delta.
+    pub venue_filled: Quantity,
+    /// Venue reason carried by the removal delta.
+    pub reason: Option<String>,
+    /// Venue event time of the removal delta.
+    pub ts_event: UnixNanos,
+}
 
 /// Snapshot of the mutable fields seen on a tracked `OpenOrdersDelta`.
 ///
@@ -66,29 +85,29 @@ const DEDUP_CAPACITY: usize = 10_000;
 pub struct DeltaSnapshot {
     pub qty: Quantity,
     pub filled: Quantity,
-    pub limit_price_bits: Option<u64>,
-    pub stop_price_bits: Option<u64>,
+    pub limit_price: Option<Decimal>,
+    pub stop_price: Option<Decimal>,
 }
 
 impl DeltaSnapshot {
     pub(crate) fn new(
         qty: Quantity,
         filled: Quantity,
-        limit_price: Option<f64>,
-        stop_price: Option<f64>,
+        limit_price: Option<Decimal>,
+        stop_price: Option<Decimal>,
     ) -> Self {
         Self {
             qty,
             filled,
-            limit_price_bits: limit_price.map(f64::to_bits),
-            stop_price_bits: stop_price.map(f64::to_bits),
+            limit_price,
+            stop_price,
         }
     }
 
     pub(crate) fn non_fill_fields_match(&self, other: &Self) -> bool {
         self.qty == other.qty
-            && self.limit_price_bits == other.limit_price_bits
-            && self.stop_price_bits == other.stop_price_bits
+            && self.limit_price == other.limit_price
+            && self.stop_price == other.stop_price
     }
 }
 
@@ -131,7 +150,7 @@ pub struct WsDispatchState {
     ///
     /// Kraken's spot v2 executions channel sends a `pending_new` frame with
     /// full order details, then follow-up frames (`new`, `amended`,
-    /// `restated`, `status`) that omit fields which have not changed —
+    /// `restated`, `status`) that omit fields which have not changed -
     /// Kraken's docs show `symbol` omitted on the `new` delta. The dispatch
     /// needs the symbol to resolve the instrument, so we cache it here from
     /// any frame that carries it (first writer wins). Keyed by venue
@@ -158,7 +177,7 @@ pub struct WsDispatchState {
     /// delta frames (`new`, `amended`, `restated`, `status`) routinely omit
     /// it. Without this mapping the dispatch cannot resolve the tracked
     /// order from a delta and falls back to the untracked report path,
-    /// which loses the typed `OrderAccepted` event — the symptom behind
+    /// which loses the typed `OrderAccepted` event - the symptom behind
     /// issue #4051.
     ///
     /// Populated whenever a frame resolves a `cl_ord_id` (first writer
@@ -185,6 +204,10 @@ pub struct WsDispatchState {
     /// Compared against `OrderIdentity::quantity` to decide when to clean up
     /// tracked state on a terminal fill.
     pub order_filled_qty: DashMap<ClientOrderId, Quantity>,
+    /// Terminal part-fill removals waiting for their fills to be accounted,
+    /// populated by the futures delta side of dispatch and resolved by the
+    /// fill side.
+    pub pending_removals: DashMap<ClientOrderId, PendingRemoval>,
     /// Trade IDs for which an `OrderFilled` event has been emitted.
     ///
     /// Bounded FIFO dedup: when capacity is reached, the oldest entry is
@@ -206,6 +229,7 @@ impl Default for WsDispatchState {
             order_client_id_cache: DashMap::new(),
             delta_snapshots: DashMap::new(),
             order_filled_qty: DashMap::new(),
+            pending_removals: DashMap::new(),
             emitted_trades: Mutex::new(IndexSet::with_capacity(DEDUP_CAPACITY)),
             clearing: AtomicBool::new(false),
         }
@@ -254,7 +278,7 @@ impl WsDispatchState {
     /// Caches the symbol for a venue `order_id` if not already present.
     ///
     /// Atomic via [`DashMap::entry`] so concurrent callers cannot overwrite an
-    /// existing cached value — first writer wins, all later writers no-op.
+    /// existing cached value - first writer wins, all later writers no-op.
     /// The cheap `contains_key` fast path skips the key allocation when the
     /// entry already exists; the `or_insert_with` covers the race that opens
     /// between that check and the insert.
@@ -286,7 +310,7 @@ impl WsDispatchState {
     /// already present.
     ///
     /// Atomic via [`DashMap::entry`] so concurrent callers cannot overwrite an
-    /// existing cached value — first writer wins. The cheap `contains_key`
+    /// existing cached value - first writer wins. The cheap `contains_key`
     /// fast path skips the key allocation when the entry already exists.
     pub fn cache_order_client_id(&self, order_id: &str, client_order_id: ClientOrderId) {
         if self.order_client_id_cache.contains_key(order_id) {
@@ -317,12 +341,8 @@ impl WsDispatchState {
     /// duplicate), `false` otherwise. When the dedup set is at capacity the
     /// oldest entry is evicted to make room, preserving the `DEDUP_CAPACITY`
     /// most recently seen trade IDs.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "dedup mutex poisoning is not expected"
-    )]
     pub fn check_and_insert_trade(&self, trade_id: TradeId) -> bool {
-        let mut set = self.emitted_trades.lock().expect("dedup mutex poisoned");
+        let mut set = self.emitted_trades.lock();
 
         if set.contains(&trade_id) {
             return true;
@@ -342,6 +362,7 @@ impl WsDispatchState {
         self.emitted_accepted.remove(client_order_id);
         self.order_filled_qty.remove(client_order_id);
         self.delta_snapshots.remove(client_order_id);
+        self.pending_removals.remove(client_order_id);
     }
 
     /// Records cumulative filled quantity for a tracked order. Used by the
@@ -354,6 +375,25 @@ impl WsDispatchState {
     #[must_use]
     pub fn previous_filled_qty(&self, client_order_id: &ClientOrderId) -> Option<Quantity> {
         self.order_filled_qty.get(client_order_id).map(|r| *r)
+    }
+
+    /// Parks a terminal part-fill removal until the fills feed accounts it.
+    pub fn insert_pending_removal(&self, client_order_id: ClientOrderId, removal: PendingRemoval) {
+        self.evict_map_if_full(&self.pending_removals);
+        self.pending_removals.insert(client_order_id, removal);
+    }
+
+    /// Returns a clone of the parked removal for the order, if any.
+    #[must_use]
+    pub fn pending_removal(&self, client_order_id: &ClientOrderId) -> Option<PendingRemoval> {
+        self.pending_removals
+            .get(client_order_id)
+            .map(|r| r.clone())
+    }
+
+    /// Removes the parked removal for the order, if any.
+    pub fn remove_pending_removal(&self, client_order_id: &ClientOrderId) {
+        self.pending_removals.remove(client_order_id);
     }
 
     /// Records the latest delta snapshot for a tracked order. Used by the
@@ -490,6 +530,7 @@ pub(crate) fn fill_report_to_order_filled(
         false,
         report.venue_position_id,
         Some(report.commission),
+        None,
     )
 }
 
@@ -617,9 +658,9 @@ mod tests {
         let overflow = TradeId::new(format!("trade-{DEDUP_CAPACITY}").as_str());
         assert!(!state.check_and_insert_trade(overflow));
 
-        // Inspect the dedup set directly to confirm FIFO behaviour without
+        // Inspect the dedup set directly to confirm FIFO behavior without
         // perturbing state via another `check_and_insert_trade` call.
-        let set = state.emitted_trades.lock().expect("dedup mutex poisoned");
+        let set = state.emitted_trades.lock();
         assert_eq!(set.len(), DEDUP_CAPACITY);
         assert!(
             !set.contains(&TradeId::new("trade-0")),
@@ -647,14 +688,26 @@ mod tests {
         let cid = ClientOrderId::new("uuid-3");
         state.register_identity(cid, make_identity());
         state.insert_accepted(cid);
+        state.record_filled_qty(cid, Quantity::from("0.0001"));
+        state.insert_pending_removal(
+            cid,
+            PendingRemoval {
+                venue_filled: Quantity::from("0.0001"),
+                reason: Some("partial_fill".to_string()),
+                ts_event: UnixNanos::default(),
+            },
+        );
 
         assert!(state.lookup_identity(&cid).is_some());
         assert!(state.emitted_accepted.contains(&cid));
+        assert!(state.pending_removal(&cid).is_some());
 
         state.cleanup_terminal(&cid);
 
         assert!(state.lookup_identity(&cid).is_none());
         assert!(!state.emitted_accepted.contains(&cid));
+        assert!(state.previous_filled_qty(&cid).is_none());
+        assert!(state.pending_removal(&cid).is_none());
     }
 
     #[rstest]

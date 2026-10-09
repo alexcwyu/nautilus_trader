@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use std::collections::HashMap;
+
 use ahash::AHashMap;
 use log::LevelFilter;
 use nautilus_core::{UUID4, python::to_pyvalue_err};
@@ -30,10 +32,11 @@ use crate::{
         parse_level_filter_str,
         writer::FileWriterConfig,
     },
+    python::config_error_to_pyvalue_err,
 };
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl LoggerConfig {
     /// Configuration for the Nautilus logger.
     #[new]
@@ -50,7 +53,10 @@ impl LoggerConfig {
         fileout_sync_on_flush=None,
         buffered_stdout=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "PyO3 constructor mirrors LoggerConfig keyword arguments"
+    )]
     fn py_new(
         stdout_level: Option<LogLevel>,
         fileout_level: Option<LogLevel>,
@@ -80,7 +86,77 @@ impl LoggerConfig {
         );
         config.fileout_sync_on_flush = fileout_sync_on_flush.unwrap_or(true);
         config.buffered_stdout = buffered_stdout.unwrap_or(false);
+        config.validate().map_err(config_error_to_pyvalue_err)?;
         Ok(config)
+    }
+
+    #[getter]
+    #[pyo3(name = "stdout_level")]
+    fn py_stdout_level(&self) -> LogLevel {
+        level_filter_to_log_level(self.stdout_level)
+    }
+
+    #[getter]
+    #[pyo3(name = "fileout_level")]
+    fn py_fileout_level(&self) -> LogLevel {
+        level_filter_to_log_level(self.fileout_level)
+    }
+
+    #[getter]
+    #[pyo3(name = "component_levels")]
+    fn py_component_levels(&self) -> HashMap<String, String> {
+        self.component_level
+            .iter()
+            .map(|(component, level)| (component.to_string(), level.to_string()))
+            .collect()
+    }
+
+    #[getter]
+    #[pyo3(name = "is_colored")]
+    const fn py_is_colored(&self) -> bool {
+        self.is_colored
+    }
+
+    #[getter]
+    #[pyo3(name = "print_config")]
+    const fn py_print_config(&self) -> bool {
+        self.print_config
+    }
+
+    #[getter]
+    #[pyo3(name = "bypass_logging")]
+    const fn py_bypass_logging(&self) -> bool {
+        self.bypass_logging
+    }
+
+    #[getter]
+    #[pyo3(name = "log_components_only")]
+    const fn py_log_components_only(&self) -> bool {
+        self.log_components_only
+    }
+
+    #[getter]
+    #[pyo3(name = "file_config")]
+    fn py_file_config(&self) -> Option<FileWriterConfig> {
+        self.file_config.clone()
+    }
+
+    #[getter]
+    #[pyo3(name = "clear_log_file")]
+    const fn py_clear_log_file(&self) -> bool {
+        self.clear_log_file
+    }
+
+    #[getter]
+    #[pyo3(name = "fileout_sync_on_flush")]
+    const fn py_fileout_sync_on_flush(&self) -> bool {
+        self.fileout_sync_on_flush
+    }
+
+    #[getter]
+    #[pyo3(name = "buffered_stdout")]
+    const fn py_buffered_stdout(&self) -> bool {
+        self.buffered_stdout
     }
 
     /// Parses a configuration from a spec string.
@@ -102,10 +178,10 @@ impl LoggerConfig {
     }
 }
 
-#[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
+#[pymethods]
 impl FileWriterConfig {
-    /// Creates a new `FileWriterConfig` instance.
+    /// Configures file log output.
     #[new]
     #[pyo3(signature = (directory=None, file_name=None, file_format=None, file_rotate=None))]
     #[must_use]
@@ -116,6 +192,32 @@ impl FileWriterConfig {
         file_rotate: Option<(u64, u32)>,
     ) -> Self {
         Self::new(directory, file_name, file_format, file_rotate)
+    }
+
+    #[getter]
+    #[pyo3(name = "directory")]
+    fn py_directory(&self) -> Option<&str> {
+        self.directory.as_deref()
+    }
+
+    #[getter]
+    #[pyo3(name = "file_name")]
+    fn py_file_name(&self) -> Option<&str> {
+        self.file_name.as_deref()
+    }
+
+    #[getter]
+    #[pyo3(name = "file_format")]
+    fn py_file_format(&self) -> Option<&str> {
+        self.file_format.as_deref()
+    }
+
+    #[getter]
+    #[pyo3(name = "file_rotate")]
+    fn py_file_rotate(&self) -> Option<(u64, u32)> {
+        self.file_rotate
+            .as_ref()
+            .map(|rotate| (rotate.max_file_size, rotate.max_backup_count))
     }
 }
 
@@ -128,6 +230,10 @@ impl FileWriterConfig {
 ///
 /// Should only be called once during an applications run, ideally at the
 /// beginning of the run.
+///
+/// # Errors
+///
+/// Returns an error if the logging subsystem fails to initialize.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.common")]
 #[pyo3(name = "init_logging")]
@@ -155,6 +261,9 @@ pub fn py_init_logging(
     let component_levels = parse_component_levels(component_levels).map_err(to_pyvalue_err)?;
 
     let file_config = FileWriterConfig::new(directory, file_name, file_format, file_rotate);
+    file_config
+        .validate()
+        .map_err(config_error_to_pyvalue_err)?;
 
     let mut config = LoggerConfig::new(
         map_log_level_to_filter(level_stdout),
@@ -172,11 +281,16 @@ pub fn py_init_logging(
     config.fileout_sync_on_flush = fileout_sync_on_flush.unwrap_or(true);
     config.buffered_stdout = buffered_stdout.unwrap_or(false);
 
-    if config.bypass_logging {
+    let is_bypassed = config.bypass_logging;
+    let guard = logging::init_logging(trader_id, instance_id, config, file_config)
+        .map_err(to_pyvalue_err)?;
+
+    // Set after init succeeds so a failed attempt leaves no global bypass behind
+    if is_bypassed {
         logging_set_bypass();
     }
 
-    logging::init_logging(trader_id, instance_id, config, file_config).map_err(to_pyvalue_err)
+    Ok(guard)
 }
 
 #[pyfunction()]
@@ -220,6 +334,17 @@ fn parse_component_levels(
     }
 }
 
+const fn level_filter_to_log_level(level: LevelFilter) -> LogLevel {
+    match level {
+        LevelFilter::Off => LogLevel::Off,
+        LevelFilter::Error => LogLevel::Error,
+        LevelFilter::Warn => LogLevel::Warning,
+        LevelFilter::Info => LogLevel::Info,
+        LevelFilter::Debug => LogLevel::Debug,
+        LevelFilter::Trace => LogLevel::Trace,
+    }
+}
+
 /// Create a new log event.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.common")]
@@ -228,7 +353,7 @@ pub fn py_logger_log(level: LogLevel, color: LogColor, component: &str, message:
     logger::log(level, color, Ustr::from(component), message);
 }
 
-/// Logs the standard Nautilus system header.
+/// Logs the Nautilus startup header with system, identifier, and version details.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.common")]
 #[pyo3(name = "log_header")]
@@ -236,7 +361,7 @@ pub fn py_log_header(trader_id: TraderId, machine_id: &str, instance_id: UUID4, 
     headers::log_header(trader_id, machine_id, instance_id, Ustr::from(component));
 }
 
-/// Logs system information.
+/// Logs current memory and swap usage.
 #[pyfunction]
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.common")]
 #[pyo3(name = "log_sysinfo")]
@@ -301,14 +426,13 @@ pub fn py_init_tracing() -> PyResult<()> {
     crate::logging::bridge::init_tracing().map_err(to_pyvalue_err)
 }
 
-/// A thin wrapper around the global Rust logger which exposes ergonomic
-/// logging helpers for Python code.
+/// Python wrapper around the global Rust logger.
 ///
 /// It mirrors the familiar Python `logging` interface while forwarding
 /// all records through the Nautilus logging infrastructure so that log levels
 /// and formatting remain consistent across Rust and Python.
 #[pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
+    module = "nautilus_trader.common",
     name = "Logger",
     unsendable,
     from_py_object
@@ -323,6 +447,18 @@ impl PyLogger {
     pub fn new(name: &str) -> Self {
         Self {
             name: Ustr::from(name),
+        }
+    }
+
+    /// Logs a failed Python callback with its traceback and component identity.
+    pub fn log_callback_error(&self, method: &str, result: PyResult<()>) {
+        if let Err(e) = result {
+            let exception = format_exception(&e);
+            self.log_message(
+                LogLevel::Error,
+                Some(LogColor::Red),
+                &format!("Python {method} failed:\n{exception}"),
+            );
         }
     }
 
@@ -409,10 +545,138 @@ impl PyLogger {
         log::logger().flush();
     }
 
-    /// Emit a log record at the given level (Python-facing helper).
+    /// Emits a log record at the given level for Python callers.
     #[pyo3(name = "_log")]
     #[pyo3(signature = (level, color=None, message=""))]
     fn py_log(&self, level: LogLevel, color: Option<LogColor>, message: &str) {
         self.log_message(level, color, message);
+    }
+}
+
+/// Formats a Python exception, including its traceback and chained exceptions.
+///
+/// Falls back to the exception type and message if traceback formatting fails.
+#[must_use]
+pub fn format_exception(e: &PyErr) -> String {
+    Python::attach(|py| {
+        py.import("traceback")
+            .and_then(|module| {
+                module.call_method1(
+                    "format_exception",
+                    (e.get_type(py), e.value(py), e.traceback(py)),
+                )
+            })
+            .and_then(|lines| lines.extract::<Vec<String>>())
+            .map_or_else(|_| e.to_string(), |lines| lines.concat())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::python::to_pyruntime_err;
+    use pyo3::ffi::c_str;
+    use rstest::rstest;
+
+    use super::*;
+
+    // Uses the process-global logger, so it relies on nextest running each test in its own process
+    #[rstest]
+    fn test_init_logging_failure_leaves_no_bypass_for_retry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blocking_file = temp_dir.path().join("not_a_directory");
+        std::fs::write(&blocking_file, "").unwrap();
+
+        let init = |directory: &std::path::Path, is_bypassed: bool| {
+            py_init_logging(
+                TraderId::from("TRADER-001"),
+                UUID4::new(),
+                LogLevel::Off,
+                Some(LogLevel::Info),
+                None,
+                Some(directory.to_str().unwrap().to_string()),
+                None,
+                None,
+                None,
+                None,
+                Some(is_bypassed),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        let failed = init(&blocking_file, true);
+        let guard = init(temp_dir.path(), false).unwrap();
+        log::info!(component = "BypassTest"; "logged after retry");
+        crate::logging::logging_sync_to_disk().unwrap();
+
+        assert!(failed.is_err());
+        let log_path = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|extension| extension == "log"))
+            .unwrap();
+        let contents = std::fs::read_to_string(log_path).unwrap();
+        assert!(
+            contents.contains("logged after retry"),
+            "log file: {contents:?}"
+        );
+        drop(guard);
+    }
+
+    #[rstest]
+    fn test_format_exception_traceback_and_cause() {
+        Python::initialize();
+        Python::attach(|py| {
+            let module = PyModule::from_code(
+                py,
+                c_str!(
+                    r#"
+def callback():
+    try:
+        fail()
+    except ValueError as e:
+        raise RuntimeError("callback failure") from e
+
+def fail():
+    raise ValueError("original failure")
+"#
+                ),
+                c_str!("strategy_callback.py"),
+                c_str!("strategy_callback"),
+            )
+            .unwrap();
+            let e = module.call_method0("callback").unwrap_err();
+            let formatted = format_exception(&e);
+
+            assert!(formatted.contains("File \"strategy_callback.py\", line 9, in fail"));
+            assert!(formatted.contains("File \"strategy_callback.py\", line 6, in callback"));
+            assert!(formatted.contains("ValueError: original failure"));
+            assert!(formatted.contains("The above exception was the direct cause"));
+            assert!(formatted.ends_with("RuntimeError: callback failure\n"));
+        });
+    }
+
+    #[rstest]
+    fn test_format_exception_without_traceback() {
+        Python::initialize();
+        let e = to_pyruntime_err("callback failure");
+        assert_eq!(format_exception(&e), "RuntimeError: callback failure\n");
+    }
+
+    #[rstest]
+    fn test_format_exception_fallback() {
+        Python::initialize();
+        Python::attach(|py| {
+            let traceback = py.import("traceback").unwrap();
+            let original = traceback.getattr("format_exception").unwrap();
+            traceback.setattr("format_exception", py.None()).unwrap();
+            let e = to_pyruntime_err("callback failure");
+            let formatted = format_exception(&e);
+            traceback.setattr("format_exception", original).unwrap();
+
+            assert_eq!(formatted, "RuntimeError: callback failure");
+        });
     }
 }

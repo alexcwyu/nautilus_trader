@@ -1,7 +1,7 @@
 # Delta-Neutral Options Strategy (Bybit)
 
 :::note
-This is a **Rust-only** v2 system tutorial. It runs a live delta-neutral
+This is a **Rust-only** system tutorial. It runs a live delta-neutral
 short-volatility strategy on Bybit using the Rust `LiveNode`.
 :::
 
@@ -27,7 +27,8 @@ session, the strategy will trade.
   pattern.
 - A Bybit API key with **trading permissions** for options and linear
   perpetuals.
-- Environment variables:
+- Environment variables for Bybit mainnet, which the example targets by
+  default (see [Running the example](#running-the-example) for testnet):
 
 ```bash
 export BYBIT_API_KEY="your-api-key"
@@ -112,13 +113,16 @@ configures the strategy:
 ```rust
 let hedge_instrument_id = InstrumentId::from("BTCUSDT-LINEAR.BYBIT");
 
-let strategy_config =
-    DeltaNeutralVolConfig::new("BTC".to_string(), hedge_instrument_id, client_id)
-        .with_contracts(1)
-        .with_rehedge_delta_threshold(0.5)
-        .with_rehedge_interval_secs(30)
-        .with_enter_strangle(false)
-        .with_iv_param_key("order_iv".to_string());
+let strategy_config = DeltaNeutralVolConfig::builder()
+    .option_family("BTC".to_string())
+    .hedge_instrument_id(hedge_instrument_id)
+    .client_id(client_id)
+    .contracts(1)
+    .rehedge_delta_threshold(0.5)
+    .rehedge_interval_secs(30)
+    .enter_strangle(false)
+    .iv_param_key("order_iv".to_string())
+    .build();
 
 let strategy = DeltaNeutralVol::new(strategy_config);
 ```
@@ -127,19 +131,19 @@ Parameters (defaults shown are the struct defaults; the example
 overrides `enter_strangle` to `false` and `iv_param_key` to
 `"order_iv"`):
 
-| Parameter                 | Default    | Example          | Description                                  |
-|---------------------------|------------|------------------|----------------------------------------------|
-| `option_family`           | required   | `"BTC"`          | Underlying filter for instrument discovery.  |
-| `hedge_instrument_id`     | required   | `BTCUSDT-LINEAR` | Perpetual used for delta hedging.            |
-| `client_id`               | required   | `"BYBIT"`        | Data and execution client identifier.        |
-| `target_call_delta`       | `0.20`     | -                | Target call delta for strike selection.      |
-| `target_put_delta`        | `-0.20`    | -                | Target put delta for strike selection.       |
-| `contracts`               | `1`        | -                | Contracts per leg.                           |
-| `rehedge_delta_threshold` | `0.5`      | -                | Portfolio delta that triggers a hedge.       |
-| `rehedge_interval_secs`   | `30`       | -                | Periodic rehedge timer interval.             |
-| `enter_strangle`          | `true`     | `false`          | Place entry orders when Greeks arrive.       |
-| `entry_iv_offset`         | `0.0`      | -                | Vol points below mark IV for entry pricing.  |
-| `iv_param_key`            | `"px_vol"` | `"order_iv"`     | Adapter‑specific IV parameter key.           |
+| Parameter                 | Default    | Example          | Description                                 |
+| ------------------------- | ---------- | ---------------- | ------------------------------------------- |
+| `option_family`           | required   | `"BTC"`          | Underlying filter for instrument discovery. |
+| `hedge_instrument_id`     | required   | `BTCUSDT-LINEAR` | Perpetual used for delta hedging.           |
+| `client_id`               | required   | `"BYBIT"`        | Data and execution client identifier.       |
+| `target_call_delta`       | `0.20`     | -                | Target call delta for strike selection.     |
+| `target_put_delta`        | `-0.20`    | -                | Target put delta for strike selection.      |
+| `contracts`               | `1`        | -                | Contracts per leg.                          |
+| `rehedge_delta_threshold` | `0.5`      | -                | Portfolio delta that triggers a hedge.      |
+| `rehedge_interval_secs`   | `30`       | -                | Periodic rehedge timer interval.            |
+| `enter_strangle`          | `true`     | `false`          | Place entry orders when Greeks arrive.      |
+| `entry_iv_offset`         | `0.0`      | -                | Vol points below mark IV for entry pricing. |
+| `iv_param_key`            | `"px_vol"` | `"order_iv"`     | Adapter-specific IV parameter key.          |
 
 The `iv_param_key` is the key difference between venues. Bybit uses
 `order_iv`, which the adapter maps to the `orderIv` field in the
@@ -159,7 +163,7 @@ let data_config = BybitDataClientConfig {
     ..Default::default()
 };
 
-let exec_config = BybitExecClientConfig {
+let exec_config = BybitExecutionClientConfig {
     api_key: None,
     api_secret: None,
     product_types: vec![BybitProductType::Option, BybitProductType::Linear],
@@ -228,9 +232,9 @@ vol points from mark IV: an offset of 0.02 sells two vol points below
 mark for faster fills.
 
 :::note
-Bybit's demo environment rejects orders with `order_iv`. The adapter
-denies them before they reach the API. Use mainnet or testnet for
-IV-based order placement.
+In Bybit's demo environment, new orders carry `order_iv` through the HTTP
+create-order endpoint. Amending an order by `order_iv` is not supported in
+demo: the adapter drops the modify with a warning before it reaches the API.
 :::
 
 ### Rehedging
@@ -250,8 +254,21 @@ duplicate submissions while an order is in flight.
 
 The strategy tracks positions via `on_order_filled`, not by querying
 the cache on every tick. Each fill updates the corresponding position
-counter (call, put, or hedge). At startup, existing positions are
-hydrated from the cache (populated by reconciliation).
+counter (call, put, or hedge). At startup, the strategy hydrates the
+counters from the cache (populated by reconciliation): it sums the signed
+quantity of every open position on the selected call, the selected put,
+and the hedge instrument. It does not filter by strategy, so positions
+opened elsewhere on those instruments count. Option positions on other
+strikes do not.
+
+:::warning
+Hydration treats any open `BTCUSDT-LINEAR` position as part of the hedge.
+With no option positions, an unrelated perpetual position larger than
+`rehedge_delta_threshold` breaches the threshold once Greeks arrive for
+both legs, and the strategy submits a market order that flattens it. Run
+the strategy on an account with no unrelated positions on the hedge
+instrument.
+:::
 
 ### Shutdown
 
@@ -272,8 +289,8 @@ Selected put: BTC-28APR26-75000-P-USDT-OPTION.BYBIT (strike=75000)
 Strangle: 1 contracts per leg, hedge on BTCUSDT-LINEAR.BYBIT
 ```
 
-That is enough to reason about the strategy's structural behaviour. The
-panels below visualise the mechanics around the actual selected strikes
+That is enough to reason about the strategy's structural behavior. The
+panels below visualize the mechanics around the actual selected strikes
 (75,000 / 81,000) at the captured underlying.
 
 ![Short strangle payoff at expiry](./assets/delta_neutral_options_bybit/panel_a_strangle_payoff.png)
@@ -306,12 +323,22 @@ deltas around the underlying.*
 
 ### Regenerate the panels
 
+The log comes from `bybit-delta-neutral`, the live trading binary. It
+connects to Bybit mainnet with your API keys. With the default config it
+places no entry orders, but it submits hedge orders if the account holds
+positions on the selected legs or the hedge instrument.
+
+After building NautilusTrader from source, run these commands from the repository root:
+
 ```bash
+make sync
+
+cargo build --release --example bybit-delta-neutral --package nautilus-bybit --features examples
 timeout 30 ./target/release/examples/bybit-delta-neutral > /tmp/bybit_dn.log 2>&1
 
-uv sync --extra visualization
 DN_LOG=/tmp/bybit_dn.log \
-    python3 docs/tutorials/assets/delta_neutral_options_bybit/render_panels.py
+    uv run --project python --no-sync \
+        python docs/tutorials/assets/delta_neutral_options_bybit/render_panels.py
 ```
 
 The renderer parses selected strikes from the log; the panels themselves
@@ -332,6 +359,17 @@ are illustrative because the default config does not place orders.
   remain open and unhedged until manually managed.
 
 ## Running the example
+
+:::warning
+The example trades on Bybit **mainnet** by default. It has no network
+constant: both client configs use `..Default::default()`, which selects
+`BybitEnvironment::Mainnet` and reads `BYBIT_API_KEY` and
+`BYBIT_API_SECRET`. To run on testnet, add
+`environment: BybitEnvironment::Testnet` to both `data_config` and
+`exec_config` in `node_delta_neutral.rs`, import `BybitEnvironment` from
+`nautilus_bybit::common::enums`, and rebuild. On testnet the adapter reads
+`BYBIT_TESTNET_API_KEY` and `BYBIT_TESTNET_API_SECRET`.
+:::
 
 ```bash
 cargo run --example bybit-delta-neutral --package nautilus-bybit --features examples

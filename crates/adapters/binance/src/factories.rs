@@ -17,6 +17,8 @@
 
 use std::{cell::RefCell, rc::Rc};
 
+#[cfg(test)]
+use nautilus_common::clock::VirtualClock;
 use nautilus_common::{
     cache::CacheView,
     clients::{DataClient, ExecutionClient},
@@ -26,7 +28,7 @@ use nautilus_common::{
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     enums::{AccountType, OmsType},
-    identifiers::ClientId,
+    identifiers::{ClientId, TraderId},
 };
 
 use crate::{
@@ -34,7 +36,7 @@ use crate::{
         consts::{BINANCE, BINANCE_VENUE},
         enums::BinanceProductType,
     },
-    config::{BinanceDataClientConfig, BinanceExecClientConfig},
+    config::{BinanceDataClientConfig, BinanceExecutionClientConfig},
     futures::{data::BinanceFuturesDataClient, execution::BinanceFuturesExecutionClient},
     spot::{data::BinanceSpotDataClient, execution::BinanceSpotExecutionClient},
 };
@@ -43,7 +45,7 @@ use crate::{
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.binance", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -85,6 +87,8 @@ impl DataClientFactory for BinanceDataClientFactory {
 
         let client_id = ClientId::from(name);
 
+        binance_config.validate()?;
+
         let product_type = binance_config.product_type;
 
         match product_type {
@@ -116,7 +120,7 @@ impl DataClientFactory for BinanceDataClientFactory {
 #[derive(Debug, Clone)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.binance", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.binance", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -141,21 +145,25 @@ impl Default for BinanceExecutionClientFactory {
 impl ExecutionClientFactory for BinanceExecutionClientFactory {
     fn create(
         &self,
+        trader_id: TraderId,
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
+        _clock: Rc<RefCell<dyn Clock>>,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
         let binance_config = config
             .as_any()
-            .downcast_ref::<BinanceExecClientConfig>()
+            .downcast_ref::<BinanceExecutionClientConfig>()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Invalid config type for BinanceExecutionClientFactory. Expected BinanceExecClientConfig, was {config:?}",
+                    "Invalid config type for BinanceExecutionClientFactory. Expected BinanceExecutionClientConfig, was {config:?}",
                 )
             })?
             .clone();
 
         let product_type = binance_config.product_type;
+
+        binance_config.validate()?;
 
         match product_type {
             BinanceProductType::Spot => {
@@ -164,7 +172,7 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
                 let oms_type = OmsType::Hedging;
 
                 let core = ExecutionClientCore::new(
-                    binance_config.trader_id,
+                    trader_id,
                     ClientId::from(name),
                     *BINANCE_VENUE,
                     oms_type,
@@ -178,12 +186,11 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
                 Ok(Box::new(client))
             }
             BinanceProductType::UsdM | BinanceProductType::CoinM => {
-                // Futures uses margin account type and netting OMS
                 let account_type = AccountType::Margin;
-                let oms_type = OmsType::Netting;
+                let oms_type = binance_config.oms_type.unwrap_or(OmsType::Netting);
 
                 let core = ExecutionClientCore::new(
-                    binance_config.trader_id,
+                    trader_id,
                     ClientId::from(name),
                     *BINANCE_VENUE,
                     oms_type,
@@ -209,13 +216,18 @@ impl ExecutionClientFactory for BinanceExecutionClientFactory {
     }
 
     fn config_type(&self) -> &'static str {
-        stringify!(BinanceExecClientConfig)
+        stringify!(BinanceExecutionClientConfig)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::factories::DataClientFactory;
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{
+        cache::Cache,
+        factories::{DataClientFactory, ExecutionClientFactory},
+    };
     use rstest::rstest;
 
     use super::*;
@@ -231,5 +243,38 @@ mod tests {
     fn test_binance_data_client_factory_default() {
         let factory = BinanceDataClientFactory;
         assert_eq!(factory.name(), BINANCE);
+    }
+
+    #[rstest]
+    #[case(BinanceProductType::Spot, Some(OmsType::Netting), OmsType::Hedging)]
+    #[case(BinanceProductType::UsdM, None, OmsType::Netting)]
+    #[case(BinanceProductType::UsdM, Some(OmsType::Hedging), OmsType::Hedging)]
+    fn test_binance_execution_client_factory_selects_oms_type(
+        #[case] product_type: BinanceProductType,
+        #[case] oms_type: Option<OmsType>,
+        #[case] expected: OmsType,
+    ) {
+        let factory = BinanceExecutionClientFactory::new();
+        let config = BinanceExecutionClientConfig {
+            product_type,
+            use_ws_trading: false,
+            oms_type,
+            api_key: Some("test_key".into()),
+            api_secret: Some("test_secret".into()),
+            ..Default::default()
+        };
+        let cache = Rc::new(RefCell::new(Cache::default()));
+
+        let client = factory
+            .create(
+                TraderId::from("TRADER-001"),
+                "BINANCE-TEST",
+                &config,
+                cache.into(),
+                Rc::new(RefCell::new(VirtualClock::new())),
+            )
+            .unwrap();
+
+        assert_eq!(client.oms_type(), expected);
     }
 }

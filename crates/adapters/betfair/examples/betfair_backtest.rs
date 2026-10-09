@@ -24,10 +24,14 @@
 //! The actor computes a running bid/ask quoted volume imbalance per runner.
 //! In Betfair terms: bids = "back" orders, asks = "lay" orders.
 //!
+//! Edit the constants below to change the data file and imbalance log interval.
+//!
 //! Run with: `cargo run -p nautilus-betfair --features examples --example betfair-backtest`
 //!
 //! Or pass a custom file path:
 //!   `cargo run -p nautilus-betfair --features examples --example betfair-backtest -- path/to/file.gz`
+//!
+//! No credentials are required.
 
 use std::path::PathBuf;
 
@@ -40,14 +44,18 @@ use nautilus_betfair::{
     common::consts::BETFAIR_VENUE,
     loader::{BetfairDataItem, BetfairDataLoader},
 };
+use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
 use nautilus_model::{
-    data::{Data, OrderBookDeltas_API},
+    data::Data,
     enums::{AccountType, BookType, OmsType},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
     types::{Currency, Money},
 };
 use nautilus_trading::examples::actors::BookImbalanceActor;
+
+const DATA_FILE: &str = "test_data/local/betfair/1.253378068.gz";
+const LOG_INTERVAL: u64 = 5000;
 
 /// Loads a Betfair `.gz` streaming file and separates instruments from data.
 ///
@@ -56,8 +64,7 @@ use nautilus_trading::examples::actors::BookImbalanceActor;
 /// deltas, trades, and settlement events, and skip Betfair-specific types
 /// (tickers, BSP, race GPS data) that have no `Data` variant.
 ///
-/// `OrderBookDeltas_API` is a thin wrapper around `OrderBookDeltas` needed
-/// by the `Data` enum (legacy FFI shim, will be removed).
+/// `Data::BookDeltas` boxes its `OrderBookDeltas` payload to keep the enum small.
 fn load_betfair_data(
     filepath: &std::path::Path,
 ) -> anyhow::Result<(AHashMap<InstrumentId, InstrumentAny>, Vec<Data>)> {
@@ -87,7 +94,7 @@ fn load_betfair_data(
             }
             // Order book deltas and trades map directly to Data variants
             BetfairDataItem::Deltas(d) => {
-                data.push(Data::Deltas(OrderBookDeltas_API::new(d)));
+                data.push(Data::BookDeltas(Box::new(d)));
             }
             BetfairDataItem::Trade(t) => {
                 data.push(Data::Trade(t));
@@ -111,7 +118,7 @@ fn resolve_filepath() -> PathBuf {
                 .ancestors()
                 .nth(3)
                 .unwrap()
-                .join("tests/test_data/local/betfair/1.253378068.gz")
+                .join(DATA_FILE)
         },
         PathBuf::from,
     )
@@ -121,7 +128,7 @@ fn main() -> anyhow::Result<()> {
     let filepath = resolve_filepath();
     if !filepath.exists() {
         anyhow::bail!(
-            "File not found: {}\n\nCopy Betfair .gz files to tests/test_data/local/betfair/",
+            "File not found: {}\n\nCopy Betfair .gz files to test_data/local/betfair/",
             filepath.display()
         );
     }
@@ -146,18 +153,15 @@ fn main() -> anyhow::Result<()> {
             .account_type(AccountType::Cash)
             .book_type(BookType::L2_MBP)
             .starting_balances(vec![Money::from("1_000_000 GBP")])
-            .build(),
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()?,
     )?;
 
     for instrument in instruments.values() {
         engine.add_instrument(instrument)?;
     }
 
-    let log_interval: u64 = std::env::var("IMBALANCE_LOG_INTERVAL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5000);
-    let actor = BookImbalanceActor::new(instrument_ids, log_interval, None);
+    let actor = BookImbalanceActor::new(instrument_ids, LOG_INTERVAL, None);
     engine.add_actor(actor)?;
     engine.add_data(data, None, true, true)?;
 

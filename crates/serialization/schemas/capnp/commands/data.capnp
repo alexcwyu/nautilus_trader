@@ -5,7 +5,6 @@
 # between releases. Do not depend on wire compatibility across versions.
 
 using Identifiers = import "../common/identifiers.capnp";
-using Types = import "../common/types.capnp";
 using Enums = import "../common/enums.capnp";
 using Market = import "../data/market.capnp";
 using Base = import "../common/base.capnp";
@@ -43,7 +42,7 @@ struct SubscribeCommand {
         instrument @1 :SubscribeInstrument;
         instruments @2 :SubscribeInstruments;
         bookDeltas @3 :SubscribeBookDeltas;
-        bookDepth10 @4 :SubscribeBookDepth10;
+        bookDepth @4 :SubscribeBookDepth;
         bookSnapshots @5 :SubscribeBookSnapshots;
         quotes @6 :SubscribeQuotes;
         trades @7 :SubscribeTrades;
@@ -63,7 +62,7 @@ struct UnsubscribeCommand {
         instrument @1 :UnsubscribeInstrument;
         instruments @2 :UnsubscribeInstruments;
         bookDeltas @3 :UnsubscribeBookDeltas;
-        bookDepth10 @4 :UnsubscribeBookDepth10;
+        bookDepth @4 :UnsubscribeBookDepth;
         bookSnapshots @5 :UnsubscribeBookSnapshots;
         quotes @6 :UnsubscribeQuotes;
         trades @7 :UnsubscribeTrades;
@@ -112,7 +111,7 @@ struct SubscribeBookDeltas {
     depth @3 :UInt32;
 }
 
-struct SubscribeBookDepth10 {
+struct SubscribeBookDepth @0xbcf1c6b4f4ad99b8 {
     header @0 :DataCommandHeader;
     instrumentId @1 :Identifiers.InstrumentId;
 }
@@ -184,7 +183,7 @@ struct UnsubscribeBookDeltas {
     instrumentId @1 :Identifiers.InstrumentId;
 }
 
-struct UnsubscribeBookDepth10 {
+struct UnsubscribeBookDepth @0xeba25002462f2bd9 {
     header @0 :DataCommandHeader;
     instrumentId @1 :Identifiers.InstrumentId;
 }

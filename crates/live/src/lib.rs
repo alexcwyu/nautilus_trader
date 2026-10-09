@@ -15,13 +15,14 @@
 
 //! Live system node for [NautilusTrader](https://nautilustrader.io).
 //!
-//! The `nautilus-live` crate provides high-level abstractions and infrastructure for running live trading
-//! systems, including data streaming, execution management, and system lifecycle handling.
-//! It builds on top of the system kernel to provide simplified interfaces for live deployment:
+//! The crate provides live event transport, execution state management, and node lifecycle support.
 //!
-//! - `LiveNode` High-level abstraction for live system nodes.
-//! - `LiveNodeConfig` Configuration for live node deployment.
-//! - `AsyncRunner` for managing system real-time data flow.
+//! - [`execution`] supplies adapter-facing order context, failure classification, report filtering,
+//!   event emission, and the execution manager. The manager tracks reconciliation state, requests
+//!   reports for individual checks, and applies startup reconciliation events.
+//! - `node` (with the `node` feature) owns the kernel lifecycle, recurring reconciliation tasks,
+//!   collection deadlines, cancellation, and dispatch through the live event loop.
+//! - [`runner`] routes asynchronous data, execution, system, and timer traffic.
 //!
 //! # NautilusTrader
 //!
@@ -38,13 +39,19 @@
 //! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
 //! or as part of a Rust only build.
 //!
-//! - `node` (default): Enables the full live node, builder, config, and execution manager.
-//! - `plugin` (default): Enables the host-side plug-in adapters and loader from `nautilus-plugin`.
-//! - `ffi`: Enables the C foreign function interface (FFI) from [cbindgen](https://github.com/mozilla/cbindgen).
-//! - `streaming`: Enables `persistence` dependency for streaming configuration (requires `node`).
-//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) (auto-enables `node` and `streaming`).
 //! - `defi`: Enables DeFi (Decentralized Finance) support.
-//! - `extension-module`: Builds the crate as a Python extension module.
+//! - `examples`: Enables example strategies and testkit support for live nodes.
+//! - `extension-module`: Builds as a Python extension module.
+//! - `fuzz`: Provides shared libFuzzer integration for adapter fuzz binaries.
+//! - `node` (default): Enables the live node, builder, configuration, and system-kernel dependencies.
+//! - `plugin` (default): Keeps compatibility stubs for plug-in config validation.
+//! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs) and auto-enables `node` and
+//!   `streaming`.
+//! - `simulation`: Enables deterministic simulation testing with
+//!   [MadSim](https://crates.io/crates/madsim).
+//! - `streaming`: Enables the `nautilus-persistence` dependency for streaming configuration and
+//!   requires `node`.
+//! - `test-support`: Enables engine-wired execution support for adapter integration tests.
 //!
 //! # Lean adapter builds
 //!
@@ -56,26 +63,30 @@
 //! nautilus-live = { workspace = true, default-features = false }
 //! ```
 //!
-//! With `node` disabled, this crate exposes only `emitter` and `runner`, and skips
+//! With `node` disabled, execution support (including the manager), run-to-completion
+//! reconciliation, the runner, socket controls, and task support remain available. This skips
 //! the transitive dependencies on `nautilus-system`, `nautilus-trading`,
 //! `nautilus-portfolio`, `nautilus-risk`, and `nautilus-data`.
 //!
-//! # Opting out of plug-in support
+//! # Plug-in support
 //!
-//! Builds that statically link every actor and strategy can drop the plug-in
-//! adapter machinery (and its `libloading`-backed loader) by disabling the
-//! `plugin` feature:
+//! The open-source live crate does not host dynamic plug-ins directly.
+//! `nautilus-plugin` is the public guest ABI crate, while host-side loading,
+//! vtables, bridge adapters, and server policy belong to the host-side plug-in
+//! integration.
+//! A non-empty `LiveNodeConfig.plugins` list is rejected unless an application
+//! provides that host-side integration.
 //!
 //! ```toml
 //! nautilus-live = { workspace = true, default-features = false, features = ["node"] }
 //! ```
 //!
-//! With `plugin` disabled, the `plugin` module is removed, the unsafe FFI
-//! surface that supports it does not link, and `nautilus-plugin` is not pulled
-//! into the dependency graph. A non-empty `LiveNodeConfig.plugins` list is
-//! rejected at build time under this configuration.
+//! With `plugin` disabled, the compatibility `plugin` module is removed. A
+//! non-empty `LiveNodeConfig.plugins` list is rejected under this configuration
+//! as well.
 
 #![warn(rustc::all)]
+#![warn(clippy::pedantic)]
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(nonstandard_style)]
@@ -83,32 +94,64 @@
 #![deny(clippy::missing_errors_doc)]
 #![deny(clippy::missing_panics_doc)]
 #![deny(rustdoc::broken_intra_doc_links)]
+#![allow(
+    clippy::similar_names,
+    reason = "timing and plug-in identifiers such as elapsed_ms/elapsed_ns and loaded/loader are intentionally parallel"
+)]
+#![allow(
+    clippy::single_match_else,
+    reason = "match can be clearer than if-let-else for some reconciliation state transitions"
+)]
+#![allow(
+    clippy::too_many_lines,
+    reason = "live node lifecycle and reconciliation flows exceed the default threshold by design"
+)]
+#![allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "config types deserialize plain field values; unsafe in unrelated impls is sound"
+)]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
-pub mod emitter;
+pub mod book;
+pub mod execution;
 pub mod runner;
+pub mod socket;
+pub mod task;
 
-#[cfg(feature = "node")]
-pub mod builder;
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod fuzz;
 
-#[cfg(feature = "node")]
-pub mod config;
-
-#[cfg(feature = "node")]
-pub mod manager;
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub use fuzz::Corpus;
 
 #[cfg(feature = "node")]
 pub mod node;
 
-#[cfg(feature = "node")]
-mod execution;
-
-#[cfg(feature = "plugin")]
-pub mod plugin;
-
 #[cfg(feature = "python")]
 pub mod python;
 
+#[cfg(feature = "test-support")]
+pub mod testing;
+
+mod dispatch;
+
 // Re-exports for adapters
-pub use emitter::ExecutionEventEmitter;
+pub use execution::{emitter, emitter::ExecutionEventEmitter, manager};
 pub use nautilus_common::factories::OrderEventFactory;
 pub use nautilus_execution::client::core::ExecutionClientCore;
+#[cfg(feature = "plugin")]
+pub use node::plugin;
+#[cfg(feature = "node")]
+pub use node::{builder, config};
+pub use socket::{
+    SocketControl, SocketControlFactory, SocketReconnectLookup, SocketReconnectRegistry,
+    SocketReconnectRequestOutcome,
+};

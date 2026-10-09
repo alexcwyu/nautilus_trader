@@ -35,6 +35,14 @@ pub enum TransportError {
     #[error("handshake failed: {0}")]
     Handshake(String),
 
+    /// Server rejected the WebSocket HTTP upgrade.
+    #[error("WebSocket upgrade rejected with status {0}")]
+    UpgradeRejected(u16),
+
+    /// Proxy rejected the HTTP CONNECT request.
+    #[error("proxy CONNECT rejected with status {0}")]
+    ProxyConnectRejected(u16),
+
     /// URL was invalid or unsupported.
     #[error("invalid URL: {0}")]
     InvalidUrl(String),
@@ -69,8 +77,8 @@ pub enum TransportError {
 
     /// UTF-8 validation failed on a text frame.
     ///
-    /// Only emitted by backends that validate (e.g. `tokio-tungstenite`); the
-    /// in-house HFT backend does not validate and will not produce this.
+    /// Both shipped backends validate incoming text frames: tokio-tungstenite
+    /// during frame assembly and sockudo-ws at parse time.
     #[error("invalid UTF-8 in text frame")]
     InvalidUtf8,
 
@@ -100,6 +108,11 @@ impl TransportError {
             Self::ConnectionClosed | Self::ConnectionReset | Self::ClosedByPeer(_)
         )
     }
+}
+
+// Keep initial-connect retry policy and handshake log severity consistent
+pub(crate) const fn retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
 }
 
 #[cfg(test)]
@@ -159,6 +172,8 @@ mod tests {
             TransportError::InvalidUtf8,
             TransportError::Tls("bad".into()),
             TransportError::Handshake("bad".into()),
+            TransportError::UpgradeRejected(429),
+            TransportError::ProxyConnectRejected(503),
         ] {
             assert!(err.is_fatal(), "expected fatal: {err:?}");
             assert!(!err.is_closed(), "expected not closed: {err:?}");

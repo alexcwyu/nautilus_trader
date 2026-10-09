@@ -135,6 +135,7 @@ impl Verifier {
         let scan = self.scan_entries(high_watermark, &mut findings)?;
 
         self.cross_check_indices(&scan, &mut findings)?;
+        check_snapshot_anchor(self.backend.as_ref(), high_watermark, &mut findings)?;
         validate_manifest(&manifest, high_watermark, &scan, &mut findings);
 
         Ok(VerifyReport {
@@ -185,13 +186,28 @@ impl Verifier {
                 Ok(None) | Err(EventStoreError::Gap { .. }) => {
                     extend_pending_gap(seq, &mut gap_cursor);
                 }
-                Err(EventStoreError::HashMismatch { seq: bad }) => {
+                Err(scan_err) => {
+                    let finding = match scan_err {
+                        EventStoreError::HashMismatch { seq: bad } => {
+                            VerifyFinding::HashMismatch { seq: bad }
+                        }
+                        EventStoreError::SeqMismatch {
+                            table_key,
+                            embedded_seq,
+                        } => VerifyFinding::SeqMismatch {
+                            table_key,
+                            embedded_seq,
+                        },
+                        EventStoreError::Corrupted(reason) => {
+                            VerifyFinding::Undecodable { seq, reason }
+                        }
+                        other => return Err(VerifyError::Backend(other)),
+                    };
                     flush_pending_gap(seq, &mut gap_cursor, findings);
-                    findings.push(VerifyFinding::HashMismatch { seq: bad });
+                    findings.push(finding);
                     corrupted_seqs.insert(seq);
                     scanned += 1;
                 }
-                Err(other) => return Err(VerifyError::Backend(other)),
             }
         }
 
@@ -268,6 +284,35 @@ fn classify_target(stored_seq: u64, scan: &EntryScan) -> Option<IndexDrift> {
     } else {
         Some(IndexDrift::DanglingTarget { stored_seq })
     }
+}
+
+// The restore path reads the snapshot anchor before tail replay, so an anchor that
+// fails to decode or points past the durable watermark must not verify clean. Other
+// read failures (disk pressure, storage errors) propagate: suppressing them would
+// pass a run whose restore would fail reading the same anchor.
+fn check_snapshot_anchor(
+    backend: &dyn EventStore,
+    high_watermark: u64,
+    findings: &mut Vec<VerifyFinding>,
+) -> Result<(), VerifyError> {
+    match backend.latest_snapshot_anchor() {
+        Ok(Some(anchor)) if anchor.high_watermark > high_watermark => {
+            findings.push(VerifyFinding::SnapshotAnchorInvalid {
+                reason: format!(
+                    "snapshot anchor high_watermark {} exceeds durable high_watermark {high_watermark}",
+                    anchor.high_watermark,
+                ),
+            });
+        }
+        Ok(_) => {}
+        Err(EventStoreError::Corrupted(msg)) => {
+            findings.push(VerifyFinding::SnapshotAnchorInvalid {
+                reason: format!("snapshot anchor unreadable: {msg}"),
+            });
+        }
+        Err(other) => return Err(VerifyError::Backend(other)),
+    }
+    Ok(())
 }
 
 fn validate_manifest(
@@ -378,6 +423,15 @@ pub enum VerifyFinding {
         /// The seq embedded inside the decoded entry value.
         embedded_seq: u64,
     },
+    /// The row stored at `seq` failed to decode into an entry.
+    ///
+    /// Recorded per slot so one bad row cannot mask every other finding.
+    Undecodable {
+        /// The sequence number whose stored bytes failed to decode.
+        seq: u64,
+        /// Operator-readable explanation of the decode failure.
+        reason: String,
+    },
     /// A stored sidecar index entry diverges from the projection rebuilt from the
     /// entry table.
     IndexDrift {
@@ -394,6 +448,12 @@ pub enum VerifyFinding {
         /// Which manifest field the finding applies to.
         kind: ManifestField,
         /// Operator-readable explanation of the mismatch.
+        reason: String,
+    },
+    /// The recorded snapshot anchor cannot support a restore: it fails to decode or
+    /// points past the durable high-watermark.
+    SnapshotAnchorInvalid {
+        /// Operator-readable explanation of the failure.
         reason: String,
     },
 }
@@ -967,6 +1027,109 @@ mod tests {
         fn high_watermark(&self) -> Result<u64, EventStoreError> {
             self.inner.high_watermark()
         }
+    }
+
+    /// Test backend that fails `scan_seq` for one slot with a decode-style
+    /// `Corrupted` error, exercising the accumulate-don't-abort contract.
+    struct UndecodableBackend {
+        inner: MemoryBackend,
+        target_key: u64,
+    }
+
+    impl EventStore for UndecodableBackend {
+        fn open_run(&mut self, m: RunManifest) -> Result<(), EventStoreError> {
+            self.inner.open_run(m)
+        }
+        fn append_batch(&mut self, e: &[AppendEntry]) -> Result<u64, EventStoreError> {
+            self.inner.append_batch(e)
+        }
+        fn scan_range(
+            &self,
+            from: u64,
+            to: u64,
+            direction: ScanDirection,
+        ) -> Result<Vec<EventStoreEntry>, EventStoreError> {
+            self.inner.scan_range(from, to, direction)
+        }
+        fn scan_seq(&self, seq: u64) -> Result<Option<EventStoreEntry>, EventStoreError> {
+            if seq == self.target_key {
+                return Err(EventStoreError::Corrupted(format!(
+                    "decode entry seq={seq}: bad length prefix",
+                )));
+            }
+            self.inner.scan_seq(seq)
+        }
+        fn lookup(&self, kind: IndexKind, key: &str) -> Result<Option<u64>, EventStoreError> {
+            self.inner.lookup(kind, key)
+        }
+        fn iter_index_keys(&self, kind: IndexKind) -> Result<Vec<(String, u64)>, EventStoreError> {
+            self.inner.iter_index_keys(kind)
+        }
+        fn seal(&mut self, status: RunStatus) -> Result<(), EventStoreError> {
+            self.inner.seal(status)
+        }
+        fn manifest(&self) -> Result<RunManifest, EventStoreError> {
+            self.inner.manifest()
+        }
+        fn high_watermark(&self) -> Result<u64, EventStoreError> {
+            self.inner.high_watermark()
+        }
+    }
+
+    #[rstest]
+    fn undecodable_row_is_recorded_and_scan_continues() {
+        // One row fails to decode at seq 2; the walk must continue so later entries
+        // still count and indices pointing at the bad row classify as TargetCorrupted.
+        let mut inner = MemoryBackend::new();
+        inner
+            .open_run(manifest("run-undecodable"))
+            .expect("open run");
+        inner
+            .append_batch(&[
+                append_with(1, 10, Vec::new()),
+                AppendEntry::new(
+                    build_entry(2, Headers::empty(), 11),
+                    vec![IndexKey::new(IndexKind::ClientOrderId, "O-1".to_string())],
+                ),
+                append_with(3, 12, Vec::new()),
+            ])
+            .expect("append");
+        inner.seal(RunStatus::Ended).expect("seal");
+
+        let backend = UndecodableBackend {
+            inner,
+            target_key: 2,
+        };
+
+        let report = Verifier::new(Box::new(backend)).verify().expect("verify");
+
+        assert!(!report.is_clean());
+        assert_eq!(report.entries_scanned, 3);
+        assert_eq!(
+            report.findings.len(),
+            2,
+            "findings was: {:?}",
+            report.findings,
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f, VerifyFinding::Undecodable { seq: 2, .. },)),
+            "findings was: {:?}",
+            report.findings,
+        );
+        assert!(
+            report.findings.iter().any(|f| matches!(
+                f,
+                VerifyFinding::IndexDrift {
+                    drift: IndexDrift::TargetCorrupted { stored_seq: 2 },
+                    ..
+                },
+            )),
+            "findings was: {:?}",
+            report.findings,
+        );
     }
 
     #[rstest]

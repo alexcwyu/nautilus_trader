@@ -15,6 +15,8 @@
 
 //! HTTP client error types.
 
+use std::error::Error;
+
 /// Errors returned by the HTTP client.
 ///
 /// Includes generic transport errors, timeouts, and proxy configuration errors.
@@ -22,6 +24,9 @@
 pub enum HttpClientError {
     #[error("HTTP error occurred: {0}")]
     Error(String),
+
+    #[error("HTTP transport error: {0}")]
+    TransportError(String),
 
     #[error("HTTP request timed out: {0}")]
     TimeoutError(String),
@@ -33,18 +38,57 @@ pub enum HttpClientError {
     ClientBuildError(String),
 }
 
-impl From<reqwest::Error> for HttpClientError {
-    fn from(source: reqwest::Error) -> Self {
-        if source.is_timeout() {
-            Self::TimeoutError(source.to_string())
-        } else {
-            Self::Error(source.to_string())
-        }
-    }
-}
-
 impl From<String> for HttpClientError {
     fn from(value: String) -> Self {
         Self::Error(value)
+    }
+}
+
+pub(super) fn transport_error(e: &(dyn Error + 'static)) -> HttpClientError {
+    let mut message = String::new();
+    let mut cause = Some(e);
+    let mut timed_out = false;
+
+    while let Some(e) = cause {
+        if !message.is_empty() {
+            message.push_str(": ");
+        }
+        message.push_str(&e.to_string());
+
+        timed_out |= e
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_timeout)
+            || e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut);
+        cause = e.source();
+    }
+
+    if timed_out {
+        HttpClientError::TimeoutError(message)
+    } else {
+        HttpClientError::TransportError(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::timeout(io::ErrorKind::TimedOut, true)]
+    #[case::refused(io::ErrorKind::ConnectionRefused, false)]
+    fn socket_errors_preserve_classification(#[case] kind: io::ErrorKind, #[case] timeout: bool) {
+        let error = transport_error(&io::Error::new(kind, "socket failure"));
+        match (error, timeout) {
+            (HttpClientError::TimeoutError(message), true)
+            | (HttpClientError::TransportError(message), false) => {
+                assert_eq!(message, "socket failure");
+            }
+            (error, _) => panic!("unexpected classification: {error}"),
+        }
     }
 }

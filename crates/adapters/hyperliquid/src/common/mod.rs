@@ -13,6 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+pub mod builder_fee;
 pub mod consts;
 pub mod converters;
 pub mod credential;
@@ -20,6 +21,8 @@ pub mod enums;
 pub mod models;
 pub mod parse;
 pub mod types;
+
+pub(crate) mod rate_limits;
 
 #[cfg(test)]
 pub mod testing;

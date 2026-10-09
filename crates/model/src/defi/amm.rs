@@ -48,15 +48,15 @@ use crate::{
 /// ## Instrument ID Format
 ///
 /// The instrument ID encodes with the following components:
-/// - `symbol` – The pool identifier (address for V2/V3, Pool ID for V4)
-/// - `venue`  – The chain name plus DEX ID
+/// - `symbol` - The pool identifier (address for V2/V3, Pool ID for V4)
+/// - `venue`  - The chain name plus DEX ID
 ///
 /// String representation: `<POOL_IDENTIFIER>.<CHAIN_NAME>:<DEX_ID>`
 ///
 /// Example: `0x11b815efB8f581194ae79006d24E0d814B7697F6.Ethereum:UniswapV3`
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.model", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.model", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -81,7 +81,7 @@ pub struct Pool {
     /// The second token in the trading pair.
     pub token1: Token,
     /// The trading fee tier used by the pool expressed in hundred-thousandths
-    /// (1e-6) of one unit – identical to Uniswap-V3’s fee representation.
+    /// (1e-6) of one unit - identical to Uniswap-V3's fee representation.
     ///
     /// Examples:
     /// • `500`   →  0.05 %  (5 bps)
@@ -255,8 +255,7 @@ impl Display for Pool {
             "Pool(instrument_id={}, dex={}, fee={}, address={})",
             self.instrument_id,
             self.dex.name,
-            self.fee
-                .map_or("None".to_string(), |fee| format!("fee={fee}, ")),
+            self.fee.map_or("None".to_string(), |fee| fee.to_string()),
             self.address
         )
     }
@@ -298,7 +297,7 @@ mod tests {
         );
 
         let token0 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             "0xA0b86a33E6441b936662bb6B5d1F8Fb0E2b57A5D"
                 .parse()
                 .unwrap(),
@@ -308,7 +307,7 @@ mod tests {
         );
 
         let token1 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             "0xdAC17F958D2ee523a2206206994597C13D831ec7"
                 .parse()
                 .unwrap(),
@@ -324,7 +323,7 @@ mod tests {
         let ts_init = UnixNanos::from(1_234_567_890_000_000_000u64);
 
         let pool = Pool::new(
-            chain.clone(),
+            Arc::clone(&chain),
             Arc::new(dex),
             pool_address,
             pool_identifier,
@@ -358,6 +357,11 @@ mod tests {
             pool.to_full_spec_string(),
             "WETH/USDT-3000.Ethereum:UniswapV3"
         );
+        assert_eq!(
+            pool.to_string(),
+            "Pool(instrument_id=0x11b815efB8f581194ae79006d24E0d814B7697F6.Ethereum:UniswapV3, \
+             dex=UniswapV3, fee=3000, address=0x11b815efB8f581194ae79006d24E0d814B7697F6)"
+        );
     }
 
     #[rstest]
@@ -379,7 +383,7 @@ mod tests {
         );
 
         let token0 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             "0xA0b86a33E6441b936662bb6B5d1F8Fb0E2b57A5D"
                 .parse()
                 .unwrap(),
@@ -389,7 +393,7 @@ mod tests {
         );
 
         let token1 = Token::new(
-            chain.clone(),
+            Arc::clone(&chain),
             "0xdAC17F958D2ee523a2206206994597C13D831ec7"
                 .parse()
                 .unwrap(),
@@ -401,6 +405,7 @@ mod tests {
         let pool_address = "0x11b815efB8f581194ae79006d24E0d814B7697F6"
             .parse()
             .unwrap();
+
         let pool = Pool::new(
             chain,
             Arc::new(dex),

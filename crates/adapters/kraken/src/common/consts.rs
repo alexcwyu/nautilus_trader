@@ -68,7 +68,7 @@ pub static KRAKEN_FUTURES_WS_SUBSCRIPTION_QUOTA: LazyLock<Quota> = LazyLock::new
 /// Kraken Spot WebSocket request rate limit (conservative).
 ///
 /// The Spot WS message rate limit is dynamic and varies depending on system load.
-/// No fixed number is documented — the server returns `{"Error": "Exceeded msg rate"}`
+/// No fixed number is documented - the server returns `{"Error": "Exceeded msg rate"}`
 /// when exceeded. This conservative quota should avoid hitting the limit under normal use.
 ///
 /// <https://docs.kraken.com/api/docs/guides/spot-ratelimits>
@@ -103,3 +103,10 @@ pub static KRAKEN_RATE_LIMIT_KEY_ORDER: LazyLock<[Ustr; 1]> =
 pub const KRAKEN_FUTURES_POST_ONLY_REJECT: &str = "post_order_failed_because_it_would_filled";
 pub const KRAKEN_SPOT_POST_ONLY_REJECT: &str = "Post only order";
 pub const KRAKEN_SPOT_POST_ONLY_ERROR: &str = "EOrder:Post only order";
+
+/// Key under which a spot instrument carries Kraken's `altname` in its `info` map.
+///
+/// Present only when the altname differs from the `AssetPairs` key that is the instrument
+/// `raw_symbol`, so a client fed through the cache APIs can index the alias without the
+/// `AssetPairs` response.
+pub(crate) const KRAKEN_ALTNAME_KEY: &str = "kraken_altname";

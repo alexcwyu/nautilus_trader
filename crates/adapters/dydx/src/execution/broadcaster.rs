@@ -41,7 +41,7 @@ use std::sync::{
 use cosmrs::Any;
 use nautilus_network::{
     ratelimiter::{RateLimiter, clock::MonotonicClock, quota::Quota},
-    retry::{RetryConfig, RetryManager},
+    retry::{RetryConfig, RetryError, RetryManager},
 };
 
 use super::{tx_manager::TransactionManager, types::PreparedTransaction};
@@ -216,7 +216,7 @@ impl TxBroadcaster {
                 // Broadcast
                 let mut grpc = grpc_client;
                 let tx_hash = grpc.broadcast_tx(prepared.tx_bytes).await.map_err(|e| {
-                    log::error!("gRPC broadcast failed for {op_name}: {e}");
+                    log::debug!("gRPC broadcast failed for {op_name}: {e}");
                     DydxError::Nautilus(e)
                 })?;
 
@@ -229,26 +229,37 @@ impl TxBroadcaster {
             if e.is_sequence_mismatch() {
                 // Set flag so next attempt will resync
                 needs_resync_for_retry.store(true, Ordering::SeqCst);
-                log::warn!("Sequence mismatch detected, will resync and retry");
+                log::debug!("Sequence mismatch detected, will resync and retry");
                 true
             } else if e.is_transient() {
                 // Also resync on transient errors (timeout, unavailable).
                 // Without this, each retry allocates a NEW sequence, causing drift
                 // (e.g., timeout → alloc 314, timeout → alloc 315, then sequence mismatch).
                 needs_resync_for_retry.store(true, Ordering::SeqCst);
-                log::warn!("Transient error detected, will resync and retry: {e}");
+                log::debug!("Transient error detected, will resync and retry: {e}");
                 true
             } else {
                 false
             }
         };
 
-        let create_error = |msg: String| -> DydxError { DydxError::Nautilus(anyhow::anyhow!(msg)) };
+        let create_error =
+            |error: RetryError| DydxError::Nautilus(anyhow::anyhow!(error.to_string()));
 
         // Permit is held throughout retry loop, released when _permit drops
-        self.retry_manager
-            .execute_with_retry(operation_name, operation, should_retry, create_error)
-            .await
+        let result = self
+            .retry_manager
+            .invocation(operation_name, operation, should_retry, create_error)
+            .execute()
+            .await;
+
+        if let Err(ref e) = result
+            && (e.is_transient() || e.is_sequence_mismatch())
+        {
+            log::warn!("Broadcast exhausted retries: operation={operation_name}, error={e}");
+        }
+
+        result
     }
 
     /// Broadcasts a short-term order transaction without sequence management.
@@ -292,7 +303,6 @@ impl TxBroadcaster {
                     );
                     Ok(String::new())
                 } else {
-                    log::error!("gRPC broadcast failed for {operation_name}: {dydx_err}");
                     Err(dydx_err)
                 }
             }
@@ -324,10 +334,7 @@ impl TxBroadcaster {
         let tx_hash = grpc
             .broadcast_tx(prepared.tx_bytes.clone())
             .await
-            .map_err(|e| {
-                log::error!("gRPC broadcast failed for {operation}: {e}");
-                DydxError::Nautilus(e)
-            })?;
+            .map_err(DydxError::Nautilus)?;
 
         log::debug!("{operation} successfully: tx_hash={tx_hash}");
         Ok(tx_hash)

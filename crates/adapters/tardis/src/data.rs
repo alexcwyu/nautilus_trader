@@ -27,7 +27,7 @@ use ahash::{AHashMap, AHashSet};
 use futures_util::{SinkExt, StreamExt};
 use nautilus_common::{
     clients::DataClient,
-    live::{runner::get_data_event_sender, runtime::get_runtime},
+    live::{runner::get_data_event_sender, sender::EventSender},
     messages::{
         DataEvent,
         data::{
@@ -36,13 +36,20 @@ use nautilus_common::{
         },
     },
 };
-use nautilus_core::string::urlencoding;
+use nautilus_core::{consts::NAUTILUS_USER_AGENT, string::urlencoding};
+use nautilus_live::task::TaskGroup;
 use nautilus_model::{
     data::Data,
     identifiers::{ClientId, Venue},
 };
-use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
-use tokio_tungstenite::{connect_async, tungstenite};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        self,
+        client::IntoClientRequest,
+        http::{HeaderValue, header::USER_AGENT},
+    },
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -59,12 +66,14 @@ use crate::{
     machine::{
         cache::DerivativeTickerCache,
         client::determine_instrument_info,
-        message::WsMessage,
+        is_unsupported_streaming_error,
+        message::{WsMessage, decode_ws_message},
         parse::{
             parse_derivative_ticker_index_price, parse_derivative_ticker_mark_price,
             parse_tardis_ws_message_data, parse_tardis_ws_message_funding_rate,
         },
         types::{TardisInstrumentKey, TardisInstrumentMiniInfo},
+        validate_stream_options,
     },
 };
 
@@ -75,8 +84,8 @@ pub struct TardisDataClient {
     config: TardisDataClientConfig,
     is_connected: Arc<AtomicBool>,
     cancellation_token: CancellationToken,
-    tasks: Vec<JoinHandle<()>>,
-    data_sender: UnboundedSender<DataEvent>,
+    tasks: TaskGroup,
+    data_sender: EventSender<DataEvent>,
 }
 
 impl TardisDataClient {
@@ -88,12 +97,14 @@ impl TardisDataClient {
     pub fn new(client_id: ClientId, config: TardisDataClientConfig) -> anyhow::Result<Self> {
         let data_sender = get_data_event_sender();
 
+        let tasks = TaskGroup::new();
+
         Ok(Self {
             client_id,
             config,
             is_connected: Arc::new(AtomicBool::new(false)),
-            cancellation_token: CancellationToken::new(),
-            tasks: Vec::new(),
+            cancellation_token: tasks.cancellation_token(),
+            tasks,
             data_sender,
         })
     }
@@ -143,7 +154,7 @@ impl TardisDataClient {
     /// error if the first connection fails. In stream mode the spawned task
     /// handles subsequent reconnections automatically.
     fn spawn_ws_task(
-        &mut self,
+        &self,
         ws_stream: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
@@ -152,12 +163,12 @@ impl TardisDataClient {
         book_snapshot_output: BookSnapshotOutput,
         extract_bbo_as_quotes: bool,
         is_stream_mode: bool,
-    ) {
+    ) -> anyhow::Result<()> {
         let sender = self.data_sender.clone();
         let cancel = self.cancellation_token.clone();
         let connected = self.is_connected.clone();
 
-        let handle = get_runtime().spawn(async move {
+        let future = async move {
             let mut reconnect_delay = Duration::from_secs(WS_INITIAL_RECONNECT_DELAY_SECS);
             let instrument_map = instrument_map;
 
@@ -198,8 +209,16 @@ impl TardisDataClient {
                 );
 
                 // Reconnect WS first (critical path), then refresh instruments
+                let ws_request = match build_ws_request(&url) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        log::error!("{e}");
+                        break;
+                    }
+                };
+
                 let ws_result = tokio::select! {
-                    result = connect_async(&url) => Some(result),
+                    result = connect_async(ws_request) => Some(result),
                     () = cancel.cancelled() => None,
                 };
 
@@ -243,9 +262,12 @@ impl TardisDataClient {
             }
 
             connected.store(false, Ordering::Release);
-        });
+        };
 
-        self.tasks.push(handle);
+        self.tasks
+            .spawn(future)
+            .map_err(|e| anyhow::anyhow!("failed to register Tardis stream task: {e}"))?;
+        Ok(())
     }
 
     /// Runs a single WebSocket session: starts heartbeat, processes messages,
@@ -255,7 +277,7 @@ impl TardisDataClient {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
         cancel: &CancellationToken,
-        sender: &UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         instrument_map: &AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>,
         book_snapshot_output: &BookSnapshotOutput,
         extract_bbo_as_quotes: bool,
@@ -265,7 +287,7 @@ impl TardisDataClient {
         let heartbeat_token = cancel.child_token();
         let heartbeat_signal = heartbeat_token.clone();
 
-        get_runtime().spawn(async move {
+        let heartbeat = async move {
             let mut interval =
                 tokio::time::interval(Duration::from_secs(WS_HEARTBEAT_INTERVAL_SECS));
             loop {
@@ -281,19 +303,22 @@ impl TardisDataClient {
                     () = heartbeat_signal.cancelled() => break,
                 }
             }
-        });
+        };
 
-        let should_reconnect = Self::run_ws_loop(
-            &mut reader,
-            cancel,
-            sender,
-            instrument_map,
-            book_snapshot_output,
-            extract_bbo_as_quotes,
-        )
-        .await;
-
-        heartbeat_token.cancel();
+        let message_loop = async {
+            let should_reconnect = Self::run_ws_loop(
+                &mut reader,
+                cancel,
+                sender,
+                instrument_map,
+                book_snapshot_output,
+                extract_bbo_as_quotes,
+            )
+            .await;
+            heartbeat_token.cancel();
+            should_reconnect
+        };
+        let (should_reconnect, ()) = tokio::join!(message_loop, heartbeat);
         should_reconnect
     }
 
@@ -304,7 +329,7 @@ impl TardisDataClient {
     fn send_derivative_ticker_events(
         ws_msg: &WsMessage,
         info: &Arc<TardisInstrumentMiniInfo>,
-        sender: &UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         cache: &mut DerivativeTickerCache,
     ) -> bool {
         if let Some(funding) = parse_tardis_ws_message_funding_rate(ws_msg.clone(), info)
@@ -319,7 +344,7 @@ impl TardisDataClient {
                 parse_derivative_ticker_mark_price(msg, info.instrument_id, info.price_precision)
                 && cache.should_emit_mark_price(&mark_price)
                 && sender
-                    .send(DataEvent::Data(Data::MarkPriceUpdate(mark_price)))
+                    .send(DataEvent::Data(Data::MarkPrice(mark_price)))
                     .is_err()
             {
                 return false;
@@ -329,7 +354,7 @@ impl TardisDataClient {
                 parse_derivative_ticker_index_price(msg, info.instrument_id, info.price_precision)
                 && cache.should_emit_index_price(&index_price)
                 && sender
-                    .send(DataEvent::Data(Data::IndexPriceUpdate(index_price)))
+                    .send(DataEvent::Data(Data::IndexPrice(index_price)))
                     .is_err()
             {
                 return false;
@@ -349,7 +374,7 @@ impl TardisDataClient {
             >,
         >,
         cancel: &CancellationToken,
-        sender: &UnboundedSender<DataEvent>,
+        sender: &EventSender<DataEvent>,
         instrument_map: &AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>,
         book_snapshot_output: &BookSnapshotOutput,
         extract_bbo_as_quotes: bool,
@@ -366,63 +391,67 @@ impl TardisDataClient {
             };
 
             match msg {
-                Some(Ok(tungstenite::Message::Text(text))) => {
-                    match serde_json::from_str::<WsMessage>(&text) {
-                        Ok(ws_msg) => {
-                            if matches!(ws_msg, WsMessage::Disconnect(_)) {
-                                log::debug!("Received disconnect message");
-                                continue;
-                            }
+                Some(Ok(tungstenite::Message::Text(text))) => match decode_ws_message(&text) {
+                    Ok(ws_msg) => {
+                        if matches!(ws_msg, WsMessage::Disconnect(_)) {
+                            log::debug!("Received disconnect message");
+                            continue;
+                        }
 
-                            let info = determine_instrument_info(&ws_msg, instrument_map);
+                        let info = determine_instrument_info(&ws_msg, instrument_map);
 
-                            if let Some(info) = info {
-                                if matches!(ws_msg, WsMessage::DerivativeTicker(_)) {
-                                    if !Self::send_derivative_ticker_events(
-                                        &ws_msg,
-                                        &info,
-                                        sender,
-                                        &mut ticker_cache,
-                                    ) {
+                        if let Some(info) = info {
+                            if matches!(ws_msg, WsMessage::DerivativeTicker(_)) {
+                                if !Self::send_derivative_ticker_events(
+                                    &ws_msg,
+                                    &info,
+                                    sender,
+                                    &mut ticker_cache,
+                                ) {
+                                    return false;
+                                }
+                            } else {
+                                let data = parse_tardis_ws_message_data(
+                                    ws_msg,
+                                    &info,
+                                    book_snapshot_output,
+                                    extract_bbo_as_quotes,
+                                );
+
+                                for data in data {
+                                    if let Err(e) = sender.send(DataEvent::Data(data)) {
+                                        log::error!("Failed to send data event: {e}");
                                         return false;
-                                    }
-                                } else {
-                                    let data = parse_tardis_ws_message_data(
-                                        ws_msg,
-                                        &info,
-                                        book_snapshot_output,
-                                        extract_bbo_as_quotes,
-                                    );
-
-                                    for data in data {
-                                        if let Err(e) = sender.send(DataEvent::Data(data)) {
-                                            log::error!("Failed to send data event: {e}");
-                                            return false;
-                                        }
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            log::error!("Failed to deserialize message: {e}");
-                        }
                     }
+                    Err(e) => {
+                        log::error!("Failed to deserialize message: {e}");
+                    }
+                },
+                Some(Ok(tungstenite::Message::Close(Some(frame))))
+                    if is_unsupported_streaming_error(&frame.reason) =>
+                {
+                    log::error!("Tardis Machine rejected streaming: {}", frame.reason);
+                    return false;
                 }
                 Some(Ok(tungstenite::Message::Close(frame))) => {
                     if let Some(frame) = frame {
-                        log::info!("WebSocket closed: {} {}", frame.code, frame.reason);
+                        log::debug!("WebSocket closed: {} {}", frame.code, frame.reason);
                     } else {
-                        log::info!("WebSocket closed");
+                        log::debug!("WebSocket closed");
                     }
                     return true;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
-                    log::error!("WebSocket error: {e}");
+                    log::warn!("WebSocket error: {e}");
                     return true;
                 }
                 None => {
-                    log::info!("Stream ended");
+                    log::debug!("Stream ended");
                     return true;
                 }
             }
@@ -447,22 +476,13 @@ impl DataClient for TardisDataClient {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         log::info!("Stopping {}", self.client_id);
-        self.cancellation_token.cancel();
-
-        for handle in self.tasks.drain(..) {
-            handle.abort();
-        }
+        self.tasks.begin_shutdown();
         self.is_connected.store(false, Ordering::Release);
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        self.cancellation_token.cancel();
-
-        for handle in self.tasks.drain(..) {
-            handle.abort();
-        }
-        self.cancellation_token = CancellationToken::new();
+        self.tasks.begin_shutdown();
         self.is_connected.store(false, Ordering::Release);
         Ok(())
     }
@@ -479,43 +499,55 @@ impl DataClient for TardisDataClient {
         !self.is_connected()
     }
 
-    fn subscribe_mark_prices(&mut self, cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
-        log::info!("Subscribed mark prices for {}", cmd.instrument_id);
+    fn subscribe_mark_prices(&mut self, _cmd: SubscribeMarkPrices) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
-        log::info!("Subscribed index prices for {}", cmd.instrument_id);
+    fn subscribe_index_prices(&mut self, _cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn subscribe_funding_rates(&mut self, cmd: SubscribeFundingRates) -> anyhow::Result<()> {
-        log::info!("Subscribed funding rates for {}", cmd.instrument_id);
+    fn subscribe_funding_rates(&mut self, _cmd: SubscribeFundingRates) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn unsubscribe_mark_prices(&mut self, cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
-        log::info!("Unsubscribed mark prices for {}", cmd.instrument_id);
+    fn unsubscribe_mark_prices(&mut self, _cmd: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn unsubscribe_index_prices(&mut self, cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
-        log::info!("Unsubscribed index prices for {}", cmd.instrument_id);
+    fn unsubscribe_index_prices(&mut self, _cmd: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn unsubscribe_funding_rates(&mut self, cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
-        log::info!("Unsubscribed funding rates for {}", cmd.instrument_id);
+    fn unsubscribe_funding_rates(&mut self, _cmd: &UnsubscribeFundingRates) -> anyhow::Result<()> {
         Ok(())
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        if self.is_connected() {
+        if self.is_connected() && self.tasks.is_open() {
             return Ok(());
         }
 
-        if self.config.options.is_empty() && self.config.stream_options.is_empty() {
-            anyhow::bail!("Either replay `options` or `stream_options` must be provided");
+        match (
+            self.config.options.as_slice(),
+            self.config.stream_options.as_slice(),
+        ) {
+            ([], []) => {
+                anyhow::bail!("Either replay `options` or `stream_options` must be provided")
+            }
+            ([], stream_options) => validate_stream_options(stream_options)?,
+            _ => {}
+        }
+
+        if !self.tasks.is_open() {
+            self.tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to terminate Tardis tasks: {e}"))?;
+            self.tasks
+                .start_generation()
+                .map_err(|e| anyhow::anyhow!("Failed to start Tardis task generation: {e}"))?;
+            self.cancellation_token = self.tasks.cancellation_token();
         }
 
         let is_stream_mode = self.is_stream_mode();
@@ -523,11 +555,20 @@ impl DataClient for TardisDataClient {
         let extract_bbo_as_quotes = self.config.extract_bbo_as_quotes;
 
         let http_client = TardisHttpClient::new(
-            self.config.api_key.as_deref(),
-            None,
+            self.config
+                .api_key
+                .as_ref()
+                .map(|value| value.expose_secret()),
+            self.config
+                .tardis_http_url
+                .as_ref()
+                .map(|value| value.expose_secret()),
             None,
             self.config.normalize_symbols,
-            self.config.proxy_url.clone(),
+            self.config
+                .proxy_url
+                .as_ref()
+                .map(|value| value.expose_secret().to_owned()),
         )?;
 
         let exchanges: AHashSet<_> = if is_stream_mode {
@@ -540,7 +581,12 @@ impl DataClient for TardisDataClient {
             self.config.options.iter().map(|opt| opt.exchange).collect()
         };
 
-        let base_url = resolve_ws_base_url(self.config.tardis_ws_url.as_deref())?;
+        let base_url = resolve_ws_base_url(
+            self.config
+                .tardis_ws_url
+                .as_ref()
+                .map(|value| value.expose_secret()),
+        )?;
         let (instrument_map, instruments) = http_client
             .bootstrap_instruments(&exchanges)
             .await
@@ -558,51 +604,72 @@ impl DataClient for TardisDataClient {
         log::info!("Connecting to Tardis Machine {mode_label}");
         log::debug!("URL: {url}");
 
-        self.cancellation_token = CancellationToken::new();
-
-        let (ws_stream, _) = connect_async(&url)
+        let (ws_stream, _) = connect_async(build_ws_request(&url)?)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to Tardis Machine: {e}"))?;
 
         log::info!("Connected to Tardis Machine");
 
-        self.spawn_ws_task(
+        self.is_connected.store(true, Ordering::Release);
+
+        if let Err(e) = self.spawn_ws_task(
             ws_stream,
             url,
             instrument_map,
             book_snapshot_output,
             extract_bbo_as_quotes,
             is_stream_mode,
-        );
-        self.is_connected.store(true, Ordering::Release);
+        ) {
+            self.is_connected.store(false, Ordering::Release);
+            self.tasks.begin_shutdown();
+            if let Err(teardown_error) = self
+                .tasks
+                .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+                .await
+            {
+                return Err(e.context(format!("Tardis startup teardown failed: {teardown_error}")));
+            }
+            return Err(e);
+        }
 
         log::info!("Connected: {}", self.client_id);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.cancellation_token.cancel();
-        self.cancellation_token = CancellationToken::new();
+        self.tasks.begin_shutdown();
+        let had_tasks = !self.tasks.is_empty();
+        let tasks_result = self
+            .tasks
+            .finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to terminate Tardis tasks: {e}"));
 
-        let handles: Vec<_> = self.tasks.drain(..).collect();
-        if !handles.is_empty() {
-            for handle in handles {
-                if let Err(e) = handle.await {
-                    log::error!("Error joining task: {e}");
-                }
-            }
+        if had_tasks {
             log::info!("Disconnected: {}", self.client_id);
         }
 
         self.is_connected.store(false, Ordering::Release);
 
-        Ok(())
+        tasks_result
     }
+}
+
+/// Builds a Tardis Machine WebSocket handshake request carrying the Nautilus
+/// user agent.
+fn build_ws_request(url: &str) -> anyhow::Result<tungstenite::http::Request<()>> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("Failed to build Tardis Machine WebSocket request: {e}"))?;
+    request
+        .headers_mut()
+        .insert(USER_AGENT, HeaderValue::from_static(NAUTILUS_USER_AGENT));
+    Ok(request)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use jiff::civil::Date;
     use nautilus_common::live::runner::set_data_event_sender;
     use rstest::rstest;
 
@@ -610,8 +677,160 @@ mod tests {
     use crate::{
         common::{consts::TARDIS_CLIENT_ID, enums::TardisExchange},
         config::TardisDataClientConfig,
-        machine::types::ReplayNormalizedRequestOptions,
+        machine::types::{ReplayNormalizedRequestOptions, StreamNormalizedRequestOptions},
     };
+
+    #[rstest]
+    #[case(vec![], "Either replay `options` or `stream_options` must be provided")]
+    #[case(
+        vec![TardisExchange::Bitmex],
+        "Unsupported Tardis streaming exchange: bitmex (historical-only; use replay options)"
+    )]
+    #[case(
+        vec![TardisExchange::Deribit, TardisExchange::Bitmex],
+        "Unsupported Tardis streaming exchange: bitmex (historical-only; use replay options)"
+    )]
+    #[tokio::test]
+    async fn test_connect_rejects_invalid_stream_options_before_network_access(
+        #[case] exchanges: Vec<TardisExchange>,
+        #[case] expected_error: &str,
+    ) {
+        setup_test_env();
+
+        let config = TardisDataClientConfig {
+            api_key: Some("test-key".into()),
+            tardis_http_url: Some("http://127.0.0.1:0".into()),
+            tardis_ws_url: Some("ws://127.0.0.1:0".into()),
+            stream_options: exchanges
+                .into_iter()
+                .map(|exchange| StreamNormalizedRequestOptions {
+                    exchange,
+                    symbols: None,
+                    data_types: vec!["trade".to_string()],
+                    with_disconnect_messages: None,
+                    timeout_interval_ms: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let mut client = TardisDataClient::new(*TARDIS_CLIENT_ID, config).unwrap();
+
+        let error = client.connect().await.unwrap_err();
+
+        assert_eq!(error.to_string(), expected_error);
+        assert!(client.is_disconnected());
+    }
+
+    #[rstest]
+    #[case(
+        "Error: Real-time streaming is not supported for exchange bitmex",
+        false
+    )]
+    #[case(
+        "Error: Real-time streaming is not supported for exchange coinflex",
+        false
+    )]
+    #[case("Too many subsequent errors when connecting to deribit WS API", true)]
+    #[tokio::test]
+    async fn test_ws_session_close_reconnect_policy(
+        #[case] reason: &'static str,
+        #[case] expected_reconnect: bool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Error,
+                    reason: reason.into(),
+                }))
+                .await
+                .unwrap();
+        });
+
+        let (websocket, _) = connect_async(format!("ws://{address}")).await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let reconnect = tokio::time::timeout(
+            Duration::from_secs(2),
+            TardisDataClient::run_ws_session(
+                websocket,
+                &CancellationToken::new(),
+                &EventSender::from(sender),
+                &AHashMap::new(),
+                &BookSnapshotOutput::Deltas,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(reconnect, expected_reconnect);
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_exchange_finishes_stream_task_without_reconnecting() {
+        setup_test_env();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .close(Some(tungstenite::protocol::CloseFrame {
+                    code: tungstenite::protocol::frame::coding::CloseCode::Error,
+                    reason: "Error: Real-time streaming is not supported for exchange bitmex"
+                        .into(),
+                }))
+                .await
+                .unwrap();
+
+            listener
+        });
+
+        let (websocket, _) = connect_async(&url).await.unwrap();
+        let client =
+            TardisDataClient::new(*TARDIS_CLIENT_ID, TardisDataClientConfig::default()).unwrap();
+        client.is_connected.store(true, Ordering::Release);
+        client
+            .spawn_ws_task(
+                websocket,
+                url,
+                AHashMap::new(),
+                BookSnapshotOutput::Deltas,
+                false,
+                true,
+            )
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !client.tasks.all_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Unsupported exchange must finish the task without reconnecting");
+
+        let listener = server.await.unwrap();
+
+        assert!(client.is_disconnected());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[rstest]
+    fn test_build_ws_request_rejects_invalid_url() {
+        assert!(build_ws_request("not a url").is_err());
+    }
 
     fn setup_test_env() {
         use std::cell::OnceCell;
@@ -636,8 +855,8 @@ mod tests {
             options: vec![ReplayNormalizedRequestOptions {
                 exchange: TardisExchange::BinanceFutures,
                 symbols: Some(vec!["BTCUSDT".to_string()]),
-                from: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
-                to: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                from: Date::new(2024, 1, 1).unwrap(),
+                to: Date::new(2024, 1, 2).unwrap(),
                 data_types: vec!["trade".to_string()],
                 with_disconnect_messages: Some(false),
             }],
@@ -662,8 +881,8 @@ mod tests {
             options: vec![ReplayNormalizedRequestOptions {
                 exchange: TardisExchange::BinanceFutures,
                 symbols: Some(vec!["BTCUSDT".to_string()]),
-                from: NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
-                to: NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+                from: Date::new(2024, 1, 1).unwrap(),
+                to: Date::new(2024, 1, 2).unwrap(),
                 data_types: vec!["trade".to_string(), "derivative_ticker".to_string()],
                 with_disconnect_messages: Some(false),
             }],
@@ -676,5 +895,31 @@ mod tests {
         let decoded = urlencoding::decode(ws_url.split("options=").nth(1).unwrap()).unwrap();
         let count = decoded.matches("derivative_ticker").count();
         assert_eq!(count, 1, "derivative_ticker should appear exactly once");
+    }
+
+    #[rstest]
+    fn test_stop_marks_client_disconnected_synchronously() {
+        setup_test_env();
+
+        let mut client =
+            TardisDataClient::new(*TARDIS_CLIENT_ID, TardisDataClientConfig::default()).unwrap();
+        client.is_connected.store(true, Ordering::Release);
+
+        client.stop().unwrap();
+
+        assert!(client.is_disconnected());
+    }
+
+    #[rstest]
+    fn test_reset_marks_client_disconnected_synchronously() {
+        setup_test_env();
+
+        let mut client =
+            TardisDataClient::new(*TARDIS_CLIENT_ID, TardisDataClientConfig::default()).unwrap();
+        client.is_connected.store(true, Ordering::Release);
+
+        client.reset().unwrap();
+
+        assert!(client.is_disconnected());
     }
 }

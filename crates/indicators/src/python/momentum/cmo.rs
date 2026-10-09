@@ -13,22 +13,23 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::data::{Bar, QuoteTick, TradeTick};
 use pyo3::prelude::*;
 
 use crate::{
     average::MovingAverageType, indicator::Indicator, momentum::cmo::ChandeMomentumOscillator,
+    python::float_precision,
 };
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl ChandeMomentumOscillator {
-    /// Creates a new `ChandeMomentumOscillator` instance.
+    /// Chande momentum oscillator.
     #[new]
     #[pyo3(signature = (period, ma_type=None))]
-    #[must_use]
-    pub fn py_new(period: usize, ma_type: Option<MovingAverageType>) -> Self {
-        Self::new(period, ma_type)
+    pub fn py_new(period: usize, ma_type: Option<MovingAverageType>) -> PyResult<Self> {
+        Self::new_checked(period, ma_type).map_err(to_pyvalue_err)
     }
 
     #[getter]
@@ -73,18 +74,20 @@ impl ChandeMomentumOscillator {
     }
 
     #[pyo3(name = "handle_quote_tick")]
-    const fn py_handle_quote_tick(&mut self, _quote: &QuoteTick) {
-        // Function body intentionally left blank.
+    fn py_handle_quote_tick(&mut self, quote: &QuoteTick) -> PyResult<()> {
+        self.handle_quote(quote).map_err(to_pyvalue_err)
     }
 
     #[pyo3(name = "handle_trade_tick")]
-    const fn py_handle_trade_tick(&mut self, _trade: &TradeTick) {
-        // Function body intentionally left blank.
+    fn py_handle_trade_tick(&mut self, trade: &TradeTick) {
+        self.handle_trade(trade);
     }
 
     #[pyo3(name = "handle_bar")]
-    fn py_handle_bar(&mut self, bar: &Bar) {
-        self.update_raw((&bar.close).into());
+    fn py_handle_bar(&mut self, bar: &Bar) -> PyResult<()> {
+        float_precision::check_bar(bar)?;
+        self.handle_bar(bar);
+        Ok(())
     }
 
     #[pyo3(name = "reset")]

@@ -18,34 +18,39 @@
 use std::error::Error;
 
 use indexmap::IndexMap;
+use nautilus_core::DurationNanos;
 use nautilus_model::{
     data::{
         FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate,
-        QuoteTick, TradeTick,
+        OptionGreekValues, OptionGreeks, QuoteTick, TradeTick,
         bar::{Bar, BarSpecification, BarType},
         delta::OrderBookDelta,
         deltas::OrderBookDeltas,
-        depth::OrderBookDepth10,
+        depth::OrderBookDepth,
         order::BookOrder,
     },
     enums::{
         AccountType, AggregationSource, AggressorSide, AssetClass, BarAggregation, BookAction,
-        BookType, ContingencyType, CurrencyType, InstrumentClass, InstrumentCloseType,
-        LiquiditySide, MarketStatusAction, OmsType, OptionKind, OrderSide, OrderStatus, OrderType,
-        PositionAdjustmentType, PositionSide, PriceType, RecordFlag, TimeInForce,
-        TrailingOffsetType, TriggerType,
+        BookType, ContingencyType, CurrencyType, GreeksConvention, InstrumentClass,
+        InstrumentCloseType, LiquiditySide, MarketStatusAction, OmsType, OptionKind, OrderSide,
+        OrderStatus, OrderType, PositionAdjustmentType, PositionSide, PriceType, RecordFlag,
+        TimeInForce, TrailingOffsetType, TriggerType,
     },
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
-        OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted, OrderTriggered,
-        OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
+        OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized, OrderModifyRejected,
+        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
+        OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed,
+        PositionOpened,
     },
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
         OrderListId, PositionId, StrategyId, Symbol, TradeId, TraderId, Venue, VenueOrderId,
     },
-    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
+    types::{
+        AccountBalance, Currency, MarginBalance, Money, Price, Quantity, money::MoneyRaw,
+        price::PriceRaw, quantity::QuantityRaw,
+    },
 };
 use rust_decimal::Decimal;
 use ustr::Ustr;
@@ -53,11 +58,16 @@ use uuid::Uuid;
 
 use super::{FromCapnp, ToCapnp};
 use crate::{
-    base_capnp, enums_capnp, identifiers_capnp, market_capnp, order_capnp, position_capnp,
-    types_capnp,
+    base_capnp, enums_capnp, identifiers_capnp, market_capnp,
+    numeric::{raw_to_wire, wire_to_raw},
+    order_capnp, position_capnp, types_capnp,
 };
 
-trait CapnpWriteExt<'a, T>
+const DECIMAL_FLAGS_RESERVED_MASK: u32 = 0x7F00_FFFF;
+const DECIMAL_SCALE_MASK: u32 = 0x00FF_0000;
+const DECIMAL_SCALE_SHIFT: u32 = 16;
+
+pub(crate) trait CapnpWriteExt<'a, T>
 where
     T: ToCapnp<'a>,
 {
@@ -92,7 +102,7 @@ where
     }
 }
 
-fn read_optional_from_capnp<'a, T, FHas, FGet>(
+pub(crate) fn read_optional_from_capnp<'a, T, FHas, FGet>(
     has: FHas,
     get: FGet,
 ) -> Result<Option<T>, Box<dyn Error>>
@@ -107,6 +117,29 @@ where
     } else {
         Ok(None)
     }
+}
+
+fn write_string_map(map: &IndexMap<Ustr, Ustr>, mut builder: base_capnp::string_map::Builder<'_>) {
+    let mut entries = builder.reborrow().init_entries(map.len() as u32);
+    for (index, (key, value)) in map.iter().enumerate() {
+        let mut entry = entries.reborrow().get(index as u32);
+        entry.set_key(key.as_str());
+        entry.set_value(value.as_str());
+    }
+}
+
+fn read_string_map(
+    reader: base_capnp::string_map::Reader<'_>,
+) -> Result<IndexMap<Ustr, Ustr>, Box<dyn Error>> {
+    let entries = reader.get_entries()?;
+    let mut map = IndexMap::with_capacity(entries.len() as usize);
+    for entry in entries {
+        map.insert(
+            Ustr::from(entry.get_key()?.to_str()?),
+            Ustr::from(entry.get_value()?.to_str()?),
+        );
+    }
+    Ok(map)
 }
 
 impl<'a> ToCapnp<'a> for nautilus_core::UUID4 {
@@ -148,13 +181,30 @@ fn decimal_to_parts(value: &Decimal) -> (u64, u64, u64, u32) {
     (lo as u64, mid as u64, hi as u64, flags)
 }
 
-fn decimal_from_parts(lo: u64, mid: u64, hi: u64, flags: u32) -> Decimal {
+fn decimal_from_parts(lo: u64, mid: u64, hi: u64, flags: u32) -> Result<Decimal, Box<dyn Error>> {
+    if flags & DECIMAL_FLAGS_RESERVED_MASK != 0 {
+        return Err("Decimal flags contain unsupported bits".into());
+    }
+
+    let scale = (flags & DECIMAL_SCALE_MASK) >> DECIMAL_SCALE_SHIFT;
+    if scale > Decimal::MAX_SCALE {
+        return Err(format!(
+            "Decimal scale exceeds maximum {}, was {scale}",
+            Decimal::MAX_SCALE
+        )
+        .into());
+    }
+
+    let lo = u32::try_from(lo).map_err(|_| "Decimal lo limb exceeds u32")?;
+    let mid = u32::try_from(mid).map_err(|_| "Decimal mid limb exceeds u32")?;
+    let hi = u32::try_from(hi).map_err(|_| "Decimal hi limb exceeds u32")?;
+
     let mut bytes = [0u8; 16];
     bytes[0..4].copy_from_slice(&flags.to_le_bytes());
-    bytes[4..8].copy_from_slice(&(lo as u32).to_le_bytes());
-    bytes[8..12].copy_from_slice(&(mid as u32).to_le_bytes());
-    bytes[12..16].copy_from_slice(&(hi as u32).to_le_bytes());
-    Decimal::deserialize(bytes)
+    bytes[4..8].copy_from_slice(&lo.to_le_bytes());
+    bytes[8..12].copy_from_slice(&mid.to_le_bytes());
+    bytes[12..16].copy_from_slice(&hi.to_le_bytes());
+    Ok(Decimal::deserialize(bytes))
 }
 
 impl<'a> ToCapnp<'a> for Decimal {
@@ -177,7 +227,7 @@ impl<'a> FromCapnp<'a> for Decimal {
         let lo = reader.get_lo();
         let mid = reader.get_mid();
         let hi = reader.get_hi();
-        Ok(decimal_from_parts(lo, mid, hi, flags))
+        decimal_from_parts(lo, mid, hi, flags)
     }
 }
 
@@ -194,7 +244,7 @@ impl<'a> FromCapnp<'a> for TraderId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -211,7 +261,7 @@ impl<'a> FromCapnp<'a> for StrategyId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -228,7 +278,7 @@ impl<'a> FromCapnp<'a> for ActorId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -245,7 +295,7 @@ impl<'a> FromCapnp<'a> for AccountId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -262,7 +312,7 @@ impl<'a> FromCapnp<'a> for ClientId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -279,7 +329,7 @@ impl<'a> FromCapnp<'a> for ClientOrderId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -296,7 +346,7 @@ impl<'a> FromCapnp<'a> for VenueOrderId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -313,7 +363,7 @@ impl<'a> FromCapnp<'a> for TradeId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -330,7 +380,7 @@ impl<'a> FromCapnp<'a> for PositionId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -347,7 +397,7 @@ impl<'a> FromCapnp<'a> for ExecAlgorithmId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -364,7 +414,7 @@ impl<'a> FromCapnp<'a> for ComponentId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -381,7 +431,7 @@ impl<'a> FromCapnp<'a> for OrderListId {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -398,7 +448,7 @@ impl<'a> FromCapnp<'a> for Symbol {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -415,7 +465,7 @@ impl<'a> FromCapnp<'a> for Venue {
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         let value = reader.get_value()?.to_str()?;
-        Ok(value.into())
+        Ok(Self::new_checked(value)?)
     }
 }
 
@@ -441,9 +491,8 @@ impl<'a> FromCapnp<'a> for InstrumentId {
 impl<'a> ToCapnp<'a> for Price {
     type Builder = types_capnp::price::Builder<'a>;
 
-    #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
     fn to_capnp(&self, mut builder: Self::Builder) {
-        let raw_i128: i128 = self.raw.into();
+        let raw_i128: i128 = raw_to_wire(self.raw());
         let lo = raw_i128 as u64;
         let hi = (raw_i128 >> 64) as u64;
 
@@ -469,25 +518,19 @@ impl<'a> FromCapnp<'a> for Price {
         // to all upper bits when widened to i128, preserving two's complement.
         let raw_i128 = ((hi as i64 as i128) << 64) | (lo as i128);
 
-        #[cfg(not(feature = "high-precision"))]
-        let raw = i64::try_from(raw_i128).map_err(|_| -> Box<dyn Error> {
+        let raw: PriceRaw = wire_to_raw(raw_i128).ok_or_else(|| -> Box<dyn Error> {
             "Price value overflows i64 in standard precision mode".into()
         })?;
 
-        #[cfg(feature = "high-precision")]
-        let raw = raw_i128;
-
-        #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
-        Ok(Self::from_raw(raw.into(), precision))
+        Ok(Self::from_raw_checked(raw, precision)?)
     }
 }
 
 impl<'a> ToCapnp<'a> for Quantity {
     type Builder = types_capnp::quantity::Builder<'a>;
 
-    #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
     fn to_capnp(&self, mut builder: Self::Builder) {
-        let raw_u128: u128 = self.raw.into();
+        let raw_u128: u128 = raw_to_wire(self.raw());
         let lo = raw_u128 as u64;
         let hi = (raw_u128 >> 64) as u64;
 
@@ -511,16 +554,11 @@ impl<'a> FromCapnp<'a> for Quantity {
         // Reconstruct u128 from two u64 halves (unsigned, no sign extension needed)
         let raw_u128 = ((hi as u128) << 64) | (lo as u128);
 
-        #[cfg(not(feature = "high-precision"))]
-        let raw = u64::try_from(raw_u128).map_err(|_| -> Box<dyn Error> {
+        let raw: QuantityRaw = wire_to_raw(raw_u128).ok_or_else(|| -> Box<dyn Error> {
             "Quantity value overflows u64 in standard precision mode".into()
         })?;
 
-        #[cfg(feature = "high-precision")]
-        let raw = raw_u128;
-
-        #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
-        Ok(Self::from_raw(raw.into(), precision))
+        Ok(Self::from_raw_checked(raw, precision)?)
     }
 }
 
@@ -566,8 +604,8 @@ pub fn account_type_from_capnp(value: enums_capnp::AccountType) -> AccountType {
 pub fn aggressor_side_to_capnp(value: AggressorSide) -> enums_capnp::AggressorSide {
     match value {
         AggressorSide::NoAggressor => enums_capnp::AggressorSide::NoAggressor,
-        AggressorSide::Buyer => enums_capnp::AggressorSide::Buyer,
-        AggressorSide::Seller => enums_capnp::AggressorSide::Seller,
+        AggressorSide::Buy => enums_capnp::AggressorSide::Buy,
+        AggressorSide::Sell => enums_capnp::AggressorSide::Sell,
     }
 }
 
@@ -575,8 +613,8 @@ pub fn aggressor_side_to_capnp(value: AggressorSide) -> enums_capnp::AggressorSi
 pub fn aggressor_side_from_capnp(value: enums_capnp::AggressorSide) -> AggressorSide {
     match value {
         enums_capnp::AggressorSide::NoAggressor => AggressorSide::NoAggressor,
-        enums_capnp::AggressorSide::Buyer => AggressorSide::Buyer,
-        enums_capnp::AggressorSide::Seller => AggressorSide::Seller,
+        enums_capnp::AggressorSide::Buy => AggressorSide::Buy,
+        enums_capnp::AggressorSide::Sell => AggressorSide::Sell,
     }
 }
 
@@ -659,21 +697,44 @@ pub fn option_kind_from_capnp(value: enums_capnp::OptionKind) -> OptionKind {
 }
 
 #[must_use]
-pub fn order_side_to_capnp(value: OrderSide) -> enums_capnp::OrderSide {
+pub fn greeks_convention_to_capnp(value: GreeksConvention) -> enums_capnp::GreeksConvention {
     match value {
-        OrderSide::NoOrderSide => enums_capnp::OrderSide::NoOrderSide,
-        OrderSide::Buy => enums_capnp::OrderSide::Buy,
-        OrderSide::Sell => enums_capnp::OrderSide::Sell,
+        GreeksConvention::BlackScholes => enums_capnp::GreeksConvention::BlackScholes,
+        GreeksConvention::PriceAdjusted => enums_capnp::GreeksConvention::PriceAdjusted,
     }
 }
 
 #[must_use]
-pub fn order_side_from_capnp(value: enums_capnp::OrderSide) -> OrderSide {
+pub fn greeks_convention_from_capnp(value: enums_capnp::GreeksConvention) -> GreeksConvention {
     match value {
-        enums_capnp::OrderSide::NoOrderSide => OrderSide::NoOrderSide,
-        enums_capnp::OrderSide::Buy => OrderSide::Buy,
-        enums_capnp::OrderSide::Sell => OrderSide::Sell,
+        enums_capnp::GreeksConvention::BlackScholes => GreeksConvention::BlackScholes,
+        enums_capnp::GreeksConvention::PriceAdjusted => GreeksConvention::PriceAdjusted,
     }
+}
+
+#[must_use]
+pub fn order_side_to_capnp(value: Option<OrderSide>) -> enums_capnp::OrderSide {
+    match value {
+        None => enums_capnp::OrderSide::NoOrderSide,
+        Some(OrderSide::Buy) => enums_capnp::OrderSide::Buy,
+        Some(OrderSide::Sell) => enums_capnp::OrderSide::Sell,
+    }
+}
+
+#[must_use]
+pub fn order_side_from_capnp(value: enums_capnp::OrderSide) -> Option<OrderSide> {
+    match value {
+        enums_capnp::OrderSide::NoOrderSide => None,
+        enums_capnp::OrderSide::Buy => Some(OrderSide::Buy),
+        enums_capnp::OrderSide::Sell => Some(OrderSide::Sell),
+    }
+}
+
+fn order_side_required_from_capnp(
+    value: enums_capnp::OrderSide,
+) -> Result<OrderSide, Box<dyn Error>> {
+    order_side_from_capnp(value)
+        .ok_or_else(|| "Cap'n Proto required order side was NO_ORDER_SIDE".into())
 }
 
 #[must_use]
@@ -723,6 +784,7 @@ pub fn order_status_to_capnp(value: OrderStatus) -> enums_capnp::OrderStatus {
         OrderStatus::PendingCancel => enums_capnp::OrderStatus::PendingCancel,
         OrderStatus::PartiallyFilled => enums_capnp::OrderStatus::PartiallyFilled,
         OrderStatus::Filled => enums_capnp::OrderStatus::Filled,
+        OrderStatus::Voided => enums_capnp::OrderStatus::Voided,
     }
 }
 
@@ -743,6 +805,7 @@ pub fn order_status_from_capnp(value: enums_capnp::OrderStatus) -> OrderStatus {
         enums_capnp::OrderStatus::PendingCancel => OrderStatus::PendingCancel,
         enums_capnp::OrderStatus::PartiallyFilled => OrderStatus::PartiallyFilled,
         enums_capnp::OrderStatus::Filled => OrderStatus::Filled,
+        enums_capnp::OrderStatus::Voided => OrderStatus::Voided,
     }
 }
 
@@ -773,75 +836,82 @@ pub fn time_in_force_from_capnp(value: enums_capnp::TimeInForce) -> TimeInForce 
 }
 
 #[must_use]
-pub fn trigger_type_to_capnp(value: TriggerType) -> enums_capnp::TriggerType {
+pub fn trigger_type_to_capnp(value: Option<TriggerType>) -> enums_capnp::TriggerType {
     match value {
-        TriggerType::NoTrigger => enums_capnp::TriggerType::NoTrigger,
-        TriggerType::Default => enums_capnp::TriggerType::Default,
-        TriggerType::LastPrice => enums_capnp::TriggerType::LastPrice,
-        TriggerType::MarkPrice => enums_capnp::TriggerType::MarkPrice,
-        TriggerType::IndexPrice => enums_capnp::TriggerType::IndexPrice,
-        TriggerType::BidAsk => enums_capnp::TriggerType::BidAsk,
-        TriggerType::DoubleLast => enums_capnp::TriggerType::DoubleLast,
-        TriggerType::DoubleBidAsk => enums_capnp::TriggerType::DoubleBidAsk,
-        TriggerType::LastOrBidAsk => enums_capnp::TriggerType::LastOrBidAsk,
-        TriggerType::MidPoint => enums_capnp::TriggerType::MidPoint,
+        None => enums_capnp::TriggerType::NoTrigger,
+        Some(TriggerType::Default) => enums_capnp::TriggerType::Default,
+        Some(TriggerType::LastPrice) => enums_capnp::TriggerType::LastPrice,
+        Some(TriggerType::MarkPrice) => enums_capnp::TriggerType::MarkPrice,
+        Some(TriggerType::IndexPrice) => enums_capnp::TriggerType::IndexPrice,
+        Some(TriggerType::BidAsk) => enums_capnp::TriggerType::BidAsk,
+        Some(TriggerType::DoubleLast) => enums_capnp::TriggerType::DoubleLast,
+        Some(TriggerType::DoubleBidAsk) => enums_capnp::TriggerType::DoubleBidAsk,
+        Some(TriggerType::LastOrBidAsk) => enums_capnp::TriggerType::LastOrBidAsk,
+        Some(TriggerType::MidPoint) => enums_capnp::TriggerType::MidPoint,
     }
 }
 
 #[must_use]
-pub fn trigger_type_from_capnp(value: enums_capnp::TriggerType) -> TriggerType {
+pub fn trigger_type_from_capnp(value: enums_capnp::TriggerType) -> Option<TriggerType> {
     match value {
-        enums_capnp::TriggerType::NoTrigger => TriggerType::NoTrigger,
-        enums_capnp::TriggerType::Default => TriggerType::Default,
-        enums_capnp::TriggerType::LastPrice => TriggerType::LastPrice,
-        enums_capnp::TriggerType::MarkPrice => TriggerType::MarkPrice,
-        enums_capnp::TriggerType::IndexPrice => TriggerType::IndexPrice,
-        enums_capnp::TriggerType::BidAsk => TriggerType::BidAsk,
-        enums_capnp::TriggerType::DoubleLast => TriggerType::DoubleLast,
-        enums_capnp::TriggerType::DoubleBidAsk => TriggerType::DoubleBidAsk,
-        enums_capnp::TriggerType::LastOrBidAsk => TriggerType::LastOrBidAsk,
-        enums_capnp::TriggerType::MidPoint => TriggerType::MidPoint,
+        enums_capnp::TriggerType::NoTrigger => None,
+        enums_capnp::TriggerType::Default => Some(TriggerType::Default),
+        enums_capnp::TriggerType::LastPrice => Some(TriggerType::LastPrice),
+        enums_capnp::TriggerType::MarkPrice => Some(TriggerType::MarkPrice),
+        enums_capnp::TriggerType::IndexPrice => Some(TriggerType::IndexPrice),
+        enums_capnp::TriggerType::BidAsk => Some(TriggerType::BidAsk),
+        enums_capnp::TriggerType::DoubleLast => Some(TriggerType::DoubleLast),
+        enums_capnp::TriggerType::DoubleBidAsk => Some(TriggerType::DoubleBidAsk),
+        enums_capnp::TriggerType::LastOrBidAsk => Some(TriggerType::LastOrBidAsk),
+        enums_capnp::TriggerType::MidPoint => Some(TriggerType::MidPoint),
     }
 }
 
 #[must_use]
-pub fn contingency_type_to_capnp(value: ContingencyType) -> enums_capnp::ContingencyType {
+pub fn contingency_type_to_capnp(value: Option<ContingencyType>) -> enums_capnp::ContingencyType {
     match value {
-        ContingencyType::NoContingency => enums_capnp::ContingencyType::NoContingency,
-        ContingencyType::Oco => enums_capnp::ContingencyType::Oco,
-        ContingencyType::Oto => enums_capnp::ContingencyType::Oto,
-        ContingencyType::Ouo => enums_capnp::ContingencyType::Ouo,
+        None => enums_capnp::ContingencyType::NoContingency,
+        Some(ContingencyType::Oco) => enums_capnp::ContingencyType::Oco,
+        Some(ContingencyType::Oto) => enums_capnp::ContingencyType::Oto,
+        Some(ContingencyType::Ouo) => enums_capnp::ContingencyType::Ouo,
     }
 }
 
 #[must_use]
-pub fn contingency_type_from_capnp(value: enums_capnp::ContingencyType) -> ContingencyType {
+pub fn contingency_type_from_capnp(value: enums_capnp::ContingencyType) -> Option<ContingencyType> {
     match value {
-        enums_capnp::ContingencyType::NoContingency => ContingencyType::NoContingency,
-        enums_capnp::ContingencyType::Oco => ContingencyType::Oco,
-        enums_capnp::ContingencyType::Oto => ContingencyType::Oto,
-        enums_capnp::ContingencyType::Ouo => ContingencyType::Ouo,
+        enums_capnp::ContingencyType::NoContingency => None,
+        enums_capnp::ContingencyType::Oco => Some(ContingencyType::Oco),
+        enums_capnp::ContingencyType::Oto => Some(ContingencyType::Oto),
+        enums_capnp::ContingencyType::Ouo => Some(ContingencyType::Ouo),
     }
 }
 
 #[must_use]
-pub fn position_side_to_capnp(value: PositionSide) -> enums_capnp::PositionSide {
+pub fn position_side_to_capnp(value: Option<PositionSide>) -> enums_capnp::PositionSide {
     match value {
-        PositionSide::NoPositionSide => enums_capnp::PositionSide::NoPositionSide,
-        PositionSide::Flat => enums_capnp::PositionSide::Flat,
-        PositionSide::Long => enums_capnp::PositionSide::Long,
-        PositionSide::Short => enums_capnp::PositionSide::Short,
+        None => enums_capnp::PositionSide::NoPositionSide,
+        Some(PositionSide::Flat) => enums_capnp::PositionSide::Flat,
+        Some(PositionSide::Long) => enums_capnp::PositionSide::Long,
+        Some(PositionSide::Short) => enums_capnp::PositionSide::Short,
     }
 }
 
 #[must_use]
-pub fn position_side_from_capnp(value: enums_capnp::PositionSide) -> PositionSide {
+pub fn position_side_from_capnp(value: enums_capnp::PositionSide) -> Option<PositionSide> {
     match value {
-        enums_capnp::PositionSide::NoPositionSide => PositionSide::NoPositionSide,
-        enums_capnp::PositionSide::Flat => PositionSide::Flat,
-        enums_capnp::PositionSide::Long => PositionSide::Long,
-        enums_capnp::PositionSide::Short => PositionSide::Short,
+        enums_capnp::PositionSide::NoPositionSide => None,
+        enums_capnp::PositionSide::Flat => Some(PositionSide::Flat),
+        enums_capnp::PositionSide::Long => Some(PositionSide::Long),
+        enums_capnp::PositionSide::Short => Some(PositionSide::Short),
     }
+}
+
+fn position_side_required_from_capnp(
+    value: enums_capnp::PositionSide,
+) -> Result<PositionSide, Box<dyn Error>> {
+    position_side_from_capnp(value)
+        .ok_or_else(|| "Cap'n Proto required position side was NO_POSITION_SIDE".into())
 }
 
 #[must_use]
@@ -1031,26 +1101,28 @@ pub fn bar_aggregation_from_capnp(value: enums_capnp::BarAggregation) -> BarAggr
 }
 
 #[must_use]
-pub fn trailing_offset_type_to_capnp(value: TrailingOffsetType) -> enums_capnp::TrailingOffsetType {
+pub fn trailing_offset_type_to_capnp(
+    value: Option<TrailingOffsetType>,
+) -> enums_capnp::TrailingOffsetType {
     match value {
-        TrailingOffsetType::NoTrailingOffset => enums_capnp::TrailingOffsetType::NoTrailingOffset,
-        TrailingOffsetType::Price => enums_capnp::TrailingOffsetType::Price,
-        TrailingOffsetType::BasisPoints => enums_capnp::TrailingOffsetType::BasisPoints,
-        TrailingOffsetType::Ticks => enums_capnp::TrailingOffsetType::Ticks,
-        TrailingOffsetType::PriceTier => enums_capnp::TrailingOffsetType::PriceTier,
+        None => enums_capnp::TrailingOffsetType::NoTrailingOffset,
+        Some(TrailingOffsetType::Price) => enums_capnp::TrailingOffsetType::Price,
+        Some(TrailingOffsetType::BasisPoints) => enums_capnp::TrailingOffsetType::BasisPoints,
+        Some(TrailingOffsetType::Ticks) => enums_capnp::TrailingOffsetType::Ticks,
+        Some(TrailingOffsetType::PriceTier) => enums_capnp::TrailingOffsetType::PriceTier,
     }
 }
 
 #[must_use]
 pub fn trailing_offset_type_from_capnp(
     value: enums_capnp::TrailingOffsetType,
-) -> TrailingOffsetType {
+) -> Option<TrailingOffsetType> {
     match value {
-        enums_capnp::TrailingOffsetType::NoTrailingOffset => TrailingOffsetType::NoTrailingOffset,
-        enums_capnp::TrailingOffsetType::Price => TrailingOffsetType::Price,
-        enums_capnp::TrailingOffsetType::BasisPoints => TrailingOffsetType::BasisPoints,
-        enums_capnp::TrailingOffsetType::Ticks => TrailingOffsetType::Ticks,
-        enums_capnp::TrailingOffsetType::PriceTier => TrailingOffsetType::PriceTier,
+        enums_capnp::TrailingOffsetType::NoTrailingOffset => None,
+        enums_capnp::TrailingOffsetType::Price => Some(TrailingOffsetType::Price),
+        enums_capnp::TrailingOffsetType::BasisPoints => Some(TrailingOffsetType::BasisPoints),
+        enums_capnp::TrailingOffsetType::Ticks => Some(TrailingOffsetType::Ticks),
+        enums_capnp::TrailingOffsetType::PriceTier => Some(TrailingOffsetType::PriceTier),
     }
 }
 
@@ -1093,6 +1165,7 @@ pub fn instrument_close_type_from_capnp(
 }
 
 #[must_use]
+#[rustfmt::skip]
 pub fn market_status_action_to_capnp(value: MarketStatusAction) -> enums_capnp::MarketStatusAction {
     match value {
         MarketStatusAction::None => enums_capnp::MarketStatusAction::None,
@@ -1101,9 +1174,7 @@ pub fn market_status_action_to_capnp(value: MarketStatusAction) -> enums_capnp::
         MarketStatusAction::Quoting => enums_capnp::MarketStatusAction::Quoting,
         MarketStatusAction::Cross => enums_capnp::MarketStatusAction::Cross,
         MarketStatusAction::Rotation => enums_capnp::MarketStatusAction::Rotation,
-        MarketStatusAction::NewPriceIndication => {
-            enums_capnp::MarketStatusAction::NewPriceIndication
-        }
+        MarketStatusAction::NewPriceIndication => enums_capnp::MarketStatusAction::NewPriceIndication,
         MarketStatusAction::Trading => enums_capnp::MarketStatusAction::Trading,
         MarketStatusAction::Halt => enums_capnp::MarketStatusAction::Halt,
         MarketStatusAction::Pause => enums_capnp::MarketStatusAction::Pause,
@@ -1111,16 +1182,13 @@ pub fn market_status_action_to_capnp(value: MarketStatusAction) -> enums_capnp::
         MarketStatusAction::PreClose => enums_capnp::MarketStatusAction::PreClose,
         MarketStatusAction::Close => enums_capnp::MarketStatusAction::Close,
         MarketStatusAction::PostClose => enums_capnp::MarketStatusAction::PostClose,
-        MarketStatusAction::ShortSellRestrictionChange => {
-            enums_capnp::MarketStatusAction::ShortSellRestrictionChange
-        }
-        MarketStatusAction::NotAvailableForTrading => {
-            enums_capnp::MarketStatusAction::NotAvailableForTrading
-        }
+        MarketStatusAction::ShortSellRestrictionChange => enums_capnp::MarketStatusAction::ShortSellRestrictionChange,
+        MarketStatusAction::NotAvailableForTrading => enums_capnp::MarketStatusAction::NotAvailableForTrading,
     }
 }
 
 #[must_use]
+#[rustfmt::skip]
 pub fn market_status_action_from_capnp(
     value: enums_capnp::MarketStatusAction,
 ) -> MarketStatusAction {
@@ -1131,9 +1199,7 @@ pub fn market_status_action_from_capnp(
         enums_capnp::MarketStatusAction::Quoting => MarketStatusAction::Quoting,
         enums_capnp::MarketStatusAction::Cross => MarketStatusAction::Cross,
         enums_capnp::MarketStatusAction::Rotation => MarketStatusAction::Rotation,
-        enums_capnp::MarketStatusAction::NewPriceIndication => {
-            MarketStatusAction::NewPriceIndication
-        }
+        enums_capnp::MarketStatusAction::NewPriceIndication => MarketStatusAction::NewPriceIndication,
         enums_capnp::MarketStatusAction::Trading => MarketStatusAction::Trading,
         enums_capnp::MarketStatusAction::Halt => MarketStatusAction::Halt,
         enums_capnp::MarketStatusAction::Pause => MarketStatusAction::Pause,
@@ -1141,12 +1207,8 @@ pub fn market_status_action_from_capnp(
         enums_capnp::MarketStatusAction::PreClose => MarketStatusAction::PreClose,
         enums_capnp::MarketStatusAction::Close => MarketStatusAction::Close,
         enums_capnp::MarketStatusAction::PostClose => MarketStatusAction::PostClose,
-        enums_capnp::MarketStatusAction::ShortSellRestrictionChange => {
-            MarketStatusAction::ShortSellRestrictionChange
-        }
-        enums_capnp::MarketStatusAction::NotAvailableForTrading => {
-            MarketStatusAction::NotAvailableForTrading
-        }
+        enums_capnp::MarketStatusAction::ShortSellRestrictionChange => MarketStatusAction::ShortSellRestrictionChange,
+        enums_capnp::MarketStatusAction::NotAvailableForTrading => MarketStatusAction::NotAvailableForTrading,
     }
 }
 
@@ -1190,18 +1252,23 @@ impl<'a> FromCapnp<'a> for Currency {
         let name = reader.get_name()?.to_str()?;
         let currency_type = currency_type_from_capnp(reader.get_currency_type()?);
 
-        Ok(Self::new(code, precision, iso4217, name, currency_type))
+        Ok(Self::new_checked(
+            code,
+            precision,
+            iso4217,
+            name,
+            currency_type,
+        )?)
     }
 }
 
 impl<'a> ToCapnp<'a> for Money {
     type Builder = types_capnp::money::Builder<'a>;
 
-    #[expect(clippy::useless_conversion)] // Needed for non-high-precision builds
     fn to_capnp(&self, mut builder: Self::Builder) {
         let mut raw_builder = builder.reborrow().init_raw();
 
-        let raw_i128: i128 = self.raw.into();
+        let raw_i128: i128 = raw_to_wire(self.raw());
         raw_builder.set_lo(raw_i128 as u64);
         raw_builder.set_hi((raw_i128 >> 64) as u64);
 
@@ -1224,18 +1291,11 @@ impl<'a> FromCapnp<'a> for Money {
         let currency_reader = reader.get_currency()?;
         let currency = Currency::from_capnp(currency_reader)?;
 
-        #[cfg(not(feature = "high-precision"))]
-        {
-            let raw = i64::try_from(raw_i128).map_err(|_| -> Box<dyn Error> {
-                "Money value overflows i64 in standard precision mode".into()
-            })?;
-            Ok(Self::from_raw(raw.into(), currency))
-        }
+        let raw: MoneyRaw = wire_to_raw(raw_i128).ok_or_else(|| -> Box<dyn Error> {
+            "Money value overflows i64 in standard precision mode".into()
+        })?;
 
-        #[cfg(feature = "high-precision")]
-        {
-            Ok(Self::from_raw(raw_i128, currency))
-        }
+        Ok(Self::from_raw(raw, currency))
     }
 }
 
@@ -1267,7 +1327,7 @@ impl<'a> FromCapnp<'a> for AccountBalance {
         let free_reader = reader.get_free()?;
         let free = Money::from_capnp(free_reader)?;
 
-        Ok(Self::new(total, locked, free))
+        Ok(Self::new_checked(total, locked, free)?)
     }
 }
 
@@ -1281,12 +1341,8 @@ impl<'a> ToCapnp<'a> for MarginBalance {
         let maintenance_builder = builder.reborrow().init_maintenance();
         self.maintenance.to_capnp(maintenance_builder);
 
-        // Only set the instrument pointer for per-instrument entries; leave
-        // unset to signal account-wide (cross margin) balances.
-        if let Some(instrument_id) = self.instrument_id {
-            let instrument_builder = builder.init_instrument();
-            instrument_id.to_capnp(instrument_builder);
-        }
+        // An unset pointer represents an account-wide cross-margin balance
+        self.instrument_id.write_capnp(|| builder.init_instrument());
     }
 }
 
@@ -1300,14 +1356,10 @@ impl<'a> FromCapnp<'a> for MarginBalance {
         let maintenance_reader = reader.get_maintenance()?;
         let maintenance = Money::from_capnp(maintenance_reader)?;
 
-        let instrument_id = if reader.has_instrument() {
-            let instrument_reader = reader.get_instrument()?;
-            Some(InstrumentId::from_capnp(instrument_reader)?)
-        } else {
-            None
-        };
+        let instrument_id =
+            read_optional_from_capnp(|| reader.has_instrument(), || reader.get_instrument())?;
 
-        Ok(Self::new(initial, maintenance, instrument_id))
+        Ok(Self::new_checked(initial, maintenance, instrument_id)?)
     }
 }
 
@@ -1780,6 +1832,98 @@ impl<'a> FromCapnp<'a> for FundingRateUpdate {
     }
 }
 
+impl<'a> ToCapnp<'a> for OptionGreeks {
+    type Builder = market_capnp::option_greeks::Builder<'a>;
+
+    fn to_capnp(&self, mut builder: Self::Builder) {
+        let instrument_id_builder = builder.reborrow().init_instrument_id();
+        self.instrument_id.to_capnp(instrument_id_builder);
+
+        builder.set_convention(greeks_convention_to_capnp(self.convention));
+        builder.set_delta(self.greeks.delta);
+        builder.set_gamma(self.greeks.gamma);
+        builder.set_vega(self.greeks.vega);
+        builder.set_theta(self.greeks.theta);
+        builder.set_rho(self.greeks.rho);
+
+        if let Some(mark_iv) = self.mark_iv {
+            builder.reborrow().set_mark_iv(mark_iv);
+            builder.reborrow().set_has_mark_iv(true);
+        }
+
+        if let Some(bid_iv) = self.bid_iv {
+            builder.reborrow().set_bid_iv(bid_iv);
+            builder.reborrow().set_has_bid_iv(true);
+        }
+
+        if let Some(ask_iv) = self.ask_iv {
+            builder.reborrow().set_ask_iv(ask_iv);
+            builder.reborrow().set_has_ask_iv(true);
+        }
+
+        if let Some(underlying_price) = self.underlying_price {
+            builder.reborrow().set_underlying_price(underlying_price);
+            builder.reborrow().set_has_underlying_price(true);
+        }
+
+        if let Some(open_interest) = self.open_interest {
+            builder.reborrow().set_open_interest(open_interest);
+            builder.reborrow().set_has_open_interest(true);
+        }
+
+        let mut ts_event_builder = builder.reborrow().init_ts_event();
+        ts_event_builder.set_value(*self.ts_event);
+
+        let mut ts_init_builder = builder.reborrow().init_ts_init();
+        ts_init_builder.set_value(*self.ts_init);
+    }
+}
+
+impl<'a> FromCapnp<'a> for OptionGreeks {
+    type Reader = market_capnp::option_greeks::Reader<'a>;
+
+    fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
+        let instrument_id_reader = reader.get_instrument_id()?;
+        let instrument_id = InstrumentId::from_capnp(instrument_id_reader)?;
+        let convention = greeks_convention_from_capnp(reader.get_convention()?);
+        let greeks = OptionGreekValues {
+            delta: reader.get_delta(),
+            gamma: reader.get_gamma(),
+            vega: reader.get_vega(),
+            theta: reader.get_theta(),
+            rho: reader.get_rho(),
+        };
+        let mark_iv = reader.get_has_mark_iv().then_some(reader.get_mark_iv());
+        let bid_iv = reader.get_has_bid_iv().then_some(reader.get_bid_iv());
+        let ask_iv = reader.get_has_ask_iv().then_some(reader.get_ask_iv());
+        let underlying_price = reader
+            .get_has_underlying_price()
+            .then_some(reader.get_underlying_price());
+        let open_interest = reader
+            .get_has_open_interest()
+            .then_some(reader.get_open_interest());
+
+        let ts_event_reader = reader.get_ts_event()?;
+        let ts_event = ts_event_reader.get_value();
+
+        let ts_init_reader = reader.get_ts_init()?;
+        let ts_init = ts_init_reader.get_value();
+
+        Ok(Self {
+            instrument_id,
+            convention,
+            greeks,
+            mark_iv,
+            bid_iv,
+            ask_iv,
+            underlying_price,
+            open_interest,
+            ts_event: ts_event.into(),
+            ts_init: ts_init.into(),
+        })
+    }
+}
+
 impl<'a> ToCapnp<'a> for InstrumentClose {
     type Builder = market_capnp::instrument_close::Builder<'a>;
 
@@ -1907,7 +2051,7 @@ impl<'a> ToCapnp<'a> for BarSpecification {
     type Builder = market_capnp::bar_spec::Builder<'a>;
 
     fn to_capnp(&self, mut builder: Self::Builder) {
-        builder.set_step(self.step.get() as u32);
+        builder.set_step(self.step.get() as u64);
         builder.set_aggregation(bar_aggregation_to_capnp(self.aggregation));
         builder.set_price_type(price_type_to_capnp(self.price_type));
     }
@@ -1919,8 +2063,9 @@ impl<'a> FromCapnp<'a> for BarSpecification {
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
         use std::num::NonZero;
 
-        let step = reader.get_step();
-        let step = NonZero::new(step as usize).ok_or("BarSpecification step must be non-zero")?;
+        let step = usize::try_from(reader.get_step())
+            .map_err(|_| "BarSpecification step exceeds usize range")?;
+        let step = NonZero::new(step).ok_or("BarSpecification step must be non-zero")?;
 
         let aggregation = bar_aggregation_from_capnp(reader.get_aggregation()?);
         let price_type = price_type_from_capnp(reader.get_price_type()?);
@@ -1936,14 +2081,17 @@ impl<'a> FromCapnp<'a> for BarSpecification {
 impl<'a> ToCapnp<'a> for BarType {
     type Builder = market_capnp::bar_type::Builder<'a>;
 
+    /// Encodes the standard form only: the composite chain is a local aggregation
+    /// detail and wire representations carry the standard bar type.
     fn to_capnp(&self, mut builder: Self::Builder) {
+        let standard = self.standard();
         let instrument_id_builder = builder.reborrow().init_instrument_id();
-        self.instrument_id().to_capnp(instrument_id_builder);
+        standard.instrument_id().to_capnp(instrument_id_builder);
 
         let spec_builder = builder.reborrow().init_spec();
-        self.spec().to_capnp(spec_builder);
+        standard.spec().to_capnp(spec_builder);
 
-        builder.set_aggregation_source(aggregation_source_to_capnp(self.aggregation_source()));
+        builder.set_aggregation_source(aggregation_source_to_capnp(standard.aggregation_source()));
     }
 }
 
@@ -2185,8 +2333,8 @@ impl<'a> FromCapnp<'a> for OrderBookDeltas {
     }
 }
 
-impl<'a> ToCapnp<'a> for OrderBookDepth10 {
-    type Builder = market_capnp::order_book_depth10::Builder<'a>;
+impl<'a> ToCapnp<'a> for OrderBookDepth {
+    type Builder = market_capnp::order_book_depth::Builder<'a>;
 
     fn to_capnp(&self, mut builder: Self::Builder) {
         let instrument_id_builder = builder.reborrow().init_instrument_id();
@@ -2238,55 +2386,42 @@ impl<'a> ToCapnp<'a> for OrderBookDepth10 {
     }
 }
 
-impl<'a> FromCapnp<'a> for OrderBookDepth10 {
-    type Reader = market_capnp::order_book_depth10::Reader<'a>;
+impl<'a> FromCapnp<'a> for OrderBookDepth {
+    type Reader = market_capnp::order_book_depth::Reader<'a>;
 
     fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
-        use nautilus_model::data::order::NULL_ORDER;
-
         let instrument_id_reader = reader.get_instrument_id()?;
         let instrument_id = InstrumentId::from_capnp(instrument_id_reader)?;
 
-        // Convert bids (BookLevel list to BookOrder array)
+        // The Capnp lists retain the snapshot length.
         let bids_reader = reader.get_bids()?;
-        let mut bids = [NULL_ORDER; 10];
+        let mut bids = Vec::with_capacity(bids_reader.len() as usize);
 
-        for (i, level_reader) in bids_reader.iter().enumerate().take(10) {
+        for level_reader in bids_reader {
             let price_reader = level_reader.get_price()?;
             let price = Price::from_capnp(price_reader)?;
 
             let size_reader = level_reader.get_size()?;
             let size = Quantity::from_capnp(size_reader)?;
 
-            bids[i] = BookOrder::new(OrderSide::Buy, price, size, 0);
+            bids.push(BookOrder::new(OrderSide::Buy, price, size, 0));
         }
 
-        // Convert asks (BookLevel list to BookOrder array)
         let asks_reader = reader.get_asks()?;
-        let mut asks = [NULL_ORDER; 10];
+        let mut asks = Vec::with_capacity(asks_reader.len() as usize);
 
-        for (i, level_reader) in asks_reader.iter().enumerate().take(10) {
+        for level_reader in asks_reader {
             let price_reader = level_reader.get_price()?;
             let price = Price::from_capnp(price_reader)?;
 
             let size_reader = level_reader.get_size()?;
             let size = Quantity::from_capnp(size_reader)?;
 
-            asks[i] = BookOrder::new(OrderSide::Sell, price, size, 0);
+            asks.push(BookOrder::new(OrderSide::Sell, price, size, 0));
         }
 
-        // Convert counts
-        let bid_counts_reader = reader.get_bid_counts()?;
-        let mut bid_counts = [0u32; 10];
-        for (i, count) in bid_counts_reader.iter().enumerate().take(10) {
-            bid_counts[i] = count;
-        }
-
-        let ask_counts_reader = reader.get_ask_counts()?;
-        let mut ask_counts = [0u32; 10];
-        for (i, count) in ask_counts_reader.iter().enumerate().take(10) {
-            ask_counts[i] = count;
-        }
+        let bid_counts = reader.get_bid_counts()?.iter().collect::<Vec<_>>();
+        let ask_counts = reader.get_ask_counts()?.iter().collect::<Vec<_>>();
 
         let flags = reader.get_flags();
         let sequence = reader.get_sequence();
@@ -2297,7 +2432,7 @@ impl<'a> FromCapnp<'a> for OrderBookDepth10 {
         let ts_init_reader = reader.get_ts_init()?;
         let ts_init = ts_init_reader.get_value();
 
-        Ok(Self {
+        Ok(Self::new_checked(
             instrument_id,
             bids,
             asks,
@@ -2305,9 +2440,9 @@ impl<'a> FromCapnp<'a> for OrderBookDepth10 {
             ask_counts,
             flags,
             sequence,
-            ts_event: ts_event.into(),
-            ts_init: ts_init.into(),
-        })
+            ts_event.into(),
+            ts_init.into(),
+        )?)
     }
 }
 
@@ -2760,13 +2895,15 @@ impl<'a> ToCapnp<'a> for OrderCanceled {
         let client_order_id_builder = builder.reborrow().init_client_order_id();
         self.client_order_id.to_capnp(client_order_id_builder);
 
-        if let Some(ref venue_order_id) = self.venue_order_id {
-            let venue_order_id_builder = builder.reborrow().init_venue_order_id();
-            venue_order_id.to_capnp(venue_order_id_builder);
-        }
+        self.venue_order_id
+            .write_capnp(|| builder.reborrow().init_venue_order_id());
 
         self.account_id
             .write_capnp(|| builder.reborrow().init_account_id());
+
+        if let Some(reason) = self.reason {
+            builder.reborrow().set_reason(reason.as_str());
+        }
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -2805,6 +2942,12 @@ impl<'a> FromCapnp<'a> for OrderCanceled {
         let account_id =
             read_optional_from_capnp(|| reader.has_account_id(), || reader.get_account_id())?;
 
+        let reason = if reader.has_reason() {
+            Some(Ustr::from(reader.get_reason()?.to_str()?))
+        } else {
+            None
+        };
+
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
 
@@ -2827,6 +2970,7 @@ impl<'a> FromCapnp<'a> for OrderCanceled {
             ts_event: ts_event.into(),
             ts_init: ts_init.into(),
             reconciliation,
+            reason,
             causation_id: None,
         })
     }
@@ -2849,10 +2993,8 @@ impl<'a> ToCapnp<'a> for OrderExpired {
         let client_order_id_builder = builder.reborrow().init_client_order_id();
         self.client_order_id.to_capnp(client_order_id_builder);
 
-        if let Some(ref venue_order_id) = self.venue_order_id {
-            let venue_order_id_builder = builder.reborrow().init_venue_order_id();
-            venue_order_id.to_capnp(venue_order_id_builder);
-        }
+        self.venue_order_id
+            .write_capnp(|| builder.reborrow().init_venue_order_id());
 
         self.account_id
             .write_capnp(|| builder.reborrow().init_account_id());
@@ -2938,10 +3080,8 @@ impl<'a> ToCapnp<'a> for OrderTriggered {
         let client_order_id_builder = builder.reborrow().init_client_order_id();
         self.client_order_id.to_capnp(client_order_id_builder);
 
-        if let Some(ref venue_order_id) = self.venue_order_id {
-            let venue_order_id_builder = builder.reborrow().init_venue_order_id();
-            venue_order_id.to_capnp(venue_order_id_builder);
-        }
+        self.venue_order_id
+            .write_capnp(|| builder.reborrow().init_venue_order_id());
 
         self.account_id
             .write_capnp(|| builder.reborrow().init_account_id());
@@ -3027,13 +3167,10 @@ impl<'a> ToCapnp<'a> for OrderPendingUpdate {
         let client_order_id_builder = builder.reborrow().init_client_order_id();
         self.client_order_id.to_capnp(client_order_id_builder);
 
-        if let Some(ref venue_order_id) = self.venue_order_id {
-            let venue_order_id_builder = builder.reborrow().init_venue_order_id();
-            venue_order_id.to_capnp(venue_order_id_builder);
-        }
-
-        let account_id_builder = builder.reborrow().init_account_id();
-        self.account_id.to_capnp(account_id_builder);
+        self.venue_order_id
+            .write_capnp(|| builder.reborrow().init_venue_order_id());
+        self.account_id
+            .write_capnp(|| builder.reborrow().init_account_id());
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -3064,15 +3201,13 @@ impl<'a> FromCapnp<'a> for OrderPendingUpdate {
         let client_order_id_reader = reader.get_client_order_id()?;
         let client_order_id = ClientOrderId::from_capnp(client_order_id_reader)?;
 
-        let venue_order_id = if reader.has_venue_order_id() {
-            let venue_order_id_reader = reader.get_venue_order_id()?;
-            Some(VenueOrderId::from_capnp(venue_order_id_reader)?)
-        } else {
-            None
-        };
+        let venue_order_id = read_optional_from_capnp(
+            || reader.has_venue_order_id(),
+            || reader.get_venue_order_id(),
+        )?;
 
-        let account_id_reader = reader.get_account_id()?;
-        let account_id = AccountId::from_capnp(account_id_reader)?;
+        let account_id =
+            read_optional_from_capnp(|| reader.has_account_id(), || reader.get_account_id())?;
 
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
@@ -3118,13 +3253,10 @@ impl<'a> ToCapnp<'a> for OrderPendingCancel {
         let client_order_id_builder = builder.reborrow().init_client_order_id();
         self.client_order_id.to_capnp(client_order_id_builder);
 
-        if let Some(ref venue_order_id) = self.venue_order_id {
-            let venue_order_id_builder = builder.reborrow().init_venue_order_id();
-            venue_order_id.to_capnp(venue_order_id_builder);
-        }
-
-        let account_id_builder = builder.reborrow().init_account_id();
-        self.account_id.to_capnp(account_id_builder);
+        self.venue_order_id
+            .write_capnp(|| builder.reborrow().init_venue_order_id());
+        self.account_id
+            .write_capnp(|| builder.reborrow().init_account_id());
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -3155,15 +3287,13 @@ impl<'a> FromCapnp<'a> for OrderPendingCancel {
         let client_order_id_reader = reader.get_client_order_id()?;
         let client_order_id = ClientOrderId::from_capnp(client_order_id_reader)?;
 
-        let venue_order_id = if reader.has_venue_order_id() {
-            let venue_order_id_reader = reader.get_venue_order_id()?;
-            Some(VenueOrderId::from_capnp(venue_order_id_reader)?)
-        } else {
-            None
-        };
+        let venue_order_id = read_optional_from_capnp(
+            || reader.has_venue_order_id(),
+            || reader.get_venue_order_id(),
+        )?;
 
-        let account_id_reader = reader.get_account_id()?;
-        let account_id = AccountId::from_capnp(account_id_reader)?;
+        let account_id =
+            read_optional_from_capnp(|| reader.has_account_id(), || reader.get_account_id())?;
 
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
@@ -3399,20 +3529,11 @@ impl<'a> ToCapnp<'a> for OrderUpdated {
         let quantity_builder = builder.reborrow().init_quantity();
         self.quantity.to_capnp(quantity_builder);
 
-        if let Some(price) = self.price {
-            let price_builder = builder.reborrow().init_price();
-            price.to_capnp(price_builder);
-        }
-
-        if let Some(trigger_price) = self.trigger_price {
-            let trigger_price_builder = builder.reborrow().init_trigger_price();
-            trigger_price.to_capnp(trigger_price_builder);
-        }
-
-        if let Some(protection_price) = self.protection_price {
-            let protection_price_builder = builder.reborrow().init_protection_price();
-            protection_price.to_capnp(protection_price_builder);
-        }
+        self.price.write_capnp(|| builder.reborrow().init_price());
+        self.trigger_price
+            .write_capnp(|| builder.reborrow().init_trigger_price());
+        self.protection_price
+            .write_capnp(|| builder.reborrow().init_protection_price());
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -3455,26 +3576,15 @@ impl<'a> FromCapnp<'a> for OrderUpdated {
         let quantity_reader = reader.get_quantity()?;
         let quantity = Quantity::from_capnp(quantity_reader)?;
 
-        let price = if reader.has_price() {
-            let price_reader = reader.get_price()?;
-            Some(Price::from_capnp(price_reader)?)
-        } else {
-            None
-        };
+        let price = read_optional_from_capnp(|| reader.has_price(), || reader.get_price())?;
 
-        let trigger_price = if reader.has_trigger_price() {
-            let trigger_price_reader = reader.get_trigger_price()?;
-            Some(Price::from_capnp(trigger_price_reader)?)
-        } else {
-            None
-        };
+        let trigger_price =
+            read_optional_from_capnp(|| reader.has_trigger_price(), || reader.get_trigger_price())?;
 
-        let protection_price = if reader.has_protection_price() {
-            let protection_price_reader = reader.get_protection_price()?;
-            Some(Price::from_capnp(protection_price_reader)?)
-        } else {
-            None
-        };
+        let protection_price = read_optional_from_capnp(
+            || reader.has_protection_price(),
+            || reader.get_protection_price(),
+        )?;
 
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
@@ -3534,7 +3644,7 @@ impl<'a> ToCapnp<'a> for OrderFilled {
         let trade_id_builder = builder.reborrow().init_trade_id();
         self.trade_id.to_capnp(trade_id_builder);
 
-        builder.set_order_side(order_side_to_capnp(self.order_side));
+        builder.set_order_side(order_side_to_capnp(self.order_side.into()));
         builder.set_order_type(order_type_to_capnp(self.order_type));
 
         let last_qty_builder = builder.reborrow().init_last_qty();
@@ -3559,14 +3669,13 @@ impl<'a> ToCapnp<'a> for OrderFilled {
 
         builder.set_reconciliation(self.reconciliation);
 
-        if let Some(position_id) = &self.position_id {
-            let position_id_builder = builder.reborrow().init_position_id();
-            position_id.to_capnp(position_id_builder);
-        }
+        self.position_id
+            .write_capnp(|| builder.reborrow().init_position_id());
+        self.commission
+            .write_capnp(|| builder.reborrow().init_commission());
 
-        if let Some(commission) = &self.commission {
-            let commission_builder = builder.reborrow().init_commission();
-            commission.to_capnp(commission_builder);
+        if let Some(info) = &self.info {
+            write_string_map(info, builder.reborrow().init_info());
         }
     }
 }
@@ -3596,7 +3705,7 @@ impl<'a> FromCapnp<'a> for OrderFilled {
         let trade_id_reader = reader.get_trade_id()?;
         let trade_id = TradeId::from_capnp(trade_id_reader)?;
 
-        let order_side = order_side_from_capnp(reader.get_order_side()?);
+        let order_side = order_side_required_from_capnp(reader.get_order_side()?)?;
         let order_type = order_type_from_capnp(reader.get_order_type()?);
 
         let last_qty_reader = reader.get_last_qty()?;
@@ -3621,16 +3730,14 @@ impl<'a> FromCapnp<'a> for OrderFilled {
 
         let reconciliation = reader.get_reconciliation();
 
-        let position_id = if reader.has_position_id() {
-            let position_id_reader = reader.get_position_id()?;
-            Some(PositionId::from_capnp(position_id_reader)?)
-        } else {
-            None
-        };
+        let position_id =
+            read_optional_from_capnp(|| reader.has_position_id(), || reader.get_position_id())?;
 
-        let commission = if reader.has_commission() {
-            let commission_reader = reader.get_commission()?;
-            Some(Money::from_capnp(commission_reader)?)
+        let commission =
+            read_optional_from_capnp(|| reader.has_commission(), || reader.get_commission())?;
+
+        let info = if reader.has_info() {
+            Some(read_string_map(reader.get_info()?)?)
         } else {
             None
         };
@@ -3655,7 +3762,124 @@ impl<'a> FromCapnp<'a> for OrderFilled {
             reconciliation,
             position_id,
             commission,
+            info,
             causation_id: None,
+        })
+    }
+}
+
+impl<'a> ToCapnp<'a> for OrderFillVoided {
+    type Builder = order_capnp::order_fill_voided::Builder<'a>;
+
+    fn to_capnp(&self, mut builder: Self::Builder) {
+        self.trader_id.to_capnp(builder.reborrow().init_trader_id());
+        self.strategy_id
+            .to_capnp(builder.reborrow().init_strategy_id());
+        self.instrument_id
+            .to_capnp(builder.reborrow().init_instrument_id());
+        self.client_order_id
+            .to_capnp(builder.reborrow().init_client_order_id());
+        self.venue_order_id
+            .to_capnp(builder.reborrow().init_venue_order_id());
+        self.account_id
+            .to_capnp(builder.reborrow().init_account_id());
+        builder.set_correction_id(self.correction_id.as_str());
+        self.trade_id.to_capnp(builder.reborrow().init_trade_id());
+        self.voided_qty
+            .to_capnp(builder.reborrow().init_voided_qty());
+        self.commission_voided
+            .write_capnp(|| builder.reborrow().init_commission_voided());
+        builder.set_order_side(order_side_to_capnp(self.order_side.into()));
+        builder.set_order_type(order_type_to_capnp(self.order_type));
+        self.last_px.to_capnp(builder.reborrow().init_last_px());
+        self.currency.to_capnp(builder.reborrow().init_currency());
+        builder.set_liquidity_side(liquidity_side_to_capnp(self.liquidity_side));
+
+        self.position_id
+            .write_capnp(|| builder.reborrow().init_position_id());
+
+        if let Some(reason) = self.reason {
+            builder.set_reason(reason.as_str());
+        }
+
+        if let Some(info) = &self.info {
+            write_string_map(info, builder.reborrow().init_info());
+        }
+        self.event_id.to_capnp(builder.reborrow().init_event_id());
+        builder.reborrow().init_ts_event().set_value(*self.ts_event);
+        builder.reborrow().init_ts_init().set_value(*self.ts_init);
+        builder.set_reconciliation(self.reconciliation);
+        builder.set_is_reopened(self.is_reopened);
+        self.causation_id
+            .write_capnp(|| builder.reborrow().init_causation_id());
+    }
+}
+
+impl<'a> FromCapnp<'a> for OrderFillVoided {
+    type Reader = order_capnp::order_fill_voided::Reader<'a>;
+
+    fn from_capnp(reader: Self::Reader) -> Result<Self, Box<dyn Error>> {
+        let trader_id = TraderId::from_capnp(reader.get_trader_id()?)?;
+        let strategy_id = StrategyId::from_capnp(reader.get_strategy_id()?)?;
+        let instrument_id = InstrumentId::from_capnp(reader.get_instrument_id()?)?;
+        let client_order_id = ClientOrderId::from_capnp(reader.get_client_order_id()?)?;
+        let venue_order_id = VenueOrderId::from_capnp(reader.get_venue_order_id()?)?;
+        let account_id = AccountId::from_capnp(reader.get_account_id()?)?;
+        let correction_id = Ustr::from(reader.get_correction_id()?.to_str()?);
+        let trade_id = TradeId::from_capnp(reader.get_trade_id()?)?;
+        let voided_qty = Quantity::from_capnp(reader.get_voided_qty()?)?;
+        let commission_voided = read_optional_from_capnp(
+            || reader.has_commission_voided(),
+            || reader.get_commission_voided(),
+        )?;
+        let order_side = order_side_required_from_capnp(reader.get_order_side()?)?;
+        let order_type = order_type_from_capnp(reader.get_order_type()?);
+        let last_px = Price::from_capnp(reader.get_last_px()?)?;
+        let currency = Currency::from_capnp(reader.get_currency()?)?;
+        let liquidity_side = liquidity_side_from_capnp(reader.get_liquidity_side()?);
+        let position_id =
+            read_optional_from_capnp(|| reader.has_position_id(), || reader.get_position_id())?;
+        let reason = if reader.has_reason() {
+            Some(Ustr::from(reader.get_reason()?.to_str()?))
+        } else {
+            None
+        };
+        let info = if reader.has_info() {
+            Some(read_string_map(reader.get_info()?)?)
+        } else {
+            None
+        };
+        let event_id = nautilus_core::UUID4::from_capnp(reader.get_event_id()?)?;
+        let ts_event = reader.get_ts_event()?.get_value().into();
+        let ts_init = reader.get_ts_init()?.get_value().into();
+        let causation_id =
+            read_optional_from_capnp(|| reader.has_causation_id(), || reader.get_causation_id())?;
+
+        Ok(Self {
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            account_id,
+            correction_id,
+            trade_id,
+            voided_qty,
+            commission_voided,
+            order_side,
+            order_type,
+            last_px,
+            currency,
+            liquidity_side,
+            position_id,
+            reason,
+            info,
+            event_id,
+            ts_event,
+            ts_init,
+            reconciliation: reader.get_reconciliation(),
+            is_reopened: reader.get_is_reopened(),
+            causation_id,
         })
     }
 }
@@ -3677,7 +3901,7 @@ impl<'a> ToCapnp<'a> for OrderInitialized {
         let client_order_id_builder = builder.reborrow().init_client_order_id();
         self.client_order_id.to_capnp(client_order_id_builder);
 
-        builder.set_order_side(order_side_to_capnp(self.order_side));
+        builder.set_order_side(order_side_to_capnp(self.order_side.into()));
         builder.set_order_type(order_type_to_capnp(self.order_type));
 
         let quantity_builder = builder.reborrow().init_quantity();
@@ -3698,62 +3922,38 @@ impl<'a> ToCapnp<'a> for OrderInitialized {
         let mut ts_init_builder = builder.reborrow().init_ts_init();
         ts_init_builder.set_value(*self.ts_init);
 
-        // Optional fields
-        if let Some(price) = self.price {
-            let price_builder = builder.reborrow().init_price();
-            price.to_capnp(price_builder);
-        }
+        self.price.write_capnp(|| builder.reborrow().init_price());
+        self.activation_price
+            .write_capnp(|| builder.reborrow().init_activation_price());
+        self.trigger_price
+            .write_capnp(|| builder.reborrow().init_trigger_price());
 
-        if let Some(trigger_price) = self.trigger_price {
-            let trigger_price_builder = builder.reborrow().init_trigger_price();
-            trigger_price.to_capnp(trigger_price_builder);
-        }
+        builder.set_trigger_type(trigger_type_to_capnp(self.trigger_type));
 
-        if let Some(trigger_type) = self.trigger_type {
-            builder.set_trigger_type(trigger_type_to_capnp(trigger_type));
-        }
+        self.limit_offset
+            .write_capnp(|| builder.reborrow().init_limit_offset());
+        self.trailing_offset
+            .write_capnp(|| builder.reborrow().init_trailing_offset());
 
-        if let Some(limit_offset) = self.limit_offset {
-            let limit_offset_builder = builder.reborrow().init_limit_offset();
-            limit_offset.to_capnp(limit_offset_builder);
-        }
-
-        if let Some(trailing_offset) = self.trailing_offset {
-            let trailing_offset_builder = builder.reborrow().init_trailing_offset();
-            trailing_offset.to_capnp(trailing_offset_builder);
-        }
-
-        if let Some(trailing_offset_type) = self.trailing_offset_type {
-            builder.set_trailing_offset_type(trailing_offset_type_to_capnp(trailing_offset_type));
-        }
+        builder.set_trailing_offset_type(trailing_offset_type_to_capnp(self.trailing_offset_type));
 
         if let Some(expire_time) = self.expire_time {
             let mut expire_time_builder = builder.reborrow().init_expire_time();
             expire_time_builder.set_value(*expire_time);
         }
 
-        if let Some(display_qty) = self.display_qty {
-            let display_qty_builder = builder.reborrow().init_display_qty();
-            display_qty.to_capnp(display_qty_builder);
-        }
+        self.display_qty
+            .write_capnp(|| builder.reborrow().init_display_qty());
 
-        if let Some(emulation_trigger) = self.emulation_trigger {
-            builder.set_emulation_trigger(trigger_type_to_capnp(emulation_trigger));
-        }
+        builder.set_emulation_trigger(trigger_type_to_capnp(self.emulation_trigger));
 
-        if let Some(trigger_instrument_id) = &self.trigger_instrument_id {
-            let trigger_instrument_id_builder = builder.reborrow().init_trigger_instrument_id();
-            trigger_instrument_id.to_capnp(trigger_instrument_id_builder);
-        }
+        self.trigger_instrument_id
+            .write_capnp(|| builder.reborrow().init_trigger_instrument_id());
 
-        if let Some(contingency_type) = self.contingency_type {
-            builder.set_contingency_type(contingency_type_to_capnp(contingency_type));
-        }
+        builder.set_contingency_type(contingency_type_to_capnp(self.contingency_type));
 
-        if let Some(order_list_id) = &self.order_list_id {
-            let order_list_id_builder = builder.reborrow().init_order_list_id();
-            order_list_id.to_capnp(order_list_id_builder);
-        }
+        self.order_list_id
+            .write_capnp(|| builder.reborrow().init_order_list_id());
 
         if let Some(linked_order_ids) = &self.linked_order_ids {
             let mut linked_order_ids_builder = builder
@@ -3765,32 +3965,21 @@ impl<'a> ToCapnp<'a> for OrderInitialized {
             }
         }
 
-        if let Some(parent_order_id) = &self.parent_order_id {
-            let parent_order_id_builder = builder.reborrow().init_parent_order_id();
-            parent_order_id.to_capnp(parent_order_id_builder);
-        }
+        self.parent_order_id
+            .write_capnp(|| builder.reborrow().init_parent_order_id());
 
-        if let Some(exec_algorithm_id) = &self.exec_algorithm_id {
-            let exec_algorithm_id_builder = builder.reborrow().init_exec_algorithm_id();
-            exec_algorithm_id.to_capnp(exec_algorithm_id_builder);
-        }
+        self.exec_algorithm_id
+            .write_capnp(|| builder.reborrow().init_exec_algorithm_id());
 
         if let Some(exec_algorithm_params) = &self.exec_algorithm_params {
-            let mut params_builder = builder.reborrow().init_exec_algorithm_params();
-            let mut entries_builder = params_builder
-                .reborrow()
-                .init_entries(exec_algorithm_params.len() as u32);
-            for (i, (key, value)) in exec_algorithm_params.iter().enumerate() {
-                let mut entry_builder = entries_builder.reborrow().get(i as u32);
-                entry_builder.set_key(key.as_str());
-                entry_builder.set_value(value.as_str());
-            }
+            write_string_map(
+                exec_algorithm_params,
+                builder.reborrow().init_exec_algorithm_params(),
+            );
         }
 
-        if let Some(exec_spawn_id) = &self.exec_spawn_id {
-            let exec_spawn_id_builder = builder.reborrow().init_exec_spawn_id();
-            exec_spawn_id.to_capnp(exec_spawn_id_builder);
-        }
+        self.exec_spawn_id
+            .write_capnp(|| builder.reborrow().init_exec_spawn_id());
 
         if let Some(tags) = &self.tags {
             let mut tags_builder = builder.reborrow().init_tags(tags.len() as u32);
@@ -3817,7 +4006,7 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
         let client_order_id_reader = reader.get_client_order_id()?;
         let client_order_id = ClientOrderId::from_capnp(client_order_id_reader)?;
 
-        let order_side = order_side_from_capnp(reader.get_order_side()?);
+        let order_side = order_side_required_from_capnp(reader.get_order_side()?)?;
         let order_type = order_type_from_capnp(reader.get_order_type()?);
 
         let quantity_reader = reader.get_quantity()?;
@@ -3838,44 +4027,28 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
         let ts_init_reader = reader.get_ts_init()?;
         let ts_init = ts_init_reader.get_value();
 
-        // Optional fields
-        let price = if reader.has_price() {
-            let price_reader = reader.get_price()?;
-            Some(Price::from_capnp(price_reader)?)
-        } else {
-            None
-        };
+        let price = read_optional_from_capnp(|| reader.has_price(), || reader.get_price())?;
 
-        let trigger_price = if reader.has_trigger_price() {
-            let trigger_price_reader = reader.get_trigger_price()?;
-            Some(Price::from_capnp(trigger_price_reader)?)
-        } else {
-            None
-        };
+        let activation_price = read_optional_from_capnp(
+            || reader.has_activation_price(),
+            || reader.get_activation_price(),
+        )?;
 
-        let trigger_type = match reader.get_trigger_type()? {
-            enums_capnp::TriggerType::NoTrigger => None,
-            other => Some(trigger_type_from_capnp(other)),
-        };
+        let trigger_price =
+            read_optional_from_capnp(|| reader.has_trigger_price(), || reader.get_trigger_price())?;
 
-        let limit_offset = if reader.has_limit_offset() {
-            let limit_offset_reader = reader.get_limit_offset()?;
-            Some(Decimal::from_capnp(limit_offset_reader)?)
-        } else {
-            None
-        };
+        let trigger_type = trigger_type_from_capnp(reader.get_trigger_type()?);
 
-        let trailing_offset = if reader.has_trailing_offset() {
-            let trailing_offset_reader = reader.get_trailing_offset()?;
-            Some(Decimal::from_capnp(trailing_offset_reader)?)
-        } else {
-            None
-        };
+        let limit_offset =
+            read_optional_from_capnp(|| reader.has_limit_offset(), || reader.get_limit_offset())?;
 
-        let trailing_offset_type = match reader.get_trailing_offset_type()? {
-            enums_capnp::TrailingOffsetType::NoTrailingOffset => None,
-            other => Some(trailing_offset_type_from_capnp(other)),
-        };
+        let trailing_offset = read_optional_from_capnp(
+            || reader.has_trailing_offset(),
+            || reader.get_trailing_offset(),
+        )?;
+
+        let trailing_offset_type =
+            trailing_offset_type_from_capnp(reader.get_trailing_offset_type()?);
 
         let expire_time = if reader.has_expire_time() {
             let expire_time_reader = reader.get_expire_time()?;
@@ -3885,36 +4058,20 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
             None
         };
 
-        let display_qty = if reader.has_display_qty() {
-            let display_qty_reader = reader.get_display_qty()?;
-            Some(Quantity::from_capnp(display_qty_reader)?)
-        } else {
-            None
-        };
+        let display_qty =
+            read_optional_from_capnp(|| reader.has_display_qty(), || reader.get_display_qty())?;
 
-        let emulation_trigger = match reader.get_emulation_trigger()? {
-            enums_capnp::TriggerType::NoTrigger => None,
-            other => Some(trigger_type_from_capnp(other)),
-        };
+        let emulation_trigger = trigger_type_from_capnp(reader.get_emulation_trigger()?);
 
-        let trigger_instrument_id = if reader.has_trigger_instrument_id() {
-            let trigger_instrument_id_reader = reader.get_trigger_instrument_id()?;
-            Some(InstrumentId::from_capnp(trigger_instrument_id_reader)?)
-        } else {
-            None
-        };
+        let trigger_instrument_id = read_optional_from_capnp(
+            || reader.has_trigger_instrument_id(),
+            || reader.get_trigger_instrument_id(),
+        )?;
 
-        let contingency_type = match reader.get_contingency_type()? {
-            enums_capnp::ContingencyType::NoContingency => None,
-            other => Some(contingency_type_from_capnp(other)),
-        };
+        let contingency_type = contingency_type_from_capnp(reader.get_contingency_type()?);
 
-        let order_list_id = if reader.has_order_list_id() {
-            let order_list_id_reader = reader.get_order_list_id()?;
-            Some(OrderListId::from_capnp(order_list_id_reader)?)
-        } else {
-            None
-        };
+        let order_list_id =
+            read_optional_from_capnp(|| reader.has_order_list_id(), || reader.get_order_list_id())?;
 
         let linked_order_ids = if reader.has_linked_order_ids() {
             let linked_order_ids_reader = reader.get_linked_order_ids()?;
@@ -3927,40 +4084,24 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
             None
         };
 
-        let parent_order_id = if reader.has_parent_order_id() {
-            let parent_order_id_reader = reader.get_parent_order_id()?;
-            Some(ClientOrderId::from_capnp(parent_order_id_reader)?)
-        } else {
-            None
-        };
+        let parent_order_id = read_optional_from_capnp(
+            || reader.has_parent_order_id(),
+            || reader.get_parent_order_id(),
+        )?;
 
-        let exec_algorithm_id = if reader.has_exec_algorithm_id() {
-            let exec_algorithm_id_reader = reader.get_exec_algorithm_id()?;
-            Some(ExecAlgorithmId::from_capnp(exec_algorithm_id_reader)?)
-        } else {
-            None
-        };
+        let exec_algorithm_id = read_optional_from_capnp(
+            || reader.has_exec_algorithm_id(),
+            || reader.get_exec_algorithm_id(),
+        )?;
 
         let exec_algorithm_params = if reader.has_exec_algorithm_params() {
-            let params_reader = reader.get_exec_algorithm_params()?;
-            let entries_reader = params_reader.get_entries()?;
-            let mut params = IndexMap::with_capacity(entries_reader.len() as usize);
-            for entry_reader in entries_reader {
-                let key = Ustr::from(entry_reader.get_key()?.to_str()?);
-                let value = Ustr::from(entry_reader.get_value()?.to_str()?);
-                params.insert(key, value);
-            }
-            Some(params)
+            Some(read_string_map(reader.get_exec_algorithm_params()?)?)
         } else {
             None
         };
 
-        let exec_spawn_id = if reader.has_exec_spawn_id() {
-            let exec_spawn_id_reader = reader.get_exec_spawn_id()?;
-            Some(ClientOrderId::from_capnp(exec_spawn_id_reader)?)
-        } else {
-            None
-        };
+        let exec_spawn_id =
+            read_optional_from_capnp(|| reader.has_exec_spawn_id(), || reader.get_exec_spawn_id())?;
 
         let tags = if reader.has_tags() {
             let tags_reader = reader.get_tags()?;
@@ -3990,6 +4131,7 @@ impl<'a> FromCapnp<'a> for OrderInitialized {
             ts_event: ts_event.into(),
             ts_init: ts_init.into(),
             price,
+            activation_price,
             trigger_price,
             trigger_type,
             limit_offset,
@@ -4035,8 +4177,8 @@ impl<'a> ToCapnp<'a> for PositionOpened {
         let opening_order_id_builder = builder.reborrow().init_opening_order_id();
         self.opening_order_id.to_capnp(opening_order_id_builder);
 
-        builder.set_entry(order_side_to_capnp(self.entry));
-        builder.set_side(position_side_to_capnp(self.side));
+        builder.set_entry(order_side_to_capnp(self.entry.into()));
+        builder.set_side(position_side_to_capnp(self.side.into()));
         builder.set_signed_qty(self.signed_qty);
 
         let quantity_builder = builder.reborrow().init_quantity();
@@ -4052,6 +4194,9 @@ impl<'a> ToCapnp<'a> for PositionOpened {
         self.currency.to_capnp(currency_builder);
 
         builder.set_avg_px_open(self.avg_px_open);
+
+        self.realized_pnl
+            .write_capnp(|| builder.reborrow().init_realized_pnl());
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -4086,8 +4231,8 @@ impl<'a> FromCapnp<'a> for PositionOpened {
         let opening_order_id_reader = reader.get_opening_order_id()?;
         let opening_order_id = ClientOrderId::from_capnp(opening_order_id_reader)?;
 
-        let entry = order_side_from_capnp(reader.get_entry()?);
-        let side = position_side_from_capnp(reader.get_side()?);
+        let entry = order_side_required_from_capnp(reader.get_entry()?)?;
+        let side = position_side_required_from_capnp(reader.get_side()?)?;
         let signed_qty = reader.get_signed_qty();
 
         let quantity_reader = reader.get_quantity()?;
@@ -4103,6 +4248,9 @@ impl<'a> FromCapnp<'a> for PositionOpened {
         let currency = Currency::from_capnp(currency_reader)?;
 
         let avg_px_open = reader.get_avg_px_open();
+
+        let realized_pnl =
+            read_optional_from_capnp(|| reader.has_realized_pnl(), || reader.get_realized_pnl())?;
 
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
@@ -4128,6 +4276,7 @@ impl<'a> FromCapnp<'a> for PositionOpened {
             last_px,
             currency,
             avg_px_open,
+            realized_pnl,
             event_id,
             ts_event: ts_event.into(),
             ts_init: ts_init.into(),
@@ -4158,8 +4307,8 @@ impl<'a> ToCapnp<'a> for PositionChanged {
         let opening_order_id_builder = builder.reborrow().init_opening_order_id();
         self.opening_order_id.to_capnp(opening_order_id_builder);
 
-        builder.set_entry(order_side_to_capnp(self.entry));
-        builder.set_side(position_side_to_capnp(self.side));
+        builder.set_entry(order_side_to_capnp(self.entry.into()));
+        builder.set_side(position_side_to_capnp(self.side.into()));
         builder.set_signed_qty(self.signed_qty);
 
         let quantity_builder = builder.reborrow().init_quantity();
@@ -4223,8 +4372,8 @@ impl<'a> FromCapnp<'a> for PositionChanged {
         let opening_order_id_reader = reader.get_opening_order_id()?;
         let opening_order_id = ClientOrderId::from_capnp(opening_order_id_reader)?;
 
-        let entry = order_side_from_capnp(reader.get_entry()?);
-        let side = position_side_from_capnp(reader.get_side()?);
+        let entry = order_side_required_from_capnp(reader.get_entry()?)?;
+        let side = position_side_required_from_capnp(reader.get_side()?)?;
         let signed_qty = reader.get_signed_qty();
 
         let quantity_reader = reader.get_quantity()?;
@@ -4249,12 +4398,8 @@ impl<'a> FromCapnp<'a> for PositionChanged {
         };
         let realized_return = reader.get_realized_return();
 
-        let realized_pnl = if reader.has_realized_pnl() {
-            let realized_pnl_reader = reader.get_realized_pnl()?;
-            Some(Money::from_capnp(realized_pnl_reader)?)
-        } else {
-            None
-        };
+        let realized_pnl =
+            read_optional_from_capnp(|| reader.has_realized_pnl(), || reader.get_realized_pnl())?;
 
         let unrealized_pnl_reader = reader.get_unrealized_pnl()?;
         let unrealized_pnl = Money::from_capnp(unrealized_pnl_reader)?;
@@ -4325,8 +4470,8 @@ impl<'a> ToCapnp<'a> for PositionClosed {
         self.closing_order_id
             .write_capnp(|| builder.reborrow().init_closing_order_id());
 
-        builder.set_entry(order_side_to_capnp(self.entry));
-        builder.set_side(position_side_to_capnp(self.side));
+        builder.set_entry(order_side_to_capnp(self.entry.into()));
+        builder.set_side(position_side_to_capnp(self.side.into()));
         builder.set_signed_qty(self.signed_qty);
 
         let quantity_builder = builder.reborrow().init_quantity();
@@ -4354,7 +4499,7 @@ impl<'a> ToCapnp<'a> for PositionClosed {
         let unrealized_pnl_builder = builder.reborrow().init_unrealized_pnl();
         self.unrealized_pnl.to_capnp(unrealized_pnl_builder);
 
-        builder.set_duration(self.duration);
+        builder.set_duration(self.duration.as_u64());
 
         let event_id_builder = builder.reborrow().init_event_id();
         self.event_id.to_capnp(event_id_builder);
@@ -4402,8 +4547,8 @@ impl<'a> FromCapnp<'a> for PositionClosed {
             || reader.get_closing_order_id(),
         )?;
 
-        let entry = order_side_from_capnp(reader.get_entry()?);
-        let side = position_side_from_capnp(reader.get_side()?);
+        let entry = order_side_required_from_capnp(reader.get_entry()?)?;
+        let side = position_side_required_from_capnp(reader.get_side()?)?;
         let signed_qty = reader.get_signed_qty();
 
         let quantity_reader = reader.get_quantity()?;
@@ -4428,17 +4573,13 @@ impl<'a> FromCapnp<'a> for PositionClosed {
         };
         let realized_return = reader.get_realized_return();
 
-        let realized_pnl = if reader.has_realized_pnl() {
-            let realized_pnl_reader = reader.get_realized_pnl()?;
-            Some(Money::from_capnp(realized_pnl_reader)?)
-        } else {
-            None
-        };
+        let realized_pnl =
+            read_optional_from_capnp(|| reader.has_realized_pnl(), || reader.get_realized_pnl())?;
 
         let unrealized_pnl_reader = reader.get_unrealized_pnl()?;
         let unrealized_pnl = Money::from_capnp(unrealized_pnl_reader)?;
 
-        let duration = reader.get_duration();
+        let duration = DurationNanos::new(reader.get_duration());
 
         let event_id_reader = reader.get_event_id()?;
         let event_id = nautilus_core::UUID4::from_capnp(event_id_reader)?;
@@ -4512,19 +4653,11 @@ impl<'a> ToCapnp<'a> for PositionAdjusted {
 
         builder.set_adjustment_type(position_adjustment_type_to_capnp(self.adjustment_type));
 
-        if let Some(qty_change) = self.quantity_change {
-            let (lo, mid, hi, flags) = decimal_to_parts(&qty_change);
-            let mut qty_change_builder = builder.reborrow().init_quantity_change();
-            qty_change_builder.set_lo(lo);
-            qty_change_builder.set_mid(mid);
-            qty_change_builder.set_hi(hi);
-            qty_change_builder.set_flags(flags);
-        }
+        self.quantity_change
+            .write_capnp(|| builder.reborrow().init_quantity_change());
 
-        if let Some(ref pnl) = self.pnl_change {
-            let pnl_change_builder = builder.reborrow().init_pnl_change();
-            pnl.to_capnp(pnl_change_builder);
-        }
+        self.pnl_change
+            .write_capnp(|| builder.reborrow().init_pnl_change());
 
         if let Some(reason) = self.reason {
             builder.set_reason(reason.as_str());
@@ -4562,24 +4695,13 @@ impl<'a> FromCapnp<'a> for PositionAdjusted {
 
         let adjustment_type = position_adjustment_type_from_capnp(reader.get_adjustment_type()?);
 
-        let quantity_change = if reader.has_quantity_change() {
-            let qty_change_reader = reader.get_quantity_change()?;
-            Some(decimal_from_parts(
-                qty_change_reader.get_lo(),
-                qty_change_reader.get_mid(),
-                qty_change_reader.get_hi(),
-                qty_change_reader.get_flags(),
-            ))
-        } else {
-            None
-        };
+        let quantity_change = read_optional_from_capnp(
+            || reader.has_quantity_change(),
+            || reader.get_quantity_change(),
+        )?;
 
-        let pnl_change = if reader.has_pnl_change() {
-            let pnl_change_reader = reader.get_pnl_change()?;
-            Some(Money::from_capnp(pnl_change_reader)?)
-        } else {
-            None
-        };
+        let pnl_change =
+            read_optional_from_capnp(|| reader.has_pnl_change(), || reader.get_pnl_change())?;
 
         let reason = if reader.has_reason() {
             Some(Ustr::from(reader.get_reason()?.to_str()?))
@@ -4616,10 +4738,13 @@ impl<'a> FromCapnp<'a> for PositionAdjusted {
 #[cfg(test)]
 mod tests {
     use capnp::message::Builder;
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{DurationNanos, UUID4, UnixNanos};
     use nautilus_model::{
         data::stubs::*,
-        events::order::{spec::OrderCanceledSpec, stubs::*},
+        events::order::{
+            spec::{OrderCanceledSpec, OrderFillVoidedSpec},
+            stubs::*,
+        },
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -4690,7 +4815,7 @@ mod tests {
         let currency = Currency::USD();
         let bytes = serialize_currency(&currency).unwrap();
         let decoded = deserialize_currency(&bytes).unwrap();
-        assert_eq!(currency, decoded);
+        assert_currency_fields(currency, decoded);
     }
 
     #[rstest]
@@ -4698,7 +4823,15 @@ mod tests {
         let currency = Currency::BTC();
         let bytes = serialize_currency(&currency).unwrap();
         let decoded = deserialize_currency(&bytes).unwrap();
-        assert_eq!(currency, decoded);
+        assert_currency_fields(currency, decoded);
+    }
+
+    fn assert_currency_fields(expected: Currency, actual: Currency) {
+        assert_eq!(actual.code, expected.code);
+        assert_eq!(actual.precision, expected.precision);
+        assert_eq!(actual.iso4217, expected.iso4217);
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.currency_type, expected.currency_type);
     }
 
     #[rstest]
@@ -4754,8 +4887,12 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decimal_roundtrip_preserves_scale_and_sign() {
-        let decimal = Decimal::from_parts(0xffff_ffff, 0x7fff_ffff, 0x0000_00ff, false, 9);
+    #[case::positive(false, 9)]
+    #[case::negative(true, 9)]
+    #[case::maximum_scale_positive(false, Decimal::MAX_SCALE)]
+    #[case::maximum_scale_negative(true, Decimal::MAX_SCALE)]
+    fn test_decimal_roundtrip_preserves_scale_and_sign(#[case] negative: bool, #[case] scale: u32) {
+        let decimal = Decimal::from_parts(0xffff_ffff, 0x7fff_ffff, 0x0000_00ff, negative, scale);
 
         let mut message = capnp::message::Builder::new_default();
         {
@@ -4768,6 +4905,7 @@ mod tests {
             .expect("reader");
         let decoded = Decimal::from_capnp(reader).expect("decoded decimal");
         assert_eq!(decimal, decoded);
+        assert_eq!(decimal.serialize(), decoded.serialize());
     }
 
     #[rstest]
@@ -4920,7 +5058,7 @@ mod tests {
     );
     capnp_simple_roundtrip_test!(
         trade_tick_capnp_roundtrip,
-        stub_trade_ethusdt_buyer(),
+        stub_trade_ethusdt_buy(),
         market_capnp::trade_tick::Builder,
         market_capnp::trade_tick::Reader,
         TradeTick
@@ -4968,11 +5106,11 @@ mod tests {
         OrderBookDeltas
     );
     capnp_simple_roundtrip_test!(
-        order_book_depth10_capnp_roundtrip,
-        sample_order_book_depth10(),
-        market_capnp::order_book_depth10::Builder,
-        market_capnp::order_book_depth10::Reader,
-        OrderBookDepth10
+        order_book_depth_capnp_roundtrip,
+        sample_order_book_depth(),
+        market_capnp::order_book_depth::Builder,
+        market_capnp::order_book_depth::Reader,
+        OrderBookDepth
     );
     capnp_simple_roundtrip_test!(
         mark_price_update_capnp_roundtrip,
@@ -4994,6 +5132,20 @@ mod tests {
         market_capnp::funding_rate_update::Builder,
         market_capnp::funding_rate_update::Reader,
         FundingRateUpdate
+    );
+    capnp_simple_roundtrip_test!(
+        option_greeks_capnp_roundtrip,
+        sample_option_greeks(),
+        market_capnp::option_greeks::Builder,
+        market_capnp::option_greeks::Reader,
+        OptionGreeks
+    );
+    capnp_simple_roundtrip_test!(
+        option_greeks_black_scholes_zero_optional_capnp_roundtrip,
+        sample_option_greeks_black_scholes_zero_optional(),
+        market_capnp::option_greeks::Builder,
+        market_capnp::option_greeks::Reader,
+        OptionGreeks
     );
     capnp_simple_roundtrip_test!(
         instrument_close_capnp_roundtrip,
@@ -5018,6 +5170,31 @@ mod tests {
         order_capnp::order_filled::Builder,
         order_capnp::order_filled::Reader
     );
+    capnp_simple_roundtrip_test!(
+        order_fill_voided_capnp_roundtrip,
+        OrderFillVoidedSpec::builder().is_reopened(true).build(),
+        order_capnp::order_fill_voided::Builder,
+        order_capnp::order_fill_voided::Reader,
+        OrderFillVoided
+    );
+    capnp_simple_roundtrip_test!(
+        order_fill_voided_populated_optionals_capnp_roundtrip,
+        {
+            let mut event = OrderFillVoidedSpec::builder()
+                .voided_qty(Quantity::from("0.561000"))
+                .commission_voided(Money::from("12.20000000 USDT"))
+                .position_id(PositionId::from("P-001"))
+                .reason(Ustr::from("VENUE_VOID"))
+                .info(IndexMap::from([(Ustr::from("source"), Ustr::from("test"))]))
+                .is_reopened(true)
+                .build();
+            event.causation_id = Some(UUID4::new());
+            event
+        },
+        order_capnp::order_fill_voided::Builder,
+        order_capnp::order_fill_voided::Reader,
+        OrderFillVoided
+    );
     order_fixture_roundtrip_test!(
         order_denied_capnp_roundtrip,
         order_denied_max_submitted_rate,
@@ -5039,6 +5216,93 @@ mod tests {
         order_capnp::order_initialized::Builder,
         order_capnp::order_initialized::Reader
     );
+    #[rstest]
+    fn order_initialized_activation_price_capnp_roundtrip(
+        order_initialized_buy_limit: OrderInitialized,
+    ) {
+        let initialized = OrderInitialized {
+            activation_price: Some(Price::from("21000")),
+            ..order_initialized_buy_limit
+        };
+        assert_capnp_roundtrip!(
+            initialized,
+            order_capnp::order_initialized::Builder,
+            order_capnp::order_initialized::Reader,
+            OrderInitialized
+        );
+    }
+
+    #[rstest]
+    #[case::empty(false)]
+    #[case::populated(true)]
+    fn order_initialized_optional_collections_capnp_roundtrip(
+        order_initialized_buy_limit: OrderInitialized,
+        #[case] populated: bool,
+    ) {
+        let initialized = OrderInitialized {
+            expire_time: Some(UnixNanos::from(123_456)),
+            linked_order_ids: Some(if populated {
+                vec![ClientOrderId::from("O-101"), ClientOrderId::from("O-202")]
+            } else {
+                vec![]
+            }),
+            exec_algorithm_params: Some(if populated {
+                IndexMap::from([
+                    (Ustr::from("interval"), Ustr::from("17")),
+                    (Ustr::from("duration"), Ustr::from("53")),
+                ])
+            } else {
+                IndexMap::new()
+            }),
+            tags: Some(if populated {
+                vec![Ustr::from("first"), Ustr::from("second")]
+            } else {
+                vec![]
+            }),
+            ..order_initialized_buy_limit
+        };
+
+        let mut message = Builder::new_default();
+        initialized.to_capnp(message.init_root::<order_capnp::order_initialized::Builder>());
+        let reader = message
+            .get_root_as_reader::<order_capnp::order_initialized::Reader>()
+            .unwrap();
+        let decoded = OrderInitialized::from_capnp(reader).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::to_value(&initialized).unwrap()
+        );
+        assert_eq!(
+            decoded
+                .exec_algorithm_params
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            initialized
+                .exec_algorithm_params
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[rstest]
+    fn order_filled_info_capnp_roundtrip(order_filled: OrderFilled) {
+        let mut info = IndexMap::new();
+        info.insert(Ustr::from("liquidation"), Ustr::from("true"));
+        info.insert(Ustr::from("maker_order_id"), Ustr::from("ABC-123"));
+        let filled = OrderFilled {
+            info: Some(info),
+            ..order_filled
+        };
+        assert_capnp_roundtrip!(
+            filled,
+            order_capnp::order_filled::Builder,
+            order_capnp::order_filled::Reader,
+            OrderFilled
+        );
+    }
     order_fixture_roundtrip_test!(
         order_submitted_capnp_roundtrip,
         order_submitted,
@@ -5088,6 +5352,32 @@ mod tests {
         order_capnp::order_pending_cancel::Builder,
         order_capnp::order_pending_cancel::Reader
     );
+    #[rstest]
+    fn order_pending_update_none_account_capnp_roundtrip(order_pending_update: OrderPendingUpdate) {
+        let event = OrderPendingUpdate {
+            account_id: None,
+            ..order_pending_update
+        };
+        assert_capnp_roundtrip!(
+            event,
+            order_capnp::order_pending_update::Builder,
+            order_capnp::order_pending_update::Reader,
+            OrderPendingUpdate
+        );
+    }
+    #[rstest]
+    fn order_pending_cancel_none_account_capnp_roundtrip(order_pending_cancel: OrderPendingCancel) {
+        let event = OrderPendingCancel {
+            account_id: None,
+            ..order_pending_cancel
+        };
+        assert_capnp_roundtrip!(
+            event,
+            order_capnp::order_pending_cancel::Builder,
+            order_capnp::order_pending_cancel::Reader,
+            OrderPendingCancel
+        );
+    }
     order_fixture_roundtrip_test!(
         order_modify_rejected_capnp_roundtrip,
         order_modify_rejected,
@@ -5126,11 +5416,39 @@ mod tests {
         );
     }
 
+    #[rstest]
+    fn order_canceled_none_reason_capnp_roundtrip() {
+        let event = OrderCanceled {
+            reason: None,
+            ..sample_order_canceled()
+        };
+        assert_capnp_roundtrip!(
+            event,
+            order_capnp::order_canceled::Builder,
+            order_capnp::order_canceled::Reader,
+            OrderCanceled
+        );
+    }
+
     // Position event coverage
     #[rstest]
     fn position_opened_capnp_roundtrip() {
         assert_capnp_roundtrip!(
             sample_position_opened(),
+            position_capnp::position_opened::Builder,
+            position_capnp::position_opened::Reader,
+            PositionOpened
+        );
+    }
+
+    #[rstest]
+    fn position_opened_none_realized_pnl_capnp_roundtrip() {
+        let event = PositionOpened {
+            realized_pnl: None,
+            ..sample_position_opened()
+        };
+        assert_capnp_roundtrip!(
+            event,
             position_capnp::position_opened::Builder,
             position_capnp::position_opened::Reader,
             PositionOpened
@@ -5208,6 +5526,48 @@ mod tests {
         )
     }
 
+    fn sample_option_greeks() -> OptionGreeks {
+        OptionGreeks {
+            instrument_id: InstrumentId::from("BTC-30JUN23-40000-C.DERIBIT"),
+            convention: GreeksConvention::PriceAdjusted,
+            greeks: OptionGreekValues {
+                delta: 0.525,
+                gamma: 0.00032,
+                vega: 12.25,
+                theta: -0.72,
+                rho: 0.18,
+            },
+            mark_iv: Some(0.52),
+            bid_iv: None,
+            ask_iv: Some(0.54),
+            underlying_price: Some(41_500.25),
+            open_interest: None,
+            ts_event: UnixNanos::from(7),
+            ts_init: UnixNanos::from(8),
+        }
+    }
+
+    fn sample_option_greeks_black_scholes_zero_optional() -> OptionGreeks {
+        OptionGreeks {
+            instrument_id: InstrumentId::from("ETH-30JUN23-2000-C.DERIBIT"),
+            convention: GreeksConvention::BlackScholes,
+            greeks: OptionGreekValues {
+                delta: 0.12,
+                gamma: 0.002,
+                vega: 8.0,
+                theta: -0.45,
+                rho: 0.06,
+            },
+            mark_iv: Some(0.0),
+            bid_iv: Some(0.0),
+            ask_iv: Some(0.0),
+            underlying_price: Some(0.0),
+            open_interest: Some(0.0),
+            ts_event: UnixNanos::from(9),
+            ts_init: UnixNanos::from(10),
+        }
+    }
+
     fn sample_instrument_status_event() -> InstrumentStatus {
         InstrumentStatus::new(
             InstrumentId::from("MSFT.XNAS"),
@@ -5231,10 +5591,11 @@ mod tests {
             .reconciliation(true)
             .venue_order_id(venue_order_id())
             .account_id(account_id())
+            .reason(Ustr::from("not-enough-liquidity"))
             .build()
     }
 
-    fn sample_order_book_depth10() -> OrderBookDepth10 {
+    fn sample_order_book_depth() -> OrderBookDepth {
         const LEVELS: usize = 10;
         let instrument_id = InstrumentId::from("AAPL.XNAS");
         let mut bids = [BookOrder::default(); LEVELS];
@@ -5255,7 +5616,7 @@ mod tests {
         }
         let bid_counts = [1_u32; LEVELS];
         let ask_counts = [1_u32; LEVELS];
-        OrderBookDepth10::new(
+        OrderBookDepth::new(
             instrument_id,
             bids,
             asks,
@@ -5284,6 +5645,7 @@ mod tests {
             last_px: Price::from("20000"),
             currency: Currency::USD(),
             avg_px_open: 20000.0,
+            realized_pnl: Some(Money::new(-0.5, Currency::USD())),
             event_id: uuid4(),
             ts_event: UnixNanos::from(9),
             ts_init: UnixNanos::from(10),
@@ -5340,7 +5702,7 @@ mod tests {
             realized_return: 0.025,
             realized_pnl: Some(Money::new(1000.0, Currency::USD())),
             unrealized_pnl: Money::new(0.0, Currency::USD()),
-            duration: 1_000_000,
+            duration: DurationNanos::from_millis(1),
             event_id: uuid4(),
             ts_opened: UnixNanos::from(14),
             ts_closed: Some(UnixNanos::from(15)),

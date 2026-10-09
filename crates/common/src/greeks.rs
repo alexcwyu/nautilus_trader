@@ -30,8 +30,10 @@ use nautilus_model::{
     position::Position,
     types::Price,
 };
+use ustr::Ustr;
 
 use crate::{
+    actor::DataActorNative,
     cache::{Cache, refs::PositionRef},
     clock::Clock,
     msgbus,
@@ -184,7 +186,7 @@ pub struct PortfolioGreeksParams {
     pub instrument_id: Option<InstrumentId>,
     /// Strategy ID to filter positions by
     pub strategy_id: Option<StrategyId>,
-    /// Position side to filter by (default: `NoPositionSide`)
+    /// Position side to filter by (default: `None`)
     pub side: Option<PositionSide>,
     /// Flat interest rate (default: 0.0425)
     #[builder(default = 0.0425)]
@@ -315,6 +317,7 @@ pub struct GreeksCalculator {
     cache: Rc<RefCell<Cache>>,
     clock: Rc<RefCell<dyn Clock>>,
     cached_futures_spreads: RefCell<AHashMap<InstrumentId, (InstrumentId, Price)>>,
+    cross_venue_underlyings: RefCell<AHashMap<Ustr, InstrumentId>>,
 }
 
 impl GreeksCalculator {
@@ -324,20 +327,31 @@ impl GreeksCalculator {
             cache,
             clock,
             cached_futures_spreads: RefCell::new(AHashMap::new()),
+            cross_venue_underlyings: RefCell::new(AHashMap::new()),
         }
+    }
+
+    /// Creates a new [`GreeksCalculator`] from a registered native actor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the actor has not been registered with a trader.
+    pub fn from_actor(actor: &impl DataActorNative) -> Self {
+        Self::new(actor.cache_rc(), actor.clock_rc())
     }
 
     /// Calculates option or underlying greeks for a given instrument and a quantity of 1.
     ///
     /// Additional features:
-    /// - Apply shocks to the spot value of the instrument's underlying, implied volatility or time to expiry.
+    /// - Apply shocks to the spot value of the instrument's underlying, implied volatility, or time to expiry.
     /// - Compute percent greeks.
-    /// - Compute beta-weighted delta, gamma and vega with respect to an index.
+    /// - Compute beta-weighted delta, gamma, and vega with respect to an index.
     ///
     /// # Errors
     ///
     /// Returns an error if the instrument definition is not found, an option instrument
-    /// has no underlying identifier, or greeks calculation fails.
+    /// has no underlying identifier, its underlying symbol matches instruments on more
+    /// than one other venue, or greeks calculation fails.
     #[expect(clippy::too_many_arguments)]
     pub fn instrument_greeks(
         &self,
@@ -374,10 +388,7 @@ impl GreeksCalculator {
 
         let instrument = {
             let cache = self.cache.borrow();
-            match cache.instrument(&instrument_id) {
-                Some(instrument) => instrument.clone(),
-                None => anyhow::bail!("Instrument definition for {instrument_id} not found"),
-            }
+            cache.try_instrument(&instrument_id)?.clone()
         };
 
         if instrument.instrument_class() != InstrumentClass::Option {
@@ -393,8 +404,22 @@ impl GreeksCalculator {
             );
         }
 
+        let has_shocks = spot_shock != 0.0 || vol_shock != 0.0 || time_to_expiry_shock != 0.0;
+
+        // Unshocked cached greeks don't use the underlying, so skip resolving it
+        if use_cached_greeks
+            && !has_shocks
+            && let Some(mut cached_greeks) = self.cache.borrow().greeks(&instrument_id)
+        {
+            if let Some(pos) = position {
+                cached_greeks.pnl = cached_greeks.price - pos.avg_px_open;
+            }
+
+            return Ok(cached_greeks);
+        }
+
         let underlying_instrument_id =
-            Self::resolve_underlying_instrument_id(&instrument, instrument_id)?;
+            self.resolve_underlying_instrument_id(&instrument, instrument_id)?;
         let mut greeks_data = self.calculate_option_greeks(
             &instrument,
             instrument_id,
@@ -414,7 +439,7 @@ impl GreeksCalculator {
             vol_beta_weights,
         )?;
 
-        if spot_shock != 0.0 || vol_shock != 0.0 || time_to_expiry_shock != 0.0 {
+        if has_shocks {
             greeks_data = self.apply_option_greeks_shocks(
                 &greeks_data,
                 underlying_instrument_id,
@@ -438,6 +463,7 @@ impl GreeksCalculator {
     }
 
     fn resolve_underlying_instrument_id(
+        &self,
         instrument: &InstrumentAny,
         instrument_id: InstrumentId,
     ) -> anyhow::Result<InstrumentId> {
@@ -445,10 +471,58 @@ impl GreeksCalculator {
             anyhow::bail!("Instrument {instrument_id} has no underlying identifier");
         };
 
-        Ok(InstrumentId::from(format!(
-            "{}.{}",
-            underlying, instrument_id.venue
-        )))
+        let same_venue_id = InstrumentId::from(format!("{underlying}.{}", instrument_id.venue));
+        let cache = self.cache.borrow();
+        let mut cross_venue_underlyings = self.cross_venue_underlyings.borrow_mut();
+
+        // Drop a purged match before any early return so a re-added instrument is rechecked
+        let remembered_id = cross_venue_underlyings
+            .get(&underlying)
+            .copied()
+            .filter(|id| cache.instrument(id).is_some());
+
+        if remembered_id.is_none() {
+            cross_venue_underlyings.remove(&underlying);
+        }
+
+        // A futures spread cached for the option's venue stands in for an uncached underlying
+        if cache.instrument(&same_venue_id).is_some()
+            || self
+                .cached_futures_spreads
+                .borrow()
+                .contains_key(&same_venue_id)
+        {
+            return Ok(same_venue_id);
+        }
+
+        if let Some(underlying_id) = remembered_id {
+            return Ok(underlying_id);
+        }
+
+        // Remember a unique cross-venue match to avoid rescanning the cache on later calls
+        let mut matches: Vec<InstrumentId> = cache
+            .instrument_ids(None)
+            .into_iter()
+            .filter(|id| id.symbol.inner() == underlying)
+            .copied()
+            .collect();
+
+        match matches.len() {
+            0 => Ok(same_venue_id),
+            1 => {
+                cross_venue_underlyings.insert(underlying, matches[0]);
+                Ok(matches[0])
+            }
+            _ => {
+                matches.sort();
+                let names = matches
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!("Ambiguous underlying for option {instrument_id}: {names}")
+            }
+        }
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -530,32 +604,34 @@ impl GreeksCalculator {
         } else {
             ts_event
         };
+
         let utc_now = utc_now_ns.to_datetime_utc();
         let expiry_utc = instrument
             .expiration_ns()
             .map(|ns| ns.to_datetime_utc())
             .unwrap_or_default();
         let expiry_int = expiry_utc
-            .format("%Y%m%d")
+            .strftime("%Y%m%d")
             .to_string()
             .parse::<i32>()
             .unwrap_or(0);
-        let raw_days = (expiry_utc - utc_now).num_days();
+        let raw_days = utc_now.duration_until(expiry_utc).as_hours() / 24;
         let expiry_in_days = raw_days.max(1) as i32;
         let expiry_in_years = expiry_in_days as f64 / 365.25;
         let currency = instrument.quote_currency().code.to_string();
 
         let cache = self.cache.borrow();
         let yield_curve = cache.yield_curve(&currency);
+
         let interest_rate = match yield_curve {
             Some(yield_curve) => yield_curve(expiry_in_years),
             None => flat_interest_rate,
         };
+
         let dividend_curve = cache.yield_curve(&underlying_instrument_id.to_string());
         drop(cache);
 
         let mut cost_of_carry = 0.0;
-
         if let Some(dividend_curve) = dividend_curve {
             cost_of_carry = interest_rate - dividend_curve(expiry_in_years);
         } else if let Some(div_yield) = flat_dividend_yield {
@@ -574,6 +650,7 @@ impl GreeksCalculator {
             self.get_price(&vol_index_id)
                 .ok_or_else(|| anyhow::anyhow!("No price available for {vol_index_id}"))?;
         }
+
         let greeks = if update_vol {
             let cached_greeks = self.cache.borrow().greeks(&instrument_id);
             match cached_greeks {
@@ -608,6 +685,7 @@ impl GreeksCalculator {
                 option_price,
             )
         };
+
         let (delta, gamma, vega) = self.modify_greeks(
             greeks.delta,
             greeks.gamma,
@@ -627,6 +705,7 @@ impl GreeksCalculator {
             None,
             None,
         )?;
+
         let greeks_data = GreeksData::new(
             utc_now_ns,
             utc_now_ns,
@@ -772,7 +851,7 @@ impl GreeksCalculator {
         anyhow::bail!("No price available for {underlying_instrument_id}")
     }
 
-    /// Modifies delta, gamma and vega based on beta weighting and percentage calculations.
+    /// Modifies delta, gamma, and vega based on beta weighting and percentage calculations.
     ///
     /// The beta weighting of delta and gamma follows this equation linking the returns of a stock x to the ones of an index I:
     /// (x - x0) / x0 = alpha + beta (I - I0) / I0 + epsilon
@@ -836,7 +915,6 @@ impl GreeksCalculator {
 
         if used_index_price.is_some() {
             let mut beta = 1.0;
-
             if let Some(weights) = beta_weights
                 && let Some(&weight) = weights.get(&underlying_instrument_id)
             {
@@ -844,7 +922,7 @@ impl GreeksCalculator {
             }
 
             if let Some(ref mut idx_price) = used_index_price {
-                #[allow(clippy::float_cmp, reason = "exact-equality baseline check")]
+                #[expect(clippy::float_cmp, reason = "exact-equality baseline check")]
                 if underlying_price != unshocked_underlying_price {
                     *idx_price += 1.0 / beta
                         * (*idx_price / unshocked_underlying_price)
@@ -859,6 +937,7 @@ impl GreeksCalculator {
 
         if used_index_vol.is_some() {
             let mut vega_beta = 1.0;
+
             let used_vol = if unshocked_vol == 0.0 {
                 vol
             } else {
@@ -874,12 +953,11 @@ impl GreeksCalculator {
             if let Some(ref mut idx_vol) = used_index_vol {
                 *idx_vol *= 0.01;
 
-                #[allow(clippy::float_cmp, reason = "exact-equality baseline check")]
+                #[expect(clippy::float_cmp, reason = "exact-equality baseline check")]
                 if vol != used_vol && used_vol != 0.0 {
                     *idx_vol += 1.0 / vega_beta * (*idx_vol / used_vol) * (vol - used_vol);
                 }
 
-                #[allow(clippy::float_cmp, reason = "zero price guard")]
                 if *idx_vol != 0.0 {
                     vega *= vega_beta * vol / *idx_vol;
                 }
@@ -918,14 +996,13 @@ impl GreeksCalculator {
     /// Aggregates the Greeks data for all open positions that match the specified criteria.
     ///
     /// Additional features:
-    /// - Apply shocks to the spot value of an instrument's underlying, implied volatility or time to expiry.
+    /// - Apply shocks to the spot value of an instrument's underlying, implied volatility, or time to expiry.
     /// - Compute percent greeks.
-    /// - Compute beta-weighted delta, gamma and vega with respect to an index.
+    /// - Compute beta-weighted delta, gamma, and vega with respect to an index.
     ///
     /// # Errors
     ///
     /// Returns an error if any underlying greeks calculation fails.
-    ///
     #[expect(clippy::too_many_arguments)]
     pub fn portfolio_greeks(
         &self,
@@ -965,15 +1042,13 @@ impl GreeksCalculator {
         let cache_greeks = cache_greeks.unwrap_or(false);
         let publish_greeks = publish_greeks.unwrap_or(false);
         let percent_greeks = percent_greeks.unwrap_or(false);
-        let side = side.unwrap_or(PositionSide::NoPositionSide);
-
         let cache = self.cache.borrow();
-        let open_positions = cache.positions(
+        let open_positions = cache.positions_open(
             venue.as_ref(),
             instrument_id.as_ref(),
             strategy_id.as_ref(),
             None, // account_id
-            Some(side),
+            side,
         );
         let open_positions: Vec<Position> =
             open_positions.iter().map(PositionRef::cloned).collect();
@@ -1054,11 +1129,13 @@ impl GreeksCalculator {
                 "Cannot cache futures spread: missing option instrument {call_instrument_id}"
             );
         };
+
         let Some(put_instrument) = put_instrument else {
             anyhow::bail!(
                 "Cannot cache futures spread: missing option instrument {put_instrument_id}"
             );
         };
+
         let Some(reference_future_instrument) = reference_future_instrument else {
             anyhow::bail!(
                 "Cannot cache futures spread: no reference futures instrument for {futures_instrument_id}"
@@ -1086,6 +1163,7 @@ impl GreeksCalculator {
                 "Cannot cache futures spread: missing call underlying for {call_instrument_id}"
             );
         };
+
         let Some(put_underlying) = put_instrument.underlying() else {
             anyhow::bail!(
                 "Cannot cache futures spread: missing put underlying for {put_instrument_id}"
@@ -1115,11 +1193,13 @@ impl GreeksCalculator {
                 "Cannot cache futures spread: no reference futures price for {futures_instrument_id}"
             )
         })?;
+
         let call_price = self.get_price(&call_instrument_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "Cannot cache futures spread: missing option price for {call_instrument_id}"
             )
         })?;
+
         let put_price = self.get_price(&put_instrument_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "Cannot cache futures spread: missing option price for {put_instrument_id}"
@@ -1164,9 +1244,8 @@ impl GreeksCalculator {
             .expiration_ns()
             .map(|ns| ns.to_datetime_utc())
             .unwrap_or_default();
-        let expiry_in_days = (expiry_utc - self.clock.borrow().timestamp_ns().to_datetime_utc())
-            .num_days()
-            .max(1) as i32;
+        let now = self.clock.borrow().timestamp_ns().to_datetime_utc();
+        let expiry_in_days = (now.duration_until(expiry_utc).as_hours() / 24).max(1) as i32;
         let expiry_in_years = expiry_in_days as f64 / 365.25;
         let currency = call_instrument.quote_currency().code.to_string();
         let interest_rate = self
@@ -1242,6 +1321,7 @@ impl GreeksCalculator {
                 let mut cache = cache_ref.borrow_mut();
                 cache.add_greeks(greeks.clone()).unwrap_or_default();
             });
+
             msgbus::subscribe_greeks(pattern, typed_handler, None);
         }
     }
@@ -1251,11 +1331,14 @@ impl GreeksCalculator {
 mod tests {
     use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-    use chrono::{TimeZone, Utc};
+    use jiff::{Timestamp, civil::Date, tz::Offset};
     use nautilus_model::{
-        data::{IndexPriceUpdate, QuoteTick},
-        enums::{AssetClass, OptionKind, PositionSide},
-        identifiers::{InstrumentId, StrategyId, Symbol, Venue},
+        data::{IndexPriceUpdate, QuoteTick, YieldCurveData},
+        enums::{AssetClass, OmsType, OptionKind, OrderSide, PositionSide},
+        events::order::spec::OrderFilledSpec,
+        identifiers::{
+            ClientOrderId, InstrumentId, PositionId, StrategyId, Symbol, TradeId, Venue,
+        },
         instruments::{Equity, FuturesContract, OptionContract, any::InstrumentAny},
         types::{Currency, Price, Quantity},
     };
@@ -1263,37 +1346,41 @@ mod tests {
     use ustr::Ustr;
 
     use super::*;
-    use crate::{cache::Cache, clock::TestClock};
+    use crate::{cache::Cache, clock::VirtualClock};
+
+    fn utc_timestamp(year: i16, month: i8, day: i8, hour: i8, minute: i8, second: i8) -> Timestamp {
+        Offset::UTC
+            .to_timestamp(
+                Date::new(year, month, day)
+                    .unwrap()
+                    .at(hour, minute, second, 0),
+            )
+            .unwrap()
+    }
 
     fn create_test_calculator() -> GreeksCalculator {
         let cache = Rc::new(RefCell::new(Cache::new(None, None)));
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         GreeksCalculator::new(cache, clock)
-    }
-
-    #[rstest]
-    fn test_greeks_calculator_creation() {
-        let calculator = create_test_calculator();
-        // Test that the calculator can be created
-        assert!(format!("{calculator:?}").contains("GreeksCalculator"));
     }
 
     #[rstest]
     fn test_greeks_calculator_debug() {
         let calculator = create_test_calculator();
-        // Test the debug representation
-        let debug_str = format!("{calculator:?}");
-        assert!(debug_str.contains("GreeksCalculator"));
-    }
 
-    #[rstest]
-    fn test_greeks_calculator_has_python_bindings() {
-        // This test just verifies that the GreeksCalculator struct
-        // can be compiled with Python bindings enabled
-        let calculator = create_test_calculator();
-        // The Python methods are only accessible from Python,
-        // but we can verify the struct compiles correctly
-        assert!(format!("{calculator:?}").contains("GreeksCalculator"));
+        let debug_str = format!("{calculator:?}");
+
+        assert!(debug_str.starts_with("GreeksCalculator {"), "{debug_str}");
+        assert!(debug_str.contains("cache:"), "{debug_str}");
+        assert!(debug_str.contains("clock:"), "{debug_str}");
+        assert!(
+            debug_str.contains("cached_futures_spreads: RefCell { value: {} }"),
+            "{debug_str}"
+        );
+        assert!(
+            debug_str.contains("cross_venue_underlyings: RefCell { value: {} }"),
+            "{debug_str}"
+        );
     }
 
     #[rstest]
@@ -1731,67 +1818,48 @@ mod tests {
     }
 
     fn option_with_expiration(instrument_id: &str, expiration_ns: UnixNanos) -> OptionContract {
-        let activation_ns = UnixNanos::from(Utc.with_ymd_and_hms(2021, 9, 17, 0, 0, 0).unwrap());
-        OptionContract::new(
-            InstrumentId::from(instrument_id),
-            Symbol::from("AAPL211217C00150000"),
-            AssetClass::Equity,
-            Some(Ustr::from("GMNI")),
-            Ustr::from("AAPL"),
-            OptionKind::Call,
-            Price::from("149.0"),
-            Currency::from("USD"),
-            activation_ns,
-            expiration_ns,
-            2,
-            Price::from("0.01"),
-            Quantity::from(100),
-            Quantity::from(1),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        let activation_ns = UnixNanos::from(utc_timestamp(2021, 9, 17, 0, 0, 0));
+        OptionContract::builder()
+            .instrument_id(InstrumentId::from(instrument_id))
+            .raw_symbol(Symbol::from("AAPL211217C00150000"))
+            .asset_class(AssetClass::Equity)
+            .exchange(Ustr::from("GMNI"))
+            .underlying(Ustr::from("AAPL"))
+            .option_kind(OptionKind::Call)
+            .strike_price(Price::from("149.0"))
+            .currency(Currency::from("USD"))
+            .activation_ns(activation_ns)
+            .expiration_ns(expiration_ns)
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .multiplier(Quantity::from(100))
+            .lot_size(Quantity::from(1))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     fn equity_aapl_opra() -> Equity {
-        Equity::new(
-            InstrumentId::from("AAPL.OPRA"),
-            Symbol::from("AAPL"),
-            Some(Ustr::from("US0378331005")),
-            Currency::from("USD"),
-            2,
-            Price::from("0.01"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        Equity::builder()
+            .instrument_id(InstrumentId::from("AAPL.OPRA"))
+            .raw_symbol(Symbol::from("AAPL"))
+            .isin(Ustr::from("US0378331005"))
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     #[rstest]
     fn test_resolve_underlying_instrument_id_errors_without_underlying() {
         let instrument = InstrumentAny::Equity(equity_aapl_opra());
-        let error = GreeksCalculator::resolve_underlying_instrument_id(
-            &instrument,
-            InstrumentId::from("AAPL.OPRA"),
-        )
-        .unwrap_err();
+        let error = create_test_calculator()
+            .resolve_underlying_instrument_id(&instrument, InstrumentId::from("AAPL.OPRA"))
+            .unwrap_err();
 
         assert_eq!(
             error.to_string(),
@@ -1799,36 +1867,322 @@ mod tests {
         );
     }
 
+    fn equity_with_id(instrument_id: &str) -> Equity {
+        let instrument_id = InstrumentId::from(instrument_id);
+        Equity::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(instrument_id.symbol)
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
+    }
+
+    fn calculator_with_option_and_equities(
+        option: OptionContract,
+        equity_ids: &[&str],
+    ) -> GreeksCalculator {
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(option))
+            .unwrap();
+
+        for equity_id in equity_ids {
+            cache
+                .borrow_mut()
+                .add_instrument(InstrumentAny::Equity(equity_with_id(equity_id)))
+                .unwrap();
+        }
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        GreeksCalculator::new(cache, clock)
+    }
+
+    #[rstest]
+    #[case::same_venue_preferred(&["AAPL.XNAS", "AAPL.OPRA", "AAPL.ARCX"], "AAPL.OPRA")]
+    #[case::unique_cross_venue_match(&["AAPL.XNAS", "MSFT.XNAS"], "AAPL.XNAS")]
+    #[case::no_match_keeps_option_venue(&["MSFT.XNAS"], "AAPL.OPRA")]
+    fn test_resolve_underlying_instrument_id(#[case] equity_ids: &[&str], #[case] expected: &str) {
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::default());
+        let option_id = option.id();
+        let instrument = InstrumentAny::OptionContract(option.clone());
+        let calculator = calculator_with_option_and_equities(option, equity_ids);
+
+        let underlying_id = calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        assert_eq!(underlying_id, InstrumentId::from(expected));
+    }
+
+    #[rstest]
+    fn test_resolve_underlying_instrument_id_errors_when_cross_venue_match_is_ambiguous() {
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::default());
+        let option_id = option.id();
+        let instrument = InstrumentAny::OptionContract(option.clone());
+        let calculator = calculator_with_option_and_equities(option, &["AAPL.XNAS", "AAPL.ARCX"]);
+
+        let error = calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Ambiguous underlying for option AAPL250417C00150000.OPRA: AAPL.ARCX, AAPL.XNAS"
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_underlying_instrument_id_reuses_cross_venue_match() {
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::default());
+        let option_id = option.id();
+        let instrument = InstrumentAny::OptionContract(option.clone());
+        let calculator = calculator_with_option_and_equities(option, &["AAPL.XNAS"]);
+        let first = calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        calculator
+            .cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::Equity(equity_with_id("AAPL.ARCX")))
+            .unwrap();
+        let second = calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        assert_eq!(first, InstrumentId::from("AAPL.XNAS"));
+        assert_eq!(second, InstrumentId::from("AAPL.XNAS"));
+    }
+
+    #[rstest]
+    fn test_resolve_underlying_instrument_id_rescans_after_match_is_purged() {
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::default());
+        let option_id = option.id();
+        let instrument = InstrumentAny::OptionContract(option.clone());
+        let calculator = calculator_with_option_and_equities(option, &["AAPL.XNAS"]);
+        calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        {
+            let mut cache = calculator.cache.borrow_mut();
+            cache
+                .add_instrument(InstrumentAny::Equity(equity_with_id("AAPL.ARCX")))
+                .unwrap();
+            cache.purge_instrument(InstrumentId::from("AAPL.XNAS"));
+        }
+
+        let underlying_id = calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        assert_eq!(underlying_id, InstrumentId::from("AAPL.ARCX"));
+    }
+
+    #[rstest]
+    #[case::no_underlying_cached(&[])]
+    #[case::same_venue_cached(&["AAPL.OPRA"])]
+    fn test_resolve_underlying_instrument_id_forgets_match_once_purged(
+        #[case] cached_while_purged: &[&str],
+    ) {
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::default());
+        let option_id = option.id();
+        let instrument = InstrumentAny::OptionContract(option.clone());
+        let calculator = calculator_with_option_and_equities(option, &["AAPL.XNAS"]);
+        calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        {
+            let mut cache = calculator.cache.borrow_mut();
+            cache.purge_instrument(InstrumentId::from("AAPL.XNAS"));
+            for equity_id in cached_while_purged {
+                cache
+                    .add_instrument(InstrumentAny::Equity(equity_with_id(equity_id)))
+                    .unwrap();
+            }
+        }
+
+        calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap();
+
+        {
+            let mut cache = calculator.cache.borrow_mut();
+            for equity_id in cached_while_purged {
+                cache.purge_instrument(InstrumentId::from(*equity_id));
+            }
+
+            for equity_id in ["AAPL.XNAS", "AAPL.ARCX"] {
+                cache
+                    .add_instrument(InstrumentAny::Equity(equity_with_id(equity_id)))
+                    .unwrap();
+            }
+        }
+
+        let error = calculator
+            .resolve_underlying_instrument_id(&instrument, option_id)
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Ambiguous underlying for option AAPL250417C00150000.OPRA: AAPL.ARCX, AAPL.XNAS"
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_reads_cached_greeks_when_underlying_is_ambiguous() {
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::default());
+        let option_id = option.id();
+        let position = position_from_fill(
+            &InstrumentAny::OptionContract(option.clone()),
+            "P-GREEKS-1",
+            "O-GREEKS-1",
+            "T-GREEKS-1",
+            OrderSide::Buy,
+            1,
+            "9.00",
+        );
+        let calculator = calculator_with_option_and_equities(option, &["AAPL.XNAS", "AAPL.ARCX"]);
+        let mut cached_greeks = GreeksData::from_delta(option_id, 0.5, 100.0, UnixNanos::default());
+        cached_greeks.price = 10.5;
+        calculator
+            .cache
+            .borrow_mut()
+            .add_greeks(cached_greeks.clone())
+            .unwrap();
+
+        let greeks = calculator
+            .instrument_greeks(
+                option_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                Some(position),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(greeks.instrument_id, option_id);
+        assert_eq!(greeks.greeks, cached_greeks.greeks);
+        assert_eq!(greeks.pnl, 1.5);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_prices_underlying_on_another_venue() {
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * 30);
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
+        let option_id = option.id();
+        let same_venue_cache = setup_cache_with_option_and_quotes(
+            option.clone(),
+            InstrumentId::from("AAPL.OPRA"),
+            now_ns,
+        );
+        let cross_venue_cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cross_venue_cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::OptionContract(option))
+            .unwrap();
+        cross_venue_cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::Equity(equity_with_id("AAPL.XNAS")))
+            .unwrap();
+
+        for (instrument_id, bid, ask) in [
+            (option_id, "10.50", "10.60"),
+            (InstrumentId::from("AAPL.XNAS"), "150.00", "150.10"),
+        ] {
+            cross_venue_cache
+                .borrow_mut()
+                .add_quote(QuoteTick::new(
+                    instrument_id,
+                    Price::from(bid),
+                    Price::from(ask),
+                    Quantity::from(100),
+                    Quantity::from(100),
+                    now_ns,
+                    now_ns,
+                ))
+                .unwrap();
+        }
+
+        let greeks_for = |cache: Rc<RefCell<Cache>>| {
+            let clock = Rc::new(RefCell::new(VirtualClock::new()));
+            GreeksCalculator::new(cache, clock)
+                .instrument_greeks(
+                    option_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(now_ns),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
+        };
+
+        let expected = greeks_for(same_venue_cache);
+        let greeks = greeks_for(cross_venue_cache);
+
+        assert_eq!(greeks.underlying_price, expected.underlying_price);
+        assert_eq!(greeks.vol, expected.vol);
+        assert_eq!(greeks.price, expected.price);
+        assert_eq!(greeks.greeks, expected.greeks);
+    }
+
     fn future_with_expiration(
         instrument_id: &str,
         underlying: &str,
         expiration_ns: UnixNanos,
     ) -> FuturesContract {
-        FuturesContract::new(
-            InstrumentId::from(instrument_id),
-            Symbol::from(underlying),
-            AssetClass::Index,
-            Some(Ustr::from("XCME")),
-            Ustr::from(underlying),
-            UnixNanos::default(),
-            expiration_ns,
-            Currency::from("USD"),
-            2,
-            Price::from("0.25"),
-            Quantity::from(1),
-            Quantity::from(1),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        FuturesContract::builder()
+            .instrument_id(InstrumentId::from(instrument_id))
+            .raw_symbol(Symbol::from(underlying))
+            .asset_class(AssetClass::Index)
+            .exchange(Ustr::from("XCME"))
+            .underlying(Ustr::from(underlying))
+            .activation_ns(UnixNanos::default())
+            .expiration_ns(expiration_ns)
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.25"))
+            .multiplier(Quantity::from(1))
+            .lot_size(Quantity::from(1))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     fn future_option_with_expiration(
@@ -1839,33 +2193,25 @@ mod tests {
         strike: &str,
         expiration_ns: UnixNanos,
     ) -> OptionContract {
-        OptionContract::new(
-            InstrumentId::from(instrument_id),
-            Symbol::from(raw_symbol),
-            AssetClass::Index,
-            Some(Ustr::from("XCME")),
-            Ustr::from(underlying),
-            option_kind,
-            Price::from(strike),
-            Currency::from("USD"),
-            UnixNanos::default(),
-            expiration_ns,
-            2,
-            Price::from("0.01"),
-            Quantity::from(1),
-            Quantity::from(1),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
+        OptionContract::builder()
+            .instrument_id(InstrumentId::from(instrument_id))
+            .raw_symbol(Symbol::from(raw_symbol))
+            .asset_class(AssetClass::Index)
+            .exchange(Ustr::from("XCME"))
+            .underlying(Ustr::from(underlying))
+            .option_kind(option_kind)
+            .strike_price(Price::from(strike))
+            .currency(Currency::from("USD"))
+            .activation_ns(UnixNanos::default())
+            .expiration_ns(expiration_ns)
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .multiplier(Quantity::from(1))
+            .lot_size(Quantity::from(1))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
     }
 
     fn setup_cache_with_option_and_quotes(
@@ -1883,6 +2229,7 @@ mod tests {
             .borrow_mut()
             .add_instrument(InstrumentAny::Equity(equity_aapl_opra()))
             .unwrap();
+
         let option_quote = QuoteTick::new(
             option_id,
             Price::from("10.50"),
@@ -1892,6 +2239,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let underlying_quote = QuoteTick::new(
             underlying_id,
             Price::from("150.00"),
@@ -1906,17 +2254,298 @@ mod tests {
         cache
     }
 
+    fn position_from_fill(
+        instrument: &InstrumentAny,
+        position_id: &str,
+        client_order_id: &str,
+        trade_id: &str,
+        side: OrderSide,
+        quantity: u64,
+        price: &str,
+    ) -> Position {
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(ClientOrderId::from(client_order_id))
+            .trade_id(TradeId::from(trade_id))
+            .order_side(side)
+            .last_qty(Quantity::from(quantity))
+            .last_px(Price::from(price))
+            .currency(Currency::USD())
+            .position_id(PositionId::from(position_id))
+            .build();
+        Position::new(instrument, fill)
+    }
+
+    fn calculate_portfolio_greeks(
+        calculator: &GreeksCalculator,
+        side: Option<PositionSide>,
+    ) -> anyhow::Result<PortfolioGreeks> {
+        calculator.portfolio_greeks(
+            None, None, None, None, side, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
+        )
+    }
+
+    fn assert_portfolio_greeks_eq(actual: &PortfolioGreeks, expected: &PortfolioGreeks) {
+        assert_eq!(actual.ts_init, expected.ts_init);
+        assert_eq!(actual.ts_event, expected.ts_event);
+        assert_eq!(actual.pnl, expected.pnl);
+        assert_eq!(actual.price, expected.price);
+        assert_eq!(actual.delta, expected.delta);
+        assert_eq!(actual.gamma, expected.gamma);
+        assert_eq!(actual.vega, expected.vega);
+        assert_eq!(actual.theta, expected.theta);
+        assert_eq!(actual.rho, expected.rho);
+    }
+
+    #[rstest]
+    fn test_portfolio_greeks_ignores_closed_position_with_missing_price() {
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * 30);
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+        let open_option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
+        let open_option_id = open_option.id();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let cache = setup_cache_with_option_and_quotes(open_option.clone(), underlying_id, now_ns);
+        let closed_future = future_with_expiration("CLOSED.GLBX", "CLOSED", expiry_ns);
+        let closed_future_id = closed_future.id();
+        let open_instrument = InstrumentAny::OptionContract(open_option);
+        let closed_instrument = InstrumentAny::FuturesContract(closed_future);
+
+        let open_position = position_from_fill(
+            &open_instrument,
+            "P-OPEN",
+            "O-OPEN",
+            "T-OPEN",
+            OrderSide::Buy,
+            2,
+            "10.50",
+        );
+        let mut closed_position = position_from_fill(
+            &closed_instrument,
+            "P-CLOSED",
+            "O-CLOSED-OPEN",
+            "T-CLOSED-OPEN",
+            OrderSide::Buy,
+            1,
+            "100.00",
+        );
+        cache
+            .borrow_mut()
+            .add_instrument(closed_instrument)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&open_position, OmsType::Hedging)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&closed_position, OmsType::Hedging)
+            .unwrap();
+        let closing_fill = OrderFilledSpec::builder()
+            .instrument_id(closed_future_id)
+            .client_order_id(ClientOrderId::from("O-CLOSED-CLOSE"))
+            .trade_id(TradeId::from("T-CLOSED-CLOSE"))
+            .order_side(OrderSide::Sell)
+            .last_qty(Quantity::from(1))
+            .last_px(Price::from("101.00"))
+            .currency(Currency::USD())
+            .position_id(PositionId::from("P-CLOSED"))
+            .build();
+        closed_position.apply(&closing_fill);
+        cache
+            .borrow_mut()
+            .update_position(&closed_position)
+            .unwrap();
+
+        // Pin the fixture itself: the closed position must have left the open index,
+        // or this would exercise `add_position`'s open-index insertion rather than
+        // the query scope under test.
+        assert!(closed_position.is_closed());
+        assert_eq!(
+            cache
+                .borrow()
+                .positions_open(None, None, None, None, None)
+                .len(),
+            1
+        );
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+        let expected = calculator
+            .instrument_greeks(
+                open_option_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                Some(open_position.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let expected = PortfolioGreeks::from(open_position.signed_qty * &expected);
+
+        assert_ne!(expected.delta, 0.0);
+        assert_portfolio_greeks_eq(
+            &calculate_portfolio_greeks(&calculator, None).unwrap(),
+            &expected,
+        );
+        assert_portfolio_greeks_eq(
+            &calculate_portfolio_greeks(&calculator, Some(PositionSide::Flat)).unwrap(),
+            &PortfolioGreeks::new(now_ns, now_ns, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        );
+    }
+
+    #[rstest]
+    fn test_portfolio_greeks_preserves_open_position_aggregate_and_side_filters() {
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * 30);
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(expiry);
+        let long_option = option_with_expiration("AAPL250417C00145000.OPRA", expiry_ns);
+        let short_option = option_with_expiration("AAPL250417C00155000.OPRA", expiry_ns);
+        let long_instrument = InstrumentAny::OptionContract(long_option.clone());
+        let short_instrument = InstrumentAny::OptionContract(short_option.clone());
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let cache = setup_cache_with_option_and_quotes(long_option, underlying_id, now_ns);
+        cache
+            .borrow_mut()
+            .add_instrument(short_instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                short_option.id(),
+                Price::from("3.50"),
+                Price::from("3.60"),
+                Quantity::from(100),
+                Quantity::from(100),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+        let long_position = position_from_fill(
+            &long_instrument,
+            "P-LONG",
+            "O-LONG",
+            "T-LONG",
+            OrderSide::Buy,
+            3,
+            "10.50",
+        );
+        let short_position = position_from_fill(
+            &short_instrument,
+            "P-SHORT",
+            "O-SHORT",
+            "T-SHORT",
+            OrderSide::Sell,
+            2,
+            "3.50",
+        );
+        cache
+            .borrow_mut()
+            .add_position(&long_position, OmsType::Hedging)
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_position(&short_position, OmsType::Hedging)
+            .unwrap();
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+        let long_greeks = calculator
+            .instrument_greeks(
+                long_instrument.id(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                Some(long_position.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let short_greeks = calculator
+            .instrument_greeks(
+                short_instrument.id(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                Some(short_position.clone()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let expected_long = PortfolioGreeks::from(long_position.signed_qty * &long_greeks);
+        let expected_short = PortfolioGreeks::from(short_position.signed_qty * &short_greeks);
+        let expected = expected_long + expected_short;
+
+        assert_ne!(expected.pnl, 0.0);
+        assert_ne!(expected.price, 0.0);
+        assert_ne!(expected.delta, 0.0);
+        assert_ne!(expected.gamma, 0.0);
+        assert_ne!(expected.vega, 0.0);
+        assert_ne!(expected.theta, 0.0);
+        assert_portfolio_greeks_eq(
+            &calculate_portfolio_greeks(&calculator, None).unwrap(),
+            &expected,
+        );
+        assert_portfolio_greeks_eq(
+            &calculate_portfolio_greeks(&calculator, Some(PositionSide::Long)).unwrap(),
+            &PortfolioGreeks::from(long_position.signed_qty * &long_greeks),
+        );
+        assert_portfolio_greeks_eq(
+            &calculate_portfolio_greeks(&calculator, Some(PositionSide::Short)).unwrap(),
+            &PortfolioGreeks::from(short_position.signed_qty * &short_greeks),
+        );
+    }
+
     #[rstest]
     fn test_expiry_in_days_multi_day_unchanged() {
-        let now = Utc.with_ymd_and_hms(2025, 3, 8, 12, 0, 0).unwrap();
-        let expiry = now + chrono::Duration::days(30);
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * (30));
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
         let option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
         let option_id = option.id();
         let underlying_id = InstrumentId::from("AAPL.OPRA");
         let cache = setup_cache_with_option_and_quotes(option, underlying_id, now_ns);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let calculator = GreeksCalculator::new(cache, clock);
 
         let greeks = calculator
@@ -1948,15 +2577,15 @@ mod tests {
 
     #[rstest]
     fn test_expiry_in_days_same_day_clamped_to_one() {
-        let now = Utc.with_ymd_and_hms(2025, 3, 8, 12, 0, 0).unwrap();
-        let expiry_same_day = Utc.with_ymd_and_hms(2025, 3, 8, 18, 0, 0).unwrap();
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry_same_day = utc_timestamp(2025, 3, 8, 18, 0, 0);
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry_same_day);
         let option = option_with_expiration("AAPL250308C00150000.OPRA", expiry_ns);
         let option_id = option.id();
         let underlying_id = InstrumentId::from("AAPL.OPRA");
         let cache = setup_cache_with_option_and_quotes(option, underlying_id, now_ns);
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let calculator = GreeksCalculator::new(cache, clock);
 
         let greeks = calculator
@@ -1988,8 +2617,8 @@ mod tests {
 
     #[rstest]
     fn test_instrument_greeks_beta_weights_vega_to_vol_index() {
-        let now = Utc.with_ymd_and_hms(2025, 3, 8, 12, 0, 0).unwrap();
-        let expiry = now + chrono::Duration::days(30);
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * (30));
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
         let option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
@@ -2010,7 +2639,7 @@ mod tests {
             ))
             .unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let calculator = GreeksCalculator::new(cache, clock);
         let greeks = calculator
             .instrument_greeks(
@@ -2077,8 +2706,8 @@ mod tests {
 
     #[rstest]
     fn test_instrument_greeks_errors_when_vol_index_price_missing() {
-        let now = Utc.with_ymd_and_hms(2025, 3, 8, 12, 0, 0).unwrap();
-        let expiry = now + chrono::Duration::days(30);
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * (30));
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
         let option = option_with_expiration("AAPL250417C00150000.OPRA", expiry_ns);
@@ -2087,7 +2716,7 @@ mod tests {
         let vol_index_id = InstrumentId::from("VIX.XCBF");
         let cache = setup_cache_with_option_and_quotes(option, underlying_id, now_ns);
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         let calculator = GreeksCalculator::new(cache, clock);
         let error = calculator
             .instrument_greeks(
@@ -2210,8 +2839,8 @@ mod tests {
 
     #[rstest]
     fn test_instrument_greeks_errors_when_future_underlying_price_missing_without_cached_spread() {
-        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
-        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now = utc_timestamp(2024, 2, 14, 16, 0, 0);
+        let expiry = utc_timestamp(2024, 3, 15, 16, 0, 0);
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
 
@@ -2256,6 +2885,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let put_quote = QuoteTick::new(
             put_option.id(),
             Price::from("3.33"),
@@ -2268,7 +2898,7 @@ mod tests {
         cache.borrow_mut().add_quote(call_quote).unwrap();
         cache.borrow_mut().add_quote(put_quote).unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         clock.borrow_mut().set_time(now_ns);
         let calculator = GreeksCalculator::new(cache, clock);
 
@@ -2300,8 +2930,8 @@ mod tests {
 
     #[rstest]
     fn test_cache_futures_spread_returns_price_to_reference_future() {
-        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
-        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now = utc_timestamp(2024, 2, 14, 16, 0, 0);
+        let expiry = utc_timestamp(2024, 3, 15, 16, 0, 0);
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
 
@@ -2351,6 +2981,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let put_quote = QuoteTick::new(
             put_option.id(),
             Price::from("3.33"),
@@ -2360,6 +2991,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let reference_future_quote = QuoteTick::new(
             reference_future.id(),
             Price::from("155.00"),
@@ -2376,7 +3008,7 @@ mod tests {
             .add_quote(reference_future_quote)
             .unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         clock.borrow_mut().set_time(now_ns);
         let calculator = GreeksCalculator::new(cache, clock);
 
@@ -2395,8 +3027,8 @@ mod tests {
 
     #[rstest]
     fn test_instrument_greeks_uses_cached_futures_spread_when_underlying_price_missing() {
-        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
-        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now = utc_timestamp(2024, 2, 14, 16, 0, 0);
+        let expiry = utc_timestamp(2024, 3, 15, 16, 0, 0);
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
 
@@ -2458,6 +3090,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let put_quote = QuoteTick::new(
             put_option.id(),
             Price::from("3.33"),
@@ -2467,6 +3100,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let target_call_quote = QuoteTick::new(
             target_call_option.id(),
             Price::from("6.75"),
@@ -2476,6 +3110,7 @@ mod tests {
             now_ns,
             now_ns,
         );
+
         let reference_future_quote = QuoteTick::new(
             reference_future.id(),
             Price::from("155.00"),
@@ -2493,7 +3128,7 @@ mod tests {
             .add_quote(reference_future_quote)
             .unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         clock.borrow_mut().set_time(now_ns);
         let calculator = GreeksCalculator::new(cache, clock);
         calculator
@@ -2531,8 +3166,8 @@ mod tests {
 
     #[rstest]
     fn test_instrument_greeks_uses_index_price_for_index_underlying() {
-        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
-        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now = utc_timestamp(2024, 2, 14, 16, 0, 0);
+        let expiry = utc_timestamp(2024, 3, 15, 16, 0, 0);
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
 
@@ -2576,7 +3211,7 @@ mod tests {
             ))
             .unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         clock.borrow_mut().set_time(now_ns);
         let calculator = GreeksCalculator::new(cache, clock);
 
@@ -2608,8 +3243,8 @@ mod tests {
 
     #[rstest]
     fn test_instrument_greeks_prefers_quote_over_index_price_for_index_future() {
-        let now = Utc.with_ymd_and_hms(2024, 2, 14, 16, 0, 0).unwrap();
-        let expiry = Utc.with_ymd_and_hms(2024, 3, 15, 16, 0, 0).unwrap();
+        let now = utc_timestamp(2024, 2, 14, 16, 0, 0);
+        let expiry = utc_timestamp(2024, 3, 15, 16, 0, 0);
         let now_ns = UnixNanos::from(now);
         let expiry_ns = UnixNanos::from(expiry);
 
@@ -2665,7 +3300,7 @@ mod tests {
         );
         cache.borrow_mut().add_quote(call_quote).unwrap();
 
-        let clock = Rc::new(RefCell::new(TestClock::new()));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
         clock.borrow_mut().set_time(now_ns);
         let calculator = GreeksCalculator::new(cache, clock);
 
@@ -2694,5 +3329,1073 @@ mod tests {
 
         // Should use the MID quote (159.00), not the index price (157.25)
         assert_eq!(greeks.underlying_price, 159.0);
+    }
+
+    /// Builds a calculator over the standard option/underlying quote pair used by the
+    /// `instrument_greeks` tests, plus the option id to price.
+    fn option_calculator() -> (GreeksCalculator, InstrumentId, UnixNanos) {
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * 30);
+        let now_ns = UnixNanos::from(now);
+        let option = option_with_expiration("AAPL250417C00150000.OPRA", UnixNanos::from(expiry));
+        let option_id = option.id();
+        let cache =
+            setup_cache_with_option_and_quotes(option, InstrumentId::from("AAPL.OPRA"), now_ns);
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+        (GreeksCalculator::new(cache, clock), option_id, now_ns)
+    }
+
+    fn option_greeks_with_shocks(
+        calculator: &GreeksCalculator,
+        option_id: InstrumentId,
+        ts_event: UnixNanos,
+        spot_shock: Option<f64>,
+        vol_shock: Option<f64>,
+        time_to_expiry_shock: Option<f64>,
+    ) -> GreeksData {
+        calculator
+            .instrument_greeks(
+                option_id,
+                None,
+                None,
+                spot_shock,
+                vol_shock,
+                time_to_expiry_shock,
+                None,
+                None,
+                None,
+                None,
+                Some(ts_event),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+    }
+
+    #[rstest]
+    #[case::spot(Some(5.0), None, None)]
+    #[case::vol(None, Some(0.05), None)]
+    #[case::time_to_expiry(None, None, Some(0.01))]
+    fn test_instrument_greeks_applies_each_shock_dimension_on_its_own(
+        #[case] spot_shock: Option<f64>,
+        #[case] vol_shock: Option<f64>,
+        #[case] time_to_expiry_shock: Option<f64>,
+    ) {
+        let (calculator, option_id, now_ns) = option_calculator();
+
+        let unshocked = option_greeks_with_shocks(&calculator, option_id, now_ns, None, None, None);
+        let shocked = option_greeks_with_shocks(
+            &calculator,
+            option_id,
+            now_ns,
+            spot_shock,
+            vol_shock,
+            time_to_expiry_shock,
+        );
+
+        assert_ne!(
+            scaled(shocked.price),
+            scaled(unshocked.price),
+            "a single non-zero shock must still reprice the option"
+        );
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_leaves_the_price_unshocked_when_every_shock_is_zero() {
+        let (calculator, option_id, now_ns) = option_calculator();
+
+        let unshocked = option_greeks_with_shocks(&calculator, option_id, now_ns, None, None, None);
+        let zero_shocks = option_greeks_with_shocks(
+            &calculator,
+            option_id,
+            now_ns,
+            Some(0.0),
+            Some(0.0),
+            Some(0.0),
+        );
+
+        assert_eq!(scaled(zero_shocks.price), scaled(unshocked.price));
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_pnl_is_price_less_the_position_open_price() {
+        let (calculator, option_id, now_ns) = option_calculator();
+        let instrument = calculator
+            .cache
+            .borrow()
+            .instrument(&option_id)
+            .cloned()
+            .unwrap();
+        let position = position_from_fill(
+            &instrument,
+            "P-GREEKS-1",
+            "O-GREEKS-1",
+            "T-GREEKS-1",
+            OrderSide::Buy,
+            1,
+            "9.00",
+        );
+
+        let unshocked = option_greeks_with_shocks(&calculator, option_id, now_ns, None, None, None);
+        let with_position = calculator
+            .instrument_greeks(
+                option_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                Some(position),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(scaled(with_position.price), scaled(unshocked.price));
+        assert_eq!(
+            scaled(with_position.pnl),
+            scaled(unshocked.price - 9.0),
+            "pnl must subtract the position open price from the option price"
+        );
+        assert_eq!(scaled(unshocked.pnl), 0.0);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_records_the_shocked_market_state() {
+        let (calculator, option_id, now_ns) = option_calculator();
+
+        let unshocked = option_greeks_with_shocks(&calculator, option_id, now_ns, None, None, None);
+        let shocked = option_greeks_with_shocks(
+            &calculator,
+            option_id,
+            now_ns,
+            Some(5.0),
+            Some(0.05),
+            Some(0.01),
+        );
+
+        // The underlying mid of the 150.00 / 150.10 quote plus the spot shock.
+        assert_eq!(scaled(unshocked.underlying_price), 150_050_000_000_000.0);
+        assert_eq!(scaled(shocked.underlying_price), 155_050_000_000_000.0);
+        assert_eq!(scaled(shocked.vol), scaled(unshocked.vol + 0.05));
+        assert_eq!(
+            scaled(shocked.expiry_in_years),
+            scaled(unshocked.expiry_in_years - 0.01)
+        );
+        assert_eq!(unshocked.expiry_in_days, 30);
+        assert_eq!(shocked.expiry_in_days, 26);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_cost_of_carry_subtracts_the_flat_dividend_yield() {
+        let (calculator, option_id, now_ns) = option_calculator();
+
+        let greeks = calculator
+            .instrument_greeks(
+                option_id,
+                Some(0.05),
+                Some(0.02),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(scaled(greeks.interest_rate), 50_000_000_000.0);
+        assert_eq!(scaled(greeks.cost_of_carry), 30_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_cost_of_carry_is_zero_without_a_dividend_yield() {
+        let (calculator, option_id, now_ns) = option_calculator();
+
+        let greeks = calculator
+            .instrument_greeks(
+                option_id,
+                Some(0.05),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(scaled(greeks.cost_of_carry), 0.0);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_reports_the_option_kind() {
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let expiry = now + jiff::SignedDuration::from_hours(24 * 30);
+        let now_ns = UnixNanos::from(now);
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let mut put = option_with_expiration("AAPL250417P00150000.OPRA", UnixNanos::from(expiry));
+        put.option_kind = OptionKind::Put;
+        let put_id = put.id();
+        let cache = setup_cache_with_option_and_quotes(put, underlying_id, now_ns);
+        cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                put_id,
+                Price::from("10.50"),
+                Price::from("10.60"),
+                Quantity::from(100),
+                Quantity::from(100),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+        let calculator = GreeksCalculator::new(cache, Rc::new(RefCell::new(VirtualClock::new())));
+
+        let greeks = option_greeks_with_shocks(&calculator, put_id, now_ns, None, None, None);
+
+        assert!(!greeks.is_call);
+    }
+
+    /// Builds a calculator over a single equity quote, for the `instrument_greeks` paths that
+    /// price a non-option instrument.
+    fn equity_calculator() -> (GreeksCalculator, InstrumentId, UnixNanos) {
+        let now_ns = UnixNanos::from(utc_timestamp(2025, 3, 8, 12, 0, 0));
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        let equity = equity_aapl_opra();
+        let equity_id = equity.id();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::Equity(equity))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_quote(QuoteTick::new(
+                equity_id,
+                Price::from("150.00"),
+                Price::from("150.10"),
+                Quantity::from(100),
+                Quantity::from(100),
+                now_ns,
+                now_ns,
+            ))
+            .unwrap();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+        (GreeksCalculator::new(cache, clock), equity_id, now_ns)
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_for_a_non_option_shocks_the_spot_and_prices_the_position() {
+        let (calculator, equity_id, now_ns) = equity_calculator();
+        let instrument = calculator
+            .cache
+            .borrow()
+            .instrument(&equity_id)
+            .cloned()
+            .unwrap();
+        let position = position_from_fill(
+            &instrument,
+            "P-EQUITY-1",
+            "O-EQUITY-1",
+            "T-EQUITY-1",
+            OrderSide::Buy,
+            10,
+            "140.00",
+        );
+
+        let greeks = calculator
+            .instrument_greeks(
+                equity_id,
+                None,
+                None,
+                Some(5.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                Some(position),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Underlying mid 150.05 plus the 5.00 spot shock, less the 140.00 open price.
+        assert_eq!(scaled(greeks.pnl), 15_050_000_000_000.0);
+        assert_eq!(scaled(greeks.price), 15_050_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_for_a_non_option_scales_percent_delta_by_the_shocked_spot() {
+        let (calculator, equity_id, now_ns) = equity_calculator();
+
+        let greeks = calculator
+            .instrument_greeks(
+                equity_id,
+                None,
+                None,
+                Some(5.0),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Percent delta scales the unit delta by the shocked spot of 150.05 + 5.00.
+        assert_eq!(scaled(greeks.delta), 1_550_500_000_000.0);
+    }
+
+    #[rstest]
+    fn test_instrument_greeks_cost_of_carry_prefers_the_dividend_curve_over_the_flat_yield() {
+        let (calculator, option_id, now_ns) = option_calculator();
+        calculator
+            .cache
+            .borrow_mut()
+            .add_yield_curve(YieldCurveData::new(
+                now_ns,
+                now_ns,
+                "AAPL.OPRA".to_string(),
+                vec![0.0, 5.0, 10.0],
+                vec![0.02, 0.02, 0.02],
+            ))
+            .unwrap();
+
+        let greeks = calculator
+            .instrument_greeks(
+                option_id,
+                Some(0.05),
+                Some(0.04),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(scaled(greeks.interest_rate), 50_000_000_000.0);
+        assert_eq!(
+            scaled(greeks.cost_of_carry),
+            30_000_000_000.0,
+            "the dividend curve must take precedence over the flat dividend yield"
+        );
+    }
+
+    /// Scales a Greek to picounits so exact expectations avoid raw float equality.
+    fn scaled(value: f64) -> f64 {
+        (value * 1e12).round()
+    }
+
+    #[rstest]
+    fn test_modify_greeks_reprices_the_index_when_the_underlying_is_shocked() {
+        let calculator = create_test_calculator();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let mut beta_weights = HashMap::new();
+        beta_weights.insert(underlying_id, 0.5);
+
+        let (delta, gamma, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                underlying_id,
+                165.0,
+                150.0,
+                false,
+                None,
+                Some(&beta_weights),
+                3.0,
+                0.30,
+                0,
+                None,
+                0.0,
+                None,
+                None,
+                Some(200.0),
+                None,
+            )
+            .unwrap();
+
+        // Index moves to 200 + (1 / 0.5) * (200 / 150) * (165 - 150) = 240, so the delta
+        // multiplier is 0.5 * 165 / 240.
+        assert_eq!(scaled(delta), 343_750_000_000.0);
+        assert_eq!(scaled(gamma), 236_328_125_000.0);
+        assert_eq!(scaled(vega), 3_000_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_modify_greeks_reprices_the_vol_index_when_the_vol_is_shocked() {
+        let calculator = create_test_calculator();
+        let underlying_id = InstrumentId::from("AAPL.OPRA");
+        let mut vol_beta_weights = HashMap::new();
+        vol_beta_weights.insert(underlying_id, 0.75);
+
+        let (delta, gamma, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                underlying_id,
+                150.0,
+                150.0,
+                false,
+                None,
+                None,
+                2.0,
+                0.35,
+                0,
+                None,
+                0.30,
+                None,
+                Some(&vol_beta_weights),
+                None,
+                Some(25.0),
+            )
+            .unwrap();
+
+        assert_eq!(scaled(delta), 1_000_000_000_000.0);
+        assert_eq!(scaled(gamma), 2_000_000_000_000.0);
+        assert_eq!(scaled(vega), 1_718_181_818_182.0);
+    }
+
+    #[rstest]
+    fn test_modify_greeks_uses_the_shocked_vol_as_the_baseline_when_unshocked_vol_is_zero() {
+        let calculator = create_test_calculator();
+
+        let (_, _, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                InstrumentId::from("AAPL.OPRA"),
+                150.0,
+                150.0,
+                false,
+                None,
+                None,
+                2.0,
+                0.40,
+                0,
+                None,
+                0.0,
+                None,
+                None,
+                None,
+                Some(25.0),
+            )
+            .unwrap();
+
+        // A zero unshocked vol means no vol shock, so vega only rescales by 0.40 / 0.25.
+        assert_eq!(scaled(vega), 3_200_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_modify_greeks_leaves_vega_untouched_for_a_zero_vol_index() {
+        let calculator = create_test_calculator();
+
+        let (_, _, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                InstrumentId::from("AAPL.OPRA"),
+                150.0,
+                150.0,
+                false,
+                None,
+                None,
+                2.0,
+                0.40,
+                0,
+                None,
+                0.0,
+                None,
+                None,
+                None,
+                Some(0.0),
+            )
+            .unwrap();
+
+        assert_eq!(scaled(vega), 2_000_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_modify_greeks_percent_scaling_falls_back_to_the_underlying_and_vol() {
+        let calculator = create_test_calculator();
+
+        let (delta, gamma, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                InstrumentId::from("AAPL.OPRA"),
+                150.0,
+                150.0,
+                true,
+                None,
+                None,
+                2.0,
+                0.30,
+                0,
+                None,
+                0.0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(scaled(delta), 1_500_000_000_000.0);
+        assert_eq!(scaled(gamma), 4_500_000_000_000.0);
+        assert_eq!(scaled(vega), 6_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_modify_greeks_applies_vega_time_weighting() {
+        let calculator = create_test_calculator();
+
+        let (_, _, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                InstrumentId::from("AAPL.OPRA"),
+                150.0,
+                150.0,
+                false,
+                None,
+                None,
+                2.0,
+                0.30,
+                120,
+                Some(30),
+                0.0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // sqrt(30 / 120) = 0.5
+        assert_eq!(scaled(vega), 1_000_000_000_000.0);
+    }
+
+    #[rstest]
+    fn test_modify_greeks_skips_vega_time_weighting_without_days_to_expiry() {
+        let calculator = create_test_calculator();
+
+        let (_, _, vega) = calculator
+            .modify_greeks(
+                1.0,
+                2.0,
+                InstrumentId::from("AAPL.OPRA"),
+                150.0,
+                150.0,
+                false,
+                None,
+                None,
+                2.0,
+                0.30,
+                0,
+                Some(30),
+                0.0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(scaled(vega), 2_000_000_000_000.0);
+    }
+
+    const SPREAD_CALL_ID: &str = "ESH4C150.GLBX";
+    const SPREAD_PUT_ID: &str = "ESH4P150.GLBX";
+    const SPREAD_REFERENCE_ID: &str = "ESM4.GLBX";
+    const SPREAD_UNDERLYING_ID: &str = "ESH4.GLBX";
+
+    fn spread_now_ns() -> UnixNanos {
+        UnixNanos::from(utc_timestamp(2024, 2, 14, 16, 0, 0))
+    }
+
+    fn spread_expiry_ns() -> UnixNanos {
+        UnixNanos::from(utc_timestamp(2024, 3, 15, 16, 0, 0))
+    }
+
+    fn spread_call() -> OptionContract {
+        future_option_with_expiration(
+            SPREAD_CALL_ID,
+            "ESH4C150",
+            "ESH4",
+            OptionKind::Call,
+            "150.00",
+            spread_expiry_ns(),
+        )
+    }
+
+    fn spread_put() -> OptionContract {
+        future_option_with_expiration(
+            SPREAD_PUT_ID,
+            "ESH4P150",
+            "ESH4",
+            OptionKind::Put,
+            "150.00",
+            spread_expiry_ns(),
+        )
+    }
+
+    fn spread_reference_future() -> FuturesContract {
+        future_with_expiration(SPREAD_REFERENCE_ID, "ESM4", spread_expiry_ns())
+    }
+
+    fn spread_quote(instrument_id: InstrumentId, price: &str) -> QuoteTick {
+        let price = Price::from(price);
+
+        QuoteTick::new(
+            instrument_id,
+            price,
+            price,
+            Quantity::from(100),
+            Quantity::from(100),
+            spread_now_ns(),
+            spread_now_ns(),
+        )
+    }
+
+    /// Builds a calculator over exactly the supplied instruments and quotes.
+    ///
+    /// Each `cache_futures_spread` error test drops or replaces one entry relative to
+    /// [`spread_instruments`] and [`spread_quotes`], so the resulting failure isolates a
+    /// single validation branch.
+    fn spread_calculator(
+        instruments: Vec<InstrumentAny>,
+        quotes: Vec<QuoteTick>,
+    ) -> GreeksCalculator {
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        for instrument in instruments {
+            cache.borrow_mut().add_instrument(instrument).unwrap();
+        }
+
+        for quote in quotes {
+            cache.borrow_mut().add_quote(quote).unwrap();
+        }
+
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(spread_now_ns());
+
+        GreeksCalculator::new(cache, clock)
+    }
+
+    fn spread_instruments() -> Vec<InstrumentAny> {
+        vec![
+            InstrumentAny::OptionContract(spread_call()),
+            InstrumentAny::OptionContract(spread_put()),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ]
+    }
+
+    fn spread_quotes() -> Vec<QuoteTick> {
+        vec![
+            spread_quote(InstrumentId::from(SPREAD_CALL_ID), "8.50"),
+            spread_quote(InstrumentId::from(SPREAD_PUT_ID), "3.33"),
+            spread_quote(InstrumentId::from(SPREAD_REFERENCE_ID), "155.00"),
+        ]
+    }
+
+    fn cache_spread_error(instruments: Vec<InstrumentAny>, quotes: Vec<QuoteTick>) -> String {
+        spread_calculator(instruments, quotes)
+            .cache_futures_spread(
+                InstrumentId::from(SPREAD_CALL_ID),
+                InstrumentId::from(SPREAD_PUT_ID),
+                InstrumentId::from(SPREAD_REFERENCE_ID),
+            )
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_call_instrument_missing() {
+        let instruments = vec![
+            InstrumentAny::OptionContract(spread_put()),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: missing option instrument ESH4C150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_put_instrument_missing() {
+        let instruments = vec![
+            InstrumentAny::OptionContract(spread_call()),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: missing option instrument ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_reference_future_instrument_missing() {
+        let instruments = vec![
+            InstrumentAny::OptionContract(spread_call()),
+            InstrumentAny::OptionContract(spread_put()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: no reference futures instrument for ESM4.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_call_leg_is_not_an_option() {
+        let non_option = future_with_expiration(SPREAD_CALL_ID, "ESH4", spread_expiry_ns());
+        let instruments = vec![
+            InstrumentAny::FuturesContract(non_option),
+            InstrumentAny::OptionContract(spread_put()),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: non-option instruments provided \
+             call_instrument_id=ESH4C150.GLBX put_instrument_id=ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_legs_are_not_a_call_put_pair() {
+        let second_put = future_option_with_expiration(
+            SPREAD_CALL_ID,
+            "ESH4P150",
+            "ESH4",
+            OptionKind::Put,
+            "150.00",
+            spread_expiry_ns(),
+        );
+        let instruments = vec![
+            InstrumentAny::OptionContract(second_put),
+            InstrumentAny::OptionContract(spread_put()),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: expected call/put pair \
+             call_instrument_id=ESH4C150.GLBX put_instrument_id=ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_underlyings_differ() {
+        let mismatched_put = future_option_with_expiration(
+            SPREAD_PUT_ID,
+            "ESM4P150",
+            "ESM4",
+            OptionKind::Put,
+            "150.00",
+            spread_expiry_ns(),
+        );
+        let instruments = vec![
+            InstrumentAny::OptionContract(spread_call()),
+            InstrumentAny::OptionContract(mismatched_put),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: option underlyings differ \
+             call_instrument_id=ESH4C150.GLBX put_instrument_id=ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_strike_prices_differ() {
+        let mismatched_put = future_option_with_expiration(
+            SPREAD_PUT_ID,
+            "ESH4P155",
+            "ESH4",
+            OptionKind::Put,
+            "155.00",
+            spread_expiry_ns(),
+        );
+        let instruments = vec![
+            InstrumentAny::OptionContract(spread_call()),
+            InstrumentAny::OptionContract(mismatched_put),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: strike prices differ \
+             call_instrument_id=ESH4C150.GLBX put_instrument_id=ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_expirations_differ() {
+        let mismatched_put = future_option_with_expiration(
+            SPREAD_PUT_ID,
+            "ESH4P150",
+            "ESH4",
+            OptionKind::Put,
+            "150.00",
+            UnixNanos::from(utc_timestamp(2024, 6, 21, 16, 0, 0)),
+        );
+        let instruments = vec![
+            InstrumentAny::OptionContract(spread_call()),
+            InstrumentAny::OptionContract(mismatched_put),
+            InstrumentAny::FuturesContract(spread_reference_future()),
+        ];
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: expiration dates differ \
+             call_instrument_id=ESH4C150.GLBX put_instrument_id=ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_reference_future_price_missing() {
+        let quotes = vec![
+            spread_quote(InstrumentId::from(SPREAD_CALL_ID), "8.50"),
+            spread_quote(InstrumentId::from(SPREAD_PUT_ID), "3.33"),
+        ];
+
+        assert_eq!(
+            cache_spread_error(spread_instruments(), quotes),
+            "Cannot cache futures spread: no reference futures price for ESM4.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_call_price_missing() {
+        let quotes = vec![
+            spread_quote(InstrumentId::from(SPREAD_PUT_ID), "3.33"),
+            spread_quote(InstrumentId::from(SPREAD_REFERENCE_ID), "155.00"),
+        ];
+
+        assert_eq!(
+            cache_spread_error(spread_instruments(), quotes),
+            "Cannot cache futures spread: missing option price for ESH4C150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_put_price_missing() {
+        let quotes = vec![
+            spread_quote(InstrumentId::from(SPREAD_CALL_ID), "8.50"),
+            spread_quote(InstrumentId::from(SPREAD_REFERENCE_ID), "155.00"),
+        ];
+
+        assert_eq!(
+            cache_spread_error(spread_instruments(), quotes),
+            "Cannot cache futures spread: missing option price for ESH4P150.GLBX"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_errors_when_cached_underlying_is_not_a_future() {
+        let underlying_equity = Equity::builder()
+            .instrument_id(InstrumentId::from(SPREAD_UNDERLYING_ID))
+            .raw_symbol(Symbol::from("ESH4"))
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.01"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+
+        let mut instruments = spread_instruments();
+        instruments.push(InstrumentAny::Equity(underlying_equity));
+
+        assert_eq!(
+            cache_spread_error(instruments, spread_quotes()),
+            "Cannot cache futures spread: underlying ESH4.GLBX is not a futures contract"
+        );
+    }
+
+    #[rstest]
+    fn test_cache_futures_spread_leaves_no_entry_when_validation_fails() {
+        let calculator = spread_calculator(
+            vec![
+                InstrumentAny::OptionContract(spread_call()),
+                InstrumentAny::OptionContract(spread_put()),
+            ],
+            spread_quotes(),
+        );
+
+        calculator
+            .cache_futures_spread(
+                InstrumentId::from(SPREAD_CALL_ID),
+                InstrumentId::from(SPREAD_PUT_ID),
+                InstrumentId::from(SPREAD_REFERENCE_ID),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            calculator.get_cached_futures_spread_price(InstrumentId::from(SPREAD_UNDERLYING_ID)),
+            None
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_underlying_instrument_id_prefers_cached_futures_spread_over_cross_venue_match()
+    {
+        let mut instruments = spread_instruments();
+        instruments.push(InstrumentAny::FuturesContract(future_with_expiration(
+            "ESH4.XCME",
+            "ESH4",
+            spread_expiry_ns(),
+        )));
+        let calculator = spread_calculator(instruments, spread_quotes());
+        calculator
+            .cache_futures_spread(
+                InstrumentId::from(SPREAD_CALL_ID),
+                InstrumentId::from(SPREAD_PUT_ID),
+                InstrumentId::from(SPREAD_REFERENCE_ID),
+            )
+            .unwrap();
+
+        let underlying_id = calculator
+            .resolve_underlying_instrument_id(
+                &InstrumentAny::OptionContract(spread_call()),
+                InstrumentId::from(SPREAD_CALL_ID),
+            )
+            .unwrap();
+
+        assert_eq!(underlying_id, InstrumentId::from(SPREAD_UNDERLYING_ID));
+    }
+
+    #[rstest]
+    fn test_get_cached_futures_spread_price_returns_none_for_unknown_underlying() {
+        let calculator = spread_calculator(spread_instruments(), spread_quotes());
+
+        assert_eq!(
+            calculator.get_cached_futures_spread_price(InstrumentId::from("CLZ4.NYMEX")),
+            None
+        );
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_instrument_greeks_converts_mid_of_max_float_precision_quote() {
+        let now = utc_timestamp(2025, 3, 8, 12, 0, 0);
+        let now_ns = UnixNanos::from(now);
+        let expiry_ns = UnixNanos::from(now + jiff::SignedDuration::from_hours(24 * 30));
+        let future = future_with_expiration("ES.GLBX", "ES", expiry_ns);
+        let instrument = InstrumentAny::FuturesContract(future.clone());
+        let cache = Rc::new(RefCell::new(Cache::new(None, None)));
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+
+        let quote = QuoteTick::new(
+            future.id(),
+            Price::from("100.0000000000000000"),
+            Price::from("100.0000000000000001"),
+            Quantity::from(1),
+            Quantity::from(1),
+            now_ns,
+            now_ns,
+        );
+        cache.borrow_mut().add_quote(quote).unwrap();
+        let position =
+            position_from_fill(&instrument, "P-1", "O-1", "T-1", OrderSide::Buy, 1, "99.00");
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(now_ns);
+        let calculator = GreeksCalculator::new(cache, clock);
+
+        let greeks = calculator
+            .instrument_greeks(
+                future.id(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(now_ns),
+                Some(position),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(greeks.delta, 1.0);
+        assert_eq!(greeks.pnl, 1.0);
+        assert_eq!(greeks.price, 1.0);
     }
 }

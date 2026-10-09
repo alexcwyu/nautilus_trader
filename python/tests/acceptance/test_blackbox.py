@@ -19,15 +19,18 @@ Mirrors `tests/acceptance_tests/test_blackbox.py`. The v1 suite asserts on the e
 sequence of events captured by `msgbus.subscribe(events.account.* / events.order.* /
 events.position.*)`. v2's BacktestEngine does not yet expose the kernel msgbus topic
 broadcast for arbitrary subscribers from outside the trader, so this suite asserts on
-public BacktestResult invariants instead — the strategy ran, produced multiple position
+public BacktestResult invariants instead - the strategy ran, produced multiple position
 cycles, and the run completed without raising.
 
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.backtest import BacktestEngineConfig
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import Currency
 from nautilus_trader.model import Money
@@ -43,6 +46,9 @@ MACD_CONFIG = "strategies.acceptance:MACDStrategyConfig"
 
 
 def test_cash_account_trades_macd_event_sequencing() -> None:
+    """
+    Test cash account trades macd event sequencing.
+    """
     config = BacktestEngineConfig(bypass_logging=True, run_analysis=False)
     engine = BacktestEngine(config)
 
@@ -55,6 +61,10 @@ def test_cash_account_trades_macd_event_sequencing() -> None:
             Money(10.0, Currency.from_str("ETH")),
             Money(100_000.0, Currency.from_str("USDT")),
         ],
+        fee_model=MakerTakerFeeModel(
+            maker_rate=Decimal(0),
+            taker_rate=Decimal(0),
+        ),
     )
 
     ethusdt = TestInstrumentProvider.ethusdt_binance()

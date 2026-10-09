@@ -15,62 +15,31 @@
 
 //! Arrow serialization for BinaryOption instruments.
 
-use std::{collections::HashMap, str::FromStr, sync::Arc};
+use std::{borrow::Borrow, collections::HashMap, str::FromStr, sync::Arc};
 
 use arrow::{
-    array::{BinaryArray, BinaryBuilder, StringArray, StringBuilder, UInt8Array, UInt64Array},
+    array::{Array, StringArray, StringBuilder, UInt8Array, UInt64Array},
     datatypes::{DataType, Field, Schema},
     error::ArrowError,
     record_batch::RecordBatch,
 };
-#[allow(unused_imports)]
 use nautilus_core::Params;
 use nautilus_model::{
     enums::AssetClass,
     identifiers::{InstrumentId, Symbol},
     instruments::binary_option::BinaryOption,
-    types::{price::Price, quantity::Quantity},
+    types::{money::Money, price::Price, quantity::Quantity},
 };
-#[allow(unused)]
 use rust_decimal::Decimal;
-#[allow(unused)]
-use serde_json::Value;
 use ustr::Ustr;
 
 use crate::arrow::{
     ArrowSchemaProvider, EncodeToRecordBatch, EncodingError, KEY_INSTRUMENT_ID,
-    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column,
+    KEY_PRICE_PRECISION, KEY_SIZE_PRECISION, extract_column, extract_column_by_name,
+    extract_optional_string_column_by_name, json_string_field, metadata_with_type_name,
+    optional_ustr_value, record_batch_with_timestamps, record_batch_with_u64_timestamps,
+    timestamp_data_type,
 };
-
-// Helper function to convert AssetClass to string
-fn asset_class_to_string(ac: AssetClass) -> String {
-    match ac {
-        AssetClass::FX => "FX".to_string(),
-        AssetClass::Equity => "Equity".to_string(),
-        AssetClass::Commodity => "Commodity".to_string(),
-        AssetClass::Debt => "Debt".to_string(),
-        AssetClass::Index => "Index".to_string(),
-        AssetClass::Cryptocurrency => "Cryptocurrency".to_string(),
-        AssetClass::Alternative => "Alternative".to_string(),
-    }
-}
-
-// Helper function to parse AssetClass from string
-fn asset_class_from_str(s: &str) -> Result<AssetClass, EncodingError> {
-    match s {
-        "FX" => Ok(AssetClass::FX),
-        "Equity" => Ok(AssetClass::Equity),
-        "Commodity" => Ok(AssetClass::Commodity),
-        "Debt" => Ok(AssetClass::Debt),
-        "Index" => Ok(AssetClass::Index),
-        "Cryptocurrency" => Ok(AssetClass::Cryptocurrency),
-        "Alternative" => Ok(AssetClass::Alternative),
-        _ => Err(EncodingError::ParseError(
-            "asset_class",
-            format!("Unknown asset class: {s}"),
-        )),
-    }
-}
 
 impl ArrowSchemaProvider for BinaryOption {
     fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
@@ -83,35 +52,37 @@ impl ArrowSchemaProvider for BinaryOption {
             Field::new("size_precision", DataType::UInt8, false),
             Field::new("price_increment", DataType::Utf8, false),
             Field::new("size_increment", DataType::Utf8, false),
-            Field::new("activation_ns", DataType::UInt64, false),
-            Field::new("expiration_ns", DataType::UInt64, false),
-            Field::new("maker_fee", DataType::Utf8, false),
-            Field::new("taker_fee", DataType::Utf8, false),
+            Field::new("activation_ns", timestamp_data_type(), false),
+            Field::new("expiration_ns", timestamp_data_type(), false),
+            Field::new("outcome", DataType::Utf8, true), // nullable
+            Field::new("description", DataType::Utf8, true), // nullable
             Field::new("max_quantity", DataType::Utf8, true), // nullable
             Field::new("min_quantity", DataType::Utf8, true), // nullable
-            Field::new("outcome", DataType::Utf8, true),      // nullable
-            Field::new("description", DataType::Utf8, true),  // nullable
-            Field::new("info", DataType::Binary, true),       // nullable
-            Field::new("ts_event", DataType::UInt64, false),
-            Field::new("ts_init", DataType::UInt64, false),
+            Field::new("max_notional", DataType::Utf8, true), // nullable
+            Field::new("min_notional", DataType::Utf8, true), // nullable
+            Field::new("max_price", DataType::Utf8, true), // nullable
+            Field::new("min_price", DataType::Utf8, true), // nullable
+            Field::new("margin_init", DataType::Utf8, false),
+            Field::new("margin_maint", DataType::Utf8, false),
+            Field::new("tick_scheme", DataType::Utf8, true),
+            json_string_field("info", true),
+            Field::new("ts_event", timestamp_data_type(), false),
+            Field::new("ts_init", timestamp_data_type(), false),
+            Field::new("event_id", DataType::Utf8, true),
         ];
 
-        let mut final_metadata = HashMap::new();
-        final_metadata.insert("class".to_string(), "BinaryOption".to_string());
-
-        if let Some(meta) = metadata {
-            final_metadata.extend(meta);
-        }
-
-        Schema::new_with_metadata(fields, final_metadata)
+        Schema::new_with_metadata(fields, metadata_with_type_name("BinaryOption", metadata))
     }
 }
 
 impl EncodeToRecordBatch for BinaryOption {
-    fn encode_batch(
+    fn encode_batch<T>(
         #[allow(unused)] metadata: &HashMap<String, String>,
-        data: &[Self],
-    ) -> Result<RecordBatch, ArrowError> {
+        data: &[T],
+    ) -> Result<RecordBatch, ArrowError>
+    where
+        T: std::borrow::Borrow<Self>,
+    {
         let mut id_builder = StringBuilder::new();
         let mut raw_symbol_builder = StringBuilder::new();
         let mut asset_class_builder = StringBuilder::new();
@@ -122,20 +93,26 @@ impl EncodeToRecordBatch for BinaryOption {
         let mut size_increment_builder = StringBuilder::new();
         let mut activation_ns_builder = UInt64Array::builder(data.len());
         let mut expiration_ns_builder = UInt64Array::builder(data.len());
-        let mut maker_fee_builder = StringBuilder::new();
-        let mut taker_fee_builder = StringBuilder::new();
+        let mut outcome_builder = StringBuilder::new();
+        let mut event_id_builder = StringBuilder::new();
+        let mut description_builder = StringBuilder::new();
         let mut max_quantity_builder = StringBuilder::new();
         let mut min_quantity_builder = StringBuilder::new();
-        let mut outcome_builder = StringBuilder::new();
-        let mut description_builder = StringBuilder::new();
-        let mut info_builder = BinaryBuilder::new();
+        let mut max_notional_builder = StringBuilder::new();
+        let mut min_notional_builder = StringBuilder::new();
+        let mut max_price_builder = StringBuilder::new();
+        let mut min_price_builder = StringBuilder::new();
+        let mut margin_init_builder = StringBuilder::new();
+        let mut margin_maint_builder = StringBuilder::new();
+        let mut tick_scheme_builder = StringBuilder::new();
+        let mut info_builder = StringBuilder::new();
         let mut ts_event_builder = UInt64Array::builder(data.len());
         let mut ts_init_builder = UInt64Array::builder(data.len());
 
-        for bo in data {
+        for bo in data.iter().map(Borrow::borrow) {
             id_builder.append_value(bo.id.to_string());
             raw_symbol_builder.append_value(bo.raw_symbol);
-            asset_class_builder.append_value(asset_class_to_string(bo.asset_class));
+            asset_class_builder.append_value(bo.asset_class);
             currency_builder.append_value(bo.currency.to_string());
             price_precision_builder.append_value(bo.price_precision);
             size_precision_builder.append_value(bo.size_precision);
@@ -143,20 +120,6 @@ impl EncodeToRecordBatch for BinaryOption {
             size_increment_builder.append_value(bo.size_increment.to_string());
             activation_ns_builder.append_value(bo.activation_ns.as_u64());
             expiration_ns_builder.append_value(bo.expiration_ns.as_u64());
-            maker_fee_builder.append_value(bo.maker_fee.to_string());
-            taker_fee_builder.append_value(bo.taker_fee.to_string());
-
-            if let Some(max_qty) = bo.max_quantity {
-                max_quantity_builder.append_value(max_qty.to_string());
-            } else {
-                max_quantity_builder.append_null();
-            }
-
-            if let Some(min_qty) = bo.min_quantity {
-                min_quantity_builder.append_value(min_qty.to_string());
-            } else {
-                min_quantity_builder.append_null();
-            }
 
             if let Some(outcome) = bo.outcome {
                 outcome_builder.append_value(outcome);
@@ -170,11 +133,57 @@ impl EncodeToRecordBatch for BinaryOption {
                 description_builder.append_null();
             }
 
-            // Encode info dict as JSON bytes (matching Python's msgspec.json.encode)
+            if let Some(max_qty) = bo.max_quantity {
+                max_quantity_builder.append_value(max_qty.to_string());
+            } else {
+                max_quantity_builder.append_null();
+            }
+
+            if let Some(min_qty) = bo.min_quantity {
+                min_quantity_builder.append_value(min_qty.to_string());
+            } else {
+                min_quantity_builder.append_null();
+            }
+
+            if let Some(max_notional) = bo.max_notional {
+                max_notional_builder.append_value(max_notional.to_string());
+            } else {
+                max_notional_builder.append_null();
+            }
+
+            if let Some(min_notional) = bo.min_notional {
+                min_notional_builder.append_value(min_notional.to_string());
+            } else {
+                min_notional_builder.append_null();
+            }
+
+            if let Some(max_price) = bo.max_price {
+                max_price_builder.append_value(max_price.to_string());
+            } else {
+                max_price_builder.append_null();
+            }
+
+            if let Some(min_price) = bo.min_price {
+                min_price_builder.append_value(min_price.to_string());
+            } else {
+                min_price_builder.append_null();
+            }
+
+            margin_init_builder.append_value(bo.margin_init.to_string());
+            margin_maint_builder.append_value(bo.margin_maint.to_string());
+
+            if let Some(tick_scheme) = bo.tick_scheme {
+                tick_scheme_builder.append_value(tick_scheme);
+            } else {
+                tick_scheme_builder.append_null();
+            }
+
+            event_id_builder.append_option(bo.event_id.as_ref().map(Ustr::as_str));
+
             if let Some(ref info) = bo.info {
-                match serde_json::to_vec(info) {
-                    Ok(json_bytes) => {
-                        info_builder.append_value(json_bytes);
+                match serde_json::to_string(info) {
+                    Ok(json) => {
+                        info_builder.append_value(json);
                     }
                     Err(e) => {
                         return Err(ArrowError::InvalidArgumentError(format!(
@@ -190,11 +199,8 @@ impl EncodeToRecordBatch for BinaryOption {
             ts_init_builder.append_value(bo.ts_init.as_u64());
         }
 
-        let mut final_metadata = metadata.clone();
-        final_metadata.insert("class".to_string(), "BinaryOption".to_string());
-
-        RecordBatch::try_new(
-            Self::get_schema(Some(final_metadata)).into(),
+        record_batch_with_timestamps(
+            Self::get_schema(Some(metadata.clone())).into(),
             vec![
                 Arc::new(id_builder.finish()),
                 Arc::new(raw_symbol_builder.finish()),
@@ -206,15 +212,21 @@ impl EncodeToRecordBatch for BinaryOption {
                 Arc::new(size_increment_builder.finish()),
                 Arc::new(activation_ns_builder.finish()),
                 Arc::new(expiration_ns_builder.finish()),
-                Arc::new(maker_fee_builder.finish()),
-                Arc::new(taker_fee_builder.finish()),
-                Arc::new(max_quantity_builder.finish()),
-                Arc::new(min_quantity_builder.finish()),
                 Arc::new(outcome_builder.finish()),
                 Arc::new(description_builder.finish()),
+                Arc::new(max_quantity_builder.finish()),
+                Arc::new(min_quantity_builder.finish()),
+                Arc::new(max_notional_builder.finish()),
+                Arc::new(min_notional_builder.finish()),
+                Arc::new(max_price_builder.finish()),
+                Arc::new(min_price_builder.finish()),
+                Arc::new(margin_init_builder.finish()),
+                Arc::new(margin_maint_builder.finish()),
+                Arc::new(tick_scheme_builder.finish()),
                 Arc::new(info_builder.finish()),
                 Arc::new(ts_event_builder.finish()),
                 Arc::new(ts_init_builder.finish()),
+                Arc::new(event_id_builder.finish()),
             ],
         )
     }
@@ -234,16 +246,22 @@ impl EncodeToRecordBatch for BinaryOption {
     }
 }
 
-/// Helper function to decode BinaryOption from RecordBatch
-/// (Cannot implement DecodeFromRecordBatch trait due to `Into<Data>` bound)
+/// Decodes [`BinaryOption`] instruments from a record batch.
+///
+/// Not a [`DecodeFromRecordBatch`] implementation because that trait requires `Into<Data>`.
 ///
 /// # Errors
 ///
-/// Returns an `EncodingError` if the RecordBatch cannot be decoded.
+/// Returns an `EncodingError` if the record batch cannot be decoded.
+///
+/// [`DecodeFromRecordBatch`]: crate::arrow::DecodeFromRecordBatch
 pub fn decode_binary_option_batch(
     #[allow(unused)] metadata: &HashMap<String, String>,
     record_batch: &RecordBatch,
 ) -> Result<Vec<BinaryOption>, EncodingError> {
+    let record_batch = record_batch_with_u64_timestamps(record_batch)?;
+    let record_batch = &record_batch;
+    let event_id_values = extract_optional_string_column_by_name(record_batch, "event_id")?;
     let cols = record_batch.columns();
     let num_rows = record_batch.num_rows();
 
@@ -263,25 +281,32 @@ pub fn decode_binary_option_batch(
         extract_column::<UInt64Array>(cols, "activation_ns", 8, DataType::UInt64)?;
     let expiration_ns_values =
         extract_column::<UInt64Array>(cols, "expiration_ns", 9, DataType::UInt64)?;
-    let maker_fee_values = extract_column::<StringArray>(cols, "maker_fee", 10, DataType::Utf8)?;
-    let taker_fee_values = extract_column::<StringArray>(cols, "taker_fee", 11, DataType::Utf8)?;
+    let outcome_values = cols
+        .get(10)
+        .ok_or_else(|| EncodingError::MissingColumn("outcome", 10))?;
+    let description_values = cols
+        .get(11)
+        .ok_or_else(|| EncodingError::MissingColumn("description", 11))?;
     let max_quantity_values = cols
         .get(12)
         .ok_or_else(|| EncodingError::MissingColumn("max_quantity", 12))?;
     let min_quantity_values = cols
         .get(13)
         .ok_or_else(|| EncodingError::MissingColumn("min_quantity", 13))?;
-    let outcome_values = cols
-        .get(14)
-        .ok_or_else(|| EncodingError::MissingColumn("outcome", 14))?;
-    let description_values = cols
-        .get(15)
-        .ok_or_else(|| EncodingError::MissingColumn("description", 15))?;
-    let info_values = cols
-        .get(16)
-        .ok_or_else(|| EncodingError::MissingColumn("info", 16))?;
-    let ts_event_values = extract_column::<UInt64Array>(cols, "ts_event", 17, DataType::UInt64)?;
-    let ts_init_values = extract_column::<UInt64Array>(cols, "ts_init", 18, DataType::UInt64)?;
+    let max_notional_values = extract_optional_string_column_by_name(record_batch, "max_notional")?;
+    let min_notional_values = extract_optional_string_column_by_name(record_batch, "min_notional")?;
+    let max_price_values = extract_optional_string_column_by_name(record_batch, "max_price")?;
+    let min_price_values = extract_optional_string_column_by_name(record_batch, "min_price")?;
+    let margin_init_values =
+        extract_column::<StringArray>(cols, "margin_init", 18, DataType::Utf8)?;
+    let margin_maint_values =
+        extract_column::<StringArray>(cols, "margin_maint", 19, DataType::Utf8)?;
+    let tick_scheme_values = extract_optional_string_column_by_name(record_batch, "tick_scheme")?;
+    let info_values = extract_column_by_name::<StringArray>(record_batch, "info", DataType::Utf8)?;
+    let ts_event_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_event", DataType::UInt64)?;
+    let ts_init_values =
+        extract_column_by_name::<UInt64Array>(record_batch, "ts_init", DataType::UInt64)?;
 
     let mut result = Vec::with_capacity(num_rows);
 
@@ -289,7 +314,8 @@ pub fn decode_binary_option_batch(
         let id = InstrumentId::from_str(id_values.value(i))
             .map_err(|e| EncodingError::ParseError("id", format!("row {i}: {e}")))?;
         let raw_symbol = Symbol::from(raw_symbol_values.value(i));
-        let asset_class = asset_class_from_str(asset_class_values.value(i))?;
+        let asset_class = AssetClass::from_str(asset_class_values.value(i))
+            .map_err(|e| EncodingError::ParseError("asset_class", format!("row {i}: {e}")))?;
         let currency = super::decode_currency(
             currency_values.value(i),
             "currency",
@@ -307,10 +333,10 @@ pub fn decode_binary_option_batch(
         let activation_ns = nautilus_core::UnixNanos::from(activation_ns_values.value(i));
         let expiration_ns = nautilus_core::UnixNanos::from(expiration_ns_values.value(i));
 
-        let maker_fee = Decimal::from_str(maker_fee_values.value(i))
-            .map_err(|e| EncodingError::ParseError("maker_fee", format!("row {i}: {e}")))?;
-        let taker_fee = Decimal::from_str(taker_fee_values.value(i))
-            .map_err(|e| EncodingError::ParseError("taker_fee", format!("row {i}: {e}")))?;
+        let margin_init = Decimal::from_str(margin_init_values.value(i))
+            .map_err(|e| EncodingError::ParseError("margin_init", format!("row {i}: {e}")))?;
+        let margin_maint = Decimal::from_str(margin_maint_values.value(i))
+            .map_err(|e| EncodingError::ParseError("margin_maint", format!("row {i}: {e}")))?;
 
         let max_quantity =
             if max_quantity_values.is_null(i) {
@@ -370,17 +396,16 @@ pub fn decode_binary_option_batch(
             Some(Ustr::from(desc_str))
         };
 
-        // Decode info dict from JSON bytes (matching Python's msgspec.json.decode)
         let info = if info_values.is_null(i) {
             None
         } else {
-            let info_bytes = info_values
+            let info_json = info_values
                 .as_any()
-                .downcast_ref::<BinaryArray>()
+                .downcast_ref::<StringArray>()
                 .ok_or_else(|| EncodingError::ParseError("info", format!("row {i}: invalid type")))?
                 .value(i);
 
-            match serde_json::from_slice::<Params>(info_bytes) {
+            match serde_json::from_str::<Params>(info_json) {
                 Ok(info_dict) => Some(info_dict),
                 Err(e) => {
                     return Err(EncodingError::ParseError(
@@ -394,33 +419,62 @@ pub fn decode_binary_option_batch(
         let ts_event = nautilus_core::UnixNanos::from(ts_event_values.value(i));
         let ts_init = nautilus_core::UnixNanos::from(ts_init_values.value(i));
 
-        let binary_option = BinaryOption::new(
-            id,
-            raw_symbol,
-            asset_class,
-            currency,
-            activation_ns,
-            expiration_ns,
-            price_prec,
-            size_prec,
-            price_increment,
-            size_increment,
-            outcome,
-            description,
-            max_quantity,
-            min_quantity,
-            None, // max_notional - not in Python schema
-            None, // min_notional - not in Python schema
-            None, // max_price - not in Python schema
-            None, // min_price - not in Python schema
-            None, // margin_init - not in Python schema
-            None, // margin_maint - not in Python schema
-            Some(maker_fee),
-            Some(taker_fee),
-            info,
-            ts_event,
-            ts_init,
-        );
+        let tick_scheme = optional_ustr_value(tick_scheme_values, i);
+
+        let max_notional = match max_notional_values {
+            Some(column) if !column.is_null(i) => {
+                Some(Money::from_str(column.value(i)).map_err(|e| {
+                    EncodingError::ParseError("max_notional", format!("row {i}: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+
+        let min_notional = match min_notional_values {
+            Some(column) if !column.is_null(i) => {
+                Some(Money::from_str(column.value(i)).map_err(|e| {
+                    EncodingError::ParseError("min_notional", format!("row {i}: {e}"))
+                })?)
+            }
+            _ => None,
+        };
+
+        let binary_option = BinaryOption::builder()
+            .instrument_id(id)
+            .raw_symbol(raw_symbol)
+            .asset_class(asset_class)
+            .currency(currency)
+            .activation_ns(activation_ns)
+            .expiration_ns(expiration_ns)
+            .price_precision(price_prec)
+            .size_precision(size_prec)
+            .price_increment(price_increment)
+            .size_increment(size_increment)
+            .maybe_outcome(outcome)
+            .maybe_description(description)
+            .maybe_max_quantity(max_quantity)
+            .maybe_min_quantity(min_quantity)
+            .maybe_max_notional(max_notional)
+            .maybe_min_notional(min_notional)
+            .maybe_max_price(super::optional_price_value(
+                max_price_values,
+                "max_price",
+                i,
+            )?)
+            .maybe_min_price(super::optional_price_value(
+                min_price_values,
+                "min_price",
+                i,
+            )?)
+            .margin_init(margin_init)
+            .margin_maint(margin_maint)
+            .maybe_tick_scheme(tick_scheme)
+            .maybe_event_id(optional_ustr_value(event_id_values, i))
+            .maybe_info(info)
+            .ts_event(ts_event)
+            .ts_init(ts_init)
+            .build()
+            .map_err(|e| super::instrument_validation_error::<BinaryOption>(i, e))?;
 
         result.push(binary_option);
     }

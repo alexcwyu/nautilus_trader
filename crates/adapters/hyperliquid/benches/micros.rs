@@ -18,7 +18,7 @@
 //! Decimal/UUID/event construction, dispatch state churn).
 //!
 //! Use these when a `data.rs` or `exec.rs` bench regresses and you need to
-//! localise where the time went, or when evaluating a structural change
+//! localize where the time went, or when evaluating a structural change
 //! (e.g. swapping the JSON tokenizer) and want to confirm the gain landed in
 //! the layer it was supposed to.
 //!
@@ -32,13 +32,18 @@ use std::{hint::black_box, str::FromStr};
 use common::{btc_perp, fixtures};
 use criterion::{Criterion, criterion_group, criterion_main};
 use nautilus_core::{UUID4, UnixNanos};
-use nautilus_hyperliquid::websocket::{
-    dispatch::{OrderIdentity, WsDispatchState},
-    messages::{HyperliquidWsMessage, WsBookData, WsTradeData},
-    parse::{parse_ws_order_book_deltas, parse_ws_trade_tick},
+use nautilus_hyperliquid::{
+    common::HyperliquidDataConverter,
+    http::models::Cloid,
+    websocket::{
+        dispatch::WsDispatchState,
+        messages::{HyperliquidWsMessage, WsBookData, WsTradeData},
+        parse::{parse_ws_order_book_deltas, parse_ws_trade_tick},
+    },
 };
+use nautilus_live::execution::context::{OrderContext, OrderIdentity};
 use nautilus_model::{
-    enums::{LiquiditySide, OrderSide, OrderType},
+    enums::{LiquiditySide, OrderSide, OrderType, TimeInForce},
     events::{OrderAccepted, OrderFilled},
     identifiers::{ClientOrderId, StrategyId, TradeId, VenueOrderId},
     instruments::Instrument,
@@ -156,6 +161,26 @@ fn bench_trade_id_new(c: &mut Criterion) {
     });
 }
 
+fn bench_cloid_from_client_order_id(c: &mut Criterion) {
+    let cid = ClientOrderId::from("O-BENCH-CLOID");
+    c.bench_function("atom/cloid_from_client_order_id", |b| {
+        b.iter(|| {
+            let cloid = Cloid::from_client_order_id(black_box(cid));
+            black_box(cloid);
+        });
+    });
+}
+
+fn bench_cloid_to_hex(c: &mut Criterion) {
+    let cloid = Cloid::from_client_order_id(ClientOrderId::from("O-BENCH-CLOID"));
+    c.bench_function("atom/cloid_to_hex", |b| {
+        b.iter(|| {
+            let hex = cloid.to_hex();
+            black_box(hex);
+        });
+    });
+}
+
 fn bench_uuid4_new(c: &mut Criterion) {
     c.bench_function("atom/uuid4_new", |b| {
         b.iter(|| {
@@ -165,16 +190,44 @@ fn bench_uuid4_new(c: &mut Criterion) {
     });
 }
 
+fn bench_data_converter_ws_snapshot(c: &mut Criterion) {
+    let converter = HyperliquidDataConverter::new();
+    let instrument_id = btc_perp().id();
+    let msg: HyperliquidWsMessage = serde_json::from_str(fixtures::BOOK_L2).unwrap();
+    let book: WsBookData = match msg {
+        HyperliquidWsMessage::L2Book { data } => data,
+        _ => unreachable!(),
+    };
+
+    c.bench_function("atom/data_converter_ws_snapshot", |b| {
+        b.iter(|| {
+            let deltas = converter
+                .convert_ws_snapshot(black_box(&book), instrument_id, UnixNanos::default())
+                .unwrap();
+            black_box(deltas);
+        });
+    });
+}
+
 // ----- dispatch breakdown ----------------------------------------------------
 
-fn ident() -> OrderIdentity {
-    OrderIdentity {
-        strategy_id: StrategyId::from("S-BENCH"),
-        instrument_id: btc_perp().id(),
-        order_side: OrderSide::Buy,
-        order_type: OrderType::Limit,
+fn context(client_order_id: ClientOrderId) -> OrderContext {
+    OrderContext {
+        identity: OrderIdentity {
+            client_order_id,
+            strategy_id: StrategyId::from("S-BENCH"),
+            instrument_id: btc_perp().id(),
+            order_side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+        },
         quantity: Quantity::from("0.001"),
         price: Some(Price::from("92572.0")),
+        trigger_price: None,
+        trigger_type: None,
+        time_in_force: TimeInForce::Gtc,
+        is_post_only: false,
+        is_reduce_only: false,
+        is_quote_quantity: false,
     }
 }
 
@@ -184,7 +237,7 @@ fn bench_state_construct(c: &mut Criterion) {
     c.bench_function("atom/state_construct_primed", |b| {
         b.iter(|| {
             let state = WsDispatchState::new();
-            state.register_identity(cid, ident());
+            state.register_context(context(cid));
             state.record_venue_order_id(cid, voi);
             state.insert_accepted(cid);
             black_box(state);
@@ -200,7 +253,7 @@ fn bench_state_drop(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let state = WsDispatchState::new();
-                state.register_identity(cid, ident());
+                state.register_context(context(cid));
                 state.record_venue_order_id(cid, voi);
                 state.insert_accepted(cid);
                 state
@@ -246,6 +299,7 @@ fn bench_event_filled_construct(c: &mut Criterion) {
                 false,
                 None,
                 Some(commission),
+                None,
             );
             black_box(filled);
         });
@@ -264,7 +318,7 @@ fn bench_dispatch_reused_fill(c: &mut Criterion) {
     let cid = ClientOrderId::from("O-BENCH-R");
     let voi = VenueOrderId::from("430481837807");
     let state = WsDispatchState::new();
-    state.register_identity(cid, ident());
+    state.register_context(context(cid));
     state.record_venue_order_id(cid, voi);
     state.insert_accepted(cid);
 
@@ -333,7 +387,10 @@ criterion_group!(
     bench_price_from_decimal_dp,
     bench_price_from_str_combined,
     bench_trade_id_new,
+    bench_cloid_from_client_order_id,
+    bench_cloid_to_hex,
     bench_uuid4_new,
+    bench_data_converter_ws_snapshot,
     bench_state_construct,
     bench_state_drop,
     bench_event_filled_construct,

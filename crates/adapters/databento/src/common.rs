@@ -15,14 +15,20 @@
 
 //! Common functions to support Databento adapter operations.
 
-use std::{fmt::Debug, sync::LazyLock};
+use std::{fmt::Debug, fs, path::Path, sync::LazyLock};
 
-use databento::historical::DateTimeRange;
+use databento::{dbn, historical::DateTimeRange};
+use indexmap::IndexMap;
 use nautilus_core::{UnixNanos, string::secret::REDACTED};
-use nautilus_model::identifiers::{ClientId, Venue};
+use nautilus_model::{
+    enums::BarAggregation,
+    identifiers::{ClientId, Venue},
+};
 use time::OffsetDateTime;
 use ustr::Ustr;
 use zeroize::ZeroizeOnDrop;
+
+use crate::types::{DatabentoPublisher, PublisherId};
 
 /// Venue identifier string.
 pub const DATABENTO: &str = "DATABENTO";
@@ -35,6 +41,27 @@ pub static DATABENTO_CLIENT_ID: LazyLock<ClientId> =
     LazyLock::new(|| ClientId::new(Ustr::from(DATABENTO)));
 
 pub const ALL_SYMBOLS: &str = "ALL_SYMBOLS";
+
+/// Loads Databento publishers from a JSON file.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be read or parsed as JSON.
+pub fn load_publishers(filepath: impl AsRef<Path>) -> anyhow::Result<Vec<DatabentoPublisher>> {
+    let file_content = fs::read_to_string(filepath)?;
+    Ok(serde_json::from_str(&file_content)?)
+}
+
+/// Builds the publisher-to-venue map used by Databento decoders.
+#[must_use]
+pub fn build_publisher_venue_map(
+    publishers: &[DatabentoPublisher],
+) -> IndexMap<PublisherId, Venue> {
+    publishers
+        .iter()
+        .map(|p| (p.publisher_id, Venue::from(p.venue.as_str())))
+        .collect()
+}
 
 /// API credentials required for Databento API requests.
 #[derive(Clone, ZeroizeOnDrop)]
@@ -90,6 +117,21 @@ pub fn get_date_time_range(start: UnixNanos, end: UnixNanos) -> anyhow::Result<D
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(start.as_u64()))?,
         OffsetDateTime::from_unix_timestamp_nanos(i128::from(end.as_u64()))?,
     )))
+}
+
+/// Returns the Databento OHLCV schema for a bar aggregation.
+///
+/// # Errors
+///
+/// Returns an error if Databento has no OHLCV schema for `aggregation`.
+pub fn ohlcv_schema_from_aggregation(aggregation: BarAggregation) -> anyhow::Result<dbn::Schema> {
+    match aggregation {
+        BarAggregation::Second => Ok(dbn::Schema::Ohlcv1S),
+        BarAggregation::Minute => Ok(dbn::Schema::Ohlcv1M),
+        BarAggregation::Hour => Ok(dbn::Schema::Ohlcv1H),
+        BarAggregation::Day => Ok(dbn::Schema::Ohlcv1D),
+        _ => anyhow::bail!("Unsupported bar aggregation for Databento OHLCV: {aggregation:?}"),
+    }
 }
 
 #[cfg(test)]

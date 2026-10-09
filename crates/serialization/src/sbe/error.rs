@@ -23,6 +23,15 @@ pub const MAX_GROUP_SIZE: u32 = 10_000;
 /// SBE encode error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SbeEncodeError {
+    /// Fixed-length group does not contain the required number of entries.
+    InvalidGroupSize {
+        /// Group name.
+        group: &'static str,
+        /// Actual entry count.
+        count: usize,
+        /// Required entry count.
+        expected: usize,
+    },
     /// String field exceeds the supported encoded length.
     StringTooLong {
         /// The field name.
@@ -46,11 +55,27 @@ pub enum SbeEncodeError {
         /// The field name or description.
         field: &'static str,
     },
+    /// Value collides with a sentinel reserved by the wire encoding.
+    ReservedValue {
+        /// The field name or description.
+        field: &'static str,
+    },
 }
 
 impl Display for SbeEncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InvalidGroupSize {
+                group,
+                count,
+                expected,
+            } => {
+                write!(
+                    f,
+                    "Group `{group}` requires {expected} entries, found {count}"
+                )
+            }
+
             Self::StringTooLong { field, len, max } => {
                 write!(
                     f,
@@ -62,6 +87,9 @@ impl Display for SbeEncodeError {
             }
             Self::NumericOverflow { field } => {
                 write!(f, "Numeric value overflows encoded field {field}")
+            }
+            Self::ReservedValue { field } => {
+                write!(f, "Value for {field} is reserved by the wire encoding")
             }
         }
     }
@@ -196,6 +224,17 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Numeric value overflows encoded field BarSpecification.step"
+        );
+    }
+
+    #[rstest]
+    fn test_reserved_value_display() {
+        let err = SbeEncodeError::ReservedValue {
+            field: "FundingRateUpdate.interval",
+        };
+        assert_eq!(
+            err.to_string(),
+            "Value for FundingRateUpdate.interval is reserved by the wire encoding"
         );
     }
 

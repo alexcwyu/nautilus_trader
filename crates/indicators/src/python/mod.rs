@@ -23,12 +23,18 @@
     clippy::unused_self,
     reason = "PyO3 stub methods take &self for Python API parity even when the body is empty"
 )]
+#![allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "PyO3 enum methods must keep by-reference receivers for Python instance methods"
+)]
 
 pub mod average;
 pub mod book;
 pub mod momentum;
 pub mod ratio;
 pub mod volatility;
+
+mod float_precision;
 
 use pyo3::{prelude::*, pymodule};
 
@@ -51,6 +57,7 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::average::vwap::VolumeWeightedAveragePrice>()?;
     m.add_class::<crate::average::lr::LinearRegression>()?;
     m.add_class::<crate::average::wma::WeightedMovingAverage>()?;
+    m.add_class::<crate::average::zscore::ZScore>()?;
 
     // Book
     m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
@@ -76,6 +83,7 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::momentum::psl::PsychologicalLine>()?;
     m.add_class::<crate::momentum::pressure::Pressure>()?;
     m.add_class::<crate::momentum::cci::CommodityChannelIndex>()?;
+    m.add_class::<crate::momentum::roc::RateOfChangeMode>()?;
     m.add_class::<crate::momentum::roc::RateOfChange>()?;
     m.add_class::<crate::momentum::macd::MovingAverageConvergenceDivergence>()?;
     m.add_class::<crate::momentum::obv::OnBalanceVolume>()?;
@@ -86,6 +94,11 @@ pub fn indicators(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::volatility::dc::DonchianChannel>()?;
     m.add_class::<crate::volatility::rvi::RelativeVolatilityIndex>()?;
     m.add_class::<crate::volatility::kc::KeltnerChannel>()?;
+    m.add_class::<crate::volatility::fuzzy::CandleBodySize>()?;
+    m.add_class::<crate::volatility::fuzzy::CandleDirection>()?;
+    m.add_class::<crate::volatility::fuzzy::CandleSize>()?;
+    m.add_class::<crate::volatility::fuzzy::CandleWickSize>()?;
+    m.add_class::<crate::volatility::fuzzy::FuzzyCandle>()?;
     m.add_class::<crate::volatility::fuzzy::FuzzyCandlesticks>()?;
     m.add_class::<crate::volatility::kp::KeltnerPosition>()?;
     Ok(())

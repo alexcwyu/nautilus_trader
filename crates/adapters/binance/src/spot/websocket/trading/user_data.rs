@@ -43,6 +43,9 @@ pub enum BinanceSpotExecutionType {
     Expired,
     /// Self-trade prevention triggered.
     TradePrevention,
+    /// Unknown or undocumented execution type.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Execution report event (`executionReport`) from the Spot user data stream.
@@ -132,6 +135,24 @@ pub struct BinanceSpotExecutionReport {
     /// Original client order ID (for cancel-replace).
     #[serde(rename = "C", default)]
     pub original_client_order_id: Option<String>,
+    /// Expiry reason for expired orders.
+    #[serde(rename = "eR", default)]
+    pub expiry_reason: Option<String>,
+}
+
+impl BinanceSpotExecutionReport {
+    /// Returns the client order ID of the order this report belongs to.
+    ///
+    /// When a report results from a cancel request, Binance carries the request's
+    /// ID in `c` and the ID of the order being canceled in `C`, which is empty
+    /// otherwise.
+    #[must_use]
+    pub fn order_client_order_id(&self) -> &str {
+        match self.original_client_order_id.as_deref() {
+            Some(id) if !id.is_empty() => id,
+            _ => &self.client_order_id,
+        }
+    }
 }
 
 /// Account position update event (`outboundAccountPosition`).
@@ -238,6 +259,16 @@ mod tests {
 
         assert_eq!(msg.execution_type, BinanceSpotExecutionType::Canceled);
         assert_eq!(msg.order_status, BinanceOrderStatus::Canceled);
+    }
+
+    #[rstest]
+    fn test_deserialize_execution_report_expiry_reason() {
+        let json = load_fixture_string("spot/user_data_json/execution_report_expired.json");
+        let msg: BinanceSpotExecutionReport = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(msg.execution_type, BinanceSpotExecutionType::Expired);
+        assert_eq!(msg.order_status, BinanceOrderStatus::Expired);
+        assert_eq!(msg.expiry_reason.as_deref(), Some("INSUFFICIENT_LIQUIDITY"));
     }
 
     #[rstest]

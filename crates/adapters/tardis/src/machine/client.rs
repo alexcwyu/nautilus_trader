@@ -21,7 +21,6 @@ use std::sync::{
 use ahash::AHashMap;
 use futures_util::{Stream, StreamExt, pin_mut};
 use nautilus_model::data::Data;
-use ustr::Ustr;
 
 use super::{
     Error,
@@ -40,7 +39,7 @@ use crate::{
 /// Provides a client for connecting to a [Tardis Machine Server](https://docs.tardis.dev/api/tardis-machine).
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.tardis", from_py_object)
+    pyo3::pyclass(module = "nautilus_trader.adapters.tardis", from_py_object)
 )]
 #[cfg_attr(
     feature = "python",
@@ -194,7 +193,7 @@ where
                             yield Ok(data);
                         }
                     } else {
-                        log::error!("Missing instrument info for message: {msg:?}");
+                        log::debug!("Missing instrument info for message: {msg:?}");
                         yield Err(Error::ConnectionClosed {
                             reason: "Missing instrument definition info".to_string()
                         });
@@ -202,7 +201,6 @@ where
                     }
                 }
                 Err(e) => {
-                    log::error!("Error in WebSocket stream: {e:?}");
                     yield Err(e);
                     break;
                 }
@@ -216,20 +214,12 @@ pub fn determine_instrument_info(
     instrument_map: &AHashMap<TardisInstrumentKey, Arc<TardisInstrumentMiniInfo>>,
 ) -> Option<Arc<TardisInstrumentMiniInfo>> {
     let key = match msg {
-        WsMessage::BookChange(msg) => {
-            TardisInstrumentKey::new(Ustr::from(&msg.symbol), msg.exchange)
-        }
-        WsMessage::BookSnapshot(msg) => {
-            TardisInstrumentKey::new(Ustr::from(&msg.symbol), msg.exchange)
-        }
-        WsMessage::Trade(msg) => TardisInstrumentKey::new(Ustr::from(&msg.symbol), msg.exchange),
-        WsMessage::TradeBar(msg) => TardisInstrumentKey::new(Ustr::from(&msg.symbol), msg.exchange),
-        WsMessage::DerivativeTicker(msg) => {
-            TardisInstrumentKey::new(Ustr::from(&msg.symbol), msg.exchange)
-        }
-        WsMessage::OptionSummary(msg) => {
-            TardisInstrumentKey::new(Ustr::from(&msg.symbol), msg.exchange)
-        }
+        WsMessage::BookChange(msg) => TardisInstrumentKey::new(msg.symbol, msg.exchange),
+        WsMessage::BookSnapshot(msg) => TardisInstrumentKey::new(msg.symbol, msg.exchange),
+        WsMessage::Trade(msg) => TardisInstrumentKey::new(msg.symbol, msg.exchange),
+        WsMessage::TradeBar(msg) => TardisInstrumentKey::new(msg.symbol, msg.exchange),
+        WsMessage::DerivativeTicker(msg) => TardisInstrumentKey::new(msg.symbol, msg.exchange),
+        WsMessage::OptionSummary(msg) => TardisInstrumentKey::new(msg.symbol, msg.exchange),
         WsMessage::Disconnect(_) => return None,
     };
 

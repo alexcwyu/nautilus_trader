@@ -16,16 +16,16 @@
 use std::{fmt::Debug, time::Duration};
 
 use nautilus_common::{
-    cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig,
-    msgbus::database::MessageBusConfig,
+    cache::CacheConfig, enums::Environment, logging::logger::LoggerConfig, msgbus::MessageBusConfig,
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::UUID4;
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::engine::config::ExecutionEngineConfig;
 use nautilus_model::identifiers::TraderId;
+#[cfg(feature = "streaming")]
+pub use nautilus_persistence::config::{DataCatalogConfig, RotationConfig, StreamingConfig};
 use nautilus_portfolio::config::PortfolioConfig;
 use nautilus_risk::engine::config::RiskEngineConfig;
-use serde::{Deserialize, Serialize};
 
 /// Configuration trait for a `NautilusKernel` core system instance.
 pub trait NautilusKernelConfig: Debug {
@@ -33,9 +33,9 @@ pub trait NautilusKernelConfig: Debug {
     fn environment(&self) -> Environment;
     /// Returns the trader ID for the node.
     fn trader_id(&self) -> TraderId;
-    /// Returns if trading strategy state should be loaded from the database on start.
+    /// Returns if actor and strategy state should be loaded from the database on start.
     fn load_state(&self) -> bool;
-    /// Returns if trading strategy state should be saved to the database on stop.
+    /// Returns if actor and strategy state should be saved to the database on stop.
     fn save_state(&self) -> bool;
     /// Returns if the system should request shutdown when an error log is emitted.
     ///
@@ -70,7 +70,15 @@ pub trait NautilusKernelConfig: Debug {
     /// Returns the portfolio configuration.
     fn portfolio(&self) -> Option<PortfolioConfig>;
     /// Returns the configuration for streaming to feather files.
-    fn streaming(&self) -> Option<StreamingConfig>;
+    #[cfg(feature = "streaming")]
+    fn streaming(&self) -> Option<StreamingConfig> {
+        None
+    }
+    /// Returns configurations for existing data catalogs.
+    #[cfg(feature = "streaming")]
+    fn catalogs(&self) -> Vec<DataCatalogConfig> {
+        Vec::new()
+    }
 }
 
 /// Basic implementation of `NautilusKernelConfig` for builder and testing.
@@ -82,10 +90,10 @@ pub struct KernelConfig {
     /// The trader ID for the node (must be a name and ID tag separated by a hyphen).
     #[builder(default)]
     pub trader_id: TraderId,
-    /// If trading strategy state should be loaded from the database on start.
+    /// If actor and strategy state should be loaded from the database on start.
     #[builder(default)]
     pub load_state: bool,
-    /// If trading strategy state should be saved to the database on stop.
+    /// If actor and strategy state should be saved to the database on stop.
     #[builder(default)]
     pub save_state: bool,
     /// If the system should request shutdown when an error log is emitted.
@@ -99,7 +107,7 @@ pub struct KernelConfig {
     /// The unique instance identifier for the kernel
     pub instance_id: Option<UUID4>,
     /// The timeout for all clients to connect and initialize.
-    #[builder(default = Duration::from_secs(60))]
+    #[builder(default = Duration::from_mins(1))]
     pub timeout_connection: Duration,
     /// The timeout for execution state to reconcile.
     #[builder(default = Duration::from_secs(30))]
@@ -129,7 +137,12 @@ pub struct KernelConfig {
     /// The portfolio configuration.
     pub portfolio: Option<PortfolioConfig>,
     /// The configuration for streaming to feather files.
+    #[cfg(feature = "streaming")]
     pub streaming: Option<StreamingConfig>,
+    /// Configurations for existing data catalogs.
+    #[cfg(feature = "streaming")]
+    #[builder(default)]
+    pub catalogs: Vec<DataCatalogConfig>,
 }
 
 impl NautilusKernelConfig for KernelConfig {
@@ -209,75 +222,20 @@ impl NautilusKernelConfig for KernelConfig {
         self.portfolio
     }
 
+    #[cfg(feature = "streaming")]
     fn streaming(&self) -> Option<StreamingConfig> {
         self.streaming.clone()
+    }
+
+    #[cfg(feature = "streaming")]
+    fn catalogs(&self) -> Vec<DataCatalogConfig> {
+        self.catalogs.clone()
     }
 }
 
 impl Default for KernelConfig {
     fn default() -> Self {
         Self::builder().build()
-    }
-}
-
-/// Configuration for file rotation in streaming output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RotationConfig {
-    /// Rotate based on file size.
-    Size {
-        /// Maximum buffer size in bytes before rotation.
-        max_size: u64,
-    },
-    /// Rotate based on a time interval.
-    Interval {
-        /// Interval in nanoseconds.
-        interval_ns: u64,
-    },
-    /// Rotate based on scheduled dates.
-    ScheduledDates {
-        /// Interval in nanoseconds.
-        interval_ns: u64,
-        /// Start of the scheduled rotation period.
-        schedule_ns: UnixNanos,
-    },
-    /// No automatic rotation.
-    NoRotation,
-}
-
-/// Configuration for streaming live or backtest runs to the catalog in feather format.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
-#[serde(deny_unknown_fields)]
-pub struct StreamingConfig {
-    /// The path to the data catalog.
-    pub catalog_path: String,
-    /// The `fsspec` filesystem protocol for the catalog.
-    pub fs_protocol: String,
-    /// The flush interval (milliseconds) for writing chunks.
-    pub flush_interval_ms: u64,
-    /// If any existing feather files should be replaced.
-    pub replace_existing: bool,
-    /// Rotation configuration.
-    pub rotation_config: RotationConfig,
-}
-
-impl StreamingConfig {
-    /// Creates a new [`StreamingConfig`] instance.
-    #[must_use]
-    pub const fn new(
-        catalog_path: String,
-        fs_protocol: String,
-        flush_interval_ms: u64,
-        replace_existing: bool,
-        rotation_config: RotationConfig,
-    ) -> Self {
-        Self {
-            catalog_path,
-            fs_protocol,
-            flush_interval_ms,
-            replace_existing,
-            rotation_config,
-        }
     }
 }
 
@@ -291,15 +249,60 @@ mod tests {
     fn test_kernel_config_default_connection_timeout() {
         let config = KernelConfig::default();
 
-        assert_eq!(config.timeout_connection, Duration::from_secs(60));
+        assert_eq!(config.timeout_connection, Duration::from_mins(1));
+    }
+}
+
+#[cfg(all(test, feature = "streaming"))]
+mod streaming_tests {
+    use nautilus_common::config::ConfigError;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_streaming_config_builder_valid() {
+        let config = StreamingConfig::builder()
+            .writer_path("/data/stream".to_string())
+            .flush_interval_ms(1_000)
+            .replace_existing(false)
+            .rotation_config(RotationConfig::NoRotation)
+            .build();
+
+        assert!(config.is_ok());
+    }
+
+    #[rstest]
+    fn test_streaming_config_zero_flush_interval_rejected() {
+        let result = StreamingConfig::builder()
+            .writer_path("/data/stream".to_string())
+            .flush_interval_ms(0)
+            .replace_existing(false)
+            .rotation_config(RotationConfig::NoRotation)
+            .build();
+
+        assert!(
+            matches!(result, Err(ConfigError::Range { field, .. }) if field == "flush_interval_ms")
+        );
+    }
+
+    #[rstest]
+    fn test_streaming_config_empty_writer_path_rejected() {
+        let result = StreamingConfig::builder()
+            .writer_path(String::new())
+            .flush_interval_ms(1_000)
+            .replace_existing(false)
+            .rotation_config(RotationConfig::NoRotation)
+            .build();
+
+        assert!(matches!(result, Err(ConfigError::EmptyField { field }) if field == "writer_path"));
     }
 
     #[rstest]
     fn test_streaming_config_toml_round_trip() {
         let config: StreamingConfig = toml::from_str(
             r#"
-catalog_path = "/data/catalog"
-fs_protocol = "file"
+writer_path = "/data/stream"
 flush_interval_ms = 1000
 replace_existing = false
 
@@ -309,8 +312,8 @@ max_size = 1048576
         )
         .unwrap();
 
-        assert_eq!(config.catalog_path, "/data/catalog");
-        assert_eq!(config.fs_protocol, "file");
+        assert_eq!(config.writer_path, "/data/stream");
+        assert!(config.catalog.is_none());
         assert_eq!(config.flush_interval_ms, 1000);
         assert!(!config.replace_existing);
         assert!(matches!(
@@ -325,8 +328,7 @@ max_size = 1048576
     fn test_streaming_config_with_no_rotation_toml() {
         let config: StreamingConfig = toml::from_str(
             r#"
-catalog_path = "/data/catalog"
-fs_protocol = "file"
+writer_path = "/data/stream"
 flush_interval_ms = 500
 replace_existing = true
 rotation_config = "no_rotation"

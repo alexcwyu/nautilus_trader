@@ -1,7 +1,7 @@
 # Options Data and Greeks (Bybit)
 
 :::note
-This is a **Rust-only** v2 system tutorial. It uses the Rust `LiveNode`
+This is a **Rust-only** system tutorial. It uses the Rust `LiveNode`
 with the Bybit adapter to stream live option Greeks and aggregated chain
 snapshots.
 :::
@@ -53,18 +53,10 @@ flowchart LR
 
 - A working Rust toolchain ([rustup.rs](https://rustup.rs)).
 - The NautilusTrader repository cloned and building.
-- A Bybit API key with read permissions. No trading permissions are
-  needed for data-only use. Create keys at
-  [bybit.com](https://www.bybit.com/app/user/api-management).
-- Environment variables set for authentication:
 
-```bash
-export BYBIT_API_KEY="your-api-key"
-export BYBIT_API_SECRET="your-api-secret"
-```
-
-A `.env` file in the repository root also works. The examples load it via
-`dotenvy`.
+No Bybit API key is needed. The examples leave `api_key` and `api_secret`
+unset, and the data client then uses Bybit's public market data endpoints
+without reading credentials from the environment.
 
 :::warning
 Bybit demo trading uses `stream-demo.bybit.com` only for private streams.
@@ -80,9 +72,9 @@ A Rust `DataActor` needs three pieces:
 2. The `nautilus_actor!(YourType)` macro plus a `Debug` implementation.
 3. A `DataActor` trait implementation with your callbacks.
 
-The macro generates blanket `Actor` and `Component` implementations, so
-you only implement the callbacks you need. Every callback has a default
-no-op implementation.
+The macro supplies the native runtime wiring required by the blanket `Actor`
+and `Component` implementations, so you only implement the callbacks you need.
+Every callback has a default no-op implementation.
 
 ## Part 1: per-instrument Greeks
 
@@ -206,19 +198,22 @@ fn on_option_greeks(&mut self, greeks: &OptionGreeks) -> anyhow::Result<()> {
 
 The `OptionGreeks` fields:
 
-| Field              | Type           | Description                                        |
-|--------------------|----------------|----------------------------------------------------|
-| `instrument_id`    | `InstrumentId` | The option contract.                               |
-| `delta`            | `f64`          | Price sensitivity to underlying.                   |
-| `gamma`            | `f64`          | Delta sensitivity to underlying.                   |
-| `vega`             | `f64`          | Price sensitivity to a 1% change in volatility.    |
-| `theta`            | `f64`          | Daily time decay.                                  |
-| `rho`              | `f64`          | Sensitivity to interest rate changes.              |
-| `mark_iv`          | `Option<f64>`  | Mark price implied volatility.                     |
-| `bid_iv`           | `Option<f64>`  | Bid implied volatility.                            |
-| `ask_iv`           | `Option<f64>`  | Ask implied volatility.                            |
-| `underlying_price` | `Option<f64>`  | Current underlying forward price for this expiry.  |
-| `open_interest`    | `Option<f64>`  | Open interest for this contract.                   |
+| Field              | Type               | Description                                                     |
+| ------------------ | ------------------ | --------------------------------------------------------------- |
+| `instrument_id`    | `InstrumentId`     | The option contract.                                            |
+| `convention`       | `GreeksConvention` | Greeks convention (`BlackScholes` or `PriceAdjusted`).          |
+| `delta`            | `f64`              | Price sensitivity to underlying.                                |
+| `gamma`            | `f64`              | Delta sensitivity to underlying.                                |
+| `vega`             | `f64`              | Price sensitivity to a 1% change in volatility.                 |
+| `theta`            | `f64`              | Daily time decay.                                               |
+| `rho`              | `f64`              | Sensitivity to interest rate changes.                           |
+| `mark_iv`          | `Option<f64>`      | Mark price implied volatility.                                  |
+| `bid_iv`           | `Option<f64>`      | Bid implied volatility.                                         |
+| `ask_iv`           | `Option<f64>`      | Ask implied volatility.                                         |
+| `underlying_price` | `Option<f64>`      | Venue reference price for this expiry.                          |
+| `open_interest`    | `Option<f64>`      | Open interest for this contract.                                |
+| `ts_event`         | `UnixNanos`        | UNIX timestamp (nanoseconds) when the event occurred.           |
+| `ts_init`          | `UnixNanos`        | UNIX timestamp (nanoseconds) when the instance was initialized. |
 
 The `delta`, `gamma`, `vega`, `theta`, and `rho` values live on a nested
 `greeks: OptionGreekValues` struct. `OptionGreeks` implements
@@ -261,12 +256,12 @@ This aggregation happens inside NautilusTrader. Bybit publishes
 per-contract option market data and does not expose a native option
 chain stream in the V5 public WebSocket docs.
 
-### Key types
+### Chain types
 
 **`OptionSeriesId`** identifies a single expiry series:
 
 ```rust
-let series_id = OptionSeriesId::new(
+let series_id = OptionSeriesId::new_derived(
     Venue::new("BYBIT"),    // venue
     Ustr::from("BTC"),      // underlying
     Ustr::from("USDT"),     // settlement currency
@@ -276,14 +271,15 @@ let series_id = OptionSeriesId::new(
 
 **`StrikeRange`** controls which strikes are active:
 
-| Variant       | Description                                            |
-|---------------|--------------------------------------------------------|
-| `Fixed`       | A fixed set of strike prices.                          |
-| `AtmRelative` | `strikes_above` above and `strikes_below` below ATM.   |
-| `AtmPercent`  | All strikes within `pct` of the ATM price.             |
+| Variant       | Description                                                                 |
+| ------------- | --------------------------------------------------------------------------- |
+| `Fixed`       | A fixed set of strike prices.                                               |
+| `AtmRelative` | `strikes_above` above and `strikes_below` below ATM.                        |
+| `AtmPercent`  | All strikes within `pct` of the ATM price.                                  |
+| `Delta`       | Strikes whose call or put absolute delta is within `tolerance` of `target`. |
 
-For ATM-based variants, subscriptions are deferred until the ATM price
-is determined from the venue-provided forward price.
+For dynamic strike ranges, subscriptions are deferred until the ATM price
+is determined from the venue-provided reference price.
 
 ### Subscribing
 
@@ -361,9 +357,9 @@ fn on_option_chain(&mut self, slice: &OptionChainSlice) -> anyhow::Result<()> {
 The `OptionChainSlice` fields and methods:
 
 | Name             | Type / Returns              | Description                          |
-|------------------|-----------------------------|--------------------------------------|
+| ---------------- | --------------------------- | ------------------------------------ |
 | `series_id`      | `OptionSeriesId`            | The series this snapshot covers.     |
-| `atm_strike`     | `Option<Price>`             | ATM strike from the forward price.   |
+| `atm_strike`     | `Option<Price>`             | ATM strike from the reference price. |
 | `call_count()`   | `usize`                     | Number of call strikes with data.    |
 | `put_count()`    | `usize`                     | Number of put strikes with data.     |
 | `strike_count()` | `usize`                     | Union of all strikes.                |
@@ -385,12 +381,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
     let environment = Environment::Live;
-    let trader_id = TraderId::test_default();
+    let trader_id = TraderId::from("TESTER-001");
     let client_id = ClientId::new("BYBIT");
 
     let bybit_config = BybitDataClientConfig {
-        api_key: None,    // loaded from BYBIT_API_KEY env var
-        api_secret: None, // loaded from BYBIT_API_SECRET env var
+        api_key: None,    // public market data needs no credentials
+        api_secret: None,
         product_types: vec![BybitProductType::Option],
         ..Default::default()
     };
@@ -462,7 +458,7 @@ OPTION_CHAIN | BYBIT:BTC:USDT:2026-04-28T08:00:00Z | atm=77000 | calls=7 puts=7 
 underlying ~77,000 USDT marked. Delta drops from ~0.45 below the
 underlying to near zero past the underlying. Bybit's delta on near-zero
 gamma contracts close to expiry compresses to a step-like profile around
-the forward.*
+ATM.*
 
 ![IV smile per strike](./assets/options_data_bybit/panel_b_iv_smile.png)
 
@@ -473,7 +469,7 @@ dipping from 36% at 75,500 to 30% at 77,000 and rising back to 38% at
 
 ![Underlying trajectory and open interest](./assets/options_data_bybit/panel_c_underlying_oi.png)
 
-**Figure 3.** *Underlying forward price reported in each Greeks update
+**Figure 3.** *Bybit's underlying price reported in each Greeks update
 (top) and open interest by strike at the last update (bottom). OI
 concentrates in the 70,000-76,000 USDT band: at-the-money to slightly
 out-of-the-money strikes.*
@@ -485,13 +481,19 @@ Snapshots arrive every five seconds (`snapshot_interval_ms=5000`).*
 
 ### Regenerate the panels
 
+After building NautilusTrader from source, run these commands from the repository root:
+
 ```bash
+make sync
+
+cargo build --release --package nautilus-bybit --features examples \
+    --example bybit-greeks-tester --example bybit-option-chain
 timeout 30 ./target/release/examples/bybit-greeks-tester > /tmp/bybit_greeks.log 2>&1
 timeout 30 ./target/release/examples/bybit-option-chain > /tmp/bybit_chain.log 2>&1
 
-uv sync --extra visualization
 GREEKS_LOG=/tmp/bybit_greeks.log CHAIN_LOG=/tmp/bybit_chain.log \
-    python3 docs/tutorials/assets/options_data_bybit/render_panels.py
+    uv run --project python --no-sync \
+        python docs/tutorials/assets/options_data_bybit/render_panels.py
 ```
 
 ## Complete source
@@ -505,10 +507,8 @@ GREEKS_LOG=/tmp/bybit_greeks.log CHAIN_LOG=/tmp/bybit_chain.log \
   contracts alongside the aggregated chain view in a single actor.
   Subscribe to Greeks for contracts you want to track individually, and
   the chain for a surface-level view.
-- **Add quote and depth subscriptions**. Call `subscribe_quotes` for
-  top-of-book `QuoteTick` updates on individual option contracts. Call
-  `subscribe_order_book_deltas` when you need the dedicated option
-  orderbook stream. Bybit supports option depths 25 and 100.
+- **Add quote subscriptions**. Call `subscribe_quotes` for
+  top-of-book `QuoteTick` updates on individual option contracts.
 - **Options execution**. The
   [delta-neutral strategy tutorial](delta_neutral_options_bybit.md) walks
   through a short strangle with perpetual hedging, including IV-based

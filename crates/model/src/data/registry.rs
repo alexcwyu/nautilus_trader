@@ -15,14 +15,17 @@
 
 //! Registries for custom data: JSON (de)serialization and Arrow encode/decode.
 //!
-//! Mirrors Python's `register_serializable_type` and `register_arrow` in `custom.py`.
+//! Mirrors Python's `register_custom_data_class` surface in `custom.py`.
 //! The registry only stores type name -> callbacks for lookup; each type provides
 //! its own deserialize/encode/decode via the trait or registration.
 
 use std::sync::Arc;
 
 #[cfg(feature = "arrow")]
-use arrow::{datatypes::Schema, record_batch::RecordBatch};
+use arrow::{
+    datatypes::{DataType as ArrowDataType, Field, Schema},
+    record_batch::RecordBatch,
+};
 use dashmap::{DashMap, mapref::entry::Entry};
 use nautilus_core::Params;
 #[cfg(feature = "python")]
@@ -44,6 +47,64 @@ pub type ArrowDecoder = Box<
         + Send
         + Sync,
 >;
+
+/// Validates that a custom Arrow write schema contains no unsupported opaque byte fields.
+///
+/// `allow_binary` is reserved for the Rust macro's documented `Vec<u8>` exemption. Python
+/// schemas cannot prove that provenance and must pass `false`.
+///
+/// # Errors
+///
+/// Returns an error naming the first opaque byte field.
+#[cfg(feature = "arrow")]
+pub fn validate_custom_arrow_schema(
+    type_name: &str,
+    schema: &Schema,
+    allow_binary: bool,
+) -> anyhow::Result<()> {
+    for field in schema.fields() {
+        validate_custom_arrow_field(type_name, field, allow_binary)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arrow")]
+fn validate_custom_arrow_field(
+    type_name: &str,
+    field: &Field,
+    allow_binary: bool,
+) -> anyhow::Result<()> {
+    match field.data_type() {
+        ArrowDataType::Binary if allow_binary => Ok(()),
+        ArrowDataType::Binary
+        | ArrowDataType::LargeBinary
+        | ArrowDataType::BinaryView
+        | ArrowDataType::FixedSizeBinary(_) => anyhow::bail!(
+            "custom write schema `{type_name}` contains opaque byte field `{}`: {}",
+            field.name(),
+            field.data_type(),
+        ),
+        ArrowDataType::List(child)
+        | ArrowDataType::LargeList(child)
+        | ArrowDataType::ListView(child)
+        | ArrowDataType::LargeListView(child)
+        | ArrowDataType::FixedSizeList(child, _)
+        | ArrowDataType::Map(child, _) => {
+            validate_custom_arrow_field(type_name, child, allow_binary)
+        }
+        ArrowDataType::Struct(children) => {
+            for child in children {
+                validate_custom_arrow_field(type_name, child, allow_binary)?;
+            }
+            Ok(())
+        }
+        ArrowDataType::Dictionary(_, value) => {
+            let child = Field::new(field.name(), value.as_ref().clone(), field.is_nullable());
+            validate_custom_arrow_field(type_name, &child, allow_binary)
+        }
+        _ => Ok(()),
+    }
+}
 
 struct Registries {
     json: DashMap<String, JsonDeserializer>,
@@ -415,6 +476,8 @@ pub fn get_rust_extractor(type_name: &str) -> Option<PyExtractor> {
 
 #[cfg(test)]
 mod tests {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
     use nautilus_core::UnixNanos;
     use rstest::rstest;
     use serde::{Deserialize, Serialize};
@@ -546,6 +609,50 @@ mod tests {
     }
 
     #[rstest]
+    fn data_type_registry_result_hashes_like_equal_values_from_all_routes() {
+        fn hash_data_type(data_type: &DataType) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            data_type.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let metadata = serde_json::json!({"key": "value"});
+        let constructed = DataType::new(
+            "ExampleType",
+            Some(serde_json::from_value(metadata.clone()).unwrap()),
+            Some("catalog/path".to_string()),
+        );
+        let persistence_json = serde_json::json!({
+            "type_name": constructed.type_name(),
+            "metadata": metadata,
+            "identifier": constructed.identifier(),
+        });
+        let persisted = DataType::from_persistence_json(&persistence_json.to_string()).unwrap();
+        let registry_envelope = serde_json::json!({"data_type": persistence_json});
+        let registered = parse_data_type_from_value(&registry_envelope).unwrap();
+        let deserialization_payload = serde_json::json!({
+            "type_name": constructed.type_name(),
+            "metadata": constructed.metadata(),
+            "topic": constructed.topic(),
+            "hash": constructed.precomputed_hash() ^ u64::MAX,
+            "identifier": constructed.identifier(),
+        });
+        let deserialized: DataType = serde_json::from_value(deserialization_payload).unwrap();
+
+        // Eq and Hash both observe `topic` alone, so they cannot detect a route that drops or
+        // rewrites the other fields. Assert those explicitly as well, or a registry regression
+        // that lost `identifier` would still satisfy this test.
+        for data_type in [&deserialized, &persisted, &registered] {
+            assert_eq!(data_type, &constructed);
+            assert_eq!(hash_data_type(data_type), hash_data_type(&constructed));
+            assert_eq!(data_type.type_name(), constructed.type_name());
+            assert_eq!(data_type.metadata(), constructed.metadata());
+            assert_eq!(data_type.identifier(), constructed.identifier());
+            assert_eq!(data_type.topic(), constructed.topic());
+        }
+    }
+
+    #[rstest]
     fn ensure_json_deserializer_registered_is_idempotent() {
         let deserializer: JsonDeserializer = Box::new(|value| {
             let t: TestRegCustomData = serde_json::from_value(value)?;
@@ -611,6 +718,19 @@ mod tests {
         assert!(
             r2.is_ok(),
             "second Arrow registration with same type_name should be idempotent"
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "arrow")]
+    fn python_custom_arrow_schema_rejects_opaque_bytes() {
+        let schema = Schema::new(vec![Field::new("payload", ArrowDataType::Binary, false)]);
+
+        let error = validate_custom_arrow_schema("PythonPayload", &schema, false).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "custom write schema `PythonPayload` contains opaque byte field `payload`: Binary",
         );
     }
 }

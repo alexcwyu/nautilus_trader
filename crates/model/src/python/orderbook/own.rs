@@ -27,7 +27,11 @@ use rust_decimal::Decimal;
 use crate::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     identifiers::{ClientOrderId, InstrumentId, TraderId, VenueOrderId},
-    orderbook::{OwnBookOrder, own::OwnOrderBook},
+    orderbook::{
+        OwnBookOrder,
+        own::{OwnOrderBook, validate_accepted_buffer},
+    },
+    python::types::fixed::FloatArithmetic,
     types::{Price, Quantity},
 };
 
@@ -60,7 +64,7 @@ impl OwnBookOrder {
             trader_id,
             client_order_id,
             venue_order_id,
-            side.as_specified(),
+            side,
             price,
             size,
             order_type,
@@ -104,7 +108,7 @@ impl OwnBookOrder {
     #[getter]
     #[pyo3(name = "side")]
     fn py_side(&self) -> OrderSide {
-        self.side.as_order_side()
+        self.side
     }
 
     #[getter]
@@ -151,14 +155,17 @@ impl OwnBookOrder {
 
     /// Returns the order exposure as an `f64`.
     #[pyo3(name = "exposure")]
-    fn py_exposure(&self) -> f64 {
-        self.exposure()
+    fn py_exposure(&self) -> PyResult<f64> {
+        self.price.check_float_precision()?;
+        self.size.check_float_precision()?;
+        Ok(self.exposure())
     }
 
     /// Returns the signed order exposure as an `f64`.
     #[pyo3(name = "signed_size")]
-    fn py_signed_size(&self) -> f64 {
-        self.signed_size()
+    fn py_signed_size(&self) -> PyResult<f64> {
+        self.size.check_float_precision()?;
+        Ok(self.signed_size())
     }
 }
 
@@ -203,13 +210,14 @@ impl OwnOrderBook {
         self.reset();
     }
 
-    /// Adds an own order to the book.
+    /// Adds an own order to its side of the book, replacing any order there with the same client
+    /// order ID.
     #[pyo3(name = "add")]
     fn py_add(&mut self, order: OwnBookOrder) {
         self.add(order);
     }
 
-    /// Updates an existing own order in the book.
+    /// Updates an existing own order in the book, removing it if the size becomes zero.
     ///
     /// # Errors
     ///
@@ -291,9 +299,10 @@ impl OwnOrderBook {
         status: Option<HashSet<OrderStatus>>,
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
-    ) -> IndexMap<Decimal, Vec<OwnBookOrder>> {
+    ) -> PyResult<IndexMap<Decimal, Vec<OwnBookOrder>>> {
+        validate_accepted_buffer(accepted_buffer_ns, ts_now).map_err(to_pyvalue_err)?;
         let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
-        self.bids_as_map(status_set.as_ref(), accepted_buffer_ns, ts_now)
+        Ok(self.bids_as_map(status_set.as_ref(), accepted_buffer_ns, ts_now))
     }
 
     #[pyo3(name = "asks_to_dict")]
@@ -303,15 +312,17 @@ impl OwnOrderBook {
         status: Option<HashSet<OrderStatus>>,
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
-    ) -> IndexMap<Decimal, Vec<OwnBookOrder>> {
+    ) -> PyResult<IndexMap<Decimal, Vec<OwnBookOrder>>> {
+        validate_accepted_buffer(accepted_buffer_ns, ts_now).map_err(to_pyvalue_err)?;
         let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
-        self.asks_as_map(status_set.as_ref(), accepted_buffer_ns, ts_now)
+        Ok(self.asks_as_map(status_set.as_ref(), accepted_buffer_ns, ts_now))
     }
 
     /// Aggregates own bid quantities per price level, omitting zero-quantity levels.
     ///
-    /// Filters by `status` if provided, including only matching orders. With `accepted_buffer_ns`,
-    /// only includes orders accepted at least that many nanoseconds before `ts_now` (defaults to now).
+    /// Filters by `status` if provided, including only matching orders. When `ts_now` is provided,
+    /// only includes orders whose acceptance time plus `accepted_buffer_ns` is at or before
+    /// `ts_now`. When `ts_now` is `None`, acceptance-time filtering is disabled.
     ///
     /// If `group_size` is provided, groups quantities into price buckets.
     /// If `depth` is provided, limits the number of price levels returned.
@@ -324,21 +335,23 @@ impl OwnOrderBook {
         group_size: Option<Decimal>,
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
-    ) -> IndexMap<Decimal, Decimal> {
+    ) -> PyResult<IndexMap<Decimal, Decimal>> {
+        validate_accepted_buffer(accepted_buffer_ns, ts_now).map_err(to_pyvalue_err)?;
         let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
-        self.bid_quantity(
+        Ok(self.bid_quantity(
             status_set.as_ref(),
             depth,
             group_size,
             accepted_buffer_ns,
             ts_now,
-        )
+        ))
     }
 
     /// Aggregates own ask quantities per price level, omitting zero-quantity levels.
     ///
-    /// Filters by `status` if provided, including only matching orders. With `accepted_buffer_ns`,
-    /// only includes orders accepted at least that many nanoseconds before `ts_now` (defaults to now).
+    /// Filters by `status` if provided, including only matching orders. When `ts_now` is provided,
+    /// only includes orders whose acceptance time plus `accepted_buffer_ns` is at or before
+    /// `ts_now`. When `ts_now` is `None`, acceptance-time filtering is disabled.
     ///
     /// If `group_size` is provided, groups quantities into price buckets.
     /// If `depth` is provided, limits the number of price levels returned.
@@ -351,15 +364,16 @@ impl OwnOrderBook {
         group_size: Option<Decimal>,
         accepted_buffer_ns: Option<u64>,
         ts_now: Option<u64>,
-    ) -> IndexMap<Decimal, Decimal> {
+    ) -> PyResult<IndexMap<Decimal, Decimal>> {
+        validate_accepted_buffer(accepted_buffer_ns, ts_now).map_err(to_pyvalue_err)?;
         let status_set: Option<AHashSet<OrderStatus>> = status.map(|s| s.into_iter().collect());
-        self.ask_quantity(
+        Ok(self.ask_quantity(
             status_set.as_ref(),
             depth,
             group_size,
             accepted_buffer_ns,
             ts_now,
-        )
+        ))
     }
 
     /// Returns a new own book containing this books orders plus parity-transformed opposite orders.

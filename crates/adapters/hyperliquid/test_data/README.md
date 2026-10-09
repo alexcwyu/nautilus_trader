@@ -1,6 +1,6 @@
 # Hyperliquid Test Data
 
-This directory contains real API response samples for testing.
+This directory contains API response samples and documented error messages for testing.
 
 ## Files
 
@@ -8,6 +8,7 @@ This directory contains real API response samples for testing.
 
 - `http_meta_perp_sample.json` - Perpetuals market metadata (sample of 3 markets)
 - `http_meta_spot_sample.json` - Spot market metadata (sample of 3 markets)
+- `http_outcome_meta.json` - Constructed outcomes with USDC, USDH, and missing quote-token metadata
 - `http_l2_book_btc.json` - BTC order book snapshot (5 levels each side)
 - `http_l2_book_snapshot.json` - Existing order book test data
 
@@ -16,6 +17,13 @@ This directory contains real API response samples for testing.
 - `ws_trades_sample.json` - Real-time trade message sample
 - `ws_l2_book_sample.json` - Order book update message sample
 - `ws_book_data.json` - Existing book data test sample
+
+### Documented exchange errors
+
+`exchange_error_messages.json` contains the order and cancel error messages listed in the
+[official error reference](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/error-responses).
+These messages are copied from the documentation, including its placeholders, rather than captured
+from live responses. Tests use them in both whole-request and per-order rejection responses.
 
 ## Capturing New Test Data
 

@@ -30,7 +30,7 @@
 //! 5. Render the wire `tx_info` JSON with the same field order the upstream
 //!    Go signer marshals (Sig is base64).
 //!
-//! Step 2's aggregation order — `body || attributes` — and the ascending-type
+//! Step 2's aggregation order - `body || attributes` - and the ascending-type
 //! sort over attributes are both load-bearing for byte equality with the
 //! sequencer; both come straight from `txtypes.L2TxAttributes.AggregateTxHash`.
 
@@ -78,7 +78,7 @@ fn compute_tx_hash_fp5<T: LighterTx>(tx: &T, chain_id: u32) -> Fp5 {
 
 /// Hash the attribute table into an `Fp5` digest.
 ///
-/// Mirrors `txtypes.L2TxAttributes.Hash`: emit the normalised
+/// Mirrors `txtypes.L2TxAttributes.Hash`: emit the normalized
 /// `(type, value)` pairs over [`NB_ATTRIBUTES_PER_TX`] slots, then run the
 /// length-2N preimage through [`hash_to_quintic_extension`].
 fn hash_attributes(attrs: &L2TxAttributes) -> Fp5 {
@@ -125,9 +125,22 @@ pub struct SignedTx {
     pub sig_bytes: [u8; SIG_BYTES],
 }
 
+impl SignedTx {
+    /// Lowercase hex rendering of [`Self::tx_hash`], the form the venue
+    /// echoes in sendTx responses.
+    #[must_use]
+    pub fn tx_hash_hex(&self) -> String {
+        let mut s = String::with_capacity(TX_HASH_BYTES * 2);
+        for b in &self.tx_hash {
+            write!(&mut s, "{b:02x}").expect("writing into String never fails");
+        }
+        s
+    }
+}
+
 /// JSON renderer for the L2 tx_info wire payload.
 ///
-/// Field order and base64-encoded `Sig` match the upstream Go marshalling so
+/// Field order and base64-encoded `Sig` match the upstream Go marshaling so
 /// the resulting string is byte-equivalent (modulo the random `Sig`) to what
 /// the closed signer emits, and is what the sequencer expects on `sendTx`.
 #[derive(Debug)]
@@ -144,7 +157,7 @@ impl TxInfoJson {
         let mut out = String::with_capacity(256);
         out.push('{');
         write_ctx_lead(&mut out, tx.context);
-        write_kv_i64(&mut out, "MarketIndex", i64::from(tx.market_index));
+        write_kv_i64(&mut out, "MarketIndex", tx.market_index);
         write_kv_u64(
             &mut out,
             "InitialMarginFraction",
@@ -178,7 +191,7 @@ impl TxInfoJson {
         let mut out = String::with_capacity(320);
         out.push('{');
         write_ctx_lead(&mut out, tx.context);
-        write_kv_i64(&mut out, "MarketIndex", i64::from(tx.market_index));
+        write_kv_i64(&mut out, "MarketIndex", tx.market_index);
         write_kv_i64(&mut out, "Index", tx.index);
         write_kv_i64(&mut out, "BaseAmount", tx.base_amount);
         write_kv_u64(&mut out, "Price", u64::from(tx.price));
@@ -198,7 +211,7 @@ impl TxInfoJson {
         let mut out = String::with_capacity(256);
         out.push('{');
         write_ctx_lead(&mut out, tx.context);
-        write_kv_i64(&mut out, "MarketIndex", i64::from(tx.market_index));
+        write_kv_i64(&mut out, "MarketIndex", tx.market_index);
         write_kv_i64(&mut out, "Index", tx.index);
         write_ctx_tail(&mut out, tx.context);
         write_sig(&mut out, signed);
@@ -287,7 +300,7 @@ fn write_ctx_tail(out: &mut String, ctx: TxContext) {
 }
 
 fn write_order_info(out: &mut String, order: &OrderInfo) {
-    write_kv_i64(out, "MarketIndex", i64::from(order.market_index));
+    write_kv_i64(out, "MarketIndex", order.market_index);
     write_kv_i64(out, "ClientOrderIndex", order.client_order_index);
     write_kv_i64(out, "BaseAmount", order.base_amount);
     write_kv_u64(out, "Price", u64::from(order.price));
@@ -305,13 +318,28 @@ fn write_sig(out: &mut String, signed: &SignedTx) {
     out.push_str("\",");
 }
 
-// Match upstream marshalling: Create/Modify always emit integrator keys 1-3
+// Match upstream marshaling: nil-valued attributes are omitted, and a fully
+// empty Create/Modify attribute map is encoded as null.
 fn write_attributes_with_integrator(out: &mut String, attrs: &L2TxAttributes) {
+    if attrs.is_empty() {
+        out.push_str("\"L2TxAttributes\":null");
+        return;
+    }
+
     out.push_str("\"L2TxAttributes\":{");
     let mut first = true;
-    write_attr_pair(out, &mut first, "1", attrs.integrator_account_index);
-    write_attr_pair(out, &mut first, "2", u64::from(attrs.integrator_taker_fee));
-    write_attr_pair(out, &mut first, "3", u64::from(attrs.integrator_maker_fee));
+    if attrs.integrator_account_index != 0 {
+        write_attr_pair(out, &mut first, "1", attrs.integrator_account_index);
+    }
+
+    if attrs.integrator_taker_fee != 0 {
+        write_attr_pair(out, &mut first, "2", u64::from(attrs.integrator_taker_fee));
+    }
+
+    if attrs.integrator_maker_fee != 0 {
+        write_attr_pair(out, &mut first, "3", u64::from(attrs.integrator_maker_fee));
+    }
+
     if attrs.skip_nonce != 0 {
         write_attr_pair(out, &mut first, "4", u64::from(attrs.skip_nonce));
     }
@@ -319,7 +347,7 @@ fn write_attributes_with_integrator(out: &mut String, attrs: &L2TxAttributes) {
 }
 
 // Cancel/CancelAll/Withdraw/etc.: the FFI wrapper passes only `skip_nonce`,
-// so the marshalled value is `null` when nothing is set, otherwise a single
+// so the marshaled value is `null` when nothing is set, otherwise a single
 // `{"4":1}` entry.
 fn write_attributes_skip_nonce_only(out: &mut String, attrs: &L2TxAttributes) {
     if attrs.skip_nonce == 0 {
@@ -429,7 +457,7 @@ mod tests {
         CreateOrderTxInfo {
             context: ctx_for(v),
             order: OrderInfo {
-                market_index: f["market_index"].as_i64().unwrap() as i16,
+                market_index: f["market_index"].as_i64().unwrap(),
                 client_order_index: f["client_order_index"].as_i64().unwrap(),
                 base_amount: f["base_amount"].as_i64().unwrap(),
                 price: f["price"].as_u64().unwrap() as u32,
@@ -448,7 +476,7 @@ mod tests {
         let f = &v.fields;
         CancelOrderTxInfo {
             context: ctx_for(v),
-            market_index: f["market_index"].as_i64().unwrap() as i16,
+            market_index: f["market_index"].as_i64().unwrap(),
             index: f["index"].as_i64().unwrap(),
             skip_nonce: f["skip_nonce"].as_u64().unwrap_or(0) as u8,
         }
@@ -458,12 +486,33 @@ mod tests {
         let f = &v.fields;
         ModifyOrderTxInfo {
             context: ctx_for(v),
-            market_index: f["market_index"].as_i64().unwrap() as i16,
+            market_index: f["market_index"].as_i64().unwrap(),
             index: f["index"].as_i64().unwrap(),
             base_amount: f["base_amount"].as_i64().unwrap(),
             price: f["price"].as_u64().unwrap() as u32,
             trigger_price: f["trigger_price"].as_u64().unwrap() as u32,
             attributes: attrs_from(f),
+        }
+    }
+
+    fn expect_cancel_all_orders(v: &OracleVector) -> CancelAllOrdersTxInfo {
+        let f = &v.fields;
+        CancelAllOrdersTxInfo {
+            context: ctx_for(v),
+            time_in_force: f["time_in_force"].as_u64().unwrap() as u8,
+            scheduled_time_ms: f["scheduled_time_ms"].as_i64().unwrap(),
+            skip_nonce: f["skip_nonce"].as_u64().unwrap_or(0) as u8,
+        }
+    }
+
+    fn expect_update_leverage(v: &OracleVector) -> UpdateLeverageTxInfo {
+        let f = &v.fields;
+        UpdateLeverageTxInfo {
+            context: ctx_for(v),
+            market_index: f["market_index"].as_i64().unwrap(),
+            initial_margin_fraction: f["initial_margin_fraction"].as_u64().unwrap() as u16,
+            margin_mode: f["margin_mode"].as_u64().unwrap() as u8,
+            skip_nonce: f["skip_nonce"].as_u64().unwrap_or(0) as u8,
         }
     }
 
@@ -512,9 +561,9 @@ mod tests {
 
     fn assert_round_trip_sign<T: LighterTx>(tx: &T, v: &OracleVector) {
         let sk = PrivateKey::from_le_bytes_reduce(decode_scalar_bytes(&v.sk));
-        // Pick a nonzero, fixture-derived `k` — any non-zero canonical scalar
+        // Pick a nonzero, fixture-derived `k` - any non-zero canonical scalar
         // is valid. Guarding against `k == 0` and non-canonical limbs makes
-        // the helper fail loudly on the test scaffold rather than producing
+        // the assertion fail loudly on the test scaffold rather than producing
         // an undefined signature if the XOR happens to land on a bad value.
         let mut k_bytes = decode_scalar_bytes(&v.sk);
         k_bytes[0] ^= 0x01;
@@ -527,6 +576,12 @@ mod tests {
             bytes_to_hex(&signed.tx_hash),
             v.tx_hash,
             "{}: sign_tx tx_hash diverged",
+            v.kind,
+        );
+        assert_eq!(
+            signed.tx_hash_hex(),
+            v.tx_hash,
+            "{}: tx_hash_hex must render the venue's lowercase hex form",
             v.kind,
         );
         let pk = sk.public_key();
@@ -568,6 +623,34 @@ mod tests {
         for v in suite.vectors.iter().filter(|v| v.kind == "modify_order") {
             assert_eq!(v.tx_type, 17);
             let tx = expect_modify_order(v);
+            assert_hash_matches(&tx, v);
+            assert_oracle_sig_verifies(&tx, v);
+            assert_round_trip_sign(&tx, v);
+        }
+    }
+
+    #[rstest]
+    fn oracle_tx_hash_matches_cancel_all_orders() {
+        let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
+        for v in suite
+            .vectors
+            .iter()
+            .filter(|v| v.kind == "cancel_all_orders")
+        {
+            assert_eq!(v.tx_type, 16);
+            let tx = expect_cancel_all_orders(v);
+            assert_hash_matches(&tx, v);
+            assert_oracle_sig_verifies(&tx, v);
+            assert_round_trip_sign(&tx, v);
+        }
+    }
+
+    #[rstest]
+    fn oracle_tx_hash_matches_update_leverage() {
+        let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
+        for v in suite.vectors.iter().filter(|v| v.kind == "update_leverage") {
+            assert_eq!(v.tx_type, 20);
+            let tx = expect_update_leverage(v);
             assert_hash_matches(&tx, v);
             assert_oracle_sig_verifies(&tx, v);
             assert_round_trip_sign(&tx, v);
@@ -635,6 +718,31 @@ mod tests {
     }
 
     #[rstest]
+    #[case(2)]
+    #[case(3)]
+    #[case(4)]
+    #[case(5)]
+    fn oracle_covers_conditional_create_order_type(#[case] order_type: u64) {
+        let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
+        assert!(suite.vectors.iter().any(|v| {
+            v.kind == "create_order" && v.fields["order_type"].as_u64() == Some(order_type)
+        }));
+    }
+
+    #[rstest]
+    #[case("create_order")]
+    #[case("modify_order")]
+    fn oracle_covers_production_integrator_attributes(#[case] kind: &str) {
+        let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
+        assert!(suite.vectors.iter().any(|v| {
+            v.kind == kind
+                && v.fields["integrator_account_index"].as_u64() == Some(723_813)
+                && v.fields["integrator_taker_fee"].as_u64() == Some(0)
+                && v.fields["integrator_maker_fee"].as_u64() == Some(0)
+        }));
+    }
+
+    #[rstest]
     fn cancel_order_json_emits_null_attributes_when_empty() {
         let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
         for v in suite.vectors.iter().filter(|v| v.kind == "cancel_order") {
@@ -687,24 +795,73 @@ mod tests {
     }
 
     #[rstest]
-    fn cancel_all_orders_json_pins_field_order() {
-        // Pins wire layout for `txtypes.L2CancelAllOrdersTxInfo`. No oracle
-        // vector covers this kind; live testnet replay is the only path that
-        // verifies byte-equality with the closed Go signer.
-        let tx = CancelAllOrdersTxInfo {
+    fn cancel_all_orders_json_byte_equals_oracle_modulo_sig() {
+        let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
+        for v in suite
+            .vectors
+            .iter()
+            .filter(|v| v.kind == "cancel_all_orders")
+        {
+            let tx = expect_cancel_all_orders(v);
+            let sk = PrivateKey::from_le_bytes_reduce(decode_scalar_bytes(&v.sk));
+            let signed = signed_with_fixture_k(v, &sk, |k| sign_tx(&tx, v.chain_id, &sk, k));
+            let json = TxInfoJson::cancel_all_orders(&tx, &signed);
+            assert_eq!(
+                redact_sig(&json),
+                redact_sig(&v.tx_info),
+                "cancel_all_orders tx_info diverged",
+            );
+        }
+    }
+
+    #[rstest]
+    fn tx_info_json_renders_widened_market_index_as_number() {
+        let order = OrderInfo {
+            market_index: 40_000,
+            client_order_index: 123,
+            base_amount: 1_000,
+            price: 405_000,
+            is_ask: true,
+            order_type: 0,
+            time_in_force: 1,
+            reduce_only: false,
+            trigger_price: 0,
+            order_expiry: 1_735_689_600_000,
+        };
+
+        let create = CreateOrderTxInfo {
             context: stub_context(),
-            time_in_force: 0,
-            scheduled_time_ms: 0,
+            order,
+            attributes: L2TxAttributes::default(),
+        };
+
+        let cancel = CancelOrderTxInfo {
+            context: stub_context(),
+            market_index: 40_000,
+            index: 123,
             skip_nonce: 0,
         };
-        let json = TxInfoJson::cancel_all_orders(&tx, &stub_signed());
-        let expected = concat!(
-            r#"{"AccountIndex":12345,"ApiKeyIndex":5,"#,
-            r#""TimeInForce":0,"Time":0,"#,
-            r#""ExpiredAt":1777804395089,"Nonce":7,"#,
-            r#""Sig":"REDACTED","L2TxAttributes":null}"#,
-        );
-        assert_eq!(redact_sig(&json), expected);
+
+        let modify = ModifyOrderTxInfo {
+            context: stub_context(),
+            market_index: 40_000,
+            index: 123,
+            base_amount: 1_100,
+            price: 410_000,
+            trigger_price: 0,
+            attributes: L2TxAttributes::default(),
+        };
+
+        for json in [
+            TxInfoJson::create_order(&create, &stub_signed()),
+            TxInfoJson::cancel_order(&cancel, &stub_signed()),
+            TxInfoJson::modify_order(&modify, &stub_signed()),
+        ] {
+            assert!(
+                json.contains(r#""MarketIndex":40000"#),
+                "widened MarketIndex must render unquoted, was {json}",
+            );
+        }
     }
 
     #[rstest]
@@ -726,24 +883,19 @@ mod tests {
     }
 
     #[rstest]
-    fn update_leverage_json_pins_field_order() {
-        // Pins wire layout for `txtypes.L2UpdateLeverageTxInfo`. No oracle
-        // vector covers this kind; live testnet replay verifies byte-equality.
-        let tx = UpdateLeverageTxInfo {
-            context: stub_context(),
-            market_index: 3,
-            initial_margin_fraction: 500,
-            margin_mode: 1,
-            skip_nonce: 0,
-        };
-        let json = TxInfoJson::update_leverage(&tx, &stub_signed());
-        let expected = concat!(
-            r#"{"AccountIndex":12345,"ApiKeyIndex":5,"#,
-            r#""MarketIndex":3,"InitialMarginFraction":500,"MarginMode":1,"#,
-            r#""ExpiredAt":1777804395089,"Nonce":7,"#,
-            r#""Sig":"REDACTED","L2TxAttributes":null}"#,
-        );
-        assert_eq!(redact_sig(&json), expected);
+    fn update_leverage_json_byte_equals_oracle_modulo_sig() {
+        let suite: OracleFile = serde_json::from_str(ORACLE_JSON).expect("parse oracle");
+        for v in suite.vectors.iter().filter(|v| v.kind == "update_leverage") {
+            let tx = expect_update_leverage(v);
+            let sk = PrivateKey::from_le_bytes_reduce(decode_scalar_bytes(&v.sk));
+            let signed = signed_with_fixture_k(v, &sk, |k| sign_tx(&tx, v.chain_id, &sk, k));
+            let json = TxInfoJson::update_leverage(&tx, &signed);
+            assert_eq!(
+                redact_sig(&json),
+                redact_sig(&v.tx_info),
+                "update_leverage tx_info diverged",
+            );
+        }
     }
 
     #[rstest]
@@ -779,7 +931,7 @@ mod tests {
 
     fn arb_order_info() -> impl Strategy<Value = OrderInfo> {
         (
-            any::<i16>(),
+            any::<i64>(),
             any::<i64>(),
             any::<i64>(),
             any::<u32>(),
@@ -1029,7 +1181,7 @@ mod tests {
         /// Mutating any single body, attribute, or context field changes the
         /// signed *preimage* (`hash_elements` plus `attributes()` for
         /// attribute fields). Pins body-element ordering and attribute-slot
-        /// participation deterministically — a regression that drops or
+        /// participation deterministically - a regression that drops or
         /// swaps a field makes at least one mutation a no-op on the
         /// preimage. Asserting on the preimage rather than the digest
         /// avoids the hash-collision overreach (Poseidon compresses to
@@ -1089,7 +1241,7 @@ mod tests {
 
     #[rstest]
     fn cancel_order_json_emits_skip_nonce_only_attribute() {
-        // Synthesised case: skip_nonce=1, no integrator slots
+        // Synthesized case: skip_nonce=1, no integrator slots
         let tx = CancelOrderTxInfo {
             context: TxContext {
                 account_index: 1,

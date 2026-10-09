@@ -19,7 +19,7 @@
 //! addresses) are sourced from the "Protocol Constants" reference at
 //! <https://docs.derive.xyz/reference/protocol-constants>. Both mainnet and
 //! testnet values are populated; per-instance overrides on
-//! [`crate::config::DeriveExecClientConfig`] take precedence.
+//! [`crate::config::DeriveExecutionClientConfig`] take precedence.
 
 use std::{sync::LazyLock, time::Duration};
 
@@ -134,11 +134,11 @@ pub const DECIMAL_SCALE: u128 = 1_000_000_000_000_000_000;
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default timeout for blocking on account registration during execution
-/// client `connect()`. Matches the BitMEX / Bybit / OKX adapters' 30-second
-/// budget.
+/// client `connect()`.
 pub const DERIVE_ACCOUNT_REGISTRATION_TIMEOUT_SECS: f64 = 30.0;
 
 pub const WS_HEARTBEAT_SECS: u64 = 30;
+pub const WS_HEARTBEAT_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub const RECONNECT_BASE_BACKOFF: Duration = Duration::from_millis(250);
 pub const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(30);

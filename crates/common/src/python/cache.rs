@@ -15,7 +15,7 @@
 
 //! Python bindings for the [`Cache`] component.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::LazyLock};
 
 use bytes::Bytes;
 use nautilus_core::python::to_pyvalue_err;
@@ -23,13 +23,13 @@ use nautilus_core::python::to_pyvalue_err;
 use nautilus_model::defi::{Pool, PoolProfiler};
 use nautilus_model::{
     data::{
-        Bar, BarType, FundingRateUpdate, InstrumentStatus, QuoteTick, TradeTick,
+        Bar, BarType, FundingRateUpdate, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick,
         prices::{IndexPriceUpdate, MarkPriceUpdate},
     },
     enums::{AggregationSource, OmsType, OrderSide, PositionSide, PriceType},
     identifiers::{
-        AccountId, ClientId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
-        OrderListId, PositionId, StrategyId, Venue, VenueOrderId,
+        AccountId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, OrderListId, PositionId,
+        StrategyId, Venue, VenueOrderId,
     },
     instruments::SyntheticInstrument,
     orderbook::{OrderBook, own::OwnOrderBook},
@@ -46,9 +46,22 @@ use pyo3::prelude::*;
 use rust_decimal::prelude::ToPrimitive;
 
 use crate::{
-    cache::{Cache, CacheConfig},
+    cache::{Cache, CacheConfig, database::CacheDatabaseFactory},
     enums::SerializationEncoding,
+    python::{config_error_to_pyvalue_err, factory::FactoryRegistry},
 };
+
+/// Registry for Python cache database factory extractors.
+pub type CacheDatabaseFactoryRegistry = FactoryRegistry<dyn CacheDatabaseFactory>;
+
+static GLOBAL_CACHE_DATABASE_FACTORY_REGISTRY: LazyLock<CacheDatabaseFactoryRegistry> =
+    LazyLock::new(|| CacheDatabaseFactoryRegistry::new("cache database factory"));
+
+/// Returns the global Python cache database factory registry.
+#[must_use]
+pub fn get_global_cache_database_factory_registry() -> &'static CacheDatabaseFactoryRegistry {
+    &GLOBAL_CACHE_DATABASE_FACTORY_REGISTRY
+}
 
 /// Wrapper providing shared access to [`Cache`] from Python.
 ///
@@ -56,7 +69,7 @@ use crate::{
 /// the same cache instance. All methods delegate to the underlying cache.
 #[allow(non_camel_case_types)]
 #[pyo3::pyclass(
-    module = "nautilus_trader.core.nautilus_pyo3.common",
+    module = "nautilus_trader.common",
     name = "Cache",
     unsendable,
     from_py_object
@@ -84,8 +97,9 @@ impl PyCache {
 impl PyCache {
     #[new]
     #[pyo3(signature = (config=None))]
-    fn py_new(config: Option<CacheConfig>) -> Self {
-        Self(Rc::new(RefCell::new(Cache::new(config, None))))
+    fn py_new(config: Option<CacheConfig>) -> PyResult<Self> {
+        let cache = Cache::try_new(config, None).map_err(config_error_to_pyvalue_err)?;
+        Ok(Self(Rc::new(RefCell::new(cache))))
     }
 
     #[pyo3(name = "reset")]
@@ -96,6 +110,42 @@ impl PyCache {
     #[pyo3(name = "dispose")]
     fn py_dispose(&mut self) {
         self.0.borrow_mut().dispose();
+    }
+
+    #[pyo3(name = "purge_closed_orders", signature = (ts_now, buffer_secs=0))]
+    fn py_purge_closed_orders(&mut self, ts_now: u64, buffer_secs: u64) {
+        self.0
+            .borrow_mut()
+            .purge_closed_orders(ts_now.into(), buffer_secs);
+    }
+
+    #[pyo3(name = "purge_closed_positions", signature = (ts_now, buffer_secs=0))]
+    fn py_purge_closed_positions(&mut self, ts_now: u64, buffer_secs: u64) {
+        self.0
+            .borrow_mut()
+            .purge_closed_positions(ts_now.into(), buffer_secs);
+    }
+
+    #[pyo3(name = "purge_order")]
+    fn py_purge_order(&mut self, client_order_id: ClientOrderId) {
+        self.0.borrow_mut().purge_order(client_order_id);
+    }
+
+    #[pyo3(name = "purge_position")]
+    fn py_purge_position(&mut self, position_id: PositionId) {
+        self.0.borrow_mut().purge_position(position_id);
+    }
+
+    #[pyo3(name = "purge_instrument")]
+    fn py_purge_instrument(&mut self, instrument_id: InstrumentId) {
+        self.0.borrow_mut().purge_instrument(instrument_id);
+    }
+
+    #[pyo3(name = "purge_account_events", signature = (ts_now, lookback_secs=0))]
+    fn py_purge_account_events(&mut self, ts_now: u64, lookback_secs: u64) {
+        self.0
+            .borrow_mut()
+            .purge_account_events(ts_now.into(), lookback_secs);
     }
 
     #[pyo3(name = "get")]
@@ -111,6 +161,15 @@ impl PyCache {
         self.0
             .borrow_mut()
             .add(key, Bytes::from(value))
+            .map_err(to_pyvalue_err)
+    }
+
+    /// Adds an instrument close, replacing any close cached for the same instrument.
+    #[pyo3(name = "add_instrument_close")]
+    fn py_add_instrument_close(&mut self, close: InstrumentClose) -> PyResult<()> {
+        self.0
+            .borrow_mut()
+            .add_instrument_close(close)
             .map_err(to_pyvalue_err)
     }
 
@@ -194,6 +253,11 @@ impl PyCache {
         self.0.borrow().funding_rate(&instrument_id).copied()
     }
 
+    #[pyo3(name = "funding_rates")]
+    fn py_funding_rates(&self, instrument_id: InstrumentId) -> Option<Vec<FundingRateUpdate>> {
+        self.0.borrow().funding_rates(&instrument_id)
+    }
+
     #[pyo3(name = "instrument_status")]
     fn py_instrument_status(&self, instrument_id: InstrumentId) -> Option<InstrumentStatus> {
         self.0.borrow().instrument_status(&instrument_id).copied()
@@ -204,6 +268,11 @@ impl PyCache {
         self.0.borrow().instrument_statuses(&instrument_id)
     }
 
+    #[pyo3(name = "instrument_close")]
+    fn py_instrument_close(&self, instrument_id: InstrumentId) -> Option<InstrumentClose> {
+        self.0.borrow().instrument_close(&instrument_id).copied()
+    }
+
     #[pyo3(name = "price")]
     fn py_price(&self, instrument_id: InstrumentId, price_type: PriceType) -> Option<Price> {
         self.0.borrow().price(&instrument_id, price_type)
@@ -212,6 +281,32 @@ impl PyCache {
     #[pyo3(name = "order_book")]
     fn py_order_book(&self, instrument_id: InstrumentId) -> Option<OrderBook> {
         self.0.borrow().order_book(&instrument_id).cloned()
+    }
+
+    /// Returns the best bid/ask price and size for the `instrument_id`, without cloning the
+    /// resident order book.
+    ///
+    /// Returns `(bid_price, bid_size, ask_price, ask_size)`, or `None` if the book is
+    /// missing, empty, or one-sided.
+    ///
+    /// For L3 books, each size is the first order's size at the best level, not the
+    /// aggregate level size, consistent with the order book's best-size getters.
+    ///
+    /// Prefer this over `order_book()` in hot paths that only need top-of-book values, since
+    /// `order_book()` clones the full book and its cost scales with depth.
+    #[pyo3(name = "top_of_book")]
+    fn py_top_of_book(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> Option<(Price, Quantity, Price, Quantity)> {
+        let cache = self.0.borrow();
+        let book = cache.order_book(&instrument_id)?;
+        Some((
+            book.best_bid_price()?,
+            book.best_bid_size()?,
+            book.best_ask_price()?,
+            book.best_ask_size()?,
+        ))
     }
 
     #[pyo3(name = "has_order_book")]
@@ -234,6 +329,31 @@ impl PyCache {
         self.0.borrow().has_trade_ticks(&instrument_id)
     }
 
+    #[pyo3(name = "has_mark_prices")]
+    fn py_has_mark_prices(&self, instrument_id: InstrumentId) -> bool {
+        self.0.borrow().has_mark_prices(&instrument_id)
+    }
+
+    #[pyo3(name = "has_index_prices")]
+    fn py_has_index_prices(&self, instrument_id: InstrumentId) -> bool {
+        self.0.borrow().has_index_prices(&instrument_id)
+    }
+
+    #[pyo3(name = "has_funding_rates")]
+    fn py_has_funding_rates(&self, instrument_id: InstrumentId) -> bool {
+        self.0.borrow().has_funding_rates(&instrument_id)
+    }
+
+    #[pyo3(name = "has_instrument_statuses")]
+    fn py_has_instrument_statuses(&self, instrument_id: InstrumentId) -> bool {
+        self.0.borrow().has_instrument_statuses(&instrument_id)
+    }
+
+    #[pyo3(name = "has_instrument_close")]
+    fn py_has_instrument_close(&self, instrument_id: InstrumentId) -> bool {
+        self.0.borrow().has_instrument_close(&instrument_id)
+    }
+
     #[pyo3(name = "has_bars")]
     fn py_has_bars(&self, bar_type: BarType) -> bool {
         self.0.borrow().has_bars(&bar_type)
@@ -247,6 +367,26 @@ impl PyCache {
     #[pyo3(name = "trade_count")]
     fn py_trade_count(&self, instrument_id: InstrumentId) -> usize {
         self.0.borrow().trade_count(&instrument_id)
+    }
+
+    #[pyo3(name = "mark_price_count")]
+    fn py_mark_price_count(&self, instrument_id: InstrumentId) -> usize {
+        self.0.borrow().mark_price_count(&instrument_id)
+    }
+
+    #[pyo3(name = "index_price_count")]
+    fn py_index_price_count(&self, instrument_id: InstrumentId) -> usize {
+        self.0.borrow().index_price_count(&instrument_id)
+    }
+
+    #[pyo3(name = "funding_rate_count")]
+    fn py_funding_rate_count(&self, instrument_id: InstrumentId) -> usize {
+        self.0.borrow().funding_rate_count(&instrument_id)
+    }
+
+    #[pyo3(name = "instrument_status_count")]
+    fn py_instrument_status_count(&self, instrument_id: InstrumentId) -> usize {
+        self.0.borrow().instrument_status_count(&instrument_id)
     }
 
     #[pyo3(name = "bar_count")]
@@ -519,11 +659,6 @@ impl PyCache {
             )
             .into_iter()
             .collect()
-    }
-
-    #[pyo3(name = "actor_ids")]
-    fn py_actor_ids(&self) -> Vec<ComponentId> {
-        self.0.borrow().actor_ids().into_iter().collect()
     }
 
     #[pyo3(name = "strategy_ids")]
@@ -817,23 +952,18 @@ impl PyCache {
     }
 
     #[pyo3(name = "order_list")]
-    fn py_order_list(&self, py: Python, order_list_id: OrderListId) -> PyResult<Option<Py<PyAny>>> {
-        let cache = self.0.borrow();
-        match cache.order_list(&order_list_id) {
-            Some(order_list) => Ok(Some(order_list.clone().into_pyobject(py)?.into())),
-            None => Ok(None),
-        }
+    fn py_order_list(&self, order_list_id: OrderListId) -> Option<OrderList> {
+        self.0.borrow().order_list(&order_list_id).cloned()
     }
 
     #[pyo3(name = "order_lists", signature = (venue=None, instrument_id=None, strategy_id=None, account_id=None))]
     fn py_order_lists(
         &self,
-        py: Python,
         venue: Option<Venue>,
         instrument_id: Option<InstrumentId>,
         strategy_id: Option<StrategyId>,
         account_id: Option<AccountId>,
-    ) -> PyResult<Vec<Py<PyAny>>> {
+    ) -> Vec<OrderList> {
         let cache = self.0.borrow();
         cache
             .order_lists(
@@ -843,7 +973,7 @@ impl PyCache {
                 account_id.as_ref(),
             )
             .into_iter()
-            .map(|ol| Ok(ol.clone().into_pyobject(py)?.into()))
+            .cloned()
             .collect()
     }
 
@@ -1122,7 +1252,6 @@ impl PyCache {
         self.0
             .borrow_mut()
             .snapshot_position(&position_obj)
-            .map(|_| ())
             .map_err(to_pyvalue_err)
     }
 
@@ -1139,6 +1268,269 @@ impl PyCache {
             .into_iter()
             .map(|p| Ok(p.into_pyobject(py)?.into()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_core::UnixNanos;
+    use nautilus_model::{
+        data::{BookOrder, stubs::stub_instrument_close},
+        enums::{BookType, InstrumentCloseType},
+    };
+    use pyo3::exceptions::PyValueError;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn book_order(side: OrderSide, price: &str, size: &str, id: u64) -> BookOrder {
+        BookOrder::new(side, Price::from(price), Quantity::from(size), id)
+    }
+
+    #[rstest]
+    fn test_top_of_book_missing() {
+        let cache = PyCache::from_rc(Rc::new(RefCell::new(Cache::default())));
+
+        assert_eq!(
+            cache.py_top_of_book(InstrumentId::from("AUD/USD.SIM")),
+            None
+        );
+    }
+
+    #[rstest]
+    #[case::empty(None)]
+    #[case::bid_only(Some(OrderSide::Buy))]
+    #[case::ask_only(Some(OrderSide::Sell))]
+    fn test_top_of_book_incomplete(#[case] side: Option<OrderSide>) {
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+        if let Some(side) = side {
+            book.add(book_order(side, "0.70000", "10", 1), 0, 1, 1.into());
+        }
+        let mut cache = Cache::default();
+        cache.add_order_book(book).unwrap();
+        let cache = PyCache::from_rc(Rc::new(RefCell::new(cache)));
+
+        assert_eq!(cache.py_top_of_book(instrument_id), None);
+    }
+
+    #[rstest]
+    fn test_top_of_book_python_values_and_resident_updates() {
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let mut book = OrderBook::new(instrument_id, BookType::L2_MBP);
+        book.add(
+            book_order(OrderSide::Buy, "0.70000", "10", 1),
+            0,
+            1,
+            1.into(),
+        );
+        book.add(
+            book_order(OrderSide::Sell, "0.70010", "20", 2),
+            0,
+            2,
+            2.into(),
+        );
+        let mut cache = Cache::default();
+        cache.add_order_book(book).unwrap();
+        let cache = Rc::new(RefCell::new(cache));
+
+        Python::initialize();
+        Python::attach(|py| {
+            let py_cache = Py::new(py, PyCache::from_rc(cache.clone())).unwrap();
+            let original = py_cache
+                .call_method1(py, "top_of_book", (instrument_id,))
+                .unwrap();
+            let expected = (
+                Price::from("0.70000"),
+                Quantity::from("10"),
+                Price::from("0.70010"),
+                Quantity::from("20"),
+            );
+            assert_eq!(
+                original
+                    .extract::<(Price, Quantity, Price, Quantity)>(py)
+                    .unwrap(),
+                expected
+            );
+
+            {
+                let mut cache = cache.borrow_mut();
+                let book = cache.order_book_mut(&instrument_id).unwrap();
+                book.update(
+                    book_order(OrderSide::Buy, "0.70000", "15", 1),
+                    0,
+                    3,
+                    3.into(),
+                );
+                book.add(
+                    book_order(OrderSide::Sell, "0.70005", "25", 3),
+                    0,
+                    4,
+                    4.into(),
+                );
+            }
+            let updated = py_cache
+                .call_method1(py, "top_of_book", (instrument_id,))
+                .unwrap()
+                .extract::<(Price, Quantity, Price, Quantity)>(py)
+                .unwrap();
+            assert_eq!(
+                updated,
+                (
+                    Price::from("0.70000"),
+                    Quantity::from("15"),
+                    Price::from("0.70005"),
+                    Quantity::from("25"),
+                )
+            );
+            assert_eq!(
+                original
+                    .extract::<(Price, Quantity, Price, Quantity)>(py)
+                    .unwrap(),
+                expected
+            );
+
+            cache
+                .borrow_mut()
+                .order_book_mut(&instrument_id)
+                .unwrap()
+                .clear_asks(5, 5.into());
+            assert!(
+                py_cache
+                    .call_method1(py, "top_of_book", (instrument_id,))
+                    .unwrap()
+                    .is_none(py)
+            );
+        });
+    }
+
+    #[rstest]
+    fn test_top_of_book_l3_returns_first_order_sizes() {
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+        let first_bid = book_order(OrderSide::Buy, "0.70000", "10", 1);
+        let first_ask = book_order(OrderSide::Sell, "0.70010", "20", 3);
+        book.add(first_bid, 0, 1, 1.into());
+        book.add(
+            book_order(OrderSide::Buy, "0.70000", "30", 2),
+            0,
+            2,
+            2.into(),
+        );
+        book.add(first_ask, 0, 3, 3.into());
+        book.add(
+            book_order(OrderSide::Sell, "0.70010", "40", 4),
+            0,
+            4,
+            4.into(),
+        );
+        let mut cache = Cache::default();
+        cache.add_order_book(book).unwrap();
+        let cache = PyCache::from_rc(Rc::new(RefCell::new(cache)));
+
+        assert_eq!(
+            cache.py_top_of_book(instrument_id),
+            Some((
+                Price::from("0.70000"),
+                Quantity::from("10"),
+                Price::from("0.70010"),
+                Quantity::from("20"),
+            ))
+        );
+
+        {
+            let mut inner = cache.0.borrow_mut();
+            let book = inner.order_book_mut(&instrument_id).unwrap();
+            book.delete(first_bid, 0, 5, 5.into());
+            book.delete(first_ask, 0, 6, 6.into());
+        }
+        assert_eq!(
+            cache.py_top_of_book(instrument_id),
+            Some((
+                Price::from("0.70000"),
+                Quantity::from("30"),
+                Price::from("0.70010"),
+                Quantity::from("40"),
+            ))
+        );
+    }
+
+    fn create_order_list() -> OrderList {
+        OrderList::new(
+            OrderListId::from("OL-001"),
+            InstrumentId::from("AUD/USD.SIM"),
+            StrategyId::from("S-001"),
+            vec![ClientOrderId::from("O-001")],
+            UnixNanos::from(42_u64),
+        )
+    }
+
+    #[rstest]
+    fn test_order_list_queries_preserve_concrete_type() {
+        let order_list = create_order_list();
+        let order_list_id = order_list.id;
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_order_list(order_list.clone())
+            .unwrap();
+        let py_cache = PyCache::from_rc(cache);
+
+        assert_eq!(
+            py_cache.py_order_list(order_list_id),
+            Some(order_list.clone()),
+        );
+        assert_eq!(
+            py_cache.py_order_lists(None, None, None, None),
+            vec![order_list],
+        );
+    }
+
+    #[rstest]
+    fn test_add_instrument_close_replaces_existing() {
+        let first = stub_instrument_close();
+        let replacement = InstrumentClose::new(
+            first.instrument_id,
+            Price::from("0.00000"),
+            InstrumentCloseType::EndOfSession,
+            UnixNanos::from(3_u64),
+            UnixNanos::from(4_u64),
+        );
+        let mut py_cache = PyCache::from_rc(Rc::new(RefCell::new(Cache::default())));
+
+        py_cache.py_add_instrument_close(first).unwrap();
+        py_cache.py_add_instrument_close(replacement).unwrap();
+
+        assert_eq!(
+            py_cache.py_instrument_close(first.instrument_id),
+            Some(replacement)
+        );
+    }
+
+    #[rstest]
+    fn test_py_cache_constructor_returns_value_error_for_invalid_config() {
+        Python::initialize();
+        let config = CacheConfig {
+            tick_capacity: 0,
+            ..Default::default()
+        };
+
+        let err = PyCache::py_new(Some(config)).expect_err("invalid capacity must be rejected");
+
+        Python::attach(|py| assert!(err.is_instance_of::<PyValueError>(py)));
+    }
+
+    #[rstest]
+    fn test_native_cache_binding_returns_value_error_for_invalid_config() {
+        Python::initialize();
+        let config = CacheConfig {
+            bar_capacity: 0,
+            ..Default::default()
+        };
+
+        let err = Cache::py_new(Some(config)).expect_err("invalid capacity must be rejected");
+
+        Python::attach(|py| assert!(err.is_instance_of::<PyValueError>(py)));
     }
 }
 
@@ -1196,22 +1588,23 @@ impl CacheConfig {
         bar_capacity: Option<usize>,
         save_market_data: Option<bool>,
         persist_account_events: Option<bool>,
-    ) -> Self {
-        Self::new(
-            None, // database is None since we can't expose it to Python yet
-            encoding.unwrap_or(SerializationEncoding::MsgPack),
-            timestamps_as_iso8601.unwrap_or(false),
+    ) -> PyResult<Self> {
+        let config = Self {
+            encoding: encoding.unwrap_or_default(),
+            timestamps_as_iso8601: timestamps_as_iso8601.unwrap_or(false),
             buffer_interval_ms,
             bulk_read_batch_size,
-            use_trader_prefix.unwrap_or(true),
-            use_instance_id.unwrap_or(false),
-            flush_on_start.unwrap_or(false),
-            drop_instruments_on_reset.unwrap_or(true),
-            tick_capacity.unwrap_or(10_000),
-            bar_capacity.unwrap_or(10_000),
-            persist_account_events.unwrap_or(true),
-            save_market_data.unwrap_or(false),
-        )
+            use_trader_prefix: use_trader_prefix.unwrap_or(true),
+            use_instance_id: use_instance_id.unwrap_or(false),
+            flush_on_start: flush_on_start.unwrap_or(false),
+            drop_instruments_on_reset: drop_instruments_on_reset.unwrap_or(true),
+            tick_capacity: tick_capacity.unwrap_or(10_000),
+            bar_capacity: bar_capacity.unwrap_or(10_000),
+            persist_account_events: persist_account_events.unwrap_or(true),
+            save_market_data: save_market_data.unwrap_or(false),
+        };
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     fn __str__(&self) -> String {
@@ -1287,8 +1680,8 @@ impl CacheConfig {
 impl Cache {
     /// A common in-memory `Cache` for market and execution related data.
     #[new]
-    fn py_new(config: Option<CacheConfig>) -> Self {
-        Self::new(config, None)
+    fn py_new(config: Option<CacheConfig>) -> PyResult<Self> {
+        Self::try_new(config, None).map_err(config_error_to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -1298,8 +1691,10 @@ impl Cache {
     /// Resets the cache.
     ///
     /// All stateful fields are reset to their initial value. Instruments,
-    /// currencies and synthetics are retained when `drop_instruments_on_reset`
-    /// is `false` so that repeated backtest runs can reuse the same dataset.
+    /// currencies, and synthetics are retained when `drop_instruments_on_reset`
+    /// is `false` so that repeated backtest runs can reuse the same dataset. External order claims
+    /// and execution client account, route, and external client registrations are retained so
+    /// registered strategy and client routing remain configured across resets.
     #[pyo3(name = "reset")]
     fn py_reset(&mut self) {
         self.reset();
@@ -1311,6 +1706,56 @@ impl Cache {
     #[pyo3(name = "dispose")]
     fn py_dispose(&mut self) {
         self.dispose();
+    }
+
+    /// Purges all closed orders from the cache that are older than `buffer_secs`.
+    ///
+    ///
+    /// Only orders that have been closed for at least this amount of time will be purged.
+    /// A value of 0 means purge all closed orders regardless of when they were closed.
+    #[pyo3(name = "purge_closed_orders", signature = (ts_now, buffer_secs=0))]
+    fn py_purge_closed_orders(&mut self, ts_now: u64, buffer_secs: u64) {
+        self.purge_closed_orders(ts_now.into(), buffer_secs);
+    }
+
+    /// Purges all closed positions from the cache that are older than `buffer_secs`.
+    #[pyo3(name = "purge_closed_positions", signature = (ts_now, buffer_secs=0))]
+    fn py_purge_closed_positions(&mut self, ts_now: u64, buffer_secs: u64) {
+        self.purge_closed_positions(ts_now.into(), buffer_secs);
+    }
+
+    /// Purges the order with the `client_order_id` from the cache (if found).
+    ///
+    /// For safety, an order is prevented from being purged if it's open.
+    #[pyo3(name = "purge_order")]
+    fn py_purge_order(&mut self, client_order_id: ClientOrderId) {
+        self.purge_order(client_order_id);
+    }
+
+    /// Purges the position with the `position_id` from the cache (if found).
+    ///
+    /// For safety, a position is prevented from being purged if it's open.
+    #[pyo3(name = "purge_position")]
+    fn py_purge_position(&mut self, position_id: PositionId) {
+        self.purge_position(position_id);
+    }
+
+    /// Purges the instrument with the `instrument_id` from the cache.
+    ///
+    /// This refuses to purge when associated orders or positions remain in
+    /// non-terminal state.
+    #[pyo3(name = "purge_instrument")]
+    fn py_purge_instrument(&mut self, instrument_id: InstrumentId) {
+        self.purge_instrument(instrument_id);
+    }
+
+    /// Purges all account state events which are outside the lookback window.
+    ///
+    /// Only events which are outside the lookback window will be purged.
+    /// A value of 0 means purge all account state events.
+    #[pyo3(name = "purge_account_events", signature = (ts_now, lookback_secs=0))]
+    fn py_purge_account_events(&mut self, ts_now: u64, lookback_secs: u64) {
+        self.purge_account_events(ts_now.into(), lookback_secs);
     }
 
     /// Adds the `currency` to the cache.
@@ -1385,6 +1830,13 @@ impl Cache {
     /// `override_existing`: If the added order should 'override' any existing order and replace
     /// it in the cache. This is currently used for emulated orders which are
     /// being released and transformed into another type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if not `replace_existing` and the `order.client_order_id` is already contained in the cache,
+    /// or if persisting the order to the backing database fails. The order and every index are
+    /// committed to memory before persistence is attempted, so a persistence error leaves the
+    /// cache internally consistent.
     #[pyo3(name = "add_order")]
     fn py_add_order(
         &mut self,
@@ -1406,10 +1858,7 @@ impl Cache {
 
     /// Gets a borrow of the order with the `client_order_id` (if found).
     ///
-    /// The returned `OrderRef` is tied to the cache borrow's scope and panics at runtime if
-    /// held across a mutation of the same order. Drop the borrow before dispatching events; if
-    /// post-event state is required, perform a fresh lookup. Use `Self.order_owned` when an
-    /// owned snapshot is needed for a boundary handover.
+    /// Prefer `Self.order_ref` in new native code.
     #[pyo3(name = "order")]
     fn py_order(&self, py: Python, client_order_id: ClientOrderId) -> PyResult<Option<Py<PyAny>>> {
         match self.order(&client_order_id) {
@@ -1447,8 +1896,7 @@ impl Cache {
 
     /// Returns borrows of all locally active orders matching the optional filter parameters.
     ///
-    /// Locally active orders are in the `INITIALIZED`, `EMULATED`, or `RELEASED` state
-    /// (a superset of emulated orders).
+    /// Prefer `Self.orders_active_local_refs` in new native code.
     #[pyo3(name = "orders_active_local")]
     fn py_orders_active_local(
         &self,
@@ -1551,6 +1999,12 @@ impl Cache {
     }
 
     /// Adds the `position` to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the position to the backing database fails. After
+    /// serialization succeeds, the complete operation is committed to memory before persistence
+    /// is attempted, so a persistence error leaves the cache internally consistent.
     #[pyo3(name = "add_position")]
     #[expect(clippy::needless_pass_by_value)]
     fn py_add_position(
@@ -1564,8 +2018,13 @@ impl Cache {
             .map_err(to_pyvalue_err)
     }
 
-    /// Creates a snapshot of the `position` by cloning it, assigning a new ID,
-    /// serializing it, and storing it in the position snapshots.
+    /// Creates a snapshot of the `position` by cloning it, assigning a new ID, and storing it
+    /// in the position snapshots.
+    ///
+    /// The copy excludes `replay_events` and `fill_voids`, which no snapshot consumer reads,
+    /// so snapshot size stays independent of the fills applied to the position ID. The copy
+    /// encodes only when a consumer asks for the bytes, so this call stays off the encode path
+    /// unless a backing database has to persist the frame.
     ///
     /// # Errors
     ///
@@ -1575,11 +2034,12 @@ impl Cache {
     fn py_snapshot_position(&mut self, py: Python, position: Py<PyAny>) -> PyResult<()> {
         let position_obj = position.extract::<Position>(py)?;
         self.snapshot_position(&position_obj)
-            .map(|_| ())
             .map_err(to_pyvalue_err)
     }
 
     /// Returns a borrow of the position with the `position_id` (if found).
+    ///
+    /// Prefer `Self.position_ref` in new native code.
     #[pyo3(name = "position")]
     fn py_position(&self, py: Python, position_id: PositionId) -> PyResult<Option<Py<PyAny>>> {
         match self.position(&position_id) {
@@ -1683,7 +2143,10 @@ impl Cache {
         self.add_trade(trade).map_err(to_pyvalue_err)
     }
 
-    /// Adds the `bar` to the cache.
+    /// Adds the `bar` to the cache, keeping the per-`bar_type` series newest-first.
+    ///
+    /// A newer bar is pushed, an older `ts_event` is skipped, and an equal
+    /// `ts_event` replaces the front bar for time bars.
     ///
     /// # Errors
     ///
@@ -1741,6 +2204,36 @@ impl Cache {
         self.has_trade_ticks(&instrument_id)
     }
 
+    /// Returns whether the cache contains mark price updates for the `instrument_id`.
+    #[pyo3(name = "has_mark_prices")]
+    fn py_has_mark_prices(&self, instrument_id: InstrumentId) -> bool {
+        self.has_mark_prices(&instrument_id)
+    }
+
+    /// Returns whether the cache contains index price updates for the `instrument_id`.
+    #[pyo3(name = "has_index_prices")]
+    fn py_has_index_prices(&self, instrument_id: InstrumentId) -> bool {
+        self.has_index_prices(&instrument_id)
+    }
+
+    /// Returns whether the cache contains funding rate updates for the `instrument_id`.
+    #[pyo3(name = "has_funding_rates")]
+    fn py_has_funding_rates(&self, instrument_id: InstrumentId) -> bool {
+        self.has_funding_rates(&instrument_id)
+    }
+
+    /// Returns whether the cache contains instrument status updates for the `instrument_id`.
+    #[pyo3(name = "has_instrument_statuses")]
+    fn py_has_instrument_statuses(&self, instrument_id: InstrumentId) -> bool {
+        self.has_instrument_statuses(&instrument_id)
+    }
+
+    /// Returns whether the cache contains a close for the `instrument_id`.
+    #[pyo3(name = "has_instrument_close")]
+    fn py_has_instrument_close(&self, instrument_id: InstrumentId) -> bool {
+        self.has_instrument_close(&instrument_id)
+    }
+
     /// Returns whether the cache contains bars for the `bar_type`.
     #[pyo3(name = "has_bars")]
     fn py_has_bars(&self, bar_type: BarType) -> bool {
@@ -1757,6 +2250,30 @@ impl Cache {
     #[pyo3(name = "trade_count")]
     fn py_trade_count(&self, instrument_id: InstrumentId) -> usize {
         self.trade_count(&instrument_id)
+    }
+
+    /// Gets the mark price update count for the `instrument_id`.
+    #[pyo3(name = "mark_price_count")]
+    fn py_mark_price_count(&self, instrument_id: InstrumentId) -> usize {
+        self.mark_price_count(&instrument_id)
+    }
+
+    /// Gets the index price update count for the `instrument_id`.
+    #[pyo3(name = "index_price_count")]
+    fn py_index_price_count(&self, instrument_id: InstrumentId) -> usize {
+        self.index_price_count(&instrument_id)
+    }
+
+    /// Gets the funding rate update count for the `instrument_id`.
+    #[pyo3(name = "funding_rate_count")]
+    fn py_funding_rate_count(&self, instrument_id: InstrumentId) -> usize {
+        self.funding_rate_count(&instrument_id)
+    }
+
+    /// Gets the instrument status update count for the `instrument_id`.
+    #[pyo3(name = "instrument_status_count")]
+    fn py_instrument_status_count(&self, instrument_id: InstrumentId) -> usize {
+        self.instrument_status_count(&instrument_id)
     }
 
     /// Gets the bar count for the `instrument_id`.
@@ -1795,6 +2312,12 @@ impl Cache {
         self.funding_rate(&instrument_id).copied()
     }
 
+    /// Gets all funding rate updates for the `instrument_id`.
+    #[pyo3(name = "funding_rates")]
+    fn py_funding_rates(&self, instrument_id: InstrumentId) -> Option<Vec<FundingRateUpdate>> {
+        self.funding_rates(&instrument_id)
+    }
+
     /// Gets a reference to the latest instrument status update for the `instrument_id`.
     #[pyo3(name = "instrument_status")]
     fn py_instrument_status(&self, instrument_id: InstrumentId) -> Option<InstrumentStatus> {
@@ -1805,6 +2328,12 @@ impl Cache {
     #[pyo3(name = "instrument_statuses")]
     fn py_instrument_statuses(&self, instrument_id: InstrumentId) -> Option<Vec<InstrumentStatus>> {
         self.instrument_statuses(&instrument_id)
+    }
+
+    /// Returns the close cached for `instrument_id`, if present.
+    #[pyo3(name = "instrument_close")]
+    fn py_instrument_close(&self, instrument_id: InstrumentId) -> Option<InstrumentClose> {
+        self.instrument_close(&instrument_id).copied()
     }
 
     /// Gets a reference to the order book for the `instrument_id`.
@@ -1989,12 +2518,6 @@ impl Cache {
         .collect()
     }
 
-    /// Returns the `ComponentId`s of all actors.
-    #[pyo3(name = "actor_ids")]
-    fn py_actor_ids(&self) -> Vec<ComponentId> {
-        self.actor_ids().into_iter().collect()
-    }
-
     /// Returns the `StrategyId`s of all strategies.
     #[pyo3(name = "strategy_ids")]
     fn py_strategy_ids(&self) -> Vec<StrategyId> {
@@ -2027,9 +2550,7 @@ impl Cache {
 
     /// Returns borrows of all orders matching the optional filter parameters.
     ///
-    /// Each `Ref` in the returned vector borrows its underlying cell; mutating any of
-    /// those orders while the vector is alive will panic at runtime. Drop the vector
-    /// before issuing writes.
+    /// Prefer `Self.orders_refs` in new native code.
     #[pyo3(name = "orders")]
     fn py_orders(
         &self,
@@ -2053,6 +2574,8 @@ impl Cache {
     }
 
     /// Returns borrows of all open orders matching the optional filter parameters.
+    ///
+    /// Prefer `Self.orders_open_refs` in new native code.
     #[pyo3(name = "orders_open")]
     fn py_orders_open(
         &self,
@@ -2076,6 +2599,8 @@ impl Cache {
     }
 
     /// Returns borrows of all closed orders matching the optional filter parameters.
+    ///
+    /// Prefer `Self.orders_closed_refs` in new native code.
     #[pyo3(name = "orders_closed")]
     fn py_orders_closed(
         &self,
@@ -2099,6 +2624,8 @@ impl Cache {
     }
 
     /// Returns borrows of all emulated orders matching the optional filter parameters.
+    ///
+    /// Prefer `Self.orders_emulated_refs` in new native code.
     #[pyo3(name = "orders_emulated")]
     fn py_orders_emulated(
         &self,
@@ -2122,6 +2649,8 @@ impl Cache {
     }
 
     /// Returns borrows of all in-flight orders matching the optional filter parameters.
+    ///
+    /// Prefer `Self.orders_inflight_refs` in new native code.
     #[pyo3(name = "orders_inflight")]
     fn py_orders_inflight(
         &self,
@@ -2316,6 +2845,8 @@ impl Cache {
     }
 
     /// Returns a borrow of the position for the `client_order_id` (if found).
+    ///
+    /// Prefer `Self.position_for_order_ref` in new native code.
     #[pyo3(name = "position_for_order")]
     fn py_position_for_order(
         &self,
@@ -2336,9 +2867,7 @@ impl Cache {
 
     /// Returns borrows of all positions matching the optional filter parameters.
     ///
-    /// Each `PositionRef` in the returned vector borrows its underlying cell; mutating any of
-    /// those positions while the vector is alive will panic at runtime. Drop the vector before
-    /// issuing writes.
+    /// Prefer `Self.positions_refs` in new native code.
     #[pyo3(name = "positions")]
     fn py_positions(
         &self,
@@ -2362,6 +2891,8 @@ impl Cache {
     }
 
     /// Returns borrows of all open positions matching the optional filter parameters.
+    ///
+    /// Prefer `Self.positions_open_refs` in new native code.
     #[pyo3(name = "positions_open")]
     fn py_positions_open(
         &self,
@@ -2385,6 +2916,8 @@ impl Cache {
     }
 
     /// Returns borrows of all closed positions matching the optional filter parameters.
+    ///
+    /// Prefer `Self.positions_closed_refs` in new native code.
     #[pyo3(name = "positions_closed")]
     fn py_positions_closed(
         &self,
@@ -2422,7 +2955,7 @@ impl Cache {
     /// Gets the serialized position snapshot frames for the `position_id`.
     ///
     /// Each element in the returned vector is one JSON-encoded `Position` snapshot,
-    /// in the order they were taken.
+    /// in the order they were taken. Frames that fail to serialize are skipped with a warning.
     #[pyo3(name = "position_snapshot_bytes")]
     fn py_position_snapshot_bytes(&self, position_id: PositionId) -> Option<Vec<Vec<u8>>> {
         self.position_snapshot_bytes(&position_id)
@@ -2432,7 +2965,6 @@ impl Cache {
     ///
     /// When `position_id` is `Some`, only snapshots for that position are returned.
     /// When `account_id` is `Some`, snapshots are filtered to that account.
-    /// Frames that fail to deserialize are skipped with a warning.
     #[pyo3(name = "position_snapshots", signature = (position_id=None, account_id=None))]
     fn py_position_snapshots(
         &self,
@@ -2447,6 +2979,8 @@ impl Cache {
     }
 
     /// Returns a borrow of the account for the `account_id` (if found).
+    ///
+    /// Prefer `Self.account_ref` in new native code.
     #[pyo3(name = "account")]
     fn py_account(&self, py: Python, account_id: AccountId) -> PyResult<Option<Py<PyAny>>> {
         match self.account(&account_id) {
@@ -2456,6 +2990,9 @@ impl Cache {
     }
 
     /// Returns a borrow of the account for the `venue` (if found).
+    ///
+    /// Returns `None` when more than one account is issued under the `venue`; look those
+    /// accounts up by account ID instead.
     #[pyo3(name = "account_for_venue")]
     fn py_account_for_venue(&self, py: Python, venue: Venue) -> PyResult<Option<Py<PyAny>>> {
         match self.account_for_venue(&venue) {
@@ -2465,6 +3002,8 @@ impl Cache {
     }
 
     /// Returns a reference to the account ID for the `venue` (if found).
+    ///
+    /// Returns `None` when more than one account is issued under the `venue`.
     #[pyo3(name = "account_id")]
     fn py_account_id(&self, venue: Venue) -> Option<AccountId> {
         self.account_id(&venue).copied()
@@ -2490,6 +3029,12 @@ impl Cache {
     }
 
     /// Returns the price for the `instrument_id` and `price_type` (if found).
+    ///
+    /// For `Mid`, returns `None` if no quote is cached or either price is a sentinel.
+    /// For quote precision `p`, the midpoint has precision `p + 1` when exactly representable,
+    /// otherwise `p`, rounded half-even if necessary. The fallback applies when the precision
+    /// limit or raw range rules out `p + 1`, and when `p` is the maximum float precision (16),
+    /// so a midpoint of a float-convertible quote stays float-convertible.
     #[pyo3(name = "price")]
     fn py_price(&self, instrument_id: InstrumentId, price_type: PriceType) -> Option<Price> {
         self.price(&instrument_id, price_type)
@@ -2520,7 +3065,11 @@ impl Cache {
         self.set_mark_xrate(from_currency, to_currency, xrate);
     }
 
-    /// Clears the mark exchange rate for the given currency pair.
+    /// Clears the mark exchange rate for the given currency pair direction.
+    ///
+    /// Removes only the `(from_currency, to_currency)` entry; the inverse rate written
+    /// by `Self.set_mark_xrate` is retained until cleared separately or
+    /// `Self.clear_mark_xrates` is called.
     #[pyo3(name = "clear_mark_xrate")]
     fn py_clear_mark_xrate(&mut self, from_currency: Currency, to_currency: Currency) {
         self.clear_mark_xrate(from_currency, to_currency);
@@ -2574,12 +3123,10 @@ impl Cache {
         self.force_remove_from_own_order_book(&client_order_id);
     }
 
-    /// Audit all own order books against open and inflight order indexes.
+    /// Audit all own order books against active order indexes.
     ///
-    /// Ensures closed orders are removed from own order books. This includes both
-    /// orders tracked in `orders_open` (`ACCEPTED`, `TRIGGERED`, `PENDING_*`, `PARTIALLY_FILLED`)
-    /// and `orders_inflight` (`INITIALIZED`, `SUBMITTED`) to prevent false positives
-    /// during venue latency windows.
+    /// Ensures orders absent from the open, inflight, and active-local indexes are removed from
+    /// own order books.
     #[pyo3(name = "audit_own_order_books")]
     fn py_audit_own_order_books(&mut self) {
         self.audit_own_order_books();

@@ -18,9 +18,14 @@
 use std::{collections::HashMap, fs, path::Path, str::FromStr, sync::Arc};
 
 use anyhow::Context;
-use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
-use ibapi::contracts::{ComboLegOpenClose, Contract, Exchange, SecurityType, Symbol};
+use ibapi::{
+    contracts::{ComboLegOpenClose, Contract, Exchange, LegAction, SecurityType, Symbol},
+    prelude::StreamExt,
+    subscriptions::SubscriptionItem,
+};
+use jiff::{Span, Timestamp, tz::Offset};
+use nautilus_common::cache::Cache;
 use nautilus_model::{
     identifiers::{InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -29,24 +34,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     common::{
-        contracts::parse_contract_from_json,
-        enums::IbAction,
-        parse::{
-            create_spread_instrument_id, determine_venue_from_contract, exchange_to_mic_venue,
-            ib_contract_to_instrument_id_raw, ib_contract_to_instrument_id_simplified,
-            instrument_id_to_ib_contract, is_spread_instrument_id,
-            parse_spread_instrument_id_to_legs, possible_exchanges_for_venue,
+        Symbology,
+        contracts::{
+            ConfiguredContract, KEY_BUILD_FUTURES_CHAIN, KEY_BUILD_OPTIONS_CHAIN,
+            KEY_MAX_EXPIRY_DAYS, KEY_MIN_EXPIRY_DAYS, KEY_OPTIONS_CHAIN_EXCHANGE,
+            KEY_OPTIONS_CHAIN_EXCHANGE_ALT, parse_contract_from_json,
+        },
+        enums::{IbAction, IbSecurityType},
+        spreads::{
+            create_spread_instrument_id, is_spread_instrument_id,
+            parse_spread_instrument_id_to_legs,
+        },
+        symbology::{
+            determine_venue_from_contract, exchange_to_mic_venue, possible_exchanges_for_venue,
         },
     },
     config::{InteractiveBrokersInstrumentProviderConfig, SymbologyMethod},
-    providers::parse::{parse_ib_contract_to_instrument, parse_spread_instrument_any},
+    providers::parse::{
+        expiry_timestring_to_unix_nanos, parse_ib_contract_to_instrument,
+        parse_spread_instrument_any,
+    },
 };
 
 /// Cache structure for persistent instrument caching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InstrumentCache {
     /// Timestamp when cache was created.
-    cache_timestamp: DateTime<Utc>,
+    cache_timestamp: Timestamp,
     /// Contract ID to Instrument ID mappings.
     contract_id_to_instrument_id: Vec<(i32, String)>,
     /// Instrument ID to Price Magnifier mappings.
@@ -68,15 +82,23 @@ struct InstrumentCache {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(
-        module = "nautilus_trader.core.nautilus_pyo3.interactive_brokers",
+        module = "nautilus_trader.adapters.interactive_brokers",
         unsendable,
         from_py_object
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(
+        module = "nautilus_trader.adapters.interactive_brokers"
     )
 )]
 #[derive(Debug, Clone)]
 pub struct InteractiveBrokersInstrumentProvider {
     /// Configuration for the provider.
     config: InteractiveBrokersInstrumentProviderConfig,
+    /// Contract and instrument ID mapping policy.
+    symbology: Symbology,
     /// Cache mapping contract IDs to instrument IDs.
     contract_id_to_instrument_id: Arc<DashMap<i32, InstrumentId>>,
     /// Cache mapping instrument IDs to instruments.
@@ -87,22 +109,62 @@ pub struct InteractiveBrokersInstrumentProvider {
     contracts: Arc<DashMap<InstrumentId, Contract>>,
     /// Dedicated cache for price magnifiers for fast lookups.
     price_magnifiers: Arc<DashMap<InstrumentId, i32>>,
+    /// Guards startup loading and records whether every configured input resolved.
+    startup_initialized: Arc<tokio::sync::Mutex<bool>>,
+}
+
+trait StartupInstrumentLoader {
+    async fn load_instrument_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentId>>;
+
+    async fn load_contract(
+        &self,
+        configured: &ConfiguredContract,
+    ) -> anyhow::Result<Vec<InstrumentId>>;
+}
+
+struct IbStartupInstrumentLoader<'a> {
+    provider: &'a InteractiveBrokersInstrumentProvider,
+    client: &'a ibapi::Client,
+}
+
+impl StartupInstrumentLoader for IbStartupInstrumentLoader<'_> {
+    async fn load_instrument_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentId>> {
+        self.provider
+            .load_with_return_async(self.client, instrument_id, None)
+            .await
+    }
+
+    async fn load_contract(
+        &self,
+        configured: &ConfiguredContract,
+    ) -> anyhow::Result<Vec<InstrumentId>> {
+        let spec = configured.chain_spec_json();
+        self.provider
+            .load_contract_spec(self.client, &configured.contract, spec.as_ref())
+            .await
+    }
 }
 
 impl InteractiveBrokersInstrumentProvider {
     /// Create a new `InteractiveBrokersInstrumentProvider`.
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Configuration for the provider
     pub fn new(config: InteractiveBrokersInstrumentProviderConfig) -> Self {
+        let symbology = Symbology::new(config.symbology_method);
+
         Self {
             config,
+            symbology,
             contract_id_to_instrument_id: Arc::new(DashMap::new()),
             instruments: Arc::new(DashMap::new()),
             contract_details: Arc::new(DashMap::new()),
             contracts: Arc::new(DashMap::new()),
             price_magnifiers: Arc::new(DashMap::new()),
+            startup_initialized: Arc::new(tokio::sync::Mutex::new(false)),
         }
     }
 
@@ -124,6 +186,7 @@ impl InteractiveBrokersInstrumentProvider {
                 ..Default::default()
             },
         );
+
         self.price_magnifiers.insert(instrument_id, price_magnifier);
     }
 
@@ -150,7 +213,7 @@ impl InteractiveBrokersInstrumentProvider {
             match self.load_cache(cache_path).await {
                 Ok(cache_loaded) => {
                     if cache_loaded {
-                        tracing::info!(
+                        tracing::debug!(
                             "Initialized provider with {} instruments from cache",
                             self.count()
                         );
@@ -165,15 +228,102 @@ impl InteractiveBrokersInstrumentProvider {
                 }
             }
         }
+
         Ok(())
     }
 
+    /// Initializes the provider and resolves every configured startup input.
+    ///
+    /// Successful initialization is idempotent. A failed attempt remains retryable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if initialization fails or any configured input cannot be loaded.
     pub async fn initialize_with_client(
         &self,
         client: &ibapi::Client,
     ) -> anyhow::Result<Vec<InstrumentId>> {
+        let loader = IbStartupInstrumentLoader {
+            provider: self,
+            client,
+        };
+
+        self.initialize_with_loader(&loader).await
+    }
+
+    async fn initialize_with_loader<L>(&self, loader: &L) -> anyhow::Result<Vec<InstrumentId>>
+    where
+        L: StartupInstrumentLoader + Sync,
+    {
+        let mut initialized = self.startup_initialized.lock().await;
+        if *initialized {
+            return Ok(Vec::new());
+        }
+
         self.initialize().await?;
-        self.load_all_async(client, None, None, false).await
+        let loaded_ids = self.load_configured_instruments(loader).await?;
+        *initialized = true;
+        Ok(loaded_ids)
+    }
+
+    async fn load_configured_instruments<L>(&self, loader: &L) -> anyhow::Result<Vec<InstrumentId>>
+    where
+        L: StartupInstrumentLoader + Sync,
+    {
+        let mut loaded_ids = Vec::new();
+        let mut unresolved = Vec::new();
+        let mut configured_ids: Vec<_> = self.config.load_ids.iter().copied().collect();
+        configured_ids.sort_unstable();
+
+        for instrument_id in configured_ids {
+            match loader
+                .load_instrument_id(instrument_id)
+                .await
+                .with_context(|| {
+                    format!("Failed to load configured IB instrument ID {instrument_id}")
+                })? {
+                Some(loaded_id) => loaded_ids.push(loaded_id),
+                None => unresolved.push(format!("instrument ID {instrument_id}")),
+            }
+        }
+
+        for (index, configured) in self.config.load_contracts.iter().enumerate() {
+            let contract = &configured.contract;
+
+            let mut contract_ids = loader.load_contract(configured).await.with_context(|| {
+                format!("Failed to load configured IB contract at index {index}: {contract:?}")
+            })?;
+
+            if contract_ids.is_empty() {
+                unresolved.push(format!("contract at index {index}: {contract:?}"));
+            } else {
+                loaded_ids.append(&mut contract_ids);
+            }
+        }
+
+        if !unresolved.is_empty() {
+            anyhow::bail!(
+                "Unable to resolve configured Interactive Brokers instruments: {}",
+                unresolved.join(", ")
+            );
+        }
+
+        loaded_ids.sort_unstable();
+        loaded_ids.dedup();
+        Ok(loaded_ids)
+    }
+
+    pub(crate) fn seed_from_cache(&self, cache: &Cache) -> usize {
+        let instruments = cache
+            .instrument_ids(None)
+            .into_iter()
+            .filter_map(|instrument_id| cache.instrument(instrument_id).cloned());
+        let count = self.add_cached_instruments(instruments);
+        if count > 0 {
+            tracing::debug!("Seeded IB instrument provider with {count} cached instruments");
+        }
+
+        count
     }
 
     /// Adds instruments already held by the Nautilus cache into the provider cache.
@@ -188,22 +338,29 @@ impl InteractiveBrokersInstrumentProvider {
 
         for instrument in instruments {
             let instrument_id = instrument.id();
+
             let Some(contract) = contract_from_instrument_info(&instrument) else {
                 continue;
             };
-            let price_magnifier = price_magnifier_from_instrument_info(&instrument);
+
+            let Some(price_magnifier) =
+                price_magnifier_from_instrument_info(&instrument).filter(|value| *value >= 0)
+            else {
+                continue;
+            };
 
             if self.cache_instrument(
                 instrument_id,
                 instrument,
                 None,
                 Some(contract),
-                price_magnifier,
+                Some(price_magnifier),
                 false,
             ) {
                 added += 1;
             }
         }
+
         added
     }
 
@@ -211,10 +368,6 @@ impl InteractiveBrokersInstrumentProvider {
     ///
     /// This is equivalent to Python's `determine_venue_from_contract` method.
     /// It uses the config's symbol-to-venue mapping and exchange-to-venue conversion settings.
-    ///
-    /// # Arguments
-    ///
-    /// * `contract` - The IB contract
     ///
     /// # Returns
     ///
@@ -290,15 +443,11 @@ impl InteractiveBrokersInstrumentProvider {
     }
 
     /// Get the symbology method from the provider configuration.
-    pub fn symbology_method(&self) -> crate::config::SymbologyMethod {
-        self.config.symbology_method
+    pub fn symbology_method(&self) -> SymbologyMethod {
+        self.symbology.method()
     }
 
     /// Get an instrument by its ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument ID to look up
     ///
     /// # Returns
     ///
@@ -320,25 +469,16 @@ impl InteractiveBrokersInstrumentProvider {
 
     /// Get an instrument by contract ID.
     ///
-    /// # Arguments
-    ///
-    /// * `contract_id` - The IB contract ID to look up
-    ///
     /// # Returns
     ///
     /// Returns the instrument if found, `None` otherwise.
     #[must_use]
     pub fn find_by_contract_id(&self, contract_id: i32) -> Option<InstrumentAny> {
-        self.contract_id_to_instrument_id
-            .get(&contract_id)
-            .and_then(|entry| self.find(entry.value()))
+        self.get_instrument_id_by_contract_id(contract_id)
+            .and_then(|instrument_id| self.find(&instrument_id))
     }
 
     /// Get an instrument ID by contract ID.
-    ///
-    /// # Arguments
-    ///
-    /// * `contract_id` - The IB contract ID to look up
     ///
     /// # Returns
     ///
@@ -374,15 +514,29 @@ impl InteractiveBrokersInstrumentProvider {
 
         let venue = self.determine_venue(contract, None);
 
-        match self.config.symbology_method {
-            SymbologyMethod::Simplified => {
-                ib_contract_to_instrument_id_simplified(contract, Some(venue))
-            }
-            SymbologyMethod::Raw => ib_contract_to_instrument_id_raw(contract, Some(venue)),
-        }
+        self.symbology.instrument_id(contract, Some(venue))
     }
 
     fn resolve_spread_instrument_id_for_contract(
+        &self,
+        contract: &Contract,
+    ) -> anyhow::Result<InstrumentId> {
+        let spread_instrument_id = self.spread_instrument_id_for_contract(contract)?;
+
+        if self.find(&spread_instrument_id).is_none() {
+            anyhow::bail!("Resolved BAG spread {spread_instrument_id} is not cached");
+        }
+
+        Ok(spread_instrument_id)
+    }
+
+    /// Returns the spread instrument ID of a BAG contract from its cached leg instruments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the contract has no combo legs, a leg is not cached, or a leg action
+    /// is invalid.
+    pub fn spread_instrument_id_for_contract(
         &self,
         contract: &Contract,
     ) -> anyhow::Result<InstrumentId> {
@@ -401,7 +555,8 @@ impl InteractiveBrokersInstrumentProvider {
                         combo_leg.contract_id
                     )
                 })?;
-            let ratio = IbAction::from_str(&combo_leg.action)
+
+            let ratio = IbAction::from_str(combo_leg.action.as_str())
                 .context("Invalid BAG combo leg action")?
                 .signed_multiplier()
                 * combo_leg.ratio;
@@ -409,31 +564,19 @@ impl InteractiveBrokersInstrumentProvider {
             leg_tuples.push((leg_instrument_id, ratio));
         }
 
-        let spread_instrument_id = create_spread_instrument_id(&leg_tuples)
-            .context("Failed to create spread instrument ID from BAG combo legs")?;
-
-        if self.find(&spread_instrument_id).is_none() {
-            anyhow::bail!("Resolved BAG spread {spread_instrument_id} is not cached");
-        }
-
-        Ok(spread_instrument_id)
+        create_spread_instrument_id(&leg_tuples)
+            .context("Failed to create spread instrument ID from BAG combo legs")
     }
 
     /// Check if a security type should be filtered.
-    ///
-    /// # Arguments
-    ///
-    /// * `sec_type` - The security type to check
     ///
     /// # Returns
     ///
     /// Returns `true` if the security type should be filtered.
     #[must_use]
     pub fn is_filtered_sec_type(&self, sec_type: &str) -> bool {
-        self.config
-            .filter_sec_types
-            .iter()
-            .any(|filtered| filtered.eq_ignore_ascii_case(sec_type))
+        IbSecurityType::from_str(sec_type)
+            .is_ok_and(|sec_type| self.config.filter_sec_types.contains(&sec_type))
     }
 
     /// Get all cached instruments.
@@ -467,10 +610,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// This method first checks the dedicated price magnifier cache for fast lookup.
     /// If not found, it falls back to checking contract details. If still not found,
     /// it returns the default value of 1 and logs a warning if the instrument exists.
-    ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument ID to look up
     ///
     /// # Returns
     ///
@@ -512,11 +651,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// This is equivalent to Python's `get_instrument` method.
     /// Supports BAG contracts by auto-loading legs.
     ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `contract` - The IB contract to get instrument for
-    ///
     /// # Returns
     ///
     /// Returns the instrument if found, `None` otherwise.
@@ -539,9 +673,9 @@ impl InteractiveBrokersInstrumentProvider {
             contract.last_trade_date_or_contract_month.as_str()
         );
         // Check if security type is filtered
-        let sec_type_str = security_type_code(&contract.security_type);
+        let sec_type_str = contract.security_type.to_string();
         if self.is_filtered_sec_type(&sec_type_str) {
-            tracing::warn!(
+            tracing::debug!(
                 "Skipping filtered security type {} for contract",
                 sec_type_str
             );
@@ -620,23 +754,25 @@ impl InteractiveBrokersInstrumentProvider {
         spec: Option<&serde_json::Value>,
     ) -> anyhow::Result<Vec<InstrumentId>> {
         let mut loaded_ids = Vec::new();
-        let build_futures_chain = json_bool(spec, "build_futures_chain")
-            || self.config.build_futures_chain.unwrap_or(false);
-        let build_options_chain = json_bool(spec, "build_options_chain")
-            || self.config.build_options_chain.unwrap_or(false);
-        let min_expiry_days = json_u32(spec, "min_expiry_days").or(self.config.min_expiry_days);
-        let max_expiry_days = json_u32(spec, "max_expiry_days").or(self.config.max_expiry_days);
-        let options_chain_exchange = json_string(spec, "options_chain_exchange")
-            .or_else(|| json_string(spec, "optionsChainExchange"));
+        let build_futures_chain = json_opt_bool(spec, KEY_BUILD_FUTURES_CHAIN)
+            .or(self.config.build_futures_chain)
+            .unwrap_or(false);
+        let build_options_chain = json_opt_bool(spec, KEY_BUILD_OPTIONS_CHAIN)
+            .or(self.config.build_options_chain)
+            .unwrap_or(false);
+        let min_expiry_days = json_u32(spec, KEY_MIN_EXPIRY_DAYS).or(self.config.min_expiry_days);
+        let max_expiry_days = json_u32(spec, KEY_MAX_EXPIRY_DAYS).or(self.config.max_expiry_days);
+        let options_chain_exchange = json_string(spec, KEY_OPTIONS_CHAIN_EXCHANGE)
+            .or_else(|| json_string(spec, KEY_OPTIONS_CHAIN_EXCHANGE_ALT));
+
         let chain_contract = if contract.security_type == SecurityType::ContinuousFuture
             && (build_futures_chain || build_options_chain)
         {
             match client.contract_details(contract).await {
                 Ok(details_vec) => details_vec
                     .into_iter()
-                    .next()
-                    .map(|details| {
-                        tracing::info!(
+                    .next().map_or_else(|| contract.clone(), |details| {
+                        tracing::debug!(
                             "Qualified continuous future contract {}.{} as local_symbol={} trading_class={} con_id={}",
                             contract.symbol.as_str(),
                             contract.exchange.as_str(),
@@ -645,8 +781,10 @@ impl InteractiveBrokersInstrumentProvider {
                             details.contract.contract_id,
                         );
                         details.contract
-                    })
-                    .unwrap_or_else(|| contract.clone()),
+                    }),
+                Err(e) if e.is_connection_lost() => {
+                    return Err(e).context("Failed to qualify continuous future contract");
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Failed to qualify continuous future contract {:?}: {}",
@@ -659,6 +797,7 @@ impl InteractiveBrokersInstrumentProvider {
         } else {
             contract.clone()
         };
+
         let chain_trading_class = (!chain_contract.trading_class.is_empty())
             .then_some(chain_contract.trading_class.as_str());
 
@@ -675,7 +814,7 @@ impl InteractiveBrokersInstrumentProvider {
                     max_expiry_days,
                 )
                 .await?;
-            tracing::info!(
+            tracing::debug!(
                 "Loaded {} futures instruments for chain request {}.{}",
                 loaded,
                 chain_contract.symbol.as_str(),
@@ -691,22 +830,27 @@ impl InteractiveBrokersInstrumentProvider {
         if build_options_chain {
             let expiry_min = expiry_bound_from_days(min_expiry_days);
             let expiry_max = expiry_bound_from_days(max_expiry_days);
+            // Options list on the requested exchange, which can differ from the exchange the
+            // underlying resolves to (SPY requested on SMART resolves to ARCA)
+            let options_exchange = options_chain_exchange
+                .as_deref()
+                .unwrap_or_else(|| contract.exchange.as_str());
             let mut underlyings = Vec::new();
 
             if contract.security_type == SecurityType::ContinuousFuture {
-                if !build_futures_chain {
-                    self.fetch_futures_chain(
-                        client,
-                        chain_contract.symbol.as_str(),
-                        chain_contract.exchange.as_str(),
-                        chain_contract.currency.as_str(),
-                        chain_trading_class,
-                        true,
-                        min_expiry_days,
-                        max_expiry_days,
-                    )
-                    .await?;
-                }
+                // The expiry window bounds the options, not their underlying futures: a weekly
+                // ES option expiring this week belongs to a future that expires months later
+                self.fetch_futures_chain(
+                    client,
+                    chain_contract.symbol.as_str(),
+                    chain_contract.exchange.as_str(),
+                    chain_contract.currency.as_str(),
+                    chain_trading_class,
+                    true,
+                    Some(0),
+                    Some(u32::MAX),
+                )
+                .await?;
 
                 underlyings.extend(
                     self.cached_contracts_for(
@@ -732,10 +876,10 @@ impl InteractiveBrokersInstrumentProvider {
                         &underlying,
                         expiry_min.as_deref(),
                         expiry_max.as_deref(),
-                        options_chain_exchange.as_deref(),
+                        Some(options_exchange),
                     )
                     .await?;
-                tracing::info!(
+                tracing::debug!(
                     "Loaded {} option instruments for chain request {}.{}",
                     loaded,
                     underlying.symbol.as_str(),
@@ -743,15 +887,11 @@ impl InteractiveBrokersInstrumentProvider {
                 );
             }
 
-            loaded_ids.extend(
-                self.cached_contract_ids_for(
-                    contract.symbol.as_str(),
-                    options_chain_exchange
-                        .as_deref()
-                        .unwrap_or_else(|| contract.exchange.as_str()),
-                    &[SecurityType::Option, SecurityType::FuturesOption],
-                ),
-            );
+            loaded_ids.extend(self.cached_contract_ids_for(
+                contract.symbol.as_str(),
+                options_exchange,
+                &[SecurityType::Option, SecurityType::FuturesOption],
+            ));
         }
 
         if !build_futures_chain
@@ -807,10 +947,6 @@ impl InteractiveBrokersInstrumentProvider {
     ///
     /// This is equivalent to Python's `instrument_id_to_ib_contract_details` method.
     ///
-    /// # Arguments
-    ///
-    /// * `instrument_id` - The instrument ID to convert
-    ///
     /// # Returns
     ///
     /// Returns the contract details if found, `None` otherwise.
@@ -850,7 +986,12 @@ impl InteractiveBrokersInstrumentProvider {
             return Ok(contract);
         }
 
-        instrument_id_to_ib_contract(instrument_id, None)
+        let currency = self
+            .instruments
+            .get(&instrument_id)
+            .map(|instrument| instrument.quote_currency().code.to_string());
+        self.symbology
+            .contract_with_currency(instrument_id, None, currency.as_deref())
     }
 
     pub async fn resolve_contract_for_instrument_async(
@@ -875,45 +1016,9 @@ impl InteractiveBrokersInstrumentProvider {
         self.resolve_contract_for_instrument(instrument_id)
     }
 
-    /// Load a single instrument (does not return loaded IDs).
-    ///
-    /// This is equivalent to Python's `load_async` method.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_id` - The instrument ID to load
-    /// * `force_instrument_update` - If true, force re-fetch even if already cached
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if loading fails.
-    pub async fn load_async(
-        &self,
-        client: &ibapi::Client,
-        instrument_id: InstrumentId,
-        filters: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        let filters: Option<HashMap<String, String>> = filters;
-        let force_instrument_update = filters
-            .as_ref()
-            .and_then(|f| f.get("force_instrument_update"))
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
-        self.fetch_contract_details(client, instrument_id, force_instrument_update, filters)
-            .await
-    }
-
     /// Load a single instrument and return the loaded instrument ID.
     ///
     /// This is equivalent to Python's `load_with_return_async` method.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_id` - The instrument ID to load
-    /// * `force_instrument_update` - If true, force re-fetch even if already cached
     ///
     /// # Returns
     ///
@@ -932,8 +1037,7 @@ impl InteractiveBrokersInstrumentProvider {
         let force_instrument_update = filters
             .as_ref()
             .and_then(|f| f.get("force_instrument_update"))
-            .map(|v| v == "true")
-            .unwrap_or(false);
+            .is_some_and(|v| v == "true");
 
         if is_spread_instrument_id(&instrument_id) {
             self.fetch_spread_instrument(client, instrument_id, force_instrument_update, filters)
@@ -950,77 +1054,9 @@ impl InteractiveBrokersInstrumentProvider {
         }
     }
 
-    pub async fn load_contract_with_return_async(
-        &self,
-        client: &ibapi::Client,
-        contract: &Contract,
-        spec: Option<&serde_json::Value>,
-    ) -> anyhow::Result<Vec<InstrumentId>> {
-        self.load_contract_spec(client, contract, spec).await
-    }
-
-    /// Load multiple instruments (does not return loaded IDs).
-    ///
-    /// This is equivalent to Python's `load_ids_async` method.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_ids` - Vector of instrument IDs to load
-    /// * `force_instrument_update` - If true, force re-fetch even if already cached
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if loading fails.
-    pub async fn load_ids_async(
-        &self,
-        client: &ibapi::Client,
-        instrument_ids: Vec<InstrumentId>,
-        filters: Option<HashMap<String, String>>,
-    ) -> anyhow::Result<()> {
-        let filters: Option<HashMap<String, String>> = filters;
-        let force_instrument_update = filters
-            .as_ref()
-            .and_then(|f| f.get("force_instrument_update"))
-            .map(|v| v == "true")
-            .unwrap_or(false);
-
-        for instrument_id in instrument_ids {
-            let load_result = if is_spread_instrument_id(&instrument_id) {
-                self.fetch_spread_instrument(
-                    client,
-                    instrument_id,
-                    force_instrument_update,
-                    filters.clone(),
-                )
-                .await
-                .map(|_| ())
-            } else {
-                self.fetch_contract_details(
-                    client,
-                    instrument_id,
-                    force_instrument_update,
-                    filters.clone(),
-                )
-                .await
-            };
-
-            if let Err(e) = load_result {
-                tracing::warn!("Failed to load instrument {}: {}", instrument_id, e);
-            }
-        }
-        Ok(())
-    }
-
     /// Load multiple instruments and return the loaded instrument IDs.
     ///
     /// This is equivalent to Python's `load_ids_with_return_async` method.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_ids` - Vector of instrument IDs to load
-    /// * `force_instrument_update` - If true, force re-fetch even if already cached
     ///
     /// # Returns
     ///
@@ -1073,9 +1109,9 @@ impl InteractiveBrokersInstrumentProvider {
                 contract_id: details.contract.contract_id,
                 ratio: ratio.abs(),
                 action: if *ratio > 0 {
-                    "BUY".to_string()
+                    LegAction::Buy
                 } else {
-                    "SELL".to_string()
+                    LegAction::Sell
                 },
                 exchange: details.contract.exchange.to_string(),
                 open_close: ComboLegOpenClose::Same,
@@ -1086,15 +1122,15 @@ impl InteractiveBrokersInstrumentProvider {
             .collect();
 
         Ok(Contract {
-            contract_id: 0,
             symbol: first_details.contract.symbol.clone(),
             security_type: SecurityType::Spread,
             exchange: Exchange::from("SMART"),
             currency: first_details.contract.currency.clone(),
             local_symbol: instrument_id.map_or_else(String::new, |id| id.symbol.to_string()),
-            combo_legs_description: instrument_id
-                .map(|id| format!("Spread: {}", id.symbol))
-                .unwrap_or_else(|| "Spread".to_string()),
+            combo_legs_description: instrument_id.map_or_else(
+                || "Spread".to_string(),
+                |id| format!("Spread: {}", id.symbol),
+            ),
             combo_legs,
             ..Default::default()
         })
@@ -1105,12 +1141,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// This is equivalent to Python's `_fetch_spread_instrument` method.
     /// It parses the spread instrument ID to extract leg tuples, loads each leg,
     /// and then creates the spread instrument.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `spread_instrument_id` - The spread instrument ID to fetch
-    /// * `force_instrument_update` - If true, force re-fetch even if already cached
     ///
     /// # Returns
     ///
@@ -1141,7 +1171,7 @@ impl InteractiveBrokersInstrumentProvider {
             return Ok(false);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Loading spread instrument {} with {} legs",
             spread_instrument_id,
             leg_tuples.len()
@@ -1151,7 +1181,7 @@ impl InteractiveBrokersInstrumentProvider {
         let mut leg_contract_details = Vec::new();
 
         for (leg_instrument_id, ratio) in &leg_tuples {
-            tracing::info!(
+            tracing::debug!(
                 "Loading leg instrument: {} (ratio: {})",
                 leg_instrument_id,
                 ratio
@@ -1165,7 +1195,7 @@ impl InteractiveBrokersInstrumentProvider {
                 filters.clone(),
             )
             .await
-            .with_context(|| format!("Failed to load leg instrument: {}", leg_instrument_id))?;
+            .with_context(|| format!("Failed to load leg instrument: {leg_instrument_id}"))?;
 
             // Get the contract details for this leg
             let leg_details = self
@@ -1174,8 +1204,7 @@ impl InteractiveBrokersInstrumentProvider {
                 .map(|entry| entry.value().clone())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Leg instrument {} not found in contract details after loading",
-                        leg_instrument_id
+                        "Leg instrument {leg_instrument_id} not found in contract details after loading"
                     )
                 })?;
 
@@ -1210,7 +1239,7 @@ impl InteractiveBrokersInstrumentProvider {
                 .insert(spread_instrument_id, first_details.price_magnifier);
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully loaded spread instrument {}",
             spread_instrument_id
         );
@@ -1222,13 +1251,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// This is equivalent to Python's `load_all_async` method.
     /// Python version loads from config's `_load_ids_on_start` and `_load_contracts_on_start`.
     /// Rust version accepts these as parameters for flexibility.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_ids` - Optional vector of instrument IDs to load
-    /// * `contracts` - Optional vector of IB contracts to load
-    /// * `force_instrument_update` - If true, force re-fetch even if already cached
     ///
     /// # Errors
     ///
@@ -1244,14 +1266,14 @@ impl InteractiveBrokersInstrumentProvider {
 
         // Load from instrument IDs
         let ids_to_load =
-            instrument_ids.unwrap_or_else(|| self.config.load_ids.iter().cloned().collect());
+            instrument_ids.unwrap_or_else(|| self.config.load_ids.iter().copied().collect());
 
         if !ids_to_load.is_empty() {
             let mut filters = std::collections::HashMap::new();
-
             if force_instrument_update {
                 filters.insert("force_instrument_update".to_string(), "true".to_string());
             }
+
             let filters = if filters.is_empty() {
                 None
             } else {
@@ -1282,29 +1304,20 @@ impl InteractiveBrokersInstrumentProvider {
                 }
             }
         } else {
-            for contract_json in &self.config.load_contracts {
-                match crate::common::contracts::parse_contract_from_json(contract_json)
-                    .context("Failed to parse contract from config JSON")
+            for configured in &self.config.load_contracts {
+                let spec = configured.chain_spec_json();
+
+                match self
+                    .load_contract_spec(client, &configured.contract, spec.as_ref())
+                    .await
                 {
-                    Ok(contract) => match self
-                        .load_contract_spec(client, &contract, Some(contract_json))
-                        .await
-                    {
-                        Ok(mut instrument_ids) => {
-                            loaded_ids.append(&mut instrument_ids);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Error loading instrument from contract {:?}: {}",
-                                contract,
-                                e
-                            );
-                        }
-                    },
+                    Ok(mut instrument_ids) => {
+                        loaded_ids.append(&mut instrument_ids);
+                    }
                     Err(e) => {
                         tracing::warn!(
-                            "Error parsing load contract spec {:?}: {}",
-                            contract_json,
+                            "Error loading instrument from contract {:?}: {}",
+                            configured.contract,
                             e
                         );
                     }
@@ -1315,7 +1328,7 @@ impl InteractiveBrokersInstrumentProvider {
         if loaded_ids.is_empty() {
             tracing::debug!("load_all_async called but no instruments were loaded");
         } else {
-            tracing::info!("load_all_async loaded {} instruments", loaded_ids.len());
+            tracing::debug!("load_all_async loaded {} instruments", loaded_ids.len());
         }
 
         Ok(loaded_ids)
@@ -1330,14 +1343,9 @@ fn normalize_price_magnifier(price_magnifier: i32) -> i32 {
     }
 }
 
-fn security_type_code(security_type: &SecurityType) -> String {
-    security_type.to_string()
-}
-
-fn json_bool(spec: Option<&serde_json::Value>, key: &str) -> bool {
+fn json_opt_bool(spec: Option<&serde_json::Value>, key: &str) -> Option<bool> {
     spec.and_then(|value| value.get(key))
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 fn json_u32(spec: Option<&serde_json::Value>, key: &str) -> Option<u32> {
@@ -1402,19 +1410,18 @@ fn parse_i32_json(value: &serde_json::Value) -> Option<i32> {
 
 fn expiry_bound_from_days(days: Option<u32>) -> Option<String> {
     days.map(|days| {
-        (Utc::now().date_naive() + Duration::days(i64::from(days)))
-            .format("%Y%m%d")
+        Offset::UTC
+            .to_datetime(Timestamp::now())
+            .date()
+            .checked_add(Span::new().days(i64::from(days)))
+            .expect("expiry bound date in range")
+            .strftime("%Y%m%d")
             .to_string()
     })
 }
 
 impl InteractiveBrokersInstrumentProvider {
     /// Fetch and cache contract details for an instrument ID using the provided IB client.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_id` - The instrument ID to fetch
     ///
     /// # Errors
     ///
@@ -1426,18 +1433,18 @@ impl InteractiveBrokersInstrumentProvider {
         force_instrument_update: bool,
         filters: Option<HashMap<String, String>>,
     ) -> anyhow::Result<()> {
-        if !force_instrument_update {
-            if self.instruments.contains_key(&instrument_id)
-                && (self.contract_details.contains_key(&instrument_id)
-                    || self.contracts.contains_key(&instrument_id))
-            {
-                tracing::debug!(
-                    "Instrument {} already cached, skipping fetch",
-                    instrument_id
-                );
-                return Ok(());
-            }
+        if !force_instrument_update
+            && self.instruments.contains_key(&instrument_id)
+            && (self.contract_details.contains_key(&instrument_id)
+                || self.contracts.contains_key(&instrument_id))
+        {
+            tracing::debug!(
+                "Instrument {} already cached, skipping fetch",
+                instrument_id
+            );
+            return Ok(());
         }
+
         // Convert instrument ID to IB contract
         let exchange = filters
             .as_ref()
@@ -1454,8 +1461,10 @@ impl InteractiveBrokersInstrumentProvider {
         let mut last_error = None;
 
         for candidate_exchange in exchanges_to_try {
-            let contract = instrument_id_to_ib_contract(instrument_id, Some(candidate_exchange.as_str()))
-                .with_context(|| format!("Failed to convert instrument_id {} to IB contract. Check that the instrument ID format is correct and the venue/symbol are valid.", instrument_id))?;
+            let contract = self
+                .symbology
+                .contract(instrument_id, Some(candidate_exchange.as_str()))
+                .with_context(|| format!("Failed to convert instrument_id {instrument_id} to IB contract. Check that the instrument ID format is correct and the venue/symbol are valid."))?;
 
             match client.contract_details(&contract).await {
                 Ok(result) if !result.is_empty() => {
@@ -1464,25 +1473,25 @@ impl InteractiveBrokersInstrumentProvider {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    last_error = Some((candidate_exchange.clone(), e.to_string()));
+                    last_error = Some((candidate_exchange.clone(), e));
                 }
             }
         }
 
         if details_vec.is_empty() {
-            if let Some((candidate_exchange, error)) = last_error {
-                tracing::warn!(
-                    "Failed to fetch contract details for {} on {}: {}",
-                    instrument_id,
-                    candidate_exchange,
-                    error
-                );
+            if let Some((candidate_exchange, e)) = last_error {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to fetch contract details for {instrument_id} on {candidate_exchange}"
+                    )
+                });
             } else {
                 tracing::warn!(
                     "No contract details returned for {} - instrument may not exist in IB or contract specification is incomplete",
                     instrument_id
                 );
             }
+
             return Ok(());
         }
 
@@ -1495,12 +1504,13 @@ impl InteractiveBrokersInstrumentProvider {
         if loaded_ids.is_empty() {
             tracing::warn!("No contract details were processed for {}", instrument_id);
         } else {
-            tracing::info!(
+            tracing::debug!(
                 "Successfully loaded {} instrument(s) for {}",
                 loaded_ids.len(),
                 instrument_id
             );
         }
+
         Ok(())
     }
 
@@ -1520,7 +1530,7 @@ impl InteractiveBrokersInstrumentProvider {
                     tracing::warn!(
                         "Failed to process IB contract details con_id={} sec_type={}: {}",
                         details.contract.contract_id,
-                        security_type_code(&details.contract.security_type),
+                        details.contract.security_type,
                         e
                     );
                 }
@@ -1536,9 +1546,9 @@ impl InteractiveBrokersInstrumentProvider {
         venue: Option<Venue>,
         force_instrument_update: bool,
     ) -> anyhow::Result<Option<InstrumentId>> {
-        let sec_type = security_type_code(&details.contract.security_type);
+        let sec_type = details.contract.security_type.to_string();
         if self.is_filtered_sec_type(&sec_type) {
-            tracing::warn!(
+            tracing::debug!(
                 "Skipping filtered security type {} for contract {:?}",
                 sec_type,
                 details.contract
@@ -1551,6 +1561,7 @@ impl InteractiveBrokersInstrumentProvider {
         let instrument_id = self
             .instrument_id_from_contract(&details.contract, resolved_venue)
             .context("Failed to convert IB contract to instrument ID")?;
+
         let instrument = match parse_ib_contract_to_instrument(details, instrument_id) {
             Ok(instrument) => instrument,
             Err(e) => {
@@ -1579,17 +1590,12 @@ impl InteractiveBrokersInstrumentProvider {
         Ok(Some(instrument_id))
     }
 
-    fn instrument_id_from_contract(
+    pub(crate) fn instrument_id_from_contract(
         &self,
         contract: &Contract,
         venue: Venue,
     ) -> anyhow::Result<InstrumentId> {
-        match self.config.symbology_method {
-            SymbologyMethod::Simplified => {
-                ib_contract_to_instrument_id_simplified(contract, Some(venue))
-            }
-            SymbologyMethod::Raw => ib_contract_to_instrument_id_raw(contract, Some(venue)),
-        }
+        self.symbology.instrument_id(contract, Some(venue))
     }
 
     fn cache_instrument(
@@ -1603,7 +1609,6 @@ impl InteractiveBrokersInstrumentProvider {
     ) -> bool {
         let should_update =
             force_instrument_update || !self.instruments.contains_key(&instrument_id);
-
         if should_update {
             self.instruments.insert(instrument_id, instrument);
         }
@@ -1618,6 +1623,7 @@ impl InteractiveBrokersInstrumentProvider {
                 self.contract_id_to_instrument_id
                     .insert(contract_id, instrument_id);
             }
+
             self.price_magnifiers.insert(
                 instrument_id,
                 normalize_price_magnifier(details.price_magnifier),
@@ -1627,6 +1633,7 @@ impl InteractiveBrokersInstrumentProvider {
                 self.contract_id_to_instrument_id
                     .insert(contract.contract_id, instrument_id);
             }
+
             self.contracts.insert(instrument_id, contract);
         }
 
@@ -1655,6 +1662,7 @@ impl InteractiveBrokersInstrumentProvider {
                             "Invalid filter_callable path {filter_callable:?}; expected module.callable"
                         )
                     })?;
+
                 let callable = PyModule::import(py, module_name)
                     .map_err(|e| anyhow::anyhow!("Failed to import {module_name}: {e}"))?
                     .getattr(callable_name)
@@ -1680,12 +1688,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// Batch load multiple instrument IDs.
     ///
     /// This method fetches and caches contract details for multiple instrument IDs in parallel.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `instrument_ids` - Vector of instrument IDs to load
-    /// * `filters` - Optional filters to apply (not yet implemented, reserved for future use)
     ///
     /// # Returns
     ///
@@ -1731,14 +1733,14 @@ impl InteractiveBrokersInstrumentProvider {
 
                         // Check security type (try to infer from instrument)
                         if let Some(contract_details) = self.contract_details.get(instrument_id) {
-                            let sec_type_str =
-                                security_type_code(&contract_details.contract.security_type);
+                            let sec_type_str = contract_details.contract.security_type.to_string();
 
                             if sec_type_str.to_uppercase().contains(&filter.to_uppercase()) {
                                 return true;
                             }
                         }
                     }
+
                     false
                 })
                 .collect()
@@ -1760,7 +1762,7 @@ impl InteractiveBrokersInstrumentProvider {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Batch loaded {} instruments ({} after filtering)",
             loaded_ids.len(),
             filtered_count
@@ -1783,13 +1785,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// It uses `contract_details` to fetch options with precise expiry filtering,
     /// which is more flexible than the basic `option_chain` API.
     ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `underlying` - The underlying contract
-    /// * `expiry_min` - Minimum expiry date string (YYYYMMDD format, can be None for no min)
-    /// * `expiry_max` - Maximum expiry date string (YYYYMMDD format, can be None for no max)
-    ///
     /// # Returns
     ///
     /// Returns the number of option instruments loaded.
@@ -1806,7 +1801,7 @@ impl InteractiveBrokersInstrumentProvider {
         option_chain_exchange: Option<&str>,
     ) -> anyhow::Result<usize> {
         let exchange = option_chain_exchange.unwrap_or_else(|| underlying.exchange.as_str());
-        tracing::info!(
+        tracing::debug!(
             "Building option chain for {}.{} (sec_type={:?}, contract_id={}, expiry_min={:?}, expiry_max={:?}, config_min_days={:?}, config_max_days={:?})",
             underlying.symbol.as_str(),
             exchange,
@@ -1820,13 +1815,20 @@ impl InteractiveBrokersInstrumentProvider {
 
         // First, get option chain metadata to determine expirations
         let symbol = underlying.symbol.as_str();
-        let mut option_chain_stream = client
-            .option_chain(
-                symbol,
-                exchange,
-                underlying.security_type.clone(),
-                underlying.contract_id,
-            )
+        let mut option_chain_request = client.option_chain(
+            symbol,
+            underlying.security_type.clone(),
+            underlying.contract_id,
+        );
+
+        // IB names the exchange only for futures options; for any other underlying it returns
+        // one chain per listing exchange, and naming an exchange returns none
+        if underlying.security_type == SecurityType::Future {
+            option_chain_request = option_chain_request.exchange(exchange);
+        }
+
+        let mut option_chain_stream = option_chain_request
+            .subscribe()
             .await
             .context("Failed to request option chain from IB")?;
 
@@ -1839,59 +1841,72 @@ impl InteractiveBrokersInstrumentProvider {
         let mut all_expirations = Vec::new();
 
         while let Some(result) = option_chain_stream.next().await {
-            if let Ok(chain) = result {
-                tracing::debug!(
-                    "Received option chain metadata exchange={} trading_class={} expirations={} strikes={}",
-                    chain.exchange,
-                    chain.trading_class,
-                    chain.expirations.len(),
-                    chain.strikes.len(),
-                );
+            match result {
+                Ok(SubscriptionItem::Data(chain)) => {
+                    tracing::debug!(
+                        "Received option chain metadata exchange={} trading_class={} expirations={} strikes={}",
+                        chain.exchange,
+                        chain.trading_class,
+                        chain.expirations.len(),
+                        chain.strikes.len(),
+                    );
 
-                for expiration in &chain.expirations {
-                    // Filter by expiry date string if specified
-                    let date_filter_pass = match (expiry_min, expiry_max) {
-                        (Some(min), Some(max)) => {
-                            expiration.as_str() >= min && expiration.as_str() <= max
-                        }
-                        (Some(min), None) => expiration.as_str() >= min,
-                        (None, Some(max)) => expiration.as_str() <= max,
-                        (None, None) => true,
-                    };
-
-                    // Filter by expiry days from config if specified
-                    let days_filter_pass = {
-                        let expiry_ns = crate::providers::parse::expiry_timestring_to_unix_nanos(
-                            expiration.as_str(),
-                            None,
-                        )
-                        .unwrap_or(now);
-                        let days_until_expiry = (expiry_ns.as_u64().saturating_sub(now.as_u64()))
-                            / (24 * 60 * 60 * 1_000_000_000);
-
-                        let min_days_ok = self
-                            .config
-                            .min_expiry_days
-                            .is_none_or(|min| days_until_expiry >= min as u64);
-                        let max_days_ok = self
-                            .config
-                            .max_expiry_days
-                            .is_none_or(|max| days_until_expiry <= max as u64);
-
-                        min_days_ok && max_days_ok
-                    };
-
-                    if date_filter_pass && days_filter_pass && !all_expirations.contains(expiration)
-                    {
-                        all_expirations.push(expiration.clone());
+                    if chain.exchange != exchange {
+                        continue;
                     }
+
+                    for expiration in &chain.expirations {
+                        // Filter by expiry date string if specified
+                        let date_filter_pass = match (expiry_min, expiry_max) {
+                            (Some(min), Some(max)) => {
+                                expiration.as_str() >= min && expiration.as_str() <= max
+                            }
+                            (Some(min), None) => expiration.as_str() >= min,
+                            (None, Some(max)) => expiration.as_str() <= max,
+                            (None, None) => true,
+                        };
+
+                        // Filter by expiry days from config if specified
+                        let days_filter_pass = {
+                            let expiry_ns =
+                                expiry_timestring_to_unix_nanos(expiration.as_str(), None)
+                                    .unwrap_or(now);
+                            let days_until_expiry =
+                                (expiry_ns.as_u64().saturating_sub(now.as_u64()))
+                                    / (24 * 60 * 60 * 1_000_000_000);
+
+                            let min_days_ok = self
+                                .config
+                                .min_expiry_days
+                                .is_none_or(|min| days_until_expiry >= min as u64);
+                            let max_days_ok = self
+                                .config
+                                .max_expiry_days
+                                .is_none_or(|max| days_until_expiry <= max as u64);
+
+                            min_days_ok && max_days_ok
+                        };
+
+                        if date_filter_pass
+                            && days_filter_pass
+                            && !all_expirations.contains(expiration)
+                        {
+                            all_expirations.push(expiration.clone());
+                        }
+                    }
+                }
+                Ok(SubscriptionItem::Notice(notice)) => {
+                    tracing::debug!("Received option chain notice: {notice:?}");
+                }
+                Err(e) => {
+                    tracing::warn!("Error receiving option chain metadata: {e}");
                 }
             }
         }
 
         all_expirations.sort_unstable();
 
-        tracing::info!(
+        tracing::debug!(
             "Filtered {} option expirations for {}.{}",
             all_expirations.len(),
             underlying.symbol.as_str(),
@@ -1900,7 +1915,7 @@ impl InteractiveBrokersInstrumentProvider {
 
         // Now fetch contract details for each expiry using contract_details
         for expiration in all_expirations {
-            tracing::info!(
+            tracing::debug!(
                 "Requesting option contract details for {}.{} expiry {}",
                 underlying.symbol.as_str(),
                 exchange,
@@ -1917,7 +1932,7 @@ impl InteractiveBrokersInstrumentProvider {
                 },
                 last_trade_date_or_contract_month: expiration.clone(),
                 strike: f64::MAX,
-                right: String::new(),
+                right: None,
                 multiplier: String::new(),
                 exchange: Exchange::from(exchange),
                 currency: underlying.currency.clone(),
@@ -1925,7 +1940,7 @@ impl InteractiveBrokersInstrumentProvider {
                 primary_exchange: Exchange::from(""),
                 trading_class: String::new(),
                 include_expired: false,
-                security_id_type: String::new(),
+                security_id_type: None,
                 security_id: String::new(),
                 combo_legs_description: String::new(),
                 combo_legs: Vec::new(),
@@ -1937,7 +1952,7 @@ impl InteractiveBrokersInstrumentProvider {
 
             match client.contract_details(&option_contract).await {
                 Ok(details_vec) => {
-                    tracing::info!(
+                    tracing::debug!(
                         "Received {} raw option contract details for {}.{} expiry {}",
                         details_vec.len(),
                         underlying.symbol.as_str(),
@@ -1978,7 +1993,7 @@ impl InteractiveBrokersInstrumentProvider {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully loaded {} option instruments from chain for {}.{}",
             total_loaded,
             underlying.symbol.as_str(),
@@ -2001,13 +2016,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// This method fetches all futures contracts for a given underlying symbol
     /// and populates the cache with all individual futures instruments.
     ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `symbol` - The underlying symbol
-    /// * `exchange` - The exchange (use "" for all exchanges)
-    /// * `currency` - The currency (use USD as default)
-    ///
     /// # Returns
     ///
     /// Returns the number of futures instruments loaded.
@@ -2015,6 +2023,7 @@ impl InteractiveBrokersInstrumentProvider {
     /// # Errors
     ///
     /// Returns an error if fetching fails.
+    #[allow(clippy::too_many_arguments)] // Public query options map directly to IB filters.
     pub async fn fetch_futures_chain(
         &self,
         client: &ibapi::Client,
@@ -2026,7 +2035,7 @@ impl InteractiveBrokersInstrumentProvider {
         min_expiry_days: Option<u32>,
         max_expiry_days: Option<u32>,
     ) -> anyhow::Result<usize> {
-        tracing::info!(
+        tracing::debug!(
             "Building futures chain for {}.{} (currency={}, trading_class={:?}, include_expired={}, min_days={:?}, max_days={:?}, config_min_days={:?}, config_max_days={:?})",
             symbol,
             exchange,
@@ -2041,12 +2050,12 @@ impl InteractiveBrokersInstrumentProvider {
 
         // Build futures contract for lookup
         let futures_contract = Contract {
-            contract_id: 0, // 0 for lookup by specification
+            contract_id: 0,
             symbol: Symbol::from(symbol.to_string()),
             security_type: SecurityType::Future,
             last_trade_date_or_contract_month: String::new(),
             strike: f64::MAX,
-            right: String::new(),
+            right: None,
             multiplier: String::new(),
             exchange: Exchange::from(exchange.to_string()),
             currency: ibapi::contracts::Currency::from(currency.to_string()),
@@ -2054,7 +2063,7 @@ impl InteractiveBrokersInstrumentProvider {
             primary_exchange: Exchange::from(""),
             trading_class: trading_class.unwrap_or_default().to_string(),
             include_expired,
-            security_id_type: String::new(),
+            security_id_type: None,
             security_id: String::new(),
             combo_legs_description: String::new(),
             combo_legs: Vec::new(),
@@ -2070,7 +2079,7 @@ impl InteractiveBrokersInstrumentProvider {
             .await
             .context("Failed to fetch futures chain from IB")?;
 
-        tracing::info!(
+        tracing::debug!(
             "Received {} raw futures contract details for {}.{}",
             details_vec.len(),
             symbol,
@@ -2089,7 +2098,7 @@ impl InteractiveBrokersInstrumentProvider {
             }
 
             // Check if security type is filtered
-            let sec_type_str = security_type_code(&details.contract.security_type);
+            let sec_type_str = details.contract.security_type.to_string();
             if self.is_filtered_sec_type(&sec_type_str) {
                 continue;
             }
@@ -2099,7 +2108,7 @@ impl InteractiveBrokersInstrumentProvider {
                 .contract
                 .last_trade_date_or_contract_month
                 .is_empty()
-                && let Ok(expiry_ns) = crate::providers::parse::expiry_timestring_to_unix_nanos(
+                && let Ok(expiry_ns) = expiry_timestring_to_unix_nanos(
                     &details.contract.last_trade_date_or_contract_month,
                     Some(&details),
                 )
@@ -2130,7 +2139,7 @@ impl InteractiveBrokersInstrumentProvider {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully loaded {} futures instruments from chain",
             total_loaded
         );
@@ -2151,11 +2160,6 @@ impl InteractiveBrokersInstrumentProvider {
     /// This method fetches contract details for a spread contract by requesting
     /// contract details with a BAG contract. The BAG contract should have its
     /// combo_legs populated with the individual leg contract IDs.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The IB API client
-    /// * `bag_contract` - The BAG contract with populated combo_legs
     ///
     /// # Returns
     ///
@@ -2182,7 +2186,7 @@ impl InteractiveBrokersInstrumentProvider {
             );
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Loading BAG contract with {} legs",
             bag_contract.combo_legs.len()
         );
@@ -2199,7 +2203,7 @@ impl InteractiveBrokersInstrumentProvider {
                 security_type: SecurityType::Option, // Default to Option, will be determined from contract details
                 last_trade_date_or_contract_month: String::new(),
                 strike: 0.0,
-                right: String::new(),
+                right: None,
                 multiplier: String::new(),
                 exchange: Exchange::from(combo_leg.exchange.as_str()),
                 currency: bag_contract.currency.clone(), // Use currency from BAG
@@ -2207,7 +2211,7 @@ impl InteractiveBrokersInstrumentProvider {
                 primary_exchange: Exchange::default(),
                 trading_class: String::new(),
                 include_expired: false,
-                security_id_type: String::new(),
+                security_id_type: None,
                 security_id: String::new(),
                 combo_legs_description: String::new(),
                 combo_legs: Vec::new(),
@@ -2247,21 +2251,10 @@ impl InteractiveBrokersInstrumentProvider {
                 } else {
                     // Load the leg instrument
                     let leg_venue = self.determine_venue(&leg_details.contract, Some(leg_details));
-                    let leg_instrument_id = match self.config.symbology_method {
-                        crate::config::SymbologyMethod::Simplified => {
-                            crate::common::parse::ib_contract_to_instrument_id_simplified(
-                                &leg_details.contract,
-                                Some(leg_venue),
-                            )
-                        }
-                        crate::config::SymbologyMethod::Raw => {
-                            crate::common::parse::ib_contract_to_instrument_id_raw(
-                                &leg_details.contract,
-                                Some(leg_venue),
-                            )
-                        }
-                    }
-                    .context("Failed to convert leg contract to instrument ID")?;
+                    let leg_instrument_id = self
+                        .symbology
+                        .instrument_id(&leg_details.contract, Some(leg_venue))
+                        .context("Failed to convert leg contract to instrument ID")?;
 
                     // Parse and cache the leg instrument
                     let leg_instrument =
@@ -2282,7 +2275,7 @@ impl InteractiveBrokersInstrumentProvider {
                 };
 
             // Determine ratio (positive for BUY, negative for SELL)
-            let ratio = IbAction::from_str(&combo_leg.action)
+            let ratio = IbAction::from_str(combo_leg.action.as_str())
                 .context("Invalid combo leg action")?
                 .signed_multiplier()
                 * combo_leg.ratio;
@@ -2294,8 +2287,7 @@ impl InteractiveBrokersInstrumentProvider {
                 .map(|entry| entry.value().clone())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Contract details not found for leg {} after loading",
-                        leg_instrument_id
+                        "Contract details not found for leg {leg_instrument_id} after loading"
                     )
                 })?;
 
@@ -2325,6 +2317,7 @@ impl InteractiveBrokersInstrumentProvider {
                 self.contract_id_to_instrument_id
                     .insert(bag_contract.contract_id, spread_instrument_id);
             }
+
             return Ok(0);
         }
 
@@ -2338,7 +2331,7 @@ impl InteractiveBrokersInstrumentProvider {
 
         // Check if spread is already cached after ensuring the BAG contract ID is mapped.
         if self.instruments.contains_key(&spread_instrument_id) {
-            tracing::info!("Spread instrument {} already cached", spread_instrument_id);
+            tracing::debug!("Spread instrument {} already cached", spread_instrument_id);
             self.contract_details
                 .insert(spread_instrument_id, bag_details.clone());
             self.contracts
@@ -2373,7 +2366,7 @@ impl InteractiveBrokersInstrumentProvider {
         self.price_magnifiers
             .insert(spread_instrument_id, bag_details.price_magnifier);
 
-        tracing::info!(
+        tracing::debug!(
             "Successfully loaded spread instrument {} with {} legs",
             spread_instrument_id,
             leg_tuples.len()
@@ -2391,16 +2384,12 @@ impl InteractiveBrokersInstrumentProvider {
 
     /// Save the current instrument cache to disk.
     ///
-    /// # Arguments
-    ///
-    /// * `cache_path` - Path to the cache file
-    ///
     /// # Errors
     ///
     /// Returns an error if serialization or file I/O fails.
     pub async fn save_cache(&self, cache_path: &str) -> anyhow::Result<()> {
         let cache = InstrumentCache {
-            cache_timestamp: Utc::now(),
+            cache_timestamp: Timestamp::now(),
             contract_id_to_instrument_id: self
                 .contract_id_to_instrument_id
                 .iter()
@@ -2441,7 +2430,7 @@ impl InteractiveBrokersInstrumentProvider {
         // Write cache to file
         let json = serde_json::to_string_pretty(&cache)?;
         fs::write(cache_path, json)?;
-        tracing::info!(
+        tracing::debug!(
             "Saved instrument cache to {} ({} instruments)",
             cache_path,
             cache.instruments.len()
@@ -2450,10 +2439,6 @@ impl InteractiveBrokersInstrumentProvider {
     }
 
     /// Load instrument cache from disk if valid.
-    ///
-    /// # Arguments
-    ///
-    /// * `cache_path` - Path to the cache file
     ///
     /// # Returns
     ///
@@ -2475,12 +2460,12 @@ impl InteractiveBrokersInstrumentProvider {
 
         // Check cache validity
         if let Some(validity_days) = self.config.cache_validity_days {
-            let cache_age = Utc::now() - cache.cache_timestamp;
-            let max_age = chrono::Duration::days(validity_days as i64);
+            let cache_age = cache.cache_timestamp.duration_until(Timestamp::now());
+            let max_age = jiff::SignedDuration::from_hours(24 * (validity_days as i64));
             if cache_age > max_age {
-                tracing::info!(
+                tracing::debug!(
                     "Cache is expired (age: {} days, max: {} days). Ignoring cache",
-                    cache_age.num_days(),
+                    cache_age.as_secs() / (24 * 60 * 60),
                     validity_days
                 );
                 return Ok(false);
@@ -2505,8 +2490,10 @@ impl InteractiveBrokersInstrumentProvider {
                                 self.contract_id_to_instrument_id
                                     .insert(contract.contract_id, instrument_id);
                             }
+
                             self.contracts.insert(instrument_id, contract);
                         }
+
                         loaded_count += 1;
                     }
                     Err(e) => {
@@ -2530,6 +2517,7 @@ impl InteractiveBrokersInstrumentProvider {
                     self.contract_id_to_instrument_id
                         .insert(contract.contract_id, instrument_id);
                 }
+
                 self.contracts.insert(instrument_id, contract.clone());
             }
         }
@@ -2540,6 +2528,7 @@ impl InteractiveBrokersInstrumentProvider {
                     self.contract_id_to_instrument_id
                         .insert(details.contract.contract_id, instrument_id);
                 }
+
                 self.contracts
                     .insert(instrument_id, details.contract.clone());
                 self.contract_details.insert(instrument_id, details.clone());
@@ -2561,7 +2550,7 @@ impl InteractiveBrokersInstrumentProvider {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "Loaded instrument cache from {} ({} instruments, created at {})",
             cache_path,
             loaded_count,
@@ -2573,7 +2562,10 @@ impl InteractiveBrokersInstrumentProvider {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     use nautilus_core::{Params, UnixNanos};
     use nautilus_model::{
@@ -2586,6 +2578,70 @@ mod tests {
 
     use super::*;
     use crate::common::contract_to_json_value;
+
+    struct TestStartupLoader {
+        id_calls: AtomicUsize,
+        contract_calls: AtomicUsize,
+        fail_next_id: AtomicBool,
+        resolve_ids: AtomicBool,
+        resolve_contracts: AtomicBool,
+        yield_on_load: bool,
+    }
+
+    impl TestStartupLoader {
+        fn new(resolve_ids: bool, resolve_contracts: bool) -> Self {
+            Self {
+                id_calls: AtomicUsize::new(0),
+                contract_calls: AtomicUsize::new(0),
+                fail_next_id: AtomicBool::new(false),
+                resolve_ids: AtomicBool::new(resolve_ids),
+                resolve_contracts: AtomicBool::new(resolve_contracts),
+                yield_on_load: false,
+            }
+        }
+    }
+
+    impl StartupInstrumentLoader for TestStartupLoader {
+        async fn load_instrument_id(
+            &self,
+            instrument_id: InstrumentId,
+        ) -> anyhow::Result<Option<InstrumentId>> {
+            self.id_calls.fetch_add(1, Ordering::SeqCst);
+
+            if self.yield_on_load {
+                tokio::task::yield_now().await;
+            }
+
+            if self.fail_next_id.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("Socket disconnected");
+            }
+
+            Ok(self
+                .resolve_ids
+                .load(Ordering::SeqCst)
+                .then_some(instrument_id))
+        }
+
+        async fn load_contract(
+            &self,
+            _configured: &ConfiguredContract,
+        ) -> anyhow::Result<Vec<InstrumentId>> {
+            self.contract_calls.fetch_add(1, Ordering::SeqCst);
+
+            if self.yield_on_load {
+                tokio::task::yield_now().await;
+            }
+
+            Ok(if self.resolve_contracts.load(Ordering::SeqCst) {
+                vec![InstrumentId::new(
+                    Symbol::from("MSFT"),
+                    Venue::from("NASDAQ"),
+                )]
+            } else {
+                Vec::new()
+            })
+        }
+    }
 
     fn create_test_provider_with_cache() -> (InteractiveBrokersInstrumentProvider, TempDir) {
         let temp_dir = TempDir::new().unwrap();
@@ -2605,40 +2661,123 @@ mod tests {
         (provider, temp_dir)
     }
 
+    fn opra_option_contract_details(mut contract: Contract) -> ibapi::contracts::ContractDetails {
+        contract.contract_id = 12_345;
+        contract.symbol = ibapi::contracts::Symbol::from("AAPL");
+        contract.security_type = SecurityType::Option;
+        contract.exchange = Exchange::from("SMART");
+        contract.currency = ibapi::contracts::Currency::from("USD");
+        contract.local_symbol = "AAPL  270115P00155000".to_string();
+        contract.last_trade_date_or_contract_month = "20270115".to_string();
+        contract.strike = 155.0;
+        contract.right = Some(ibapi::contracts::OptionRight::Put);
+        contract.multiplier = "100".to_string();
+
+        ibapi::contracts::ContractDetails {
+            contract,
+            min_tick: 0.01,
+            under_symbol: "AAPL".to_string(),
+            under_security_type: "STK".to_string(),
+            valid_exchanges: vec!["SMART".to_string(), "CBOE".to_string()],
+            ..Default::default()
+        }
+    }
+
     fn create_test_instrument(instrument_id: InstrumentId) -> InstrumentAny {
         create_test_instrument_with_info(instrument_id, None)
+    }
+
+    #[rstest]
+    fn test_qualified_opra_details_preserve_canonical_instrument_identity() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let requested_id = InstrumentId::from("AAPL  270115P00155000.OPRA");
+        let request = provider
+            .resolve_contract_for_instrument(requested_id)
+            .unwrap();
+
+        assert_eq!(request.security_type, SecurityType::Option);
+        assert_eq!(request.exchange.as_str(), "SMART");
+        assert!(request.symbol.as_str().is_empty());
+        assert_eq!(request.currency.as_str(), "USD");
+        assert_eq!(request.local_symbol, "AAPL  270115P00155000");
+        assert!(request.last_trade_date_or_contract_month.is_empty());
+        assert!(request.right.is_none());
+        assert_eq!(request.strike, 0.0);
+
+        let details = opra_option_contract_details(request);
+        let loaded_id = provider
+            .process_contract_detail(&details, Some(requested_id.venue), false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(loaded_id, requested_id);
+        assert_eq!(provider.count(), 1);
+        assert_eq!(
+            provider.get_instrument_id_by_contract_id(12_345),
+            Some(requested_id)
+        );
+        assert_eq!(
+            provider
+                .resolve_instrument_id_for_contract(&details.contract)
+                .unwrap(),
+            requested_id
+        );
+
+        let cached = provider.find(&requested_id).unwrap();
+
+        let InstrumentAny::OptionContract(option) = cached else {
+            panic!("expected option contract");
+        };
+
+        assert_eq!(option.id, requested_id);
+        assert_eq!(option.id.venue.as_str(), "OPRA");
+        assert!(
+            provider
+                .find(&InstrumentId::from("AAPL  270115P00155000.SMART"))
+                .is_none()
+        );
+
+        let cached_contract = provider
+            .instrument_id_to_ib_contract(&requested_id)
+            .unwrap();
+        assert_eq!(cached_contract.contract_id, 12_345);
+        assert_eq!(cached_contract.security_type, SecurityType::Option);
+        assert_eq!(cached_contract.exchange.as_str(), "SMART");
+
+        let resolved_contract = provider
+            .resolve_contract_for_instrument(requested_id)
+            .unwrap();
+        assert_eq!(resolved_contract, cached_contract);
+
+        let cached_details = provider
+            .instrument_id_to_ib_contract_details(&requested_id)
+            .unwrap();
+        assert_eq!(cached_details.contract.contract_id, 12_345);
+        assert_eq!(
+            cached_details.valid_exchanges,
+            vec!["SMART".to_string(), "CBOE".to_string()]
+        );
     }
 
     fn create_test_instrument_with_info(
         instrument_id: InstrumentId,
         info: Option<Params>,
     ) -> InstrumentAny {
-        CurrencyPair::new(
-            instrument_id,
-            Symbol::from("EUR/USD"),
-            Currency::from("EUR"),
-            Currency::from("USD"),
-            4,
-            0,
-            Price::from("0.0001"),
-            Quantity::from(1),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            info,
-            UnixNanos::default(),
-            UnixNanos::default(),
-        )
-        .into()
+        CurrencyPair::builder()
+            .instrument_id(instrument_id)
+            .raw_symbol(Symbol::from("EUR/USD"))
+            .base_currency(Currency::from("EUR"))
+            .quote_currency(Currency::from("USD"))
+            .price_precision(4)
+            .size_precision(0)
+            .price_increment(Price::from("0.0001"))
+            .size_increment(Quantity::from(1))
+            .maybe_info(info)
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap()
+            .into()
     }
 
     fn create_contract_info(contract: &Contract, price_magnifier: Option<i32>) -> Params {
@@ -2650,7 +2789,126 @@ mod tests {
                 serde_json::Value::from(price_magnifier),
             );
         }
+
         info
+    }
+
+    #[tokio::test]
+    async fn test_initialize_loads_all_configured_inputs_once() {
+        let instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"));
+
+        let contract_spec = Contract {
+            security_type: SecurityType::Stock,
+            symbol: ibapi::contracts::Symbol::from("MSFT"),
+            exchange: Exchange::from("NASDAQ"),
+            ..Default::default()
+        };
+
+        let config = InteractiveBrokersInstrumentProviderConfig {
+            load_ids: [instrument_id].into_iter().collect(),
+            load_contracts: vec![ConfiguredContract::from(contract_spec)],
+            ..Default::default()
+        };
+
+        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let loader = TestStartupLoader::new(true, true);
+
+        let loaded_ids = provider.initialize_with_loader(&loader).await.unwrap();
+        let second_result = provider.initialize_with_loader(&loader).await.unwrap();
+
+        assert_eq!(
+            loaded_ids,
+            vec![
+                instrument_id,
+                InstrumentId::new(Symbol::from("MSFT"), Venue::from("NASDAQ")),
+            ]
+        );
+        assert!(second_result.is_empty());
+        assert_eq!(loader.id_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(loader.contract_calls.load(Ordering::SeqCst), 1);
+        assert!(*provider.startup_initialized.lock().await);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_fails_closed_and_retries_unresolved_input() {
+        let instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"));
+
+        let contract_spec = Contract {
+            security_type: SecurityType::Stock,
+            symbol: ibapi::contracts::Symbol::from("MSFT"),
+            exchange: Exchange::from("NASDAQ"),
+            ..Default::default()
+        };
+
+        let config = InteractiveBrokersInstrumentProviderConfig {
+            load_ids: [instrument_id].into_iter().collect(),
+            load_contracts: vec![ConfiguredContract::from(contract_spec)],
+            ..Default::default()
+        };
+
+        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let loader = TestStartupLoader::new(true, false);
+
+        let error = provider.initialize_with_loader(&loader).await.unwrap_err();
+
+        assert!(error.to_string().contains("contract at index 0"));
+        assert!(!*provider.startup_initialized.lock().await);
+
+        loader.resolve_contracts.store(true, Ordering::SeqCst);
+        provider.initialize_with_loader(&loader).await.unwrap();
+
+        assert_eq!(loader.id_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(loader.contract_calls.load(Ordering::SeqCst), 2);
+        assert!(*provider.startup_initialized.lock().await);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_preserves_load_error_and_allows_retry() {
+        let instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"));
+
+        let config = InteractiveBrokersInstrumentProviderConfig {
+            load_ids: [instrument_id].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let loader = TestStartupLoader::new(true, true);
+        loader.fail_next_id.store(true, Ordering::SeqCst);
+
+        let error = provider.initialize_with_loader(&loader).await.unwrap_err();
+
+        let error_chain = format!("{error:#}");
+        assert!(error_chain.contains("Failed to load configured IB instrument ID AAPL.NASDAQ"));
+        assert!(error_chain.contains("Socket disconnected"));
+        assert!(!*provider.startup_initialized.lock().await);
+
+        provider.initialize_with_loader(&loader).await.unwrap();
+
+        assert_eq!(loader.id_calls.load(Ordering::SeqCst), 2);
+        assert!(*provider.startup_initialized.lock().await);
+    }
+
+    #[tokio::test]
+    async fn test_initialize_serializes_concurrent_calls() {
+        let instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"));
+
+        let config = InteractiveBrokersInstrumentProviderConfig {
+            load_ids: [instrument_id].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let provider = InteractiveBrokersInstrumentProvider::new(config);
+        let mut loader = TestStartupLoader::new(true, true);
+        loader.yield_on_load = true;
+
+        let (first, second) = tokio::join!(
+            provider.initialize_with_loader(&loader),
+            provider.initialize_with_loader(&loader),
+        );
+
+        assert_eq!(first.unwrap().len() + second.unwrap().len(), 1);
+        assert_eq!(loader.id_calls.load(Ordering::SeqCst), 1);
+        assert!(*provider.startup_initialized.lock().await);
     }
 
     #[tokio::test]
@@ -2738,11 +2996,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_cache_reads_chrono_timestamp() {
+        let provider = InteractiveBrokersInstrumentProvider::new(
+            InteractiveBrokersInstrumentProviderConfig::builder()
+                .cache_validity_days(7u32)
+                .build(),
+        );
+        let cache_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test_data/instrument_cache_chrono.json"
+        );
+
+        let loaded = provider.load_cache(cache_path).await.unwrap();
+
+        assert!(loaded);
+        assert_eq!(provider.count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_load_cache_restores_contract_details() {
         let (provider, _temp_dir) = create_test_provider_with_cache();
         let cache_path = provider.config.cache_path.as_ref().unwrap().clone();
         let instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("XNAS"));
         let instrument = create_test_instrument(instrument_id);
+
         let contract = Contract {
             contract_id: 265598,
             symbol: ibapi::contracts::Symbol::from("AAPL"),
@@ -2752,6 +3029,7 @@ mod tests {
             currency: ibapi::contracts::Currency::from("USD"),
             ..Default::default()
         };
+
         let details = ibapi::contracts::ContractDetails {
             contract: contract.clone(),
             price_magnifier: 1,
@@ -2789,15 +3067,16 @@ mod tests {
     }
 
     #[rstest]
-    fn test_filter_sec_types_uses_ib_codes_case_insensitive() {
+    fn test_filter_sec_types_uses_typed_ib_codes() {
         let config = InteractiveBrokersInstrumentProviderConfig {
-            filter_sec_types: [String::from("opt")].into_iter().collect(),
+            filter_sec_types: [IbSecurityType::Option].into_iter().collect(),
             ..Default::default()
         };
+
         let provider = InteractiveBrokersInstrumentProvider::new(config);
 
-        assert!(provider.is_filtered_sec_type(&security_type_code(&SecurityType::Option)));
-        assert!(!provider.is_filtered_sec_type(&security_type_code(&SecurityType::Stock)));
+        assert!(provider.is_filtered_sec_type(&SecurityType::Option.to_string()));
+        assert!(!provider.is_filtered_sec_type(&SecurityType::Stock.to_string()));
     }
 
     #[rstest]
@@ -2806,6 +3085,7 @@ mod tests {
         let ib_instrument_id = InstrumentId::new(Symbol::from("AAPL"), Venue::from("XNAS"));
         let non_ib_instrument_id =
             InstrumentId::new(Symbol::from("BTCUSDT"), Venue::from("BINANCE"));
+
         let contract = Contract {
             contract_id: 265598,
             symbol: ibapi::contracts::Symbol::from("AAPL"),
@@ -2815,6 +3095,7 @@ mod tests {
             currency: ibapi::contracts::Currency::from("USD"),
             ..Default::default()
         };
+
         let ib_instrument = create_test_instrument_with_info(
             ib_instrument_id,
             Some(create_contract_info(&contract, Some(100))),
@@ -2859,7 +3140,8 @@ mod tests {
         let cache_path = provider.config.cache_path.as_ref().unwrap().clone();
 
         // Create an expired cache manually
-        let old_timestamp = Utc::now() - chrono::Duration::days(10);
+        let old_timestamp = Timestamp::now() - jiff::SignedDuration::from_hours(24 * (10));
+
         let expired_cache = InstrumentCache {
             cache_timestamp: old_timestamp,
             contract_id_to_instrument_id: vec![],
@@ -2882,5 +3164,59 @@ mod tests {
             !result.unwrap(),
             "load_cache should return false for expired cache"
         );
+    }
+    #[rstest]
+    fn restored_cache_seeds_provider_with_price_magnifier() {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let mut cache = Cache::default();
+        assert_eq!(provider.seed_from_cache(&cache), 0);
+        let instrument_id = InstrumentId::from("AAPL.NASDAQ");
+
+        let contract = Contract {
+            contract_id: 265598,
+            symbol: ibapi::contracts::Symbol::from("AAPL"),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            currency: ibapi::contracts::Currency::from("USD"),
+            ..Default::default()
+        };
+
+        let instrument = create_test_instrument_with_info(
+            instrument_id,
+            Some(create_contract_info(&contract, Some(100))),
+        );
+        cache.add_instrument(instrument.clone()).unwrap();
+        let seeded = provider.seed_from_cache(&cache);
+        assert_eq!(seeded, 1);
+        assert_eq!(provider.find(&instrument_id), Some(instrument));
+        assert_eq!(provider.get_price_magnifier(&instrument_id), 100);
+        assert_eq!(
+            provider
+                .resolve_contract_for_instrument(instrument_id)
+                .unwrap(),
+            contract
+        );
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(-1))]
+    fn cached_instrument_without_valid_magnifier_requires_qualification(
+        #[case] magnifier: Option<i32>,
+    ) {
+        let provider = InteractiveBrokersInstrumentProvider::new(Default::default());
+        let instrument_id = InstrumentId::from("AAPL.NASDAQ");
+
+        let contract = Contract {
+            contract_id: 265598,
+            ..Default::default()
+        };
+
+        let instrument = create_test_instrument_with_info(
+            instrument_id,
+            Some(create_contract_info(&contract, magnifier)),
+        );
+        assert_eq!(provider.add_cached_instruments([instrument]), 0);
+        assert_eq!(provider.find(&instrument_id), None);
     }
 }

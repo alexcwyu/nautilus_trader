@@ -13,12 +13,11 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! A time-keeping abstraction (nanoseconds) that works for storing in an atomic integer.
+//! Nanosecond values suitable for atomic storage.
 
 use std::{
     fmt::Debug,
     ops::{Add, Div, Mul},
-    prelude::v1::*,
     time::Duration,
 };
 
@@ -26,20 +25,37 @@ use super::clock;
 
 /// A number of nanoseconds from a reference point.
 ///
-/// Nanos can not represent durations >584 years, but hopefully that
-/// should not be a problem in real-world applications.
+/// Values are limited to `u64::MAX` nanoseconds, or approximately 584 years.
 #[derive(PartialEq, Eq, Default, Clone, Copy, PartialOrd, Ord)]
 pub struct Nanos(u64);
 
 impl Nanos {
+    pub const fn new(u: u64) -> Self {
+        Self(u)
+    }
+
     pub const fn as_u64(self) -> u64 {
         self.0
     }
-}
 
-impl Nanos {
-    pub const fn new(u: u64) -> Self {
-        Self(u)
+    /// Converts a [`Duration`], clamping at `u64::MAX` nanoseconds (~584 years).
+    pub fn from_duration_saturating(d: Duration) -> Self {
+        Self(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    #[inline]
+    pub const fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
+    #[inline]
+    pub const fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
+    #[inline]
+    pub const fn saturating_mul(self, rhs: u64) -> Self {
+        Self(self.0.saturating_mul(rhs))
     }
 }
 
@@ -61,11 +77,13 @@ impl Debug for Nanos {
     }
 }
 
+// Add and Mul saturate: release builds disable overflow checks, and a wrapped
+// TAT would admit every request; pinning at the far future denies instead.
 impl Add<Self> for Nanos {
     type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0 + rhs.0)
+        Self(self.0.saturating_add(rhs.0))
     }
 }
 
@@ -73,7 +91,7 @@ impl Mul<u64> for Nanos {
     type Output = Self;
 
     fn mul(self, rhs: u64) -> Self::Output {
-        Self(self.0 * rhs)
+        Self(self.0.saturating_mul(rhs))
     }
 }
 
@@ -103,23 +121,6 @@ impl From<Nanos> for Duration {
     }
 }
 
-impl Nanos {
-    #[inline]
-    pub const fn saturating_sub(self, rhs: Self) -> Self {
-        Self(self.0.saturating_sub(rhs.0))
-    }
-
-    #[inline]
-    pub const fn saturating_add(self, rhs: Self) -> Self {
-        Self(self.0.saturating_add(rhs.0))
-    }
-
-    #[inline]
-    pub const fn saturating_mul(self, rhs: u64) -> Self {
-        Self(self.0.saturating_mul(rhs))
-    }
-}
-
 impl clock::Reference for Nanos {
     #[inline]
     fn duration_since(&self, earlier: Self) -> Nanos {
@@ -142,7 +143,7 @@ impl Add<Duration> for Nanos {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::time::Duration;
 
     use rstest::rstest;
@@ -165,5 +166,51 @@ mod test {
         assert_eq!(n_half.saturating_sub(n), Nanos::new(0));
         assert_eq!(n.saturating_sub(n_half), n_half);
         assert_eq!(clock::Reference::saturating_sub(&n_half, n), Nanos::new(0));
+        assert_eq!(clock::Reference::saturating_sub(&n, n_half), n_half);
+    }
+
+    #[rstest]
+    fn nanos_add_and_mul_saturate_at_max() {
+        // A wrapped TAT would admit every request; the operators must pin at
+        // u64::MAX instead (release builds disable overflow checks)
+        let max = Nanos::new(u64::MAX);
+        let one = Nanos::new(1);
+
+        assert_eq!(max + one, max);
+        assert_eq!(max * 2, max);
+        assert_eq!(Nanos::new(u64::MAX / 2 + 1) * 2, max);
+    }
+
+    #[rstest]
+    fn nanos_from_duration_saturating_clamps() {
+        assert_eq!(
+            Nanos::from_duration_saturating(Duration::MAX),
+            Nanos::new(u64::MAX)
+        );
+        assert_eq!(
+            Nanos::from_duration_saturating(Duration::from_nanos(42)),
+            Nanos::new(42)
+        );
+    }
+
+    #[rstest]
+    #[case(7, 11, 18)]
+    #[case(u64::MAX - 1, 1, u64::MAX)]
+    #[case(u64::MAX, 1, u64::MAX)]
+    fn saturating_add_preserves_sum_or_max(
+        #[case] left: u64,
+        #[case] right: u64,
+        #[case] expected: u64,
+    ) {
+        assert_eq!(
+            Nanos::new(left).saturating_add(Nanos::new(right)),
+            Nanos::new(expected)
+        );
+    }
+
+    #[rstest]
+    #[should_panic(expected = "Duration is longer than 584 years")]
+    fn conversion_rejects_unrepresentable_duration() {
+        let _ = Nanos::from(Duration::MAX);
     }
 }

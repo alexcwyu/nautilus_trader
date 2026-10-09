@@ -14,19 +14,21 @@
 // -------------------------------------------------------------------------------------------------
 
 use clap::Parser;
+use nautilus_persistence::backend::migration::parse_storage_option;
 
 /// Command-line interface for NautilusTrader.
 #[derive(Debug, Parser)]
 #[clap(version, about, author)]
 pub struct NautilusCli {
     #[clap(subcommand)]
-    pub command: Commands,
+    pub(crate) command: Commands,
 }
 
 /// Available top-level commands for the NautilusTrader CLI.
 #[derive(Parser, Debug)]
 pub enum Commands {
     Database(DatabaseOpt),
+    Catalog(CatalogOpt),
     #[cfg(feature = "defi")]
     Blockchain(BlockchainOpt),
 }
@@ -36,7 +38,7 @@ pub enum Commands {
 #[command(about = "Postgres database operations", long_about = None)]
 pub struct DatabaseOpt {
     #[clap(subcommand)]
-    pub command: DatabaseCommand,
+    pub(crate) command: DatabaseCommand,
 }
 
 /// Configuration parameters for database connection and operations.
@@ -44,22 +46,22 @@ pub struct DatabaseOpt {
 pub struct DatabaseConfig {
     /// Hostname or IP address of the database server.
     #[arg(long)]
-    pub host: Option<String>,
+    pub(crate) host: Option<String>,
     /// Port number of the database server.
     #[arg(long)]
-    pub port: Option<u16>,
+    pub(crate) port: Option<u16>,
     /// Username for connecting to the database.
     #[arg(long)]
-    pub username: Option<String>,
+    pub(crate) username: Option<String>,
     /// Name of the database.
     #[arg(long)]
-    pub database: Option<String>,
+    pub(crate) database: Option<String>,
     /// Password for connecting to the database.
     #[arg(long)]
-    pub password: Option<String>,
+    pub(crate) password: Option<String>,
     /// Directory path to the schema files.
     #[arg(long)]
-    pub schema: Option<String>,
+    pub(crate) schema: Option<String>,
 }
 
 /// Available database management commands.
@@ -70,6 +72,25 @@ pub enum DatabaseCommand {
     Init(DatabaseConfig),
     /// Drops roles, privileges and deletes all data from the database.
     Drop(DatabaseConfig),
+    /// Assigns an account's events that have no trader to a trader.
+    AssignAccount(AssignAccountConfig),
+}
+
+/// Configuration for assigning an account's events that have no trader.
+///
+/// Account events written before trader-scoped persistence carry no trader, and no trader-scoped
+/// cache loads them until they are assigned.
+#[derive(Parser, Debug, Clone)]
+pub struct AssignAccountConfig {
+    /// Account ID whose events to assign.
+    #[arg(long)]
+    pub(crate) account_id: String,
+    /// Trader ID to assign the events to.
+    #[arg(long)]
+    pub(crate) trader_id: String,
+    /// Database configuration options.
+    #[clap(flatten)]
+    pub(crate) database: DatabaseConfig,
 }
 
 #[cfg(feature = "defi")]
@@ -78,7 +99,7 @@ pub enum DatabaseCommand {
 #[command(about = "Blockchain operations", long_about = None)]
 pub struct BlockchainOpt {
     #[clap(subcommand)]
-    pub command: BlockchainCommand,
+    pub(crate) command: BlockchainCommand,
 }
 
 #[cfg(feature = "defi")]
@@ -103,10 +124,10 @@ pub enum BlockchainCommand {
     },
     /// Sync DEX pools.
     SyncDex {
-        /// The blockchain chain name (case-insensitive). Examples: ethereum, arbitrum, base, polygon, bsc
+        /// The blockchain chain name (case-insensitive). Supported chains are listed below.
         #[arg(long)]
         chain: String,
-        /// The DEX name (case-insensitive). Examples: `UniswapV3`, uniswapv3, `SushiSwapV2`, `PancakeSwapV3`
+        /// The DEX name (case-insensitive). Supported DEX names are listed below.
         #[arg(long)]
         dex: String,
         /// RPC HTTP URL for blockchain calls (optional, falls back to `RPC_HTTP_URL` env var)
@@ -124,10 +145,10 @@ pub enum BlockchainCommand {
     },
     /// Analyze a specific DEX pool.
     AnalyzePool {
-        /// The blockchain chain name (case-insensitive). Examples: ethereum, arbitrum, base, polygon, bsc
+        /// The blockchain chain name (case-insensitive). Supported chains are listed below.
         #[arg(long)]
         chain: String,
-        /// The DEX name (case-insensitive). Examples: UniswapV3, uniswapv3, SushiSwapV2, PancakeSwapV3
+        /// The DEX name (case-insensitive). Supported DEX names are listed below.
         #[arg(long)]
         dex: String,
         /// The pool contract address
@@ -140,11 +161,31 @@ pub enum BlockchainCommand {
         #[arg(long)]
         to_block: Option<u64>,
         /// RPC HTTP URL for blockchain calls (optional, falls back to RPC_HTTP_URL env var)
+        #[expect(
+            clippy::doc_markdown,
+            reason = "clap renders doc comments as plain help text"
+        )]
         #[arg(long)]
         rpc_url: Option<String>,
         /// Reset sync progress and start from the beginning, ignoring last synced block
         #[arg(long)]
         reset: bool,
+        /// Return needs_bootstrap for pools without a valid snapshot before the target block
+        #[expect(
+            clippy::doc_markdown,
+            reason = "clap renders doc comments as plain help text"
+        )]
+        #[arg(long)]
+        require_existing_snapshot: bool,
+        /// Checkpoint block numbers to snapshot in one pass (comma-separated, each at or below to-block)
+        #[arg(long, value_delimiter = ',')]
+        checkpoint_blocks: Vec<u64>,
+        /// Skip on-chain validation and persist replay-derived snapshots without the multicall compare
+        #[arg(long)]
+        skip_validation: bool,
+        /// Build the snapshot from mint/burn history plus an RPC read, without full swap storage
+        #[arg(long)]
+        snapshot_from_rpc: bool,
         /// Maximum number of Multicall calls per RPC request (optional, defaults to 200)
         #[arg(long)]
         multicall_calls_per_rpc_request: Option<u32>,
@@ -154,10 +195,10 @@ pub enum BlockchainCommand {
     },
     /// Analyze several DEX pools in one runtime.
     AnalyzePools {
-        /// The blockchain chain name (case-insensitive). Examples: ethereum, arbitrum, base, polygon, bsc
+        /// The blockchain chain name (case-insensitive). Supported chains are listed below.
         #[arg(long)]
         chain: String,
-        /// The DEX name (case-insensitive). Examples: UniswapV3, uniswapv3, SushiSwapV2, PancakeSwapV3
+        /// The DEX name (case-insensitive). Supported DEX names are listed below.
         #[arg(long)]
         dex: String,
         /// Pool contract address. Can be repeated.
@@ -173,11 +214,34 @@ pub enum BlockchainCommand {
         #[arg(long)]
         to_block: Option<u64>,
         /// RPC HTTP URL for blockchain calls (optional, falls back to RPC_HTTP_URL env var)
+        #[expect(
+            clippy::doc_markdown,
+            reason = "clap renders doc comments as plain help text"
+        )]
         #[arg(long)]
         rpc_url: Option<String>,
         /// Reset sync progress and start from the beginning, ignoring last synced block
         #[arg(long)]
         reset: bool,
+        /// Return needs_bootstrap for pools without a valid snapshot before the target block
+        #[expect(
+            clippy::doc_markdown,
+            reason = "clap renders doc comments as plain help text"
+        )]
+        #[arg(long)]
+        require_existing_snapshot: bool,
+        /// Checkpoint block numbers to snapshot in one pass (comma-separated, each at or below to-block)
+        #[arg(long, value_delimiter = ',')]
+        checkpoint_blocks: Vec<u64>,
+        /// Skip on-chain validation and persist replay-derived snapshots without the multicall compare
+        #[arg(long)]
+        skip_validation: bool,
+        /// Build snapshots from mint/burn history plus RPC reads, without full swap storage
+        #[arg(long)]
+        snapshot_from_rpc: bool,
+        /// Maximum number of pools to analyze concurrently (optional, defaults to 4)
+        #[arg(long)]
+        concurrency: Option<usize>,
         /// Maximum number of Multicall calls per RPC request (optional, defaults to 200)
         #[arg(long)]
         multicall_calls_per_rpc_request: Option<u32>,
@@ -217,6 +281,7 @@ mod tests {
             "--rpc-url",
             "http://localhost:8545",
             "--reset",
+            "--require-existing-snapshot",
             "--multicall-calls-per-rpc-request",
             "25",
             "--host",
@@ -244,6 +309,11 @@ mod tests {
                         to_block,
                         rpc_url,
                         reset,
+                        require_existing_snapshot,
+                        checkpoint_blocks,
+                        skip_validation,
+                        snapshot_from_rpc,
+                        concurrency,
                         multicall_calls_per_rpc_request,
                         database,
                     },
@@ -262,6 +332,11 @@ mod tests {
                 assert_eq!(to_block, Some(200));
                 assert_eq!(rpc_url.as_deref(), Some("http://localhost:8545"));
                 assert!(reset);
+                assert!(require_existing_snapshot);
+                assert!(checkpoint_blocks.is_empty());
+                assert!(!skip_validation);
+                assert!(!snapshot_from_rpc);
+                assert_eq!(concurrency, None);
                 assert_eq!(multicall_calls_per_rpc_request, Some(25));
                 assert_eq!(database.host.as_deref(), Some("localhost"));
                 assert_eq!(database.port, Some(5433));
@@ -272,5 +347,128 @@ mod tests {
             }
             _ => panic!("Expected analyze-pools blockchain command"),
         }
+    }
+
+    #[rstest]
+    #[case("analyze-pool")]
+    #[case("analyze-pools")]
+    fn blockchain_analysis_help_lists_capabilities_as_plain_text(#[case] subcommand: &str) {
+        let mut command = crate::cli_command();
+        let help = command
+            .find_subcommand_mut("blockchain")
+            .and_then(|command| command.find_subcommand_mut(subcommand))
+            .map(|command| command.render_long_help().to_string())
+            .unwrap();
+
+        // Snapshot-capable DEXes are listed; the registered-but-unsupported SushiSwapV2 is not.
+        assert!(help.contains("UniswapV3"));
+        assert!(help.contains("PancakeSwapV3"));
+        assert!(help.contains("AerodromeSlipstream"));
+        assert!(!help.contains("SushiSwapV2"));
+        assert!(help.contains("RPC_HTTP_URL"));
+        assert!(help.contains("needs_bootstrap"));
+        // Help is rendered as plain text, so doc-markdown backticks must not survive.
+        assert!(!help.contains("`UniswapV3`"));
+        assert!(!help.contains("`PancakeSwapV3`"));
+        assert!(!help.contains("`RPC_HTTP_URL`"));
+        assert!(!help.contains("`needs_bootstrap`"));
+    }
+
+    #[rstest]
+    fn blockchain_sync_dex_help_lists_discoverable_dexes() {
+        let mut command = crate::cli_command();
+        let help = command
+            .find_subcommand_mut("blockchain")
+            .and_then(|command| command.find_subcommand_mut("sync-dex"))
+            .map(|command| command.render_long_help().to_string())
+            .unwrap();
+
+        // sync-dex receives the discovery block, not the snapshot block.
+        assert!(help.contains("Discoverable DEXes"));
+        assert!(!help.contains("Snapshot-capable"));
+        // UniswapV2 is discovery-only, so it appears here but never in the snapshot listing.
+        assert!(help.contains("UniswapV2"));
+    }
+}
+
+/// Catalog management commands.
+#[derive(Debug, Parser)]
+pub struct CatalogOpt {
+    #[clap(subcommand)]
+    pub(crate) command: CatalogCommand,
+}
+
+/// Operations on persisted catalogs.
+#[derive(Debug, Parser)]
+pub enum CatalogCommand {
+    MigrateParquet(CatalogMigrationOpt),
+}
+
+/// Convert a Parquet catalog to the current Arrow storage format.
+#[derive(Debug, Parser)]
+pub struct CatalogMigrationOpt {
+    /// Source catalog path or object-store URI.
+    pub(crate) source: String,
+    /// Empty destination catalog path or object-store URI.
+    pub(crate) destination: String,
+    /// Validate source schemas without creating the destination.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+    /// Source object-store option in key=value form. Can be repeated.
+    #[arg(long = "source-option", value_parser = parse_storage_option)]
+    pub(crate) source_options: Vec<(String, String)>,
+    /// Destination object-store option in key=value form. Can be repeated.
+    #[arg(long = "target-option", value_parser = parse_storage_option)]
+    pub(crate) target_options: Vec<(String, String)>,
+}
+
+#[cfg(test)]
+mod database_tests {
+    use clap::Parser;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn assign_account_cli_parses_ids_and_connection_options() {
+        let cli = NautilusCli::try_parse_from([
+            "nautilus",
+            "database",
+            "assign-account",
+            "--account-id",
+            "HYPERLIQUID-001",
+            "--trader-id",
+            "TRADER-001",
+            "--host",
+            "localhost",
+            "--port",
+            "5433",
+        ])
+        .unwrap();
+
+        let Commands::Database(DatabaseOpt {
+            command: DatabaseCommand::AssignAccount(config),
+        }) = cli.command
+        else {
+            panic!("Expected assign-account database command");
+        };
+
+        assert_eq!(config.account_id, "HYPERLIQUID-001");
+        assert_eq!(config.trader_id, "TRADER-001");
+        assert_eq!(config.database.host.as_deref(), Some("localhost"));
+        assert_eq!(config.database.port, Some(5433));
+    }
+
+    #[rstest]
+    fn assign_account_cli_requires_account_and_trader() {
+        let result = NautilusCli::try_parse_from([
+            "nautilus",
+            "database",
+            "assign-account",
+            "--trader-id",
+            "T-1",
+        ]);
+
+        assert!(result.is_err());
     }
 }

@@ -24,7 +24,6 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# Read required version from tools.toml (single source of truth)
 REQUIRED_VERSION="$(bash "$SCRIPT_DIR/tool-version.sh" capnp)"
 CHECK_ONLY="${CAPNP_CHECK:-0}"
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
@@ -48,7 +47,7 @@ fi
 INSTALLED_VERSION=$(capnp --version | awk '{print $NF}')
 if [[ "$INSTALLED_VERSION" != "$REQUIRED_VERSION" ]]; then
   echo -e "${RED}Error: capnp version mismatch${NC}"
-  echo "  Required: ${REQUIRED_VERSION} (from tools.toml)"
+  echo "  Required: ${REQUIRED_VERSION} (from the shared tool catalog)"
   echo "  Installed: ${INSTALLED_VERSION}"
   echo "Please install the correct version using: ./scripts/install-capnp.sh"
   exit 1
@@ -67,7 +66,7 @@ rm -rf crates/serialization/generated/capnp/*
 # Force a clean rebuild of the serialization crate with capnp feature
 echo -e "${YELLOW}Rebuilding serialization crate to regenerate schemas...${NC}"
 cargo clean -p nautilus-serialization
-cargo build -p nautilus-serialization --features capnp --message-format=json 2>&1 |
+cargo build --locked -p nautilus-serialization --features capnp --message-format=json 2>&1 |
   grep -o '"out_dir":"[^"]*"' |
   cut -d'"' -f4 |
   grep nautilus-serialization > "$OUT_DIR_FILE" || true
