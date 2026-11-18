@@ -35,7 +35,7 @@ pub(crate) const KEY_OPTIONS_CHAIN_EXCHANGE: &str = "options_chain_exchange";
 pub(crate) const KEY_OPTIONS_CHAIN_EXCHANGE_ALT: &str = "optionsChainExchange";
 
 /// A configured IB contract with optional per-contract chain-building settings.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConfiguredContract {
     /// The IB contract to load.
     pub contract: Contract,
@@ -149,15 +149,12 @@ pub fn contract_to_json_value(contract: &Contract) -> Value {
 
 #[must_use]
 pub fn contract_to_params(contract: &Contract) -> Params {
-    let mut params = Params::new();
+    let map = match contract_to_json_value(contract) {
+        Value::Object(map) => map.into_iter().collect(),
+        _ => Default::default(),
+    };
 
-    if let Value::Object(map) = contract_to_json_value(contract) {
-        for (key, value) in map {
-            params.insert(key, value);
-        }
-    }
-
-    params
+    Params::new(map)
 }
 
 fn security_type_to_code(security_type: &SecurityType) -> String {
@@ -255,8 +252,8 @@ pub fn parse_contract_from_json(json: &Value) -> anyhow::Result<Contract> {
 ///
 /// # Errors
 ///
-/// Returns an error when a known field has the wrong JSON type, a numeric field is out of
-/// range, or an enum value is unknown.
+/// Returns an error if a known field has the wrong JSON type, a numeric field is out of range, or
+/// an enum value is unknown.
 pub fn parse_configured_contract_from_json(json: &Value) -> anyhow::Result<ConfiguredContract> {
     let obj = json
         .as_object()

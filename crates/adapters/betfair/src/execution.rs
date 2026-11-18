@@ -191,7 +191,10 @@ pub struct BetfairExecutionClient {
 
 impl BetfairExecutionClient {
     /// Creates a new [`BetfairExecutionClient`] instance.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client or stream configuration is invalid.
     pub fn new(
         core: ExecutionClientCore,
         http_client: BetfairHttpClient,
@@ -199,7 +202,10 @@ impl BetfairExecutionClient {
         stream_config: BetfairStreamConfig,
         config: BetfairExecutionClientConfig,
         currency: Currency,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+        stream_config.validate()?;
+
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
             clock,
@@ -217,7 +223,7 @@ impl BetfairExecutionClient {
         let session_tasks = TaskGroup::new();
         let pending_tasks = TaskGroup::new();
 
-        Self {
+        Ok(Self {
             core,
             clock,
             emitter,
@@ -236,7 +242,7 @@ impl BetfairExecutionClient {
             pending_tasks,
             shutdown_errors: Vec::new(),
             account_refresh_tx: None,
-        }
+        })
     }
 
     /// Returns true while new-order submissions are halted for stream recovery.
@@ -389,20 +395,49 @@ impl BetfairExecutionClient {
         venue_order_id: VenueOrderId,
     ) -> (Decimal, Decimal) {
         let events = order.events();
-        let current_fills = events.iter().filter_map(|event| match event {
-            OrderEventAny::Filled(fill) if fill.venue_order_id == venue_order_id => Some(fill),
-            _ => None,
-        });
-        let (filled_qty, notional) = current_fills.fold(
-            (Decimal::ZERO, Decimal::ZERO),
-            |(filled_qty, notional), fill| {
-                let quantity = fill.last_qty.as_decimal();
-                (
-                    filled_qty + quantity,
-                    notional + quantity * fill.last_px.as_decimal(),
-                )
-            },
-        );
+        let mut latest_px = AHashMap::new();
+        let mut quantities = Vec::new();
+
+        for event in &events {
+            let OrderEventAny::Filled(fill) = event else {
+                continue;
+            };
+
+            if fill.venue_order_id != venue_order_id {
+                continue;
+            }
+
+            let price = fill.last_px.as_decimal();
+            if latest_px.insert(fill.trade_id, price).is_some() {
+                continue;
+            }
+
+            quantities.push((fill.trade_id, fill.last_qty.as_decimal()));
+        }
+
+        let mut voided_qty = AHashMap::new();
+
+        for event in &events {
+            let OrderEventAny::FillVoided(voided) = event else {
+                continue;
+            };
+
+            voided_qty.insert(voided.trade_id, voided.voided_qty.as_decimal());
+        }
+
+        let surviving: Vec<(TradeId, Decimal)> = quantities
+            .into_iter()
+            .filter_map(|(trade_id, quantity)| {
+                let remaining = quantity - voided_qty.get(&trade_id).copied().unwrap_or_default();
+                (remaining > Decimal::ZERO).then_some((trade_id, remaining))
+            })
+            .collect();
+
+        let filled_qty: Decimal = surviving.iter().map(|(_, quantity)| *quantity).sum();
+        let notional: Decimal = surviving
+            .iter()
+            .map(|(trade_id, quantity)| *quantity * latest_px[trade_id])
+            .sum();
 
         if filled_qty > Decimal::ZERO {
             return (filled_qty, notional / filled_qty);
@@ -423,17 +458,25 @@ impl BetfairExecutionClient {
 
     fn sync_cached_fills<'a>(state: &mut OcmState, orders: impl IntoIterator<Item = &'a OrderAny>) {
         let mut replay_fills = Vec::new();
+        let mut latest_px = AHashMap::new();
         let mut voided_by_trade = AHashMap::new();
 
         for order in orders {
             for event in order.events() {
                 match event {
-                    OrderEventAny::Filled(fill) => replay_fills.push((
-                        fill.venue_order_id.to_string(),
-                        fill.trade_id,
-                        fill.last_qty.as_decimal(),
-                        fill.last_px,
-                    )),
+                    OrderEventAny::Filled(fill) => {
+                        let key = (fill.venue_order_id.to_string(), fill.trade_id);
+                        if !latest_px.contains_key(&key) {
+                            replay_fills.push((
+                                key.0.clone(),
+                                fill.trade_id,
+                                fill.last_qty.as_decimal(),
+                                fill.last_px,
+                            ));
+                        }
+
+                        latest_px.insert(key, fill.last_px);
+                    }
                     OrderEventAny::FillVoided(voided) => {
                         voided_by_trade.insert(
                             (voided.venue_order_id.to_string(), voided.trade_id),
@@ -453,7 +496,16 @@ impl BetfairExecutionClient {
             state
                 .fill_tracker
                 .sync_fill_lot(&bet_id, trade_id, quantity, price, voided_qty);
+            if let Some(accounting_px) = latest_px.get(&(bet_id.clone(), trade_id))
+                && *accounting_px != price
+            {
+                state
+                    .fill_tracker
+                    .set_accounting_px(&bet_id, trade_id, *accounting_px);
+            }
         }
+
+        state.fill_tracker.seed_missing_averages();
         let mut voided_by_bet = AHashMap::<String, Decimal>::new();
 
         for ((bet_id, _), voided_qty) in voided_by_trade {
@@ -966,7 +1018,7 @@ impl BetfairExecutionClient {
                 .send_order_event(OrderEventAny::Updated(updated));
         }
 
-        let (fill, fill_voids) = Self::derive_fill_changes(&context, &mut state);
+        let (fill, fill_voids, price_restatement) = Self::derive_fill_changes(&context, &mut state);
 
         if report.order_status == OrderStatus::Canceled
             && let Some(reason) = report.cancel_reason.as_deref()
@@ -995,6 +1047,7 @@ impl BetfairExecutionClient {
                 fill,
                 fill_voids,
                 cancel_action,
+                price_restatement,
             )
         } else {
             Self::emit_untracked_order_reports(&context, report, fill);
@@ -1043,8 +1096,9 @@ impl BetfairExecutionClient {
     fn derive_fill_changes(
         context: &UnmatchedOrderContext<'_>,
         state: &mut OcmState,
-    ) -> (Option<FillReport>, Vec<FillVoidAllocation>) {
+    ) -> (Option<FillReport>, Vec<FillVoidAllocation>, bool) {
         let order = context.order;
+        let price_restatement = state.fill_tracker.has_unseen_price_restatement(order);
         let has_applied_fill_lots = state.fill_tracker.has_fill_lots(&order.id);
         let size_matched = order.sm.unwrap_or(Decimal::ZERO);
         let size_voided = order.sv.unwrap_or(Decimal::ZERO);
@@ -1068,7 +1122,11 @@ impl BetfairExecutionClient {
         );
 
         if has_applied_fill_lots {
-            return (fill, state.fill_tracker.maybe_fill_voids(order));
+            return (
+                fill,
+                state.fill_tracker.maybe_fill_voids(order),
+                price_restatement,
+            );
         }
 
         // A first-seen snapshot has no proof that Nautilus applied the voided portion.
@@ -1081,7 +1139,7 @@ impl BetfairExecutionClient {
             );
         }
         state.fill_tracker.sync_voided_qty(&order.id, size_voided);
-        (fill, Vec::new())
+        (fill, Vec::new(), price_restatement)
     }
 
     #[allow(
@@ -1097,6 +1155,7 @@ impl BetfairExecutionClient {
         fill: Option<FillReport>,
         fill_voids: Vec<FillVoidAllocation>,
         cancel_action: CancelAction,
+        price_restatement: bool,
     ) -> bool {
         if state.claim_acceptance(client_order_id, report.venue_order_id) {
             let accepted = OrderAccepted::new(
@@ -1116,7 +1175,8 @@ impl BetfairExecutionClient {
                 .send_order_event(OrderEventAny::Accepted(accepted));
         }
 
-        let has_fill = fill.is_some();
+        let has_fill = fill.is_some() && !price_restatement;
+
         let causation_id = fill.map(|fill_report| {
             Self::emit_tracked_fill(context, report, client_order_id, strategy_id, &fill_report)
         });
@@ -2493,7 +2553,20 @@ impl ExecutionClient for BetfairExecutionClient {
                         CommandFailure::Ambiguous(_) => log::warn!(
                             "Ambiguous cancel response for {client_order_id}, awaiting OCM reconciliation: {e}",
                         ),
-                        CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_) => {
+                        CommandFailure::NotSent(_) => {
+                            let reason = format!("cancel-order error: {e}");
+                            let ts_event = clock.get_time_ns();
+                            emitter.emit_order_cancel_denied_event(
+                                strategy_id,
+                                instrument_id,
+                                client_order_id,
+                                Some(venue_order_id),
+                                &reason,
+                                ts_event,
+                                Some(cmd.command_id),
+                            );
+                        }
+                        CommandFailure::VenueRejected(_) => {
                             let reason = format!("cancel-order error: {e}");
                             let ts_event = clock.get_time_ns();
                             emitter.emit_order_cancel_rejected_event(
@@ -2503,6 +2576,7 @@ impl ExecutionClient for BetfairExecutionClient {
                                 Some(venue_order_id),
                                 &reason,
                                 ts_event,
+                                Some(cmd.command_id),
                             );
                         }
                     }
@@ -2575,9 +2649,19 @@ impl ExecutionClient for BetfairExecutionClient {
                 Err(CommandFailure::Ambiguous(_)) => log::warn!(
                     "Ambiguous cancel report for {client_order_id}, awaiting OCM reconciliation",
                 ),
-                Err(
-                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason),
-                ) => {
+                Err(CommandFailure::NotSent(reason)) => {
+                    let ts_event = clock.get_time_ns();
+                    emitter.emit_order_cancel_denied_event(
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        Some(venue_order_id),
+                        &reason,
+                        ts_event,
+                        Some(cmd.command_id),
+                    );
+                }
+                Err(CommandFailure::VenueRejected(reason)) => {
                     let ts_event = clock.get_time_ns();
                     emitter.emit_order_cancel_rejected_event(
                         strategy_id,
@@ -2586,6 +2670,7 @@ impl ExecutionClient for BetfairExecutionClient {
                         Some(venue_order_id),
                         &reason,
                         ts_event,
+                        Some(cmd.command_id),
                     );
                 }
             }
@@ -2623,13 +2708,14 @@ impl ExecutionClient for BetfairExecutionClient {
         // Betfair does not support atomic price+quantity modification
         if has_price_change && has_quantity_change {
             let ts_event = self.clock.get_time_ns();
-            self.emitter.emit_order_modify_rejected_event(
+            self.emitter.emit_order_modify_denied_event(
                 cmd.strategy_id,
                 instrument_id,
                 cmd.client_order_id,
                 Some(venue_order_id),
                 "cannot modify price and quantity simultaneously on Betfair",
                 ts_event,
+                Some(cmd.command_id),
             );
             return Ok(());
         }
@@ -2791,8 +2877,8 @@ impl ExecutionClient for BetfairExecutionClient {
                                 emitter.send_order_event(OrderEventAny::Canceled(canceled));
                             }
                             Err(
-                                CommandFailure::NotSent(reason)
-                                | CommandFailure::VenueRejected(reason),
+                                ref failure @ (CommandFailure::NotSent(ref reason)
+                                | CommandFailure::VenueRejected(ref reason)),
                             ) => {
                                 emit_replace_failure(
                                     &ocm_state,
@@ -2803,7 +2889,9 @@ impl ExecutionClient for BetfairExecutionClient {
                                     client_order_id,
                                     venue_order_id,
                                     &old_bet_id,
-                                    &reason,
+                                    reason,
+                                    failure,
+                                    cmd.command_id,
                                 );
                             }
                         }
@@ -2819,7 +2907,8 @@ impl ExecutionClient for BetfairExecutionClient {
                                     "Ambiguous replace response for {client_order_id}, awaiting reconciliation: {e}",
                                 );
                             }
-                            CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_) => {
+                            failure @ (CommandFailure::NotSent(_)
+                            | CommandFailure::VenueRejected(_)) => {
                                 emit_replace_failure(
                                     &ocm_state,
                                     &emitter,
@@ -2830,6 +2919,8 @@ impl ExecutionClient for BetfairExecutionClient {
                                     venue_order_id,
                                     &old_bet_id,
                                     &format!("modify-order error: {e}"),
+                                    &failure,
+                                    cmd.command_id,
                                 );
                             }
                         }
@@ -2848,13 +2939,14 @@ impl ExecutionClient for BetfairExecutionClient {
 
             if new_qty >= existing_qty {
                 let ts_event = self.clock.get_time_ns();
-                self.emitter.emit_order_modify_rejected_event(
+                self.emitter.emit_order_modify_denied_event(
                     strategy_id,
                     instrument_id,
                     client_order_id,
                     Some(venue_order_id),
                     "can only reduce quantity on Betfair",
                     ts_event,
+                    Some(cmd.command_id),
                 );
                 return Ok(());
             }
@@ -2891,7 +2983,23 @@ impl ExecutionClient for BetfairExecutionClient {
                             CommandFailure::Ambiguous(_) => log::warn!(
                                 "Ambiguous quantity reduction for {client_order_id}, awaiting reconciliation: {e}",
                             ),
-                            CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_) => {
+                            CommandFailure::NotSent(_) => {
+                                ocm_state
+                                    .lock()
+                                    .clear_pending_reduction(&client_order_id, &reduction_bet_id);
+
+                                let ts_event = clock.get_time_ns();
+                                emitter.emit_order_modify_denied_event(
+                                    strategy_id,
+                                    instrument_id,
+                                    client_order_id,
+                                    Some(venue_order_id),
+                                    &format!("modify-order error: {e}"),
+                                    ts_event,
+                                    Some(cmd.command_id),
+                                );
+                            }
+                            CommandFailure::VenueRejected(_) => {
                                 ocm_state
                                     .lock()
                                     .clear_pending_reduction(&client_order_id, &reduction_bet_id);
@@ -2904,6 +3012,7 @@ impl ExecutionClient for BetfairExecutionClient {
                                     Some(venue_order_id),
                                     &format!("modify-order error: {e}"),
                                     ts_event,
+                                    Some(cmd.command_id),
                                 );
                             }
                         }
@@ -2929,10 +3038,23 @@ impl ExecutionClient for BetfairExecutionClient {
                             Err(CommandFailure::Ambiguous(_)) => log::warn!(
                                 "Ambiguous quantity reduction report for {client_order_id}, awaiting reconciliation",
                             ),
-                            Err(
-                                CommandFailure::NotSent(reason)
-                                | CommandFailure::VenueRejected(reason),
-                            ) => {
+                            Err(CommandFailure::NotSent(reason)) => {
+                                ocm_state
+                                    .lock()
+                                    .clear_pending_reduction(&client_order_id, &reduction_bet_id);
+
+                                let ts_event = clock.get_time_ns();
+                                emitter.emit_order_modify_denied_event(
+                                    strategy_id,
+                                    instrument_id,
+                                    client_order_id,
+                                    Some(venue_order_id),
+                                    &reason,
+                                    ts_event,
+                                    Some(cmd.command_id),
+                                );
+                            }
+                            Err(CommandFailure::VenueRejected(reason)) => {
                                 ocm_state
                                     .lock()
                                     .clear_pending_reduction(&client_order_id, &reduction_bet_id);
@@ -2945,6 +3067,7 @@ impl ExecutionClient for BetfairExecutionClient {
                                     Some(venue_order_id),
                                     &reason,
                                     ts_event,
+                                    Some(cmd.command_id),
                                 );
                             }
                             Ok(()) => {
@@ -3005,13 +3128,14 @@ impl ExecutionClient for BetfairExecutionClient {
             });
         } else {
             let ts_event = self.clock.get_time_ns();
-            self.emitter.emit_order_modify_rejected_event(
+            self.emitter.emit_order_modify_denied_event(
                 strategy_id,
                 instrument_id,
                 client_order_id,
                 Some(venue_order_id),
                 "no effective change in price or quantity",
                 ts_event,
+                Some(cmd.command_id),
             );
         }
 
@@ -3079,6 +3203,7 @@ impl ExecutionClient for BetfairExecutionClient {
             };
 
             cancels.push(CancelOrderData {
+                command_id: cmd.command_id,
                 strategy_id: order.strategy_id(),
                 instrument_id: order.instrument_id(),
                 client_order_id,
@@ -3120,6 +3245,7 @@ impl ExecutionClient for BetfairExecutionClient {
                         .order(&cancel.client_order_id)
                         .is_some_and(|order| is_sp_order(&order));
                     cancels.push(CancelOrderData {
+                        command_id: cancel.command_id,
                         strategy_id: cancel.strategy_id,
                         instrument_id: cancel.instrument_id,
                         client_order_id: cancel.client_order_id,
@@ -3367,6 +3493,7 @@ const MAX_CANCEL_ORDERS_INSTRUCTIONS: usize = 60;
 
 #[derive(Clone, Copy, Debug)]
 struct CancelOrderData {
+    command_id: UUID4,
     strategy_id: StrategyId,
     instrument_id: InstrumentId,
     client_order_id: ClientOrderId,
@@ -3412,7 +3539,11 @@ impl BetfairExecutionClient {
                                 "Ambiguous {task_name} response for {} orders, awaiting OCM reconciliation: {e}",
                                 cancels.len(),
                             ),
-                            CommandFailure::NotSent(_) | CommandFailure::VenueRejected(_) => {
+                            CommandFailure::NotSent(_) => {
+                                let reason = format!("{task_name} error: {e}");
+                                emit_cancel_denials(&emitter, clock, cancels, &reason);
+                            }
+                            CommandFailure::VenueRejected(_) => {
                                 let reason = format!("{task_name} error: {e}");
 
                                 if emit_rejections {
@@ -3426,6 +3557,7 @@ impl BetfairExecutionClient {
                                             Some(cancel.venue_order_id),
                                             &reason,
                                             ts_event,
+                                            Some(cancel.command_id),
                                         );
                                     }
                                 } else {
@@ -3480,10 +3612,15 @@ impl BetfairExecutionClient {
                             "Ambiguous cancel result for {}, awaiting OCM reconciliation",
                             cancel.client_order_id,
                         ),
-                        Err(
-                            CommandFailure::NotSent(reason)
-                            | CommandFailure::VenueRejected(reason),
-                        ) => {
+                        Err(CommandFailure::NotSent(reason)) => {
+                            emit_cancel_denials(
+                                &emitter,
+                                clock,
+                                std::slice::from_ref(cancel),
+                                &reason,
+                            );
+                        }
+                        Err(CommandFailure::VenueRejected(reason)) => {
                             if emit_rejections {
                                 emitter.emit_order_cancel_rejected_event(
                                     cancel.strategy_id,
@@ -3492,6 +3629,7 @@ impl BetfairExecutionClient {
                                     Some(cancel.venue_order_id),
                                     &reason,
                                     clock.get_time_ns(),
+                                    Some(cancel.command_id),
                                 );
                             } else {
                                 log::warn!(
@@ -3506,6 +3644,27 @@ impl BetfairExecutionClient {
 
             Ok(())
         });
+    }
+}
+
+fn emit_cancel_denials(
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    cancels: &[CancelOrderData],
+    reason: &str,
+) {
+    let ts_event = clock.get_time_ns();
+
+    for cancel in cancels {
+        emitter.emit_order_cancel_denied_event(
+            cancel.strategy_id,
+            cancel.instrument_id,
+            cancel.client_order_id,
+            Some(cancel.venue_order_id),
+            reason,
+            ts_event,
+            Some(cancel.command_id),
+        );
     }
 }
 
@@ -3685,12 +3844,6 @@ impl ReconciliationGate {
                 Err(actual) => current = actual,
             }
         }
-    }
-
-    #[cfg(test)]
-    fn try_resume(&self, generation: u64) -> bool {
-        let _commit = self.commit_lock.lock();
-        self.try_resume_locked(generation)
     }
 
     fn try_resume_locked(&self, generation: u64) -> bool {
@@ -5001,6 +5154,15 @@ fn build_incremental_fill_reports(
             anyhow::anyhow!("Failed to parse fill report for {}: {e}", order.bet_id)
         })?;
 
+        if fill_tracker.has_pending_price_restatement(
+            &order.bet_id,
+            size_matched,
+            size_voided,
+            order.average_price_matched,
+        ) {
+            continue;
+        }
+
         let has_applied_fill_lots = fill_tracker.has_fill_lots(&order.bet_id);
         let cumulative = if has_applied_fill_lots {
             gross_matched
@@ -5512,6 +5674,8 @@ fn emit_replace_failure(
     venue_order_id: VenueOrderId,
     old_bet_id: &str,
     reason: &str,
+    failure: &CommandFailure,
+    causation_id: UUID4,
 ) {
     let ts_event = clock.get_time_ns();
     let old_terminal = {
@@ -5526,6 +5690,18 @@ fn emit_replace_failure(
         }
         old_terminal
     };
+
+    if matches!(failure, CommandFailure::NotSent(_)) {
+        emitter.emit_order_modify_denied_event(
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            Some(venue_order_id),
+            reason,
+            ts_event,
+            Some(causation_id),
+        );
+    }
 
     if old_terminal {
         let canceled = OrderCanceled::new(
@@ -5542,7 +5718,7 @@ fn emit_replace_failure(
             None,
         );
         emitter.send_order_event(OrderEventAny::Canceled(canceled));
-    } else {
+    } else if !matches!(failure, CommandFailure::NotSent(_)) {
         emitter.emit_order_modify_rejected_event(
             strategy_id,
             instrument_id,
@@ -5550,6 +5726,7 @@ fn emit_replace_failure(
             Some(venue_order_id),
             reason,
             ts_event,
+            Some(causation_id),
         );
     }
 }
@@ -5798,12 +5975,15 @@ mod tests {
     };
     use nautilus_model::{
         events::{OrderDenied, OrderSubmitted},
-        identifiers::{StrategyId, TraderId},
+        identifiers::{PositionId, StrategyId, TraderId},
+        instruments::{Instrument, InstrumentAny, stubs::audusd_sim},
         orders::builder::OrderTestBuilder,
+        position::Position,
         types::{Money, Price, Quantity},
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
@@ -7497,6 +7677,74 @@ mod tests {
     }
 
     #[rstest]
+    fn test_retained_terminal_price_restatement_does_not_reclose() {
+        let client_order_id = ClientOrderId::from("O-RULE4-LAPSE");
+        let strategy_id = StrategyId::from("S-001");
+        let account_id = AccountId::from("BETFAIR-001");
+        let bet_id = "rule4-lapse-bet";
+        let mut inner = OcmState::default();
+        inner
+            .register_submission(client_order_id, strategy_id)
+            .unwrap();
+        inner.mark_accepted(client_order_id);
+        inner.bind_venue_order_id(&client_order_id, VenueOrderId::from(bet_id));
+        let state = Arc::new(Mutex::new(inner));
+        let (emitter, mut rx) = emitter_with_receiver(account_id);
+        let instrument_id = InstrumentId::from("1.234567-12345-0.0.BETFAIR");
+        let mut terminal = cancel_unmatched_order(
+            bet_id,
+            Some(make_customer_order_ref(client_order_id.as_str())),
+        );
+        terminal.sm = Some(Decimal::from(2));
+        terminal.sc = Some(Decimal::from(18));
+        terminal.avp = Some(Decimal::from(12));
+
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &terminal,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        let opened = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            opened
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::Order(OrderEventAny::Filled(_))))
+        );
+        assert!(
+            opened
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::Order(OrderEventAny::Canceled(_))))
+        );
+
+        terminal.avp = Some(Decimal::new(947, 2));
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &terminal,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        ));
+
+        let restated = match rx.try_recv().expect("price restatement") {
+            ExecutionEvent::Order(OrderEventAny::Filled(filled)) => filled,
+            other => panic!("expected a price restatement, was {other:?}"),
+        };
+
+        assert_eq!(restated.client_order_id, client_order_id);
+        assert_eq!(restated.last_px, Price::from("9.47"));
+        assert_eq!(restated.last_qty, Quantity::from("2.00"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
     fn test_retained_terminal_all_void_correction_does_not_reclose() {
         let client_order_id = ClientOrderId::from("O-ALL-VOID");
         let strategy_id = StrategyId::from("S-001");
@@ -7696,6 +7944,209 @@ mod tests {
             rx.try_recv().is_err(),
             "already-accepted order must not re-synthesize OrderAccepted",
         );
+    }
+
+    #[rstest]
+    fn test_rule4_average_restatement_keeps_filled_quantity_and_original_void_price() {
+        let account_id = AccountId::from("BETFAIR-001");
+        let client_order_id = ClientOrderId::from("O-RULE4");
+        let strategy_id = StrategyId::from("S-RULE4");
+        let instrument_id = InstrumentId::from("1.234567-12345-0.0.BETFAIR");
+        let mut inner = OcmState::default();
+        inner
+            .register_submission(client_order_id, strategy_id)
+            .unwrap();
+        let state = Arc::new(Mutex::new(inner));
+        let (emitter, mut rx) = emitter_with_receiver(account_id);
+        let rfo = make_customer_order_ref(client_order_id.as_str());
+        let mut uo = fill_unmatched_order("bet-rule4", Some(rfo), Decimal::from(2));
+        uo.s = Decimal::from(2);
+        uo.status = crate::common::enums::StreamingOrderStatus::ExecutionComplete;
+        uo.avp = Some(Decimal::from(12));
+
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        let opened = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        let accepted = opened.iter().find_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::Accepted(accepted)) => Some(*accepted),
+            _ => None,
+        });
+
+        let filled = opened.iter().find_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::Filled(filled)) => Some(filled.clone()),
+            _ => None,
+        });
+
+        let accepted = accepted.expect("synthesized accept");
+        let filled = filled.expect("initial fill");
+
+        uo.avp = Some(Decimal::new(947, 2));
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        ));
+
+        let restatement = match rx.try_recv().expect("price restatement") {
+            ExecutionEvent::Order(OrderEventAny::Filled(filled)) => filled,
+            other => panic!("expected a price restatement, was {other:?}"),
+        };
+
+        assert!(rx.try_recv().is_err());
+
+        let repeat = BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(3),
+            UnixNanos::from(3),
+        );
+        assert!(!repeat);
+        assert!(rx.try_recv().is_err());
+
+        uo.sm = Some(Decimal::ZERO);
+        uo.sv = Some(Decimal::from(2));
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(4),
+            UnixNanos::from(4),
+        ));
+
+        let voided = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+            ExecutionEvent::Order(OrderEventAny::FillVoided(voided)) => Some(voided),
+            _ => None,
+        });
+
+        let voided = voided.expect("fill void");
+
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(strategy_id)
+            .instrument_id(instrument_id)
+            .client_order_id(client_order_id)
+            .side(OrderSide::Sell)
+            .quantity(Quantity::from("2.00"))
+            .price(Price::from("12.00"))
+            .build();
+        order.apply(OrderEventAny::Accepted(accepted)).unwrap();
+        order.apply(OrderEventAny::Filled(filled.clone())).unwrap();
+        order
+            .apply(OrderEventAny::Filled(restatement.clone()))
+            .unwrap();
+
+        let audusd = audusd_sim();
+        let position_id = PositionId::from("P-RULE4");
+        let mut opening = filled.clone();
+        opening.instrument_id = audusd.id();
+        opening.position_id = Some(position_id);
+        let mut restated_fill = restatement.clone();
+        restated_fill.instrument_id = audusd.id();
+        restated_fill.position_id = Some(position_id);
+        let mut position = Position::new(&InstrumentAny::CurrencyPair(audusd), opening);
+        position.apply(&restated_fill);
+
+        assert_eq!(restatement.trade_id, filled.trade_id);
+        assert_eq!(restatement.last_qty.as_decimal(), dec!(2));
+        assert_eq!(restatement.last_px.as_decimal(), dec!(9.47));
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty().as_decimal(), dec!(2));
+        assert!(order.leaves_qty().is_zero());
+        assert_eq!(order.avg_px(), Some(dec!(9.47)));
+        assert_eq!(filled.last_px.as_decimal(), dec!(12));
+        assert_eq!(position.quantity.as_decimal(), dec!(2));
+        assert_eq!(position.avg_px_open, restatement.last_px.as_decimal());
+        assert_eq!(position.events[0].last_px, filled.last_px);
+        assert_eq!(voided.trade_id, filled.trade_id);
+        assert_eq!(voided.last_px, filled.last_px);
+        order.apply(OrderEventAny::FillVoided(voided)).unwrap();
+    }
+
+    #[rstest]
+    fn test_rule4_restatement_prices_later_fill_from_corrected_average() {
+        let account_id = AccountId::from("BETFAIR-001");
+        let client_order_id = ClientOrderId::from("O-RULE4-PARTIAL");
+        let strategy_id = StrategyId::from("S-RULE4");
+        let instrument_id = InstrumentId::from("1.234567-12345-0.0.BETFAIR");
+        let mut inner = OcmState::default();
+        inner
+            .register_submission(client_order_id, strategy_id)
+            .unwrap();
+        inner.mark_accepted(client_order_id);
+        let state = Arc::new(Mutex::new(inner));
+        let (emitter, mut rx) = emitter_with_receiver(account_id);
+        let rfo = make_customer_order_ref(client_order_id.as_str());
+        let mut uo = fill_unmatched_order("bet-rule4-partial", Some(rfo), Decimal::from(2));
+        uo.s = Decimal::from(4);
+        uo.avp = Some(Decimal::from(12));
+
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ));
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        uo.avp = Some(Decimal::new(947, 2));
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(2),
+            UnixNanos::from(2),
+        ));
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        uo.sm = Some(Decimal::from(4));
+        uo.avp = Some(Decimal::from(10));
+        assert!(BetfairExecutionClient::process_unmatched_order(
+            &uo,
+            instrument_id,
+            account_id,
+            Currency::GBP(),
+            &emitter,
+            &state,
+            UnixNanos::from(3),
+            UnixNanos::from(3),
+        ));
+
+        let later = match rx.try_recv().expect("later fill") {
+            ExecutionEvent::Order(OrderEventAny::Filled(filled)) => filled,
+            other => panic!("expected the later fill, was {other:?}"),
+        };
+
+        // (10 * 4 - 9.47 * 2) / 2 = 10.53
+        assert_eq!(later.last_qty.as_decimal(), dec!(2));
+        assert_eq!(later.last_px.as_decimal(), dec!(10.53));
     }
 
     #[rstest]
@@ -7924,7 +8375,8 @@ mod tests {
             config.stream_config(),
             config,
             Currency::GBP(),
-        );
+        )
+        .unwrap();
 
         client.sync_ocm_state_from_cache();
 
@@ -8060,7 +8512,8 @@ mod tests {
             config.stream_config(),
             config,
             Currency::GBP(),
-        );
+        )
+        .unwrap();
 
         client.sync_ocm_state_from_cache();
 
@@ -8299,7 +8752,11 @@ mod tests {
 
         assert_ne!(current, stale);
         assert_eq!(reconciliation_gate.current_generation(), current);
-        assert!(!reconciliation_gate.try_resume(stale));
+        assert!(
+            !reconciliation_gate
+                .commit(stale, || panic!("stale reconciliation must not publish"))
+                .unwrap()
+        );
 
         handler(stream_decode(br#"{"op":"ocm","id":2,"pt":1004,"ct":"HEARTBEAT"}"#).unwrap());
         assert_eq!(reconnect_rx.try_recv().unwrap(), current);
@@ -8343,9 +8800,13 @@ mod tests {
         let current = gate.halt();
 
         assert!(gate.is_halted());
-        assert!(!gate.try_resume(stale));
+        assert!(
+            !gate
+                .commit(stale, || panic!("stale reconciliation must not publish"))
+                .unwrap()
+        );
         assert!(gate.is_halted());
-        assert!(gate.try_resume(current));
+        assert!(gate.commit(current, || Ok(())).unwrap());
         assert!(!gate.is_halted());
     }
 
@@ -10652,6 +11113,54 @@ mod tests {
         assert_eq!(later.len(), 1);
         assert_eq!(later[0].last_qty, Quantity::from("10.00"));
         assert_eq!(later[0].last_px.as_decimal(), Decimal::new(25, 1));
+    }
+
+    #[rstest]
+    fn test_fill_report_does_not_commit_price_restatement() {
+        let mut order = make_summary(
+            "bet-report-restate",
+            "1.100",
+            12345,
+            Decimal::ZERO,
+            BetfairOrderStatus::ExecutionComplete,
+            "2026-04-18T10:00:00Z",
+        );
+        order.price_size.size = Decimal::from(2);
+        order.size_matched = Some(Decimal::from(2));
+        order.size_remaining = Some(Decimal::ZERO);
+        order.average_price_matched = Some(Decimal::from(12));
+        let mut state = OcmState::default();
+        let customer_order_refs = state.customer_order_refs.clone();
+        let account_id = AccountId::from("BETFAIR-001");
+        let first = build_incremental_fill_reports(
+            &[order.clone()],
+            &mut state.fill_tracker,
+            &customer_order_refs,
+            account_id,
+            Currency::GBP(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+        order.average_price_matched = Some(Decimal::new(947, 2));
+        let restated = build_incremental_fill_reports(
+            &[order],
+            &mut state.fill_tracker,
+            &customer_order_refs,
+            account_id,
+            Currency::GBP(),
+            UnixNanos::default(),
+        )
+        .unwrap();
+        let stream = state.fill_tracker.advance_cumulative_fill(
+            "bet-report-restate",
+            Decimal::from(2),
+            Some(Decimal::new(947, 2)),
+            Decimal::from(12),
+        );
+
+        assert_eq!(first.len(), 1);
+        assert!(restated.is_empty());
+        assert_eq!(stream.unwrap().2.as_decimal(), Decimal::new(947, 2));
     }
 
     #[rstest]

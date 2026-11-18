@@ -15,6 +15,7 @@
 
 //! Python bindings for the Interactive Brokers instrument provider.
 
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_core::python::to_pyruntime_err;
 use nautilus_model::{identifiers::InstrumentId, python::instruments::instrument_any_to_pyobject};
 use pyo3::{prelude::*, types::PyList};
@@ -30,8 +31,8 @@ use crate::{
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl InteractiveBrokersInstrumentProvider {
     #[new]
-    fn py_new(config: InteractiveBrokersInstrumentProviderConfig) -> Self {
-        Self::new(config)
+    fn py_new(config: InteractiveBrokersInstrumentProviderConfig) -> PyResult<Self> {
+        Self::new(config).map_err(config_error_to_pyvalue_err)
     }
 
     fn __repr__(&self) -> String {
@@ -88,9 +89,8 @@ impl InteractiveBrokersInstrumentProvider {
 
     /// Determine venue from contract using provider configuration.
     #[pyo3(name = "determine_venue")]
-    #[allow(clippy::needless_pass_by_value)]
-    fn py_determine_venue(&self, py: Python<'_>, contract: Py<PyAny>) -> PyResult<String> {
-        let rust_contract = py_to_contract(contract.bind(py))?;
+    fn py_determine_venue(&self, contract: &Bound<'_, PyAny>) -> PyResult<String> {
+        let rust_contract = py_to_contract(contract)?;
         Ok(self.determine_venue(&rust_contract, None).to_string())
     }
 

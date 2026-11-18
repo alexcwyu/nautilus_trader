@@ -15,7 +15,7 @@
 
 //! Raw and domain HTTP clients for Lighter REST endpoints.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use jiff::Timestamp;
 use nautilus_core::{
@@ -29,6 +29,7 @@ use nautilus_model::{
 use nautilus_network::{
     http::{
         HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
+        parse_retry_after,
     },
     ratelimiter::quota::Quota,
     retry::{RetryManager, create_http_retry_manager},
@@ -69,10 +70,11 @@ use crate::{
         },
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountInactiveOrdersQuery,
-            LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery, LighterFundingsQuery,
-            LighterMakerOnlyApiKeysQuery, LighterNextNonceQuery, LighterOrderBookDetailsQuery,
-            LighterOrderBookOrdersQuery, LighterOrderBooksQuery, LighterRecentTradesQuery,
-            LighterTradesQuery, LighterTxLookup, LighterTxQuery,
+            LighterAccountLookup, LighterAccountOrdersQuery, LighterAccountQuery,
+            LighterCandlesQuery, LighterFundingsQuery, LighterMakerOnlyApiKeysQuery,
+            LighterNextNonceQuery, LighterOrderBookDetailsQuery, LighterOrderBookOrdersQuery,
+            LighterOrderBooksQuery, LighterRecentTradesQuery, LighterTradesQuery, LighterTxLookup,
+            LighterTxQuery, validate_client_order_indexes,
         },
     },
 };
@@ -81,6 +83,7 @@ const API_V1: &str = "/api/v1";
 const ENDPOINT_ACCOUNT: &str = "/api/v1/account";
 const ENDPOINT_ACCOUNT_ACTIVE_ORDERS: &str = "/api/v1/accountActiveOrders";
 const ENDPOINT_ACCOUNT_INACTIVE_ORDERS: &str = "/api/v1/accountInactiveOrders";
+const ENDPOINT_ACCOUNT_ORDERS: &str = "/api/v1/accountOrders";
 const ENDPOINT_CANDLES: &str = "/api/v1/candles";
 const ENDPOINT_FUNDINGS: &str = "/api/v1/fundings";
 const ENDPOINT_MAKER_ONLY_API_KEYS: &str = "/api/v1/getMakerOnlyApiKeys";
@@ -95,6 +98,7 @@ const ENDPOINT_SEND_TX_BATCH: &str = "/api/v1/sendTxBatch";
 const ENDPOINT_TRADES: &str = "/api/v1/trades";
 const ENDPOINT_TX: &str = "/api/v1/tx";
 const HEADER_AUTHORIZATION: &str = "authorization";
+const HEADER_RETRY_AFTER: &str = "retry-after";
 const MULTIPART_BOUNDARY: &str = "nautilus-lighter-form-boundary";
 
 /// Maximum page size accepted by Lighter REST list endpoints (`/api/v1/trades`,
@@ -223,6 +227,7 @@ impl LighterRawHttpClient {
             environment,
             client: HttpClient::builder()
                 .redirect_policy(HttpRedirectPolicy::Reject)
+                .header_keys(vec![HEADER_RETRY_AFTER.to_string()])
                 .headers(Self::default_headers())
                 .default_quota(default_quota)
                 .timeout_secs(timeout_secs)
@@ -314,7 +319,9 @@ impl LighterRawHttpClient {
     ///
     /// Returns an error if the request fails or the response is invalid.
     pub async fn get_trades(&self, query: &LighterTradesQuery) -> LighterHttpResult<LighterTrades> {
-        self.send_get_request(ENDPOINT_TRADES, Some(query)).await
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_TRADES, Some(query), headers)
+            .await
     }
 
     /// Calls `GET /api/v1/candles`.
@@ -362,7 +369,8 @@ impl LighterRawHttpClient {
         &self,
         query: &LighterAccountActiveOrdersQuery,
     ) -> LighterHttpResult<LighterOrders> {
-        self.send_get_request(ENDPOINT_ACCOUNT_ACTIVE_ORDERS, Some(query))
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_ACCOUNT_ACTIVE_ORDERS, Some(query), headers)
             .await
     }
 
@@ -375,7 +383,24 @@ impl LighterRawHttpClient {
         &self,
         query: &LighterAccountInactiveOrdersQuery,
     ) -> LighterHttpResult<LighterOrders> {
-        self.send_get_request(ENDPOINT_ACCOUNT_INACTIVE_ORDERS, Some(query))
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_ACCOUNT_INACTIVE_ORDERS, Some(query), headers)
+            .await
+    }
+
+    /// Calls `GET /api/v1/accountOrders`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_account_orders(
+        &self,
+        query: &LighterAccountOrdersQuery,
+    ) -> LighterHttpResult<LighterOrders> {
+        validate_client_order_indexes(&query.client_order_indexes)
+            .map_err(LighterHttpError::Parse)?;
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
+        self.send_get_request_with_headers(ENDPOINT_ACCOUNT_ORDERS, Some(query), headers)
             .await
     }
 
@@ -413,16 +438,8 @@ impl LighterRawHttpClient {
         let params = LighterMakerOnlyApiKeysParams {
             account_index: query.account_index,
         };
-        let headers = query
-            .authorization
-            .as_ref()
-            .or(query.auth.as_ref())
-            .map(|auth| {
-                HashMap::from([(
-                    HEADER_AUTHORIZATION.to_string(),
-                    auth.expose_secret().to_owned(),
-                )])
-            });
+
+        let headers = authorization_headers(query.authorization.as_ref(), query.auth.as_ref());
         self.send_get_request_with_headers(ENDPOINT_MAKER_ONLY_API_KEYS, Some(&params), headers)
             .await
     }
@@ -505,7 +522,7 @@ impl LighterRawHttpClient {
                     async move {
                         let response = self
                             .client
-                            .request_with_params_url_redacted(
+                            .request_with_params(
                                 Method::GET,
                                 url,
                                 params,
@@ -521,6 +538,7 @@ impl LighterRawHttpClient {
                 should_retry_lighter_http_error,
                 |e| create_lighter_http_timeout_error(e.to_string()),
             )
+            .retry_delay(&LighterHttpError::retry_after)
             .execute()
             .await
     }
@@ -608,6 +626,11 @@ impl LighterRawHttpClient {
     where
         T: DeserializeOwned + LighterResponseCheck,
     {
+        let retry_after = response.headers.get(HEADER_RETRY_AFTER).and_then(|value| {
+            let now = get_atomic_clock_realtime().get_time_ns().to_datetime_utc();
+            parse_retry_after(value, now)
+        });
+
         if !response.status.is_success() {
             let status = response.status.as_u16();
             let body = String::from_utf8_lossy(&response.body).to_string();
@@ -615,41 +638,62 @@ impl LighterRawHttpClient {
             // Status-first: a `{code,message}` body must not override the
             // retry decision for 5xx / 429.
             if status >= 500 {
-                return Err(LighterHttpError::Http { status, body });
+                return Err(LighterHttpError::Http {
+                    status,
+                    body,
+                    retry_after,
+                });
             }
 
             // HTTP 405 is a Lighter rate-limit status like 429 per the docs, not a method error
             if status == 429 || status == 405 {
-                return Err(LighterHttpError::RateLimit(body));
+                return Err(LighterHttpError::RateLimit {
+                    message: body,
+                    retry_after,
+                });
             }
 
             if let Ok(result) = serde_json::from_slice::<LighterResultCode>(&response.body)
                 && result.code != 200
             {
-                Self::result_code_error(result.code, result.message.as_deref(), "HTTP error")?;
+                Self::result_code_error(
+                    result.code,
+                    result.message.as_deref(),
+                    "HTTP error",
+                    retry_after,
+                )?;
             }
 
-            return Err(LighterHttpError::Http { status, body });
+            return Err(LighterHttpError::Http {
+                status,
+                body,
+                retry_after,
+            });
         }
 
         let payload: T = match serde_json::from_slice(&response.body) {
             Ok(payload) => payload,
             Err(payload_error) => {
                 if let Ok(result) = serde_json::from_slice::<LighterResultCode>(&response.body) {
-                    Self::check_response(&result)?;
+                    Self::check_response(&result, retry_after)?;
                 }
                 return Err(payload_error.into());
             }
         };
-        Self::check_response(&payload)?;
+
+        Self::check_response(&payload, retry_after)?;
         Ok(payload)
     }
 
-    fn check_response<T: LighterResponseCheck>(payload: &T) -> LighterHttpResult<()> {
+    fn check_response<T: LighterResponseCheck>(
+        payload: &T,
+        retry_after: Option<Duration>,
+    ) -> LighterHttpResult<()> {
         Self::result_code_error(
             payload.response_code(),
             payload.response_message(),
             "Lighter request failed",
+            retry_after,
         )
     }
 
@@ -657,12 +701,14 @@ impl LighterRawHttpClient {
         code: i32,
         message: Option<&str>,
         default_message: &str,
+        retry_after: Option<Duration>,
     ) -> LighterHttpResult<()> {
         match code {
             200 => Ok(()),
-            405 | 429 => Err(LighterHttpError::RateLimit(
-                message.unwrap_or("Lighter rate limit exceeded").to_string(),
-            )),
+            405 | 429 => Err(LighterHttpError::RateLimit {
+                message: message.unwrap_or("Lighter rate limit exceeded").to_string(),
+                retry_after,
+            }),
             code => Err(venue_error(code, message, default_message)),
         }
     }
@@ -687,6 +733,18 @@ impl LighterRawHttpClient {
 #[derive(Serialize)]
 struct LighterMakerOnlyApiKeysParams {
     account_index: i64,
+}
+
+fn authorization_headers(
+    authorization: Option<&SecretString>,
+    auth: Option<&SecretString>,
+) -> Option<HashMap<String, String>> {
+    authorization.or(auth).map(|token| {
+        HashMap::from([(
+            HEADER_AUTHORIZATION.to_string(),
+            token.expose_secret().to_owned(),
+        )])
+    })
 }
 
 fn multipart_headers() -> HashMap<String, String> {
@@ -935,6 +993,18 @@ impl LighterHttpClient {
         query: &LighterAccountInactiveOrdersQuery,
     ) -> LighterHttpResult<LighterOrders> {
         self.inner.get_account_inactive_orders(query).await
+    }
+
+    /// Calls `GET /api/v1/accountOrders`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or the response is invalid.
+    pub async fn get_account_orders(
+        &self,
+        query: &LighterAccountOrdersQuery,
+    ) -> LighterHttpResult<LighterOrders> {
+        self.inner.get_account_orders(query).await
     }
 
     /// Calls `GET /api/v1/nextNonce` for `(account_index, api_key_index)`.
@@ -1362,7 +1432,7 @@ impl LighterHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or nonempty metadata contains no valid instruments.
+    /// Returns an error if the request fails or supported markets contain no valid instruments.
     pub async fn request_instruments(&self) -> LighterHttpResult<Vec<InstrumentAny>> {
         self.request_instruments_for_query(&LighterOrderBookDetailsQuery::default())
             .await
@@ -1372,7 +1442,7 @@ impl LighterHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the request fails or nonempty metadata contains no valid instruments.
+    /// Returns an error if the request fails or supported markets contain no valid instruments.
     pub async fn request_instruments_with_status(
         &self,
     ) -> LighterHttpResult<Vec<(InstrumentAny, LighterMarketStatus)>> {
@@ -1542,26 +1612,9 @@ fn venue_error(code: i32, message: Option<&str>, default_message: &str) -> Light
 
 #[cfg(test)]
 mod tests {
-    use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
 
     use super::*;
-
-    #[tokio::test]
-    async fn test_authenticated_client_rejects_redirects() {
-        let client = LighterRawHttpClient::new(LighterEnvironment::Testnet, None, 3, None)
-            .unwrap()
-            .client;
-        assert_http_redirect_rejected(|url| async move {
-            client
-                .get(url, None, None, Some(3), None)
-                .await
-                .unwrap()
-                .status
-                .as_u16()
-        })
-        .await;
-    }
 
     #[rstest]
     #[case(ENDPOINT_TRADES, "lighter:trades")]

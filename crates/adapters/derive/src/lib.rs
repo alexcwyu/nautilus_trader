@@ -17,24 +17,22 @@
 //! [Derive](https://www.derive.xyz).
 //!
 //! The `nautilus-derive` crate provides integration with the Derive self-custodial onchain
-//! options, perpetuals, and spot exchange. Authentication uses an EVM smart-contract wallet
-//! on the Derive Chain together with a session-key signer; orders are EIP-712 typed-data
+//! options, perpetuals, and spot exchange. Authentication uses the owner's EOA or multisig
+//! together with a session-key signer; orders are EIP-712 typed-data
 //! signed against the venue's per-action module contracts.
+//!
+//! The official Derive API reference can be found at <https://docs.derive.xyz/>.
 //!
 //! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
-//! engine for multi-asset, multi-venue trading systems.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native trading engine
+//! with a deterministic, event-driven architecture for multi-asset, multi-venue systems.
 //!
-//! The system spans research, deterministic simulation, and live execution within a single
-//! event-driven architecture, providing research-to-live semantic parity.
+//! The system spans research, simulation, and live execution, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
-//! This crate provides feature flags to control source code inclusion during compilation,
-//! depending on the intended use case, i.e. whether to provide Python bindings
-//! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
-//! or as part of a Rust only build.
+//! Feature flags control code inclusion for Rust builds and Python bindings:
 //!
 //! - `examples`: Enables the crate's example binaries.
 //! - `extension-module`: Builds as a Python extension module.
@@ -43,6 +41,20 @@
 //!   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
 //!   to use 128-bit value types.
 //! - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+//! - `simulation`: Enables deterministic simulation with `cfg(madsim)`.
+//!
+//! # Integrator Attribution
+//!
+//! Signed order, replace, and trigger-order payloads set `referral_code` to `nautilus`,
+//! with no additional trading cost.
+//!
+//! See [attribution details](https://nautilustrader.io/docs/nightly/integrations/derive/#referral-code-attribution).
+//!
+//! # Documentation
+//!
+//! - [Integration guide](https://nautilustrader.io/docs/nightly/integrations/derive/)
+//! - [Rust examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/derive/examples)
+//! - [Python examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/derive)
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]
@@ -64,6 +76,8 @@ pub mod providers;
 pub mod signing;
 pub mod websocket;
 
+mod book;
+
 #[cfg(feature = "python")]
 pub mod python;
 
@@ -72,3 +86,12 @@ pub use crate::{
     execution::DeriveExecutionClient,
     factories::{DeriveDataClientFactory, DeriveExecutionClientFactory},
 };
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "shared logging fixture also provides integration-only WebSocket servers"
+)]
+mod client_logging {
+    include!("../../../network/tests/integration/common/client_logging.rs");
+}

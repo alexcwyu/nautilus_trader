@@ -31,7 +31,7 @@ use nautilus_model::{
     enums::{AggregationSource, BarAggregation, PriceType},
     identifiers::InstrumentId,
     instruments::{Instrument, any::InstrumentAny},
-    types::{Price, Quantity},
+    types::Quantity,
 };
 
 use crate::{
@@ -43,9 +43,9 @@ use crate::{
     config::{InteractiveBrokersDataClientConfig, MarketDataType},
     data::{
         convert::{
-            apply_bar_price_magnifier, apply_price_magnifier, bar_request_segments,
-            bar_type_to_ib_bar_size, calculate_duration_segments, extend_historical_tick_batch,
-            ib_bar_to_nautilus_bar, ib_timestamp_to_unix_nanos, jiff_to_ib_datetime,
+            IbPriceConverter, bar_request_range, bar_type_to_ib_bar_size,
+            extend_historical_tick_batch, historical_tick_request_end, ib_bar_to_nautilus_bar,
+            ib_timestamp_to_unix_nanos, jiff_to_ib_datetime,
             price_type_to_ib_what_to_show_for_security, retain_historical_ticks_in_range,
         },
         parse::parse_trade_tick,
@@ -121,16 +121,19 @@ impl HistoricalInteractiveBrokersClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if provider initialization or the IB connection fails.
+    /// Returns an error if configuration validation, provider initialization, or the IB connection fails.
     pub async fn connect(config: InteractiveBrokersDataClientConfig) -> anyhow::Result<Self> {
+        config.validate()?;
+
         let instrument_provider = Arc::new(InteractiveBrokersInstrumentProvider::new(
             config.instrument_provider.clone(),
-        ));
+        )?);
         let shared_client = shared_client::get_or_connect(
             &config.host,
             config.port,
             config.client_id,
             config.connection_timeout,
+            config.max_reconnect_attempts,
         )
         .await?;
         let client = shared_client.as_arc();
@@ -168,17 +171,20 @@ impl HistoricalInteractiveBrokersClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the shared client cannot connect or the instrument provider cannot
-    /// initialize.
+    /// Returns an error if configuration validation fails, the shared client cannot connect, or
+    /// the instrument provider cannot initialize.
     pub async fn connect_with_provider(
         instrument_provider: InteractiveBrokersInstrumentProvider,
         config: InteractiveBrokersDataClientConfig,
     ) -> anyhow::Result<Self> {
+        config.validate()?;
+
         let shared_client = shared_client::get_or_connect(
             &config.host,
             config.port,
             config.client_id,
             config.connection_timeout,
+            config.max_reconnect_attempts,
         )
         .await?;
         let client = shared_client.as_arc();
@@ -356,38 +362,14 @@ impl HistoricalInteractiveBrokersClient {
 
                 // Omit the end date for continuous futures (IB error 10339).
                 let is_continuous_future = contract.security_type == SecurityType::ContinuousFuture;
-                let segments = bar_request_segments(
-                    calculate_duration_segments(start_date_time, Some(end_date_time), duration),
+                let range = bar_request_range(
+                    start_date_time,
+                    Some(end_date_time),
+                    duration,
                     is_continuous_future,
                 );
 
-                for (segment_end, segment_duration) in segments {
-                    tracing::debug!(
-                        "Requesting historical bars ending on {:?} with duration {}",
-                        segment_end,
-                        segment_duration
-                    );
-
-                    let mut request = self
-                        .ib_client
-                        .historical_data(&contract, ib_bar_size)
-                        .duration(segment_duration)
-                        .what_to_show(ib_what_to_show)
-                        .trading_hours(trading_hours);
-
-                    if let Some(end) = segment_end {
-                        request = request.ending(jiff_to_ib_datetime(&end));
-                    }
-
-                    let historical_data = tokio::time::timeout(
-                        std::time::Duration::from_secs(timeout),
-                        request.fetch(),
-                    )
-                    .await
-                    .context(format!(
-                        "Historical data request timed out after {timeout} seconds"
-                    ))??;
-
+                if let Some(range) = range {
                     let instrument =
                         self.instrument_provider
                             .find(&instrument_id)
@@ -395,24 +377,45 @@ impl HistoricalInteractiveBrokersClient {
                                 format!("Instrument {instrument_id} is missing from the provider")
                             })?;
 
-                    let price_precision = instrument.price_precision();
+                    let prices = IbPriceConverter::for_instrument(
+                        &instrument,
+                        self.instrument_provider.get_price_magnifier(&instrument_id),
+                    );
                     let size_precision = instrument.size_precision();
-                    let price_magnifier =
-                        self.instrument_provider.get_price_magnifier(&instrument_id);
 
-                    // Create new bar_type with correct instrument_id
-                    for ib_bar in &historical_data.bars {
-                        let ib_bar = apply_bar_price_magnifier(ib_bar, price_magnifier);
-                        let nautilus_bar = ib_bar_to_nautilus_bar(
-                            &ib_bar,
-                            bar_type_with_id,
-                            price_precision,
-                            size_precision,
-                        )?;
-                        all_bars.push(nautilus_bar);
+                    for bar_request in range.requests(&bar_spec) {
+                        tracing::debug!("Requesting historical bars over {bar_request:?}");
+
+                        let request = bar_request
+                            .apply(self.ib_client.historical_data(&contract, ib_bar_size))
+                            .what_to_show(ib_what_to_show)
+                            .trading_hours(trading_hours);
+
+                        let historical_data = tokio::time::timeout(
+                            std::time::Duration::from_secs(timeout),
+                            request.fetch(),
+                        )
+                        .await
+                        .context(format!(
+                            "Historical data request timed out after {timeout} seconds"
+                        ))??;
+
+                        // Create new bar_type with correct instrument_id
+                        for ib_bar in &historical_data.bars {
+                            let nautilus_bar = ib_bar_to_nautilus_bar(
+                                ib_bar,
+                                bar_type_with_id,
+                                prices,
+                                size_precision,
+                            )?;
+
+                            if range.contains(nautilus_bar.ts_event) {
+                                all_bars.push(nautilus_bar);
+                            }
+                        }
+
+                        tracing::debug!("Retrieved {} bars in batch", historical_data.bars.len());
                     }
-
-                    tracing::debug!("Retrieved {} bars in batch", historical_data.bars.len());
                 }
             }
         }
@@ -536,13 +539,15 @@ impl HistoricalInteractiveBrokersClient {
                     format!("Instrument {instrument_id} is missing from the provider")
                 })?;
 
-            let price_precision = instrument.price_precision();
+            let prices = IbPriceConverter::for_instrument(
+                &instrument,
+                self.instrument_provider.get_price_magnifier(&instrument_id),
+            );
             let size_precision = instrument.size_precision();
-            let price_magnifier = self.instrument_provider.get_price_magnifier(&instrument_id);
             let mut contract_ticks = Vec::new();
 
             // Pagination loop for ticks (similar to Python _handle_timestamp_iteration)
-            let mut current_end_date = Some(end_date_time);
+            let mut current_end_date = Some(historical_tick_request_end(end_date_time));
             let current_start_date = Some(start_date_time);
             let start_date_time_ns = UnixNanos::from(
                 u64::try_from(start_date_time.as_nanosecond())
@@ -590,9 +595,6 @@ impl HistoricalInteractiveBrokersClient {
 
                             let ts_init = ts_event;
 
-                            let converted_price =
-                                apply_price_magnifier(tick.price, price_magnifier);
-
                             let Some(raw_size) = tick.size else {
                                 tracing::warn!(
                                     "Skipping historical trade tick with no size for {}",
@@ -610,9 +612,9 @@ impl HistoricalInteractiveBrokersClient {
 
                             let trade_tick = parse_trade_tick(
                                 instrument_id,
-                                converted_price,
+                                tick.price,
                                 raw_size,
-                                price_precision,
+                                prices,
                                 size_precision,
                                 ts_event,
                                 ts_init,
@@ -675,10 +677,10 @@ impl HistoricalInteractiveBrokersClient {
 
                             let ts_init = ts_event;
 
-                            let raw_bid_price =
-                                apply_price_magnifier(tick.price_bid, price_magnifier);
+                            let raw_bid_price = tick.price_bid;
 
-                            let bid_price = Price::new_checked(raw_bid_price, price_precision)
+                            let bid_price = prices
+                                .bid_price(raw_bid_price)
                                 .with_context(|| {
                                     format!(
                                         "Invalid historical bid price {raw_bid_price} for {instrument_id}"
@@ -702,10 +704,10 @@ impl HistoricalInteractiveBrokersClient {
                                     )
                                 })?;
 
-                            let raw_ask_price =
-                                apply_price_magnifier(tick.price_ask, price_magnifier);
+                            let raw_ask_price = tick.price_ask;
 
-                            let ask_price = Price::new_checked(raw_ask_price, price_precision)
+                            let ask_price = prices
+                                .ask_price(raw_ask_price)
                                 .with_context(|| {
                                     format!(
                                         "Invalid historical ask price {raw_ask_price} for {instrument_id}"
@@ -923,5 +925,48 @@ fn data_ts_event(data: &Data) -> UnixNanos {
         Data::Trade(tick) => tick.ts_event,
         Data::Quote(tick) => tick.ts_event,
         _ => UnixNanos::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_common::config::ConfigError;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::config::InteractiveBrokersInstrumentProviderConfig;
+
+    #[rstest]
+    #[case::config(false)]
+    #[case::supplied_config(true)]
+    #[tokio::test]
+    async fn test_historical_connect_rejects_duplicates_before_connection(#[case] supplied: bool) {
+        let duplicate_provider: InteractiveBrokersInstrumentProviderConfig =
+            serde_json::from_value(serde_json::json!({
+                "load_contracts": [{"conId": 265598}, {"conId": 265598}]
+            }))
+            .unwrap();
+
+        let config = InteractiveBrokersDataClientConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            connection_timeout: 1,
+            instrument_provider: duplicate_provider,
+            ..Default::default()
+        };
+
+        let result = if supplied {
+            let provider = InteractiveBrokersInstrumentProvider::new(Default::default()).unwrap();
+
+            HistoricalInteractiveBrokersClient::connect_with_provider(provider, config).await
+        } else {
+            HistoricalInteractiveBrokersClient::connect(config).await
+        };
+
+        let error = result.expect_err("duplicate config must fail before gateway connection");
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("load_contracts", None))
+        );
     }
 }

@@ -28,19 +28,22 @@ on the use case.
 - `BybitWebSocketClient`: Low-level WebSocket API connectivity for Rust callers.
 - `BybitLiquidation`: Custom data for public liquidations on linear and inverse contracts, see
   [Liquidations](#liquidations).
+- `BybitMarginBorrowResult`, `BybitMarginRepayResult`, `BybitMarginStatusResult`: Custom data
+  for manual spot margin operations, see [Manual margin operations](#manual-margin-operations).
 - `BYBIT`, `BYBIT_CLIENT_ID`, `BYBIT_VENUE`: Public identifiers.
+- `BybitMarginAction`: Names the manual margin `query_account` actions; params take its spelling
+  as a string.
 - `BybitEnvironment`, `BybitProductType`, `BybitMarginMode`, `BybitPositionIdx`,
   `BybitPositionMode`: Public enums used by the configurations and order params.
 
 :::note
-Most users define a configuration for a live trading node (as below),
-and won't need to work with the lower-level components directly.
+Most users configure a live trading node as shown below. They do not need to use the lower-level components
+directly.
 :::
 
 ## Bybit documentation
 
-Bybit provides extensive documentation for users which can be found in the [Bybit help center](https://www.bybit.com/en/help-center).
-It's recommended you also refer to the Bybit documentation in conjunction with this NautilusTrader integration guide.
+Read the [Bybit help center](https://www.bybit.com/en/help-center) with this NautilusTrader integration guide.
 
 ## Products
 
@@ -90,6 +93,33 @@ The data and execution clients load all instruments for their configured `produc
 connect. The default is `LINEAR`. Include each product type required by your subscriptions or
 orders.
 
+## Reconciliation
+
+`BybitExecutionClientConfig.load_ids` limits reconciliation to the listed instrument IDs.
+It does not limit instrument loading or order submission. Instrument loading still follows
+`product_types`. `None` or an empty list includes every configured product type. IDs must use the
+`BYBIT` venue, an uppercase symbol, and a configured product-type suffix.
+
+Uncached instruments follow the
+[instrument availability](../concepts/execution/reconciliation.md#instrument-availability) rules.
+Bybit uses the execution client's `load_ids` for this scope.
+
+- A closed order or fill with an uncached in-scope instrument fails direct report requests.
+- With `reconciliation_lookback_mins`, mass status records one cutoff at millisecond precision
+  for order and fill history, marks missing historical instruments or unlinked fills incomplete,
+  and keeps open orders of any age.
+- Lookbacks of 24 hours or longer mark history incomplete because fully canceled, rejected,
+  and deactivated orders have only
+  [24-hour retention](https://bybit-exchange.github.io/docs/v5/order/order-list).
+  The default venue order-history query covers seven days. With a lookback longer than seven days,
+  the fill query returns only the first seven days after the cutoff, so recent fills can be absent.
+- Bulk option fill queries use Bybit's
+  [BTC default](https://bybit-exchange.github.io/docs/v5/order/execution).
+  Bounded mass status marks history incomplete whenever `OPTION` is configured.
+- Order parse and commission construction errors fail the request.
+
+See [Reconciliation reports](#reconciliation-reports) for report collection and order status mapping.
+
 ## Environments
 
 Bybit provides three trading environments. Configure the appropriate
@@ -138,11 +168,13 @@ config = BybitExecutionClientConfig(
 Environment variables: `BYBIT_DEMO_API_KEY`, `BYBIT_DEMO_API_SECRET`
 
 :::warning
-**Demo environment limitations:**
+**Demo environment limitations**:
 
-- The WebSocket Trade API is **not supported** for demo trading. NautilusTrader automatically uses the HTTP REST API for order operations in demo mode, including order lists and batch cancels, which are sent as individual requests.
+- The WebSocket Trade API is **not supported** for demo trading. NautilusTrader automatically uses the HTTP REST API for order operations in demo mode, including order lists, batch modifies, and batch cancels, which are sent as individual requests.
+- The `execution.fast` private channel is **not supported**. Setting `use_ws_execution_fast=True` in demo mode is rejected; use the standard execution stream.
 - Native TP/SL and option params (`order_iv`, `mmp`) on new orders work in demo via the HTTP create-order endpoint.
-- The custom TP/SL trigger prices `tp_trigger_price` and `sl_trigger_price` are not supported in demo (orders setting them are denied); the create-order endpoint cannot carry them.
+- The custom TP/SL trigger prices `tp_trigger_price` and `sl_trigger_price` are not supported in demo (orders
+  setting them are denied). The create-order endpoint cannot carry them.
 - Demo private streams use `wss://stream-demo.bybit.com`, but public market data uses Bybit's mainnet public stream `wss://stream.bybit.com`.
 
 :::
@@ -213,28 +245,30 @@ For SPOT, LINEAR, and INVERSE products, quote subscriptions use Bybit's depth-1 
 snapshots. This feed provides best bid/ask prices and sizes at a documented 10 ms push frequency.
 OPTION quotes use the ticker feed. See the [Bybit order book specification](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook).
 
-Quotes and depth-1 book subscriptions share one WebSocket topic. Unsubscribing from one leaves the
-topic active while the other is still subscribed. A deeper book subscription uses its own topic alongside
-the depth-1 quote feed, so adding book deltas does not change the quote source. Book deltas only
-come from the requested depth. Subscribe to one book depth per instrument; unsubscribe from the
-existing book before selecting another depth.
+Book delta subscriptions for SPOT, LINEAR, and INVERSE support depths 1, 50, 200, and 1000 and default
+to 50. OPTION subscriptions support depths 25 and 100 and default to 25.
+
+Quotes and depth-1 book subscriptions share one WebSocket topic. Unsubscribing from one leaves the topic
+active while the other is still subscribed. A deeper book subscription uses its own topic alongside the
+depth-1 quote feed, so adding book deltas does not change the quote source. Book deltas only come from the
+requested depth. Subscribe to one book depth per instrument. Unsubscribe from the existing book before
+selecting another depth.
 
 ## Order book recovery
 
 ### Sequence validation
 
 Each delta must carry the update ID `u` that follows the book's last accepted frame. Any other delta
-suppresses book output and requests recovery, as does a delta that reaches a book before its first
-snapshot, such as an update the previous subscription sent before a quick resubscribe. A request
-starts recovery only when neither a running recovery nor a snapshot deadline already owns the book.
+suppresses book output and requests recovery. So does a delta that reaches a book before its first snapshot.
+For example, an update sent before a quick resubscribe can reach the new subscription. A request starts
+recovery only when neither a running recovery nor a snapshot deadline already owns the book.
 
 Every snapshot replaces the book, as the
-[Bybit order book contract](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook)
-requires. The venue sends one after each subscribe and after a service restart, which can reset `u`
-to 1, and pushes only snapshots at depth 1. A replacement snapshot can carry an update ID below the
-book's last delta, since the venue serves it from an earlier state; deltas then continue from it.
-A snapshot that arrives while the book's subscription or replacement write is still in flight is
-discarded.
+[Bybit order book contract](https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook) requires. The
+venue sends one after each subscribe and after a service restart, which can reset `u` to 1, and pushes only
+snapshots at depth 1. A replacement snapshot can carry an update ID below the book's last delta, since the
+venue serves it from an earlier state. Deltas then continue from it. A snapshot that arrives while the book's
+subscription or replacement write is still in flight is discarded.
 
 ### Snapshot deadlines
 
@@ -251,33 +285,37 @@ sends nothing, and the next depth-1 snapshot synchronizes it.
 
 ### Retry limits and reconnects
 
-Recovery unsubscribes and resubscribes the book's topic on the same connection, and the venue
-answers with a fresh snapshot. Each recovery episode makes **up to eight attempts within 180
-seconds**, with exponential backoff and jitter, then continues at an interval that doubles from one
-minute to fifteen minutes until a snapshot is accepted. Recovery never ends in a failed state.
-Unsubscribe and shutdown cancel it.
+Recovery unsubscribes and resubscribes the book's topic on the same connection, and the venue answers with a
+fresh snapshot. Each recovery episode makes **up to eight attempts within 180 seconds**, with exponential
+backoff and jitter. It then retries until it accepts a snapshot. The retry interval doubles from one minute to
+fifteen minutes. Recovery never ends in a failed state. Unsubscribe and shutdown cancel it.
 
 Recovering a depth-1 book also pauses quotes on the shared topic until the replacement snapshot
 arrives. A venue rejection of a replacement subscription is logged, and the attempt retries once
 its snapshot deadline passes.
 
-A reconnect resynchronizes every book on the reconnected product type's socket from the snapshot of
-its replayed subscription, and keeps a running recovery with its remaining budget. A recovery
-waiting between attempts after its budget retries at once on the new connection.
+A reconnect resynchronizes every book on the reconnected product type's socket from the snapshot of its
+replayed subscription. It keeps a running recovery with its remaining budget. A recovery waiting between
+attempts after its budget retries at once on the new connection.
 
-When the client cannot queue the initial subscription, such as when it would exceed the option
-connection's topic limit, it logs an error and releases the book instead of recovering it. A queued
-initial subscription whose write fails starts recovery at once.
+If the client cannot queue the initial subscription, it logs an error and releases the book instead of
+recovering it. For example, the subscription can exceed the option connection's topic limit. A queued initial
+subscription whose write fails starts recovery at once.
 
 See [Order book recovery ownership](../developer_guide/adapters.md#order-book-recovery-ownership)
 for the shared recovery machinery and adapter responsibilities.
 
 ### Live recovery validation
 
-The `bybit-book-stress` harness is a development tool for changes to book synchronization and
-recovery. It connects to Bybit mainnet public market data, submits no orders, and checks six linear
-books at the default depth of 50 against the book stream contract, including rising sequences within
-each snapshot episode, and against an independent reconstruction of the venue feed's best 50 levels.
+The `bybit-book-stress` harness is a development tool for changes to book synchronization and recovery. It
+connects to Bybit mainnet public market data and submits no orders. It checks six linear books at the default
+depth of 50 against:
+
+- The book stream contract, including rising sequences within each snapshot episode.
+- A reference book of the best 50 levels, rebuilt from the frames the proxy relays.
+
+A separate public connection, outside the proxy, compares that reference book at the same cross sequence
+(`seq`). A session fails unless every book has at least one such comparison.
 
 From the repository root, run:
 
@@ -297,9 +335,8 @@ CARGO_BUILD_JOBS=16 bash scripts/strip-adapter-env.bash \
   during a reconnect. With a nonzero timeout, it also rejects a replacement and a replayed
   subscription.
 
-`--timeout` sets the snapshot timeout in seconds, where `0` disables snapshot deadlines. `--rounds`
-sets the number of rounds (21 by default) for `churn`, `initial`, and `turnover`; `boundaries` runs
-its sequence once.
+`--timeout` sets the snapshot timeout in seconds, where `0` disables snapshot deadlines. `--rounds` sets the
+number of rounds (21 by default) for `churn`, `initial`, and `turnover`. `boundaries` runs its sequence once.
 
 The harness requires the mainnet linear WebSocket stream and the public `instruments-info` REST API.
 See [Stress harnesses](../developer_guide/spec_data_testing.md#stress-harnesses) for the shared
@@ -322,8 +359,8 @@ All the order types listed below can be used as *either* entries or exits.
 | `LIMIT_IF_TOUCHED`     | ✓    | ✓      | ✓       | -      | *Not supported for Options*.           |
 | `TRAILING_STOP_MARKET` | -    | -      | -       | -      | See [Trailing stops](#trailing-stops). |
 
-An order with a type the adapter does not support is denied locally at submission, with an
-`UNSUPPORTED_ORDER_TYPE` reason, rather than being sent to the venue.
+At submission, the adapter denies an unsupported order type locally with an `UNSUPPORTED_ORDER_TYPE` reason.
+It does not send the order to the venue.
 
 ### Execution instructions
 
@@ -334,38 +371,66 @@ An order with a type the adapter does not support is denied locally at submissio
 
 ### Time in force
 
-| Time in force | Spot | Linear | Inverse | Option | Notes                           |
-| ------------- | ---- | ------ | ------- | ------ | ------------------------------- |
-| `GTC`         | ✓    | ✓      | ✓       | ✓      | Good Till Canceled.             |
-| `GTD`         | -    | -      | -       | -      | *Not supported*; sent as `GTC`. |
-| `FOK`         | ✓    | ✓      | ✓       | ✓      | Fill or Kill.                   |
-| `IOC`         | ✓    | ✓      | ✓       | ✓      | Immediate or Cancel.            |
+| Time in force | Spot | Linear | Inverse | Option | Notes                            |
+| ------------- | ---- | ------ | ------- | ------ | -------------------------------- |
+| `GTC`         | ✓    | ✓      | ✓       | ✓      | Good Till Canceled.              |
+| `GTD`         | -    | -      | -       | -      | No native expiry; sent as `GTC`. |
+| `FOK`         | ✓    | ✓      | ✓       | ✓      | Fill or Kill.                    |
+| `IOC`         | ✓    | ✓      | ✓       | ✓      | Immediate or Cancel.             |
+
+Other time in force values (`DAY`, `AT_THE_OPEN`, and `AT_THE_CLOSE`) produce `OrderDenied` with an
+`UNSUPPORTED_TIME_IN_FORCE` reason before HTTP or WebSocket submission. This also applies to market and
+post-only orders. An unsupported TIF in an order list denies every leg before submission.
 
 ### Advanced order features
 
-| Feature            | Spot | Linear | Inverse | Option | Notes                                  |
-| ------------------ | ---- | ------ | ------- | ------ | -------------------------------------- |
-| Order Modification | ✓    | ✓      | ✓       | ✓      | Price and quantity modification.       |
-| Bracket/OCO Orders | -    | -      | -       | -      | Not implemented; submit legs yourself. |
-| Iceberg Orders     | -    | -      | -       | -      | Not implemented.                       |
+| Feature            | Spot | Linear | Inverse | Option | Notes                                        |
+| ------------------ | ---- | ------ | ------- | ------ | -------------------------------------------- |
+| Order Modification | ✓    | ✓      | ✓       | ✓      | Price and quantity modification.             |
+| Bracket/OCO Orders | -    | -      | -       | -      | See [Contingent orders](#contingent-orders). |
+| Iceberg Orders     | -    | -      | -       | -      | Not implemented.                             |
+
+Conditional orders also support trigger-price amendments.
 
 ### Batch operations
 
 | Operation    | Spot | Linear | Inverse | Option | Notes                                     |
 | ------------ | ---- | ------ | ------- | ------ | ----------------------------------------- |
 | Batch Submit | ✓    | ✓      | ✓       | ✓      | Submit multiple orders in single request. |
-| Batch Modify | -    | -      | -       | -      | Not wired into the execution client.      |
+| Batch Modify | ✓    | ✓      | ✓       | ✓      | Modify multiple orders in single request. |
 | Batch Cancel | ✓    | ✓      | ✓       | ✓      | Cancel multiple orders in single request. |
 
-Batch submit and batch cancel use the trade WebSocket on mainnet and testnet. In demo mode the
-adapter falls back to individual HTTP requests, because the demo environment has no trade
-WebSocket.
+Batch submit, batch modify, and batch cancel use the trade WebSocket on mainnet and testnet. In demo
+mode the adapter falls back to individual HTTP requests, because the demo environment has no trade WebSocket.
 
 Bybit accepts at most 10 Spot orders, 20 Linear or Inverse orders, or 5 Option orders in one batch
 request. Linear, Inverse, and Spot batches consume UID quota per order, while an Option batch
 consumes one request. The adapter splits Spot, Linear, and Inverse batches into groups of 10 by
 default so one request cannot exceed the standard rolling UID allowance. It splits Option batches
 into groups of five. The HTTP batch-cancel method accepts up to 20 Option operations in one call.
+
+### Cancel-all orders
+
+For venue-wide cancel-all (`strategy_only=False`) without an `order_side` filter, the adapter updates
+cached orders only after the venue confirms cancellation. Fills use the execution stream and
+reconciliation. The cancel request, history lookup, and confirmation queries share one
+`http_timeout_secs` deadline. The adapter waits
+`retry_delay_initial_ms` (at least 1 ms) between polling rounds. If a request fails or the deadline
+expires, unconfirmed orders stay open locally until a later order update or reconciliation confirms
+closure. With an `order_side` filter, the adapter uses batch cancel for matching orders instead.
+See [Cancel-all routing](../concepts/execution/index.md#cancel-all-routing) for command routing.
+
+### Reconciliation reports
+
+With `LiveNode`, open-order and targeted order checks collect order reports on a runtime worker. The
+node accepts the reports before finalization updates order identities on the core thread. Expired or
+canceled collections retain the identities needed for pending cancel and amend rejections. Startup
+mass status and direct asynchronous report methods still collect and finalize in one call.
+
+HTTP order reports keep a venue `rejectReason` on `cancel_reason`, except `EC_NoError`. When a
+rejected order has an empty `rejectReason`, the reason is `venue omitted rejectReason` rather than
+`UNKNOWN`. Bybit reports a post-only order that would take liquidity as `Cancelled` with
+`EC_PostOnlyWillTakeLiquidity`; reconciliation emits `OrderRejected` with `due_post_only=true`.
 
 ### Position management
 
@@ -381,21 +446,20 @@ the client connects.
 
 #### Hedge mode (BothSides)
 
-Bybit only accepts Both Sides mode on USDT linear perpetuals. Configure the position mode at Bybit,
-then pass `position_idx` through the order `params`: `1` for the long side or `2` for the short side.
-Use `0` or omit the parameter for one-way mode.
+Bybit only accepts Both Sides mode on USDT linear perpetuals. Configure the position mode at Bybit. Then pass
+`position_idx` through the order `params`. Use `1` for the long side or `2` for the short side. Use `0` or
+omit the parameter for one-way mode.
 
 Bybit documents these values in the V5 [switch position mode](https://bybit-exchange.github.io/docs/v5/position/position-mode)
 and [place order](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters)
 APIs.
 
-Orders and reports with `positionIdx=0` (one-way / Merged Single mode) carry no
-venue position ID. For hedge-mode indexes `1` and `2`, the adapter maps reports
-to venue position IDs ending in `-LONG` and `-SHORT`, and carries the same ID
-onto fills when Bybit execution messages do not include `positionIdx`.
+Orders and reports with `positionIdx=0` (one-way / Merged Single mode) carry no venue position ID. For
+hedge-mode indexes `1` and `2`, the adapter maps reports to venue position IDs ending in `-LONG` and `-SHORT`.
+If Bybit execution messages omit `positionIdx`, fills carry the same ID.
 
-In hedge mode `positionIdx` identifies the position being affected, not the trade direction, so a
-reduce-only sell resolves to the long index and a reduce-only buy resolves to the short index.
+In hedge mode, `positionIdx` identifies the affected position, not the trade direction. Thus, a reduce-only
+sell resolves to the long index. A reduce-only buy resolves to the short index.
 
 To override, pass `position_idx` via `params`:
 
@@ -428,21 +492,19 @@ The venue previously issued `CorporateAction` for stock splits and reverse split
 still accepts it in execution history recorded before its replacement by the settle and dividend
 types above.
 
-The adapter flags each as exchange-generated and logs a warning containing the
-execution ID, symbol, side, quantity, and price. Fills flow through the normal
-`FillReport` path; because these orders carry an empty `orderLinkId`, the
-execution engine treats them as external and assigns them through the
-instrument's active external order claim, configured initially with
-`external_order_instrument_ids`, or to the `EXTERNAL` strategy by default.
+The adapter flags each as exchange-generated and logs a warning containing the execution ID, symbol, side,
+quantity, and price. Fills flow through the normal `FillReport` path. Because these orders carry an empty
+`orderLinkId`, the execution engine treats them as external. It assigns them through the instrument's active
+external order claim, configured initially with `external_order_instrument_ids`. Without a claim, it assigns
+them to the `EXTERNAL` strategy.
 
 Execution types the adapter does not recognize are handled as `UNKNOWN` rather than rejected, so
 future venue additions still flow through the fill path instead of being dropped.
 
-Funding settlements use `execType=Funding`, but they are balance adjustments rather than fills.
-The adapter ignores them in historical fill reports and standard private `execution` messages, so
-it emits neither a `FillReport` nor an `OrderFilled` event and does not change local position
-quantity. During reconciliation, funding records do not count toward the requested fill-report
-limit.
+Funding settlements use `execType=Funding`, but they are balance adjustments rather than fills. The adapter
+ignores them in historical fill reports and standard private `execution` messages. Thus, it emits neither a
+`FillReport` nor an `OrderFilled` event. It does not change local position quantity. During reconciliation,
+funding records do not count toward the requested fill-report limit.
 
 Bybit also publishes an ADL ranking on position updates via the
 `adlRankIndicator` field. The range is 0 (flat / no position) to 5 (next to
@@ -467,16 +529,38 @@ Upstream references:
 
 ### Contingent orders
 
-| Feature            | Spot | Linear | Inverse | Option | Notes                                  |
-| ------------------ | ---- | ------ | ------- | ------ | -------------------------------------- |
-| Order lists        | ✓    | ✓      | ✓       | ✓      | Submitted as a batch via WebSocket.    |
-| OCO orders         | -    | -      | -       | -      | Not implemented; submit legs yourself. |
-| Bracket orders     | -    | -      | -       | -      | Not implemented; submit legs yourself. |
-| Conditional orders | ✓    | ✓      | ✓       | -      | Stop and limit-if-touched orders.      |
+| Feature            | Spot | Linear | Inverse | Option | Notes                                              |
+| ------------------ | ---- | ------ | ------- | ------ | -------------------------------------------------- |
+| Order lists        | ✓    | ✓      | ✓       | ✓      | WebSocket batch; individual HTTP requests in demo. |
+| OCO orders         | -    | -      | -       | -      | *No native linkage*; manage sibling orders.        |
+| Bracket orders     | -    | -      | -       | -      | *No native entry-fill sequencing*.                 |
+| Conditional orders | ✓    | ✓      | ✓       | -      | Stop and limit-if-touched orders.                  |
 
-An order list is validated as a unit before any leg is sent. When one leg fails validation, that
-leg is denied with its specific reason and the remaining legs are denied with `ORDER_LIST_DENIED`,
-so a partially submitted list cannot reach the venue.
+An order list is validated locally as a unit before any leg is sent. When one leg fails validation, that leg is denied
+with its specific reason. The remaining legs are denied with `ORDER_LIST_DENIED`. Thus, a partially submitted
+list cannot result from a local validation failure. Venue submission is not atomic: Bybit can accept some legs
+and reject others.
+
+#### Bracket submission limits
+
+For non-emulated bracket order lists sent to the Bybit adapter, the entry, take-profit (TP), and stop-loss
+(SL) legs submit without waiting for entry fills. The adapter does not defer exit submission or provide native
+OCO linkage for these legs.
+
+:::warning
+Bybit [rejects reduce-only limit orders when no position exists](https://www.bybit.com/en/help-center/article/Reduce-Only-Order).
+In demo trading, an `ETHUSDT-LINEAR` bracket with a resting limit entry can have its entry and conditional
+reduce-only stop-market SL accepted while the non-conditional reduce-only limit TP is rejected with
+`current position is zero, cannot fix reduce-only order qty`.
+The accepted legs can leave the position without a TP order. With `StrategyConfig.manage_contingent_orders`
+enabled, the TP rejection can also cancel its open SL sibling, leaving no exit orders.
+:::
+
+Wait for confirmed entry fills before submitting separate reduce-only exits, and size them to the filled
+position. Handle `OrderRejected` for each leg, and manage sibling cancellation and quantity updates in your
+strategy. See [Strategy-managed contingencies](../concepts/orders/advanced.md#strategy-managed-contingencies)
+for automatic management of open sibling orders. To use native TP/SL, pass [order parameters](#order-parameters)
+to `submit_order` for a single entry order. Order-list `params` apply to every leg.
 
 ### Order parameters
 
@@ -505,10 +589,10 @@ Individual orders can be customized using the `params` dictionary when submittin
 Parameters left unset are omitted from the request, so Bybit's own defaults apply.
 
 :::warning
-Bybit's `close_on_trigger` parameter is not the generic `close_position` whole-position exit
-contract used by the risk engine. The adapter sends the order quantity, and it ignores an unknown
-`close_position` parameter. Do not add `BYBIT` to `full_position_exit_venues` based on
-`close_on_trigger`; leave the venue unlisted so ordinary quantity and notional checks apply.
+Bybit's `close_on_trigger` parameter is not the generic `close_position` whole-position exit contract used by
+the risk engine. The adapter sends the order quantity, and it ignores an unknown `close_position` parameter.
+Do not add `BYBIT` to `full_position_exit_venues` based on `close_on_trigger`. Leave the venue unlisted so
+ordinary quantity and notional checks apply.
 :::
 
 The adapter validates these params before emitting `OrderSubmitted` and denies the order with a
@@ -522,15 +606,18 @@ The adapter validates these params before emitting `OrderSubmitted` and denies t
 - `smp_type` must be `"None"`, `"CancelMaker"`, `"CancelTaker"`, or `"CancelBoth"`, matched
   case-insensitively.
 
-When `take_profit` or `stop_loss` is set without `tpsl_mode`, the adapter sends `Full`. When a TP or
-SL price is set without its own `tp_trigger_by` or `sl_trigger_by`, the adapter derives the trigger
+When `take_profit` or `stop_loss` is set without `tpsl_mode`, the adapter sends `Full`. For Linear and Inverse,
+`Full` covers the entire position and supports only market TP/SL. Set `tpsl_mode="Partial"` to size native TP/SL
+to the entry's filled quantity and support limit TP/SL. See Bybit's
+[create-order parameters](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters).
+When a TP or SL price is set without its own `tp_trigger_by` or `sl_trigger_by`, the adapter derives the trigger
 type from the order's trigger type.
 
 :::note
-On demo, native TP/SL params route through the HTTP create-order endpoint, with one exception:
-the custom trigger prices `tp_trigger_price` and `sl_trigger_price` are not supported because that
-endpoint cannot carry them, and orders that set either are denied. The `is_leverage` param applies
-to Spot products only. See [Bybit's isLeverage documentation](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters).
+On demo, native TP/SL params route through the HTTP create-order endpoint, with one exception. The endpoint
+cannot carry the custom trigger prices `tp_trigger_price` and `sl_trigger_price`. Thus, the adapter denies
+orders that set either price. The `is_leverage` param applies to Spot products only. See
+[Bybit's isLeverage documentation](https://bybit-exchange.github.io/docs/v5/order/create-order#request-parameters).
 :::
 
 When `bbo_side_type` and `bbo_level` are set, Nautilus sends Bybit's
@@ -569,11 +656,11 @@ Pass `smp_type` through the order `params` to override the configured default fo
 params = {"smp_type": "CancelBoth"}
 ```
 
-The adapter denies an order whose `smp_type` is not one of the four values above, and it rejects a
-client config carrying any other value. With neither the config nor the param set, the adapter omits
-`smpType`, so Bybit's own default applies. Bybit overrides the setting in some regions: derivatives
-accounts in Kazakhstan have SMP force-enabled and cannot opt out, and spot accounts in Turkey,
-Kazakhstan, and Georgia fall back to `CancelMaker` when `smpType` is omitted, `None`, or invalid.
+The adapter denies an order whose `smp_type` is not one of the four values above, and it rejects a client
+config carrying any other value. With neither the config nor the param set, the adapter omits `smpType`, so
+Bybit's own default applies. Bybit overrides the setting in some regions. Derivatives accounts in Kazakhstan
+have SMP force-enabled and cannot opt out. For spot accounts in Turkey, Kazakhstan, and Georgia, Bybit uses
+`CancelMaker` when `smpType` is omitted, `None`, or invalid.
 
 Bybit documents the values and the regional rules in the V5
 [SMP guide](https://bybit-exchange.github.io/docs/v5/smp).
@@ -586,6 +673,9 @@ order = strategy.order_factory.limit(
     order_side=OrderSide.BUY,
     quantity=Quantity.from_str("0.01"),
     price=Price.from_str("60000.0"),
+)
+strategy.submit_order(
+    order,
     params={
         "take_profit": "65000.0",
         "stop_loss": "58000.0",
@@ -593,7 +683,6 @@ order = strategy.order_factory.limit(
         "sl_trigger_by": "LastPrice",
     },
 )
-strategy.submit_order(order)
 ```
 
 #### Example: BBO order
@@ -639,9 +728,18 @@ The following limitations apply to Spot products, as positions are not tracked o
 
 ### Options trading
 
-Bybit lists European-style options on BTC and ETH, settled in USDT or USDC.
+Bybit lists European-style options on crypto and US equity underlyings, such as BTC, ETH, SOL,
+and NVDA, settled in USDT or USDC.
 The adapter uses the `CryptoOption` instrument type and the `-OPTION` symbol
 suffix. See the [symbology section](#symbology) for the full symbol format.
+
+Option instruments carry `exercise_style` `EUROPEAN` and `settlement_type` `CASH`. Bybit definitions have
+neither field; the values follow the
+[Bybit options specification](https://www.bybit.com/en/help-center/article/Introduction-to-Bybit-Options).
+
+With `OPTION` in `product_types`, the adapter loads options for every listed base coin,
+including BTC, ETH, and SOL, on mainnet, testnet, and demo. Instrument refreshes and
+status updates cover the same base coins.
 
 #### Options data
 
@@ -677,14 +775,14 @@ In addition to the standard order parameters, option orders accept:
 | `order_iv` | `str` or `float` | Place or amend the order by implied volatility instead of price. |
 | `mmp`      | `bool`           | Enable Market Maker Protection for the order.                    |
 
-These parameters are passed through `params` on `SubmitOrder`. On mainnet they flow through the
-WebSocket trade channel; on demo they route through the HTTP create-order endpoint. Amending an
-existing order by `order_iv` is not supported in demo mode.
+These parameters are passed through `params` on `SubmitOrder`. On mainnet they flow through the WebSocket
+trade channel. On demo they route through the HTTP create-order endpoint. Amending an existing order by
+`order_iv` is not supported in demo mode.
 
 #### Options trading limitations
 
 - Amending an order by implied volatility (`order_iv`) and other WS-trade-only features are not supported in demo mode.
-- Leverage is not configurable. Option buyers pay premium; sellers post margin.
+- Leverage is not configurable. Option buyers pay premium. Sellers post margin.
 - Position mode is one-way only. Hedge mode is not supported.
 - Conditional order types (`STOP_MARKET`, `STOP_LIMIT`, `MARKET_IF_TOUCHED`,
   `LIMIT_IF_TOUCHED`) are not supported.
@@ -697,14 +795,13 @@ existing order by `order_iv` is not supported in demo mode.
 The adapter does not submit Nautilus `TRAILING_STOP_MARKET` orders to Bybit. Submitting one denies
 the order locally with an `UNSUPPORTED_ORDER_TYPE` reason.
 
-Bybit models trailing stops as an attribute of a netted position rather than as an order, so a
-trailing stop has no client order ID on the venue side and cannot be queried until it is already
-open. Attach a trailing stop through the Bybit interface if you need one, and manage the resulting
-position exit outside Nautilus.
+Bybit models trailing stops as an attribute of a netted position rather than as an order. Thus, a trailing
+stop has no venue-side client order ID. It cannot be queried until it is already open. Attach a trailing stop
+through the Bybit interface if you need one, and manage the resulting position exit outside Nautilus.
 
 ## Spot margin borrowing and repayment
 
-NautilusTrader provides automated spot margin borrow repayment functionality to prevent interest accrual after closing short positions on Bybit.
+NautilusTrader can automatically repay spot margin borrows after BUY orders fill, and strategies can drive borrowing, repayment, and borrow queries manually.
 
 ### Background
 
@@ -718,7 +815,7 @@ The execution client can automatically repay spot margin borrows after BUY order
 on Spot instruments. This feature is disabled by default, so set
 `auto_repay_spot_borrows=True` to opt in.
 
-**How it works:**
+**How it works**:
 
 1. When a Spot BUY order fully fills on the standard `execution` channel, the execution client
    attempts to repay the base coin borrow.
@@ -731,7 +828,7 @@ on Spot instruments. This feature is disabled by default, so set
    result status is logged as processing, not complete.
 1. The execution client defers queued repayments during Bybit's UTC blackout window.
 
-**Example:**
+**Example**:
 
 ```python
 from nautilus_trader.adapters.bybit import BybitExecutionClientConfig
@@ -764,7 +861,91 @@ minutes 31 seconds past the hour.
   [Manual Repay](https://bybit-exchange.github.io/docs/v5/account/repay) and
   [Manual Repay Without Asset Conversion](https://bybit-exchange.github.io/docs/v5/account/no-convert-repay).
 - Manual borrowing is still required before opening short positions unless auto-borrow is enabled
-  on your Bybit account.
+  on your Bybit account. See [Manual margin operations](#manual-margin-operations).
+
+### Manual margin operations
+
+Strategies control spot margin borrowing directly through `query_account` params. An unknown or
+missing `action` refreshes the account state instead of performing a margin operation, and an
+unknown value also logs a warning.
+
+| Param    | Type            | Description                                                                      |
+| -------- | --------------- | -------------------------------------------------------------------------------- |
+| `action` | `str`           | `borrow`, `repay`, or `get_borrow_amount` (case-insensitive).                    |
+| `coin`   | `str`           | Required. Without it the client logs an error and publishes no result.           |
+| `amount` | `str` or number | Required for `borrow` and must be positive. Omit on `repay` to repay everything. |
+
+An `amount` that is present but null, zero, negative, or not a string or number publishes a failed
+result rather than repaying everything. Unlike v1, the params must use plain strings or numbers:
+`json.dumps` raises `TypeError` on `Decimal` values and enum objects. An omitted `amount` asks the
+venue to repay the whole outstanding borrow, bounded by the available coin balance, so query the
+remaining borrow with `get_borrow_amount` before treating the liability as cleared.
+
+```python
+account_id = self.portfolio.account(BYBIT_VENUE).id
+
+# Borrow the base coin before opening a short
+self.query_account(
+    account_id=account_id,
+    params={"action": "borrow", "coin": "ETH", "amount": 0.5},
+)
+
+# Repay a specific amount, or omit "amount" to repay the whole outstanding borrow
+self.query_account(
+    account_id=account_id,
+    params={"action": "repay", "coin": "ETH", "amount": 0.05},
+)
+
+# Query the current borrowed amount
+self.query_account(
+    account_id=account_id,
+    params={"action": "get_borrow_amount", "coin": "ETH"},
+)
+```
+
+Each action that names a `coin` publishes custom data:
+
+| Action              | Published type            | Notes                                                                  |
+| ------------------- | ------------------------- | ---------------------------------------------------------------------- |
+| `borrow`            | `BybitMarginBorrowResult` | `success` and `message`; a missing or invalid `amount` publishes this. |
+| `repay`             | `BybitMarginRepayResult`  | `result_status` is the venue `P` or `SU` on success, `FAIL` otherwise. |
+| `get_borrow_amount` | `BybitMarginStatusResult` | `borrow_amount`; a failed query publishes nothing.                     |
+
+Manual repayment differs from auto-repayment:
+
+- REPAY uses Bybit's
+  [no-convert repay](https://bybit-exchange.github.io/docs/v5/account/no-convert-repay) endpoint,
+  so an explicit amount that exceeds the available coin balance fails rather than spending other
+  assets. Repaying immediately after a Spot BUY fill can therefore fall short by the base-coin
+  trading fee; use `auto_repay_spot_borrows` to cover that shortfall by conversion.
+- A REPAY is checked immediately before the request and, inside the hourly
+  [blackout window](#utc-blackout-window), is not sent: the client publishes a failed result whose
+  `message` names the retry time. A request admitted just before the window opens can still reach
+  the venue and fail with the venue's error. Borrow and borrow-amount queries are not blocked.
+- A manual repay can race the auto-repay queue on the same coin; the losing side fails with the
+  venue's error and publishes or logs it.
+
+Subscribe with each type's name and unwrap the `CustomData` in `on_data`:
+
+```python
+from nautilus_trader.adapters.bybit import BybitMarginBorrowResult
+from nautilus_trader.adapters.bybit import BybitMarginRepayResult
+from nautilus_trader.adapters.bybit import BybitMarginStatusResult
+from nautilus_trader.model import CustomData
+from nautilus_trader.model import DataType
+
+
+class MyStrategy(Strategy):
+    def on_start(self):
+        self.subscribe_data(DataType(BybitMarginBorrowResult.__name__))
+        self.subscribe_data(DataType(BybitMarginRepayResult.__name__))
+        self.subscribe_data(DataType(BybitMarginStatusResult.__name__))
+
+    def on_data(self, data: CustomData) -> None:
+        result = data.data
+        if isinstance(result, BybitMarginRepayResult) and not result.success:
+            self.log.error(f"Repay failed: {result.message}")
+```
 
 ## Funding rates
 
@@ -785,11 +966,10 @@ so its interval is unset.
 ### Liquidations
 
 The adapter emits `BybitLiquidation` custom data from Bybit's public
-[all liquidation](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation)
-WebSocket stream (`allLiquidation.{symbol}`). Bybit publishes this stream for linear and inverse
-contracts only, so the adapter rejects Spot and Option subscriptions. Bybit pushes updates every
-500 ms, and one update can carry several liquidations; the adapter emits one `BybitLiquidation` for
-each of them.
+[all liquidation](https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation) WebSocket stream
+(`allLiquidation.{symbol}`). Bybit publishes this stream for linear and inverse contracts only, so the adapter
+rejects Spot and Option subscriptions. Bybit pushes updates every 500 ms, and one update can carry several
+liquidations. The adapter emits one `BybitLiquidation` for each of them.
 
 | Field              | Type           | Description                                                       |
 | ------------------ | -------------- | ----------------------------------------------------------------- |
@@ -800,10 +980,9 @@ each of them.
 | `ts_event`         | `int`          | UNIX timestamp in nanoseconds when Bybit updated the liquidation. |
 | `ts_init`          | `int`          | UNIX timestamp in nanoseconds when the object was built.          |
 
-`position_side` is the side of the position that was liquidated, not the side of the liquidation
-order: Bybit reports `Buy` when a long position is liquidated and `Sell` when a short position is
-liquidated. `bankruptcy_price` is the price at which the position's margin is exhausted, not the
-price at which the liquidation executed.
+`position_side` is the side of the liquidated position, not the liquidation order. Bybit reports `Buy` for a
+liquidated long position and `Sell` for a liquidated short position. `bankruptcy_price` is the price at which
+the position's margin is exhausted, not the price at which the liquidation executed.
 
 Subscribe from an actor or strategy with `DataType(BybitLiquidation.__name__)`. The
 `instrument_id` metadata key is required:
@@ -884,9 +1063,15 @@ consume venue quota that this adapter cannot reserve in advance. Response header
 gap for UID limits, but separate processes still require operational coordination.
 :::
 
-Explicit venue rate-limit responses are terminal rejections for the affected order operation.
-Transport timeouts, service restarts, and duplicate request identifiers remain subject to order
-reconciliation because they do not prove whether the venue accepted the order.
+The following outcomes do not prove whether Bybit accepted the command. The adapter emits no
+`OrderRejected`, `OrderModifyRejected`, or `OrderCancelRejected`. The order stays in flight until
+a later order update or reconciliation resolves it:
+
+- HTTP or WebSocket `retCode` `10006` ("Too many visits") or `10429` ("System level frequency
+  protection") on submit, modify, or cancel
+- Transport timeouts
+- Service restarts
+- Duplicate request identifiers
 
 :::info
 For more details on rate limiting, see the official documentation: <https://bybit-exchange.github.io/docs/v5/rate-limit>.
@@ -916,17 +1101,17 @@ For Spot margin trading on UTA accounts:
 - If auto-borrow/auto-repay is enabled on your Bybit account, the venue will automatically borrow/repay funds for those margin orders
 - Without auto-borrow enabled, you'll need to manually manage borrowing through Bybit's interface
 
-**Important**: The Nautilus Bybit adapter defaults to `is_leverage=False` for Spot orders,
-meaning they won't use margin unless you explicitly enable it.
+**Important**: The Nautilus Bybit adapter defaults to `is_leverage=False` for Spot orders, so they do not use
+margin unless you explicitly enable it.
 :::
 
 ## Fee currency logic
 
 Understanding how Bybit determines the currency for trading fees is important for accurate accounting and position tracking. The fee currency rules vary between Spot and derivatives products.
 
-The adapter takes the commission amount and currency directly from the venue's `execFee` and
-`feeCurrency` fields, so the rules below describe what Bybit reports rather than a local
-calculation.
+For standard `execution` messages and REST execution reports, the adapter takes the commission amount
+and currency directly from the venue's `execFee` and `feeCurrency` fields. The fast-execution path
+described below derives commission instead.
 
 ### Spot trading fees
 
@@ -965,17 +1150,58 @@ For all derivatives products (LINEAR, INVERSE, OPTION), fees are always charged 
 | INVERSE      | Base coin (e.g., BTC for BTCUSD) | Base coin    |
 | OPTION       | USDT or USDC                     | Settle coin  |
 
-### Missing fee data
+### Fast execution commission derivation
 
-Bybit's `execution.fast` private channel omits the fee and execution type fields. Fill reports
-parsed from that channel therefore carry zero commission. Subscribe to the standard `execution`
-channel when exact fee data is required.
+With `use_ws_execution_fast=True`, the adapter subscribes to `execution.fast` instead of the standard
+`execution` channel. The fast channel omits `execFee`, `feeCurrency`, `feeRate`, and execution type.
+Before connecting the private stream, the adapter requests account maker and taker rates from
+Bybit's `/v5/account/fee-rate` endpoint and derives fast-fill commissions from the cached rates:
+
+- Spot uses base quantity times the fee rate for base-denominated fees and quote notional times the
+  fee rate for quote-denominated fees. Maker rebates use the opposite fee currency and a negative
+  commission amount.
+- Linear and inverse derivatives use instrument notional times the fee rate, denominated in
+  settlement currency. No currency conversion is applied when quote and settlement currencies differ.
+  A charged Linear fee rounds up at the settlement currency precision, as Bybit's `execFee` does.
+- The adapter rejects `use_ws_execution_fast=True` with the `OPTION` product type. The fast payload
+  lacks the underlying/index price and cap inputs required by Bybit's Option fee formula.
+
+If the fee-rate request fails and no previous rates are cached, the connection fails. On a later
+connect, a failed refresh retains the previous rates.
+
+The adapter never substitutes zero commission. When it cannot derive a commission, because the
+instrument has no cached rate or the calculation fails, it logs an error and emits no fill from the
+stream. Only execution reconciliation can then record the fill, and it does not always do so:
+
+- With `open_check_interval_secs` set, the open-order check can infer the fill from the order status
+  report while the order is still open in the system. The inferred fill has a generated trade ID and
+  no commission.
+- Without periodic checks, the fill stays unrecorded until the next reconciliation.
+- A fill skipped before the order is canceled, or during shutdown, can stay unrecorded: the order
+  closes or the session ends before a check covers it.
+
+The adapter refreshes these rates each time the execution client connects, not when an individual
+WebSocket automatically reconnects. Fast fills with an empty `orderLinkId` are correlated by venue
+order ID and deferred until the corresponding order update when necessary.
+
+:::warning
+Fast-execution-derived commission is **not authoritative from the venue**. Cached rates can be stale,
+and the formula excludes special fee schedules such as RPI, `extraFees`, product-specific fee caps,
+and rounding rules not verified against the venue. Use the standard `execution` channel or REST
+execution reports when authoritative `execFee` accounting is required.
+:::
+
+The fast channel delivers only ordinary `Trade` executions. It does not provide other execution types
+such as ADL or liquidation fills, and it does not trigger `auto_repay_spot_borrows`. Use the standard
+channel for these behaviors.
 
 ### Official documentation
 
 For complete details on Bybit's fee structure and currency rules, refer to:
 
 - [Bybit WebSocket Private Execution](https://bybit-exchange.github.io/docs/v5/websocket/private/execution)
+- [Bybit WebSocket Fast Execution](https://bybit-exchange.github.io/docs/v5/websocket/private/fast-execution)
+- [Bybit Get Fee Rate](https://bybit-exchange.github.io/docs/v5/account/fee-rate)
 - [Bybit Spot Fee Currency Instruction](https://bybit-exchange.github.io/docs/v5/enum#spot-fee-currency-instruction)
 
 ## Configuration
@@ -995,9 +1221,9 @@ The product types for each client must be specified in the configurations.
 | `base_url_ws_private`              | `None`     | Override for the private WebSocket URL.                                                                         |
 | `proxy_url`                        | `None`     | Optional proxy URL for HTTP and WebSocket transports.                                                           |
 | `http_timeout_secs`                | `60`       | Timeout (seconds) for REST requests.                                                                            |
-| `max_retries`                      | `3`        | Maximum retry attempts for REST requests.                                                                       |
-| `retry_delay_initial_ms`           | `1,000`    | Initial retry delay (milliseconds).                                                                             |
-| `retry_delay_max_ms`               | `10,000`   | Maximum retry delay (milliseconds).                                                                             |
+| `max_retries`                      | `3`        | Maximum retry attempts for REST reads.                                                                          |
+| `retry_delay_initial_ms`           | `1,000`    | Initial retry delay for REST reads (milliseconds).                                                              |
+| `retry_delay_max_ms`               | `10,000`   | Maximum retry delay for REST reads (milliseconds).                                                              |
 | `heartbeat_interval_secs`          | `20`       | Heartbeat interval (seconds) for WebSocket clients.                                                             |
 | `recv_window_ms`                   | `5,000`    | Receive window (milliseconds) for signed REST requests.                                                         |
 | `update_instruments_interval_mins` | `60`       | Interval (minutes) between instrument catalog refreshes.                                                        |
@@ -1008,29 +1234,31 @@ The product types for each client must be specified in the configurations.
 
 ### Execution client configuration options
 
-| Option                      | Default    | Description                                                                                                     |
-| --------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------- |
-| `product_types`             | `[LINEAR]` | Sequence of `BybitProductType` values to enable.                                                                |
-| `environment`               | `MAINNET`  | Bybit environment enum. Use `BybitEnvironment.MAINNET`, `BybitEnvironment.DEMO`, or `BybitEnvironment.TESTNET`. |
-| `api_key`                   | `None`     | API key; loaded from the matching environment variable when omitted.                                            |
-| `api_secret`                | `None`     | API secret; loaded from the matching environment variable when omitted.                                         |
-| `base_url_http`             | `None`     | Override for the REST base URL.                                                                                 |
-| `base_url_ws_private`       | `None`     | Override for the private WebSocket base URL.                                                                    |
-| `base_url_ws_trade`         | `None`     | Override for the trade WebSocket base URL.                                                                      |
-| `proxy_url`                 | `None`     | Optional proxy URL for HTTP and WebSocket transports.                                                           |
-| `http_timeout_secs`         | `60`       | Timeout (seconds) for REST requests.                                                                            |
-| `max_retries`               | `3`        | Maximum retry attempts for REST requests.                                                                       |
-| `retry_delay_initial_ms`    | `1,000`    | Initial retry delay (milliseconds).                                                                             |
-| `retry_delay_max_ms`        | `10,000`   | Maximum retry delay (milliseconds).                                                                             |
-| `heartbeat_interval_secs`   | `5`        | Heartbeat interval (seconds) for WebSocket clients.                                                             |
-| `auth_timeout_secs`         | `None`     | Optional WebSocket authentication timeout (seconds).                                                            |
-| `recv_window_ms`            | `5,000`    | Receive window (milliseconds) for signed REST and trade WebSocket requests.                                     |
-| `account_id`                | `None`     | Optional account ID associated with this client.                                                                |
-| `use_spot_position_reports` | `False`    | Report Spot wallet balances as positions for scoped requests; bulk reports omit Spot (no pair attribution).     |
-| `auto_repay_spot_borrows`   | `False`    | Automatically repay tracked Spot margin borrows after BUY orders fully fill.                                    |
-| `margin_mode`               | `None`     | Unified margin mode setting for the account.                                                                    |
-| `smp_type`                  | `None`     | Self-match prevention sent on every order. See [SMP](#self-match-prevention).                                   |
-| `transport_backend`         | `Sockudo`  | WebSocket transport backend.                                                                                    |
+| Option                      | Default    | Description                                                                                                                  |
+| --------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `product_types`             | `[LINEAR]` | Sequence of `BybitProductType` values to enable.                                                                             |
+| `environment`               | `MAINNET`  | Bybit environment enum. Use `BybitEnvironment.MAINNET`, `BybitEnvironment.DEMO`, or `BybitEnvironment.TESTNET`.              |
+| `api_key`                   | `None`     | API key; loaded from the matching environment variable when omitted.                                                         |
+| `api_secret`                | `None`     | API secret; loaded from the matching environment variable when omitted.                                                      |
+| `base_url_http`             | `None`     | Override for the REST base URL.                                                                                              |
+| `base_url_ws_private`       | `None`     | Override for the private WebSocket base URL.                                                                                 |
+| `base_url_ws_trade`         | `None`     | Override for the trade WebSocket base URL.                                                                                   |
+| `proxy_url`                 | `None`     | Optional proxy URL for HTTP and WebSocket transports.                                                                        |
+| `http_timeout_secs`         | `60`       | REST request timeout and total cancel-all confirmation deadline (seconds).                                                   |
+| `max_retries`               | `3`        | Maximum retry attempts for REST reads.                                                                                       |
+| `retry_delay_initial_ms`    | `1,000`    | Initial REST read retry delay and cancel-all polling interval (milliseconds).                                                |
+| `retry_delay_max_ms`        | `10,000`   | Maximum REST read retry delay (milliseconds).                                                                                |
+| `heartbeat_interval_secs`   | `20`       | Heartbeat interval (seconds) for WebSocket clients.                                                                          |
+| `auth_timeout_secs`         | `None`     | Optional WebSocket authentication timeout (seconds).                                                                         |
+| `recv_window_ms`            | `5,000`    | Receive window (milliseconds) for signed REST and trade WebSocket requests.                                                  |
+| `account_id`                | `None`     | Optional account ID associated with this client.                                                                             |
+| `use_spot_position_reports` | `False`    | Report Spot wallet balances as positions for scoped requests; bulk reports omit Spot (no pair attribution).                  |
+| `auto_repay_spot_borrows`   | `False`    | Automatically repay tracked Spot margin borrows after BUY orders fully fill on the standard execution channel.               |
+| `use_ws_execution_fast`     | `False`    | Use `execution.fast` instead of `execution`; derives non-authoritative commissions. Rejected in demo mode and with `OPTION`. |
+| `margin_mode`               | `None`     | Unified margin mode setting for the account.                                                                                 |
+| `smp_type`                  | `None`     | Self-match prevention sent on every order. See [SMP](#self-match-prevention).                                                |
+| `transport_backend`         | `Sockudo`  | WebSocket transport backend.                                                                                                 |
+| `load_ids`                  | `None`     | Instrument IDs included in reconciliation. See [Reconciliation](#reconciliation).                                            |
 
 The compiled default is Sockudo when the `transport-sockudo` Cargo feature is enabled and
 Tungstenite otherwise.

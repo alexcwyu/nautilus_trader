@@ -39,33 +39,33 @@ use nautilus_common::{
     component::Component,
     enums::Environment,
     factories::{ClientConfig, DataClientFactory, ExecutionClientFactory},
-    live::{dst, runner::get_exec_event_sender},
+    live::{LiveClock, dst, runner::get_exec_event_sender},
     logging::{logger::LoggerConfig, logging_sync_to_disk, writer::FileWriterConfig},
     messages::{
         ExecutionEvent,
         execution::{
-            CancelOrder, GenerateFillReports, GenerateOrderStatusReport,
-            GenerateOrderStatusReports, GeneratePositionStatusReports, QueryOrder, TradingCommand,
+            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
+            GeneratePositionStatusReports, QueryOrder, TradingCommand,
         },
         system::{QueueStateChanged, ShutdownSystem},
     },
     msgbus::{self, MessagingSwitchboard, ShareableMessageHandler, switchboard},
     nautilus_actor,
+    runner::{TimeEventMessage, TimeEventSender, get_time_event_sender},
     testing::{wait_until, wait_until_async},
+    timer::{TimeEvent, TimeEventCallback},
 };
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_live::{
     builder::LiveNodeBuilder,
     config::{LiveExecutionEngineConfig, LiveNodeConfig},
     node::{LiveNode, LiveNodeHandle, NodeRunMode, NodeState},
+    runner::{AsyncRunner, AsyncTimeEventSender},
 };
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
-    enums::{
-        AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide,
-        TimeInForce,
-    },
-    events::{OrderEventAny, account::state::AccountState},
+    accounts::AccountAny,
+    enums::{LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce},
+    events::OrderEventAny,
     identifiers::{
         AccountId, ActorId, ClientId, ClientOrderId, ExecAlgorithmId, InstrumentId, PositionId,
         StrategyId, TradeId, TraderId, Venue, VenueOrderId,
@@ -91,6 +91,7 @@ use proptest::{
 };
 use rstest::rstest;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
 #[derive(Debug)]
 struct TestActor {
@@ -125,21 +126,6 @@ impl TestStrategy {
 impl DataActor for TestStrategy {}
 
 nautilus_strategy!(TestStrategy);
-
-#[derive(Debug)]
-struct PositionStartupActor {
-    core: DataActorCore,
-    start_count: Rc<Cell<usize>>,
-}
-
-impl DataActor for PositionStartupActor {
-    fn on_start(&mut self) -> anyhow::Result<()> {
-        self.start_count.set(self.start_count.get() + 1);
-        Ok(())
-    }
-}
-
-nautilus_actor!(PositionStartupActor);
 
 #[derive(Debug)]
 struct PositionStartupStrategy {
@@ -350,23 +336,19 @@ fn test_builder_accepts_live() {
 // Run with: cargo nextest run -p nautilus-live --test integration node::
 
 pub(crate) mod serial_tests {
-    use super::*;
+    use super::{
+        super::startup::{
+            StartupActor, StartupMassStatusBehavior, StartupMassStatusClientState,
+            StartupMassStatusExecutionClient, StartupMassStatusExecutionClientConfig,
+            StartupMassStatusExecutionClientFactory, add_reconciliation_test_account,
+        },
+        *,
+    };
 
     #[cfg(not(madsim))]
     mod reconciliation_bench;
 
-    #[derive(Clone, Debug, Default)]
-    struct StartupMassStatusClientState {
-        connected: Arc<AtomicBool>,
-        disconnect_attempted: Arc<AtomicBool>,
-        factory_trader_id: Arc<Mutex<Option<TraderId>>>,
-        factory_clock_id: Arc<Mutex<Option<usize>>>,
-        mass_status_requested: Arc<AtomicBool>,
-        mass_status: Arc<Mutex<Option<ExecutionMassStatus>>>,
-        registered_external_orders: Arc<Mutex<Vec<ClientOrderId>>>,
-        cancel_orders_received: Arc<AtomicUsize>,
-        cancel_orders_while_connected: Arc<AtomicBool>,
-    }
+    mod report_acceptance;
 
     #[derive(Clone, Debug, Default)]
     struct FailingDisconnectDataClientState {
@@ -390,23 +372,6 @@ pub(crate) mod serial_tests {
         DisconnectKeepsConnected,
     }
 
-    #[derive(Clone, Copy, Debug)]
-    enum StartupMassStatusBehavior {
-        Available,
-        Unavailable,
-        Error,
-        Pending,
-    }
-
-    struct StartupMassStatusExecutionClient {
-        state: StartupMassStatusClientState,
-        behavior: StartupMassStatusBehavior,
-        client_id: ClientId,
-        account_id: AccountId,
-        venue: Venue,
-        handles_all_order_venues: bool,
-    }
-
     struct FailingDisconnectDataClient {
         state: FailingDisconnectDataClientState,
     }
@@ -421,28 +386,6 @@ pub(crate) mod serial_tests {
         behavior: LifecycleClientBehavior,
     }
 
-    impl StartupMassStatusExecutionClient {
-        const CLIENT_ID: &'static str = "STARTUP-MASS-STATUS";
-
-        fn new(
-            state: StartupMassStatusClientState,
-            behavior: StartupMassStatusBehavior,
-            client_id: ClientId,
-            account_id: AccountId,
-            venue: Venue,
-            handles_all_order_venues: bool,
-        ) -> Self {
-            Self {
-                state,
-                behavior,
-                client_id,
-                account_id,
-                venue,
-                handles_all_order_venues,
-            }
-        }
-    }
-
     impl FailingDisconnectDataClient {
         const CLIENT_ID: &'static str = "FAILING-DISCONNECT-DATA";
 
@@ -452,9 +395,6 @@ pub(crate) mod serial_tests {
     }
 
     #[derive(Debug)]
-    struct StartupMassStatusExecutionClientConfig;
-
-    #[derive(Debug)]
     struct FailingDisconnectDataClientConfig;
 
     #[derive(Debug)]
@@ -462,12 +402,6 @@ pub(crate) mod serial_tests {
 
     #[derive(Debug)]
     struct LifecycleExecutionClientConfig;
-
-    impl ClientConfig for StartupMassStatusExecutionClientConfig {
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
 
     impl ClientConfig for FailingDisconnectDataClientConfig {
         fn as_any(&self) -> &dyn std::any::Any {
@@ -488,16 +422,6 @@ pub(crate) mod serial_tests {
     }
 
     #[derive(Debug)]
-    struct StartupMassStatusExecutionClientFactory {
-        state: StartupMassStatusClientState,
-        behavior: StartupMassStatusBehavior,
-        client_id: ClientId,
-        account_id: AccountId,
-        venue: Venue,
-        handles_all_order_venues: bool,
-    }
-
-    #[derive(Debug)]
     struct FailingDisconnectDataClientFactory {
         state: FailingDisconnectDataClientState,
     }
@@ -512,36 +436,6 @@ pub(crate) mod serial_tests {
     struct LifecycleExecutionClientFactory {
         state: LifecycleClientState,
         behavior: LifecycleClientBehavior,
-    }
-
-    impl StartupMassStatusExecutionClientFactory {
-        fn new(state: StartupMassStatusClientState, behavior: StartupMassStatusBehavior) -> Self {
-            Self {
-                state,
-                behavior,
-                client_id: ClientId::from(StartupMassStatusExecutionClient::CLIENT_ID),
-                account_id: AccountId::from("STARTUP-MASS-STATUS-001"),
-                venue: crypto_perpetual_ethusdt().id().venue,
-                handles_all_order_venues: false,
-            }
-        }
-
-        fn with_identity(
-            mut self,
-            client_id: ClientId,
-            account_id: AccountId,
-            venue: Venue,
-        ) -> Self {
-            self.client_id = client_id;
-            self.account_id = account_id;
-            self.venue = venue;
-            self
-        }
-
-        fn with_handles_all_order_venues(mut self) -> Self {
-            self.handles_all_order_venues = true;
-            self
-        }
     }
 
     impl FailingDisconnectDataClientFactory {
@@ -559,36 +453,6 @@ pub(crate) mod serial_tests {
     impl LifecycleExecutionClientFactory {
         fn new(state: LifecycleClientState, behavior: LifecycleClientBehavior) -> Self {
             Self { state, behavior }
-        }
-    }
-
-    impl ExecutionClientFactory for StartupMassStatusExecutionClientFactory {
-        fn create(
-            &self,
-            trader_id: TraderId,
-            _name: &str,
-            _config: &dyn ClientConfig,
-            _cache: CacheView,
-            clock: Rc<RefCell<dyn Clock>>,
-        ) -> anyhow::Result<Box<dyn ExecutionClient>> {
-            *self.state.factory_trader_id.lock() = Some(trader_id);
-            *self.state.factory_clock_id.lock() = Some(Rc::as_ptr(&clock).cast::<()>() as usize);
-            Ok(Box::new(StartupMassStatusExecutionClient::new(
-                self.state.clone(),
-                self.behavior,
-                self.client_id,
-                self.account_id,
-                self.venue,
-                self.handles_all_order_venues,
-            )))
-        }
-
-        fn name(&self) -> &'static str {
-            "startup-mass-status"
-        }
-
-        fn config_type(&self) -> &'static str {
-            stringify!(StartupMassStatusExecutionClientConfig)
         }
     }
 
@@ -825,112 +689,6 @@ pub(crate) mod serial_tests {
     }
 
     #[async_trait(?Send)]
-    impl ExecutionClient for StartupMassStatusExecutionClient {
-        fn is_connected(&self) -> bool {
-            self.state.connected.load(Ordering::Relaxed)
-        }
-
-        fn client_id(&self) -> ClientId {
-            self.client_id
-        }
-
-        fn account_id(&self) -> AccountId {
-            self.account_id
-        }
-
-        fn venue(&self) -> Venue {
-            self.venue
-        }
-
-        fn handles_order_venue(&self, venue: Venue) -> bool {
-            self.handles_all_order_venues || self.venue == venue
-        }
-
-        fn oms_type(&self) -> OmsType {
-            OmsType::Hedging
-        }
-
-        fn get_account(&self) -> Option<AccountAny> {
-            None
-        }
-
-        fn generate_account_state(
-            &self,
-            _balances: Vec<AccountBalance>,
-            _margins: Vec<MarginBalance>,
-            _reported: bool,
-            _ts_event: UnixNanos,
-            _info: Option<Params>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn start(&mut self) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn stop(&mut self) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn cancel_order(&self, _cmd: CancelOrder) -> anyhow::Result<()> {
-            self.state
-                .cancel_orders_received
-                .fetch_add(1, Ordering::Relaxed);
-            self.state.cancel_orders_while_connected.store(
-                self.state.connected.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
-            Ok(())
-        }
-
-        async fn connect(&mut self) -> anyhow::Result<()> {
-            self.state.connected.store(true, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn disconnect(&mut self) -> anyhow::Result<()> {
-            self.state
-                .disconnect_attempted
-                .store(true, Ordering::Relaxed);
-            self.state.connected.store(false, Ordering::Relaxed);
-            Ok(())
-        }
-
-        async fn generate_mass_status(
-            &self,
-            _lookback_mins: Option<u64>,
-        ) -> anyhow::Result<Option<ExecutionMassStatus>> {
-            self.state
-                .mass_status_requested
-                .store(true, Ordering::Relaxed);
-
-            match self.behavior {
-                StartupMassStatusBehavior::Available => Ok(self.state.mass_status.lock().clone()),
-                StartupMassStatusBehavior::Unavailable => Ok(None),
-                StartupMassStatusBehavior::Error => Err(anyhow::anyhow!("mass status failed")),
-                StartupMassStatusBehavior::Pending => {
-                    std::future::pending::<anyhow::Result<Option<ExecutionMassStatus>>>().await
-                }
-            }
-        }
-
-        fn register_external_order(
-            &self,
-            client_order_id: ClientOrderId,
-            _venue_order_id: VenueOrderId,
-            _instrument_id: InstrumentId,
-            _strategy_id: StrategyId,
-            _ts_init: UnixNanos,
-        ) {
-            self.state
-                .registered_external_orders
-                .lock()
-                .push(client_order_id);
-        }
-    }
-
-    #[async_trait(?Send)]
     impl ExecutionClient for LifecycleExecutionClient {
         fn is_connected(&self) -> bool {
             self.state.connected.load(Ordering::Relaxed)
@@ -1091,11 +849,22 @@ pub(crate) mod serial_tests {
         bulk_order_report_requested: Arc<AtomicBool>,
         bulk_order_report_count: Arc<AtomicUsize>,
         fill_report_count: Arc<AtomicUsize>,
+        fill_report_finish_ns: Arc<AtomicU64>,
+        fill_report_finalizations: Arc<AtomicUsize>,
+        fill_report_finish_busy_ns: Arc<AtomicU64>,
+        fill_reports_finalized: Arc<Mutex<Vec<TradeId>>>,
         targeted_order_report_ids: Arc<Mutex<Vec<ClientOrderId>>>,
+        targeted_order_reports_finalized: Arc<Mutex<Vec<ClientOrderId>>>,
+        fill_report_error: Arc<AtomicBool>,
         position_report_requested: Arc<AtomicBool>,
         position_report_count: Arc<AtomicUsize>,
+        position_reports_finalized: Arc<AtomicUsize>,
+        position_reports_disposed: Arc<AtomicBool>,
         instrument_received: Arc<AtomicBool>,
         report_response_returned: Arc<AtomicBool>,
+        order_report_finish_ns: Arc<AtomicU64>,
+        order_report_finish_busy_ns: Arc<AtomicU64>,
+        order_reports_finalized: Arc<Mutex<Vec<ClientOrderId>>>,
     }
 
     struct BlockingReportExecutionClient {
@@ -1429,35 +1198,36 @@ pub(crate) mod serial_tests {
         ) -> anyhow::Result<Vec<OrderStatusReport>> {
             let task = self.order_report_task();
             task.collection.await;
-            task.result.await
+            (task.finish)()
+        }
+
+        fn generate_order_status_report_task(
+            &self,
+            cmd: &GenerateOrderStatusReport,
+        ) -> Option<ExecutionReportTask<Option<OrderStatusReport>>> {
+            self.state
+                .report_worker
+                .load(Ordering::Relaxed)
+                .then(|| self.targeted_order_report_task(cmd))
         }
 
         async fn generate_order_status_report(
             &self,
             cmd: &GenerateOrderStatusReport,
         ) -> anyhow::Result<Option<OrderStatusReport>> {
-            let client_order_id = cmd
-                .client_order_id
-                .expect("targeted report command must carry a client order ID");
+            let task = self.targeted_order_report_task(cmd);
+            task.collection.await;
+            (task.finish)()
+        }
 
-            let request_count = {
-                let mut ids = self.state.targeted_order_report_ids.lock();
-                ids.push(client_order_id);
-                ids.len()
-            };
-
-            if self.block_every_second_targeted_report && request_count.is_multiple_of(2) {
-                return std::future::pending::<anyhow::Result<Option<OrderStatusReport>>>().await;
-            }
-
-            if let Some(release) = &self.targeted_report_release {
-                release.notified().await;
-            }
-
+        fn generate_fill_reports_task(
+            &self,
+            cmd: &GenerateFillReports,
+        ) -> Option<ExecutionReportTask<Vec<FillReport>>> {
             self.state
-                .report_response_returned
-                .store(true, Ordering::Relaxed);
-            Ok(self.targeted_order_report.clone())
+                .report_worker
+                .load(Ordering::Relaxed)
+                .then(|| self.fill_report_task(cmd))
         }
 
         async fn generate_fill_reports(
@@ -1465,7 +1235,6 @@ pub(crate) mod serial_tests {
             cmd: GenerateFillReports,
         ) -> anyhow::Result<Vec<FillReport>> {
             let request_count = self.state.fill_report_count.fetch_add(1, Ordering::Relaxed) + 1;
-
             if request_count == 1
                 && let Some(release) = &self.fill_report_release
             {
@@ -1473,7 +1242,6 @@ pub(crate) mod serial_tests {
             }
 
             let mut responses = self.fill_report_responses.lock();
-
             let mut reports = if responses.len() > 1 {
                 responses.pop_front().unwrap()
             } else {
@@ -1485,7 +1253,6 @@ pub(crate) mod serial_tests {
             // test asserting fill application must respond inside the window.
             if self.fill_reports_at_window_end {
                 let window_end = cmd.end.unwrap_or(cmd.ts_init);
-
                 for report in &mut reports {
                     report.ts_event = window_end;
                     report.ts_init = window_end;
@@ -1498,42 +1265,23 @@ pub(crate) mod serial_tests {
             Ok(reports)
         }
 
+        fn generate_position_status_reports_task(
+            &self,
+            _cmd: &GeneratePositionStatusReports,
+        ) -> Option<ExecutionReportTask<Vec<PositionStatusReport>>> {
+            self.state
+                .report_worker
+                .load(Ordering::Relaxed)
+                .then(|| self.position_report_task())
+        }
+
         async fn generate_position_status_reports(
             &self,
             _cmd: &GeneratePositionStatusReports,
         ) -> anyhow::Result<Vec<PositionStatusReport>> {
-            self.state
-                .position_report_requested
-                .store(true, Ordering::Relaxed);
-            let request_count = self
-                .state
-                .position_report_count
-                .fetch_add(1, Ordering::Relaxed)
-                + 1;
-
-            if let Some(release) = &self.report_release
-                && (!self.report_release_once || request_count == 1)
-            {
-                release.notified().await;
-            }
-
-            if self.position_reports_complete {
-                if self.state.report_cpu_ns.load(Ordering::Relaxed) != 0 {
-                    Self::run_report_cpu(&self.state, request_count);
-                }
-
-                self.state
-                    .report_response_returned
-                    .store(true, Ordering::Relaxed);
-                Ok(self.position_reports.clone())
-            } else if self.report_release.is_some() {
-                self.state
-                    .report_response_returned
-                    .store(true, Ordering::Relaxed);
-                Ok(Vec::new())
-            } else {
-                std::future::pending::<anyhow::Result<Vec<PositionStatusReport>>>().await
-            }
+            let task = self.position_report_task();
+            task.collection.await;
+            (task.finish)()
         }
     }
 
@@ -1545,6 +1293,7 @@ pub(crate) mod serial_tests {
             let report_release_once = self.report_release_once;
             let order_reports_complete = self.order_reports_complete;
             let order_reports = self.order_reports.clone();
+            let finish_state = self.state.clone();
 
             ExecutionReportTask::new(
                 async move {
@@ -1570,7 +1319,6 @@ pub(crate) mod serial_tests {
 
                     *state.report_thread.lock() = Some(std::thread::current().id());
                     Self::run_report_cpu(&state, request_count);
-
                     if order_reports_complete {
                         state
                             .report_response_returned
@@ -1585,7 +1333,200 @@ pub(crate) mod serial_tests {
                         std::future::pending::<anyhow::Result<Vec<OrderStatusReport>>>().await
                     }
                 },
-                Ok,
+                move |reports| {
+                    let started = std::time::Instant::now();
+                    let delay = Duration::from_nanos(
+                        finish_state.order_report_finish_ns.load(Ordering::Relaxed),
+                    );
+                    #[cfg(all(feature = "simulation", madsim))]
+                    madsim::time::advance(delay);
+                    #[cfg(not(all(feature = "simulation", madsim)))]
+                    std::thread::sleep(delay);
+                    finish_state
+                        .order_reports_finalized
+                        .lock()
+                        .extend(reports.iter().filter_map(|report| report.client_order_id));
+                    finish_state
+                        .order_report_finish_busy_ns
+                        .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    Ok(reports)
+                },
+            )
+        }
+
+        fn targeted_order_report_task(
+            &self,
+            cmd: &GenerateOrderStatusReport,
+        ) -> ExecutionReportTask<Option<OrderStatusReport>> {
+            let client_order_id = cmd
+                .client_order_id
+                .expect("targeted command carries order ID");
+            let state = self.state.clone();
+            let finish_state = self.state.clone();
+            let release = self.targeted_report_release.clone();
+            let report = self.targeted_order_report.clone();
+            let block_every_second = self.block_every_second_targeted_report;
+
+            ExecutionReportTask::new(
+                async move {
+                    let _guard = ReportCollectionGuard::new(state.clone());
+                    *state.report_thread.lock() = Some(std::thread::current().id());
+
+                    let request_count = {
+                        let mut ids = state.targeted_order_report_ids.lock();
+                        ids.push(client_order_id);
+                        ids.len()
+                    };
+
+                    if state.report_cpu_ns.load(Ordering::Relaxed) != 0 {
+                        Self::run_report_cpu(&state, request_count);
+                    }
+
+                    if block_every_second && request_count.is_multiple_of(2) {
+                        return std::future::pending::<anyhow::Result<Option<OrderStatusReport>>>()
+                            .await;
+                    }
+
+                    if let Some(release) = release {
+                        release.notified().await;
+                    }
+
+                    state
+                        .report_response_returned
+                        .store(true, Ordering::Relaxed);
+                    Ok(report)
+                },
+                move |report| {
+                    finish_state
+                        .targeted_order_reports_finalized
+                        .lock()
+                        .push(client_order_id);
+                    Ok(report)
+                },
+            )
+        }
+
+        fn fill_report_task(
+            &self,
+            cmd: &GenerateFillReports,
+        ) -> ExecutionReportTask<Vec<FillReport>> {
+            let cmd = cmd.clone();
+            let state = self.state.clone();
+            let finish_state = self.state.clone();
+            let release = self.fill_report_release.clone();
+            let responses = self.fill_report_responses.clone();
+            let at_window_end = self.fill_reports_at_window_end;
+
+            ExecutionReportTask::new(
+                async move {
+                    let _guard = ReportCollectionGuard::new(state.clone());
+                    *state.report_thread.lock() = Some(std::thread::current().id());
+                    let count = state.fill_report_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if count == 1
+                        && let Some(release) = release
+                    {
+                        release.notified().await;
+                    }
+
+                    if state.fill_report_error.load(Ordering::Relaxed) {
+                        anyhow::bail!("fill query rejected");
+                    }
+
+                    let mut responses = responses.lock();
+                    let mut reports = if responses.len() > 1 {
+                        responses.pop_front().unwrap()
+                    } else {
+                        responses.front().cloned().unwrap_or_default()
+                    };
+
+                    if at_window_end {
+                        for report in &mut reports {
+                            report.ts_event = cmd.end.unwrap_or(cmd.ts_init);
+                            report.ts_init = report.ts_event;
+                        }
+                    }
+
+                    state
+                        .report_response_returned
+                        .store(true, Ordering::Relaxed);
+                    Ok(reports)
+                },
+                move |mut reports| {
+                    let started = std::time::Instant::now();
+                    let delay = Duration::from_nanos(
+                        finish_state.fill_report_finish_ns.load(Ordering::Relaxed),
+                    );
+                    #[cfg(all(feature = "simulation", madsim))]
+                    madsim::time::advance(delay);
+                    #[cfg(not(all(feature = "simulation", madsim)))]
+                    std::thread::sleep(delay);
+                    let mut finalized = finish_state.fill_reports_finalized.lock();
+                    reports.retain(|report| {
+                        if finalized.contains(&report.trade_id) {
+                            false
+                        } else {
+                            finalized.push(report.trade_id);
+                            true
+                        }
+                    });
+
+                    finish_state
+                        .fill_report_finalizations
+                        .fetch_add(1, Ordering::Relaxed);
+                    finish_state.fill_report_finish_busy_ns.fetch_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap(),
+                        Ordering::Relaxed,
+                    );
+                    Ok(reports)
+                },
+            )
+        }
+
+        fn position_report_task(&self) -> ExecutionReportTask<Vec<PositionStatusReport>> {
+            let state = self.state.clone();
+            let finish_state = self.state.clone();
+            let release = self.report_release.clone();
+            let release_once = self.report_release_once;
+            let complete = self.position_reports_complete;
+            let reports = self.position_reports.clone();
+            let receipt = PositionReportReceiptGuard(self.state.position_reports_disposed.clone());
+
+            ExecutionReportTask::new(
+                async move {
+                    let _guard = ReportCollectionGuard::new(state.clone());
+                    state
+                        .position_report_requested
+                        .store(true, Ordering::Relaxed);
+                    let count = state.position_report_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+                    if let Some(release) = &release
+                        && (!release_once || count == 1)
+                    {
+                        release.notified().await;
+                    }
+
+                    if complete {
+                        Self::run_report_cpu(&state, count);
+                        state
+                            .report_response_returned
+                            .store(true, Ordering::Relaxed);
+                        Ok(reports)
+                    } else if release.is_some() {
+                        state
+                            .report_response_returned
+                            .store(true, Ordering::Relaxed);
+                        Ok(Vec::new())
+                    } else {
+                        std::future::pending::<anyhow::Result<Vec<PositionStatusReport>>>().await
+                    }
+                },
+                move |reports| {
+                    let _guard = receipt;
+                    finish_state
+                        .position_reports_finalized
+                        .fetch_add(1, Ordering::Relaxed);
+                    Ok(reports)
+                },
             )
         }
 
@@ -1624,6 +1565,14 @@ pub(crate) mod serial_tests {
             self.0
                 .report_collections_active
                 .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    struct PositionReportReceiptGuard(Arc<AtomicBool>);
+
+    impl Drop for PositionReportReceiptGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
         }
     }
 
@@ -1667,34 +1616,6 @@ pub(crate) mod serial_tests {
             .cache
             .borrow_mut()
             .update_order(&accepted)
-            .unwrap();
-    }
-
-    fn add_reconciliation_test_account(node: &LiveNode) {
-        let account_id = AccountId::from("BLOCKING-REPORT-001");
-
-        let account = MarginAccount::new(
-            AccountState::new(
-                account_id,
-                AccountType::Margin,
-                vec![AccountBalance::new(
-                    Money::from("1000000 USDT"),
-                    Money::from("0 USDT"),
-                    Money::from("1000000 USDT"),
-                )],
-                Vec::new(),
-                true,
-                UUID4::new(),
-                UnixNanos::default(),
-                UnixNanos::default(),
-                Some(Currency::USDT()),
-            ),
-            true,
-        );
-        node.kernel()
-            .cache()
-            .borrow_mut()
-            .add_account(AccountAny::Margin(account))
             .unwrap();
     }
 
@@ -1753,7 +1674,6 @@ pub(crate) mod serial_tests {
 
     fn apply_reconciliation_events(node: &mut LiveNode, events: &[OrderEventAny]) {
         let exec_engine = node.kernel().exec_engine().clone();
-
         for event in events {
             exec_engine.borrow_mut().process(event);
             if let OrderEventAny::Filled(fill) = event {
@@ -2103,6 +2023,82 @@ pub(crate) mod serial_tests {
     }
 
     #[rstest]
+    #[case::direct(false)]
+    #[case::builder(true)]
+    fn test_dispose_suppresses_retained_time_sender_error(#[case] builder: bool) {
+        let directory =
+            std::env::temp_dir().join(format!("nautilus-timer-shutdown-{}", UUID4::new()));
+
+        let config = LiveNodeConfig {
+            logging: LoggerConfig {
+                fileout_level: log::LevelFilter::Error,
+                file_config: Some(FileWriterConfig {
+                    directory: Some(directory.to_str().unwrap().to_string()),
+                    file_name: Some("timer-shutdown".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let runner = AsyncRunner::new();
+        runner.bind_senders();
+        drop(runner);
+
+        let retained = Rc::new(RefCell::new(None));
+        let captured = retained.clone();
+
+        let mut node = if builder {
+            LiveNodeBuilder::from_config(config)
+                .unwrap()
+                .with_clock_factory(move || {
+                    *captured.borrow_mut() = Some(get_time_event_sender());
+                    Rc::new(RefCell::new(LiveClock::default()))
+                })
+                .build()
+                .unwrap()
+        } else {
+            LiveNode::build("TimerShutdownNode".to_string(), Some(config)).unwrap()
+        };
+
+        let sender = if builder {
+            retained.borrow_mut().take().unwrap()
+        } else {
+            get_time_event_sender()
+        };
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let observed = received.clone();
+        let callback = TimeEventCallback::from(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let event = TimeEvent::new("shutdown-timer".into(), UUID4::new(), 17.into(), 23.into());
+
+        node.dispose();
+        sender.send(TimeEventMessage::new(event.clone(), callback.clone()));
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        AsyncTimeEventSender::new(tx).send(TimeEventMessage::new(event, callback));
+        logging_sync_to_disk().unwrap();
+        let output = std::fs::read_to_string(directory.join("timer-shutdown.log")).unwrap();
+        let state = node.state();
+        drop(node);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(state, NodeState::Stopped);
+        assert_eq!(received.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            output
+                .matches("Failed to send time event message: channel closed")
+                .count(),
+            1,
+        );
+    }
+
+    #[rstest]
     fn test_add_actor() {
         let mut node = LiveNode::build("TestNode".to_string(), None).unwrap();
 
@@ -2201,13 +2197,6 @@ pub(crate) mod serial_tests {
         let kernel = node.kernel();
 
         assert_eq!(kernel.trader_id(), TraderId::from("TRADER-001"));
-    }
-
-    #[rstest]
-    fn test_exec_manager_access() {
-        let node = LiveNode::build("TestNode".to_string(), None).unwrap();
-
-        let _manager = node.exec_manager();
     }
 
     #[rstest]
@@ -2768,6 +2757,7 @@ pub(crate) mod serial_tests {
                 ts,
                 None, // correlation_id
             );
+
             msgbus::publish_any(
                 MessagingSwitchboard::shutdown_system_topic(),
                 command.as_any(),
@@ -2796,7 +2786,6 @@ pub(crate) mod serial_tests {
         let mut node = LiveNode::build("TestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
         let state_handle = handle.clone();
-
         let log_thread = std::thread::spawn(move || {
             wait_until(|| state_handle.is_running(), Duration::from_secs(5));
             log::error!("LiveNode shutdown-on-error smoke test");
@@ -2902,6 +2891,22 @@ pub(crate) mod serial_tests {
         true,
         false
     )]
+    #[case::off_tick_long(
+        Some(PositionSide::Long),
+        Some(Decimal::new(24564, 4)),
+        false,
+        false,
+        true,
+        false
+    )]
+    #[case::off_tick_short(
+        Some(PositionSide::Short),
+        Some(Decimal::new(24564, 4)),
+        false,
+        false,
+        true,
+        false
+    )]
     #[case::flat(Some(PositionSide::Flat), None, false, false, true, false)]
     #[case::empty(None, None, false, false, true, false)]
     #[case::filtered(Some(PositionSide::Long), None, true, false, true, false)]
@@ -2991,9 +2996,9 @@ pub(crate) mod serial_tests {
             .unwrap();
         add_reconciliation_test_account(&node);
         let actor_start_count = Rc::new(Cell::new(0));
-        node.add_actor(PositionStartupActor {
+        node.add_actor(StartupActor {
             core: DataActorCore::new(DataActorConfig::default()),
-            start_count: actor_start_count.clone(),
+            starts: actor_start_count.clone(),
         })
         .unwrap();
 
@@ -3185,9 +3190,9 @@ pub(crate) mod serial_tests {
             .unwrap();
         add_reconciliation_test_account(&node);
         let actor_start_count = Rc::new(Cell::new(0));
-        node.add_actor(PositionStartupActor {
+        node.add_actor(StartupActor {
             core: DataActorCore::new(DataActorConfig::default()),
-            start_count: actor_start_count.clone(),
+            starts: actor_start_count.clone(),
         })
         .unwrap();
 
@@ -3231,7 +3236,7 @@ pub(crate) mod serial_tests {
                 cache.positions_open(None, Some(&instrument_id), None, Some(&account_id), None);
             assert_eq!(positions.len(), 1);
             assert_eq!(positions[0].signed_decimal_qty(), Decimal::from(5));
-            assert_eq!(positions[0].avg_px_open, 3000.0);
+            assert_eq!(positions[0].avg_px_open, dec!(3000.0));
         } else {
             result.unwrap();
             assert_eq!(quantity_on_start.get(), Some(Decimal::ZERO));
@@ -3254,6 +3259,46 @@ pub(crate) mod serial_tests {
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(node.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
+        node.dispose();
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_startup_mass_status_registers_recovered_instrument_without_engine_borrow() {
+        let config = LiveNodeConfig {
+            exec_engine: LiveExecutionEngineConfig {
+                reconciliation: true,
+                ..Default::default()
+            },
+            delay_post_stop: Duration::ZERO,
+            ..Default::default()
+        };
+
+        let (mut node, state) = live_node_with_startup_mass_status_client(
+            "RecoveredInstrumentStartup",
+            config,
+            StartupMassStatusBehavior::Unavailable,
+        );
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        assert!(
+            node.kernel()
+                .cache()
+                .borrow()
+                .instrument(&instrument_id)
+                .is_none()
+        );
+        *state.recovered_instrument.lock() = Some(instrument.clone());
+
+        node.start().await.unwrap();
+
+        assert_eq!(
+            node.kernel().cache().borrow().instrument(&instrument_id),
+            Some(&instrument)
+        );
+        assert_eq!(state.instrument_updates.load(Ordering::Relaxed), 1);
+        assert!(state.mass_status_requested.load(Ordering::Relaxed));
+        node.stop().await.unwrap();
         node.dispose();
     }
 
@@ -3294,6 +3339,7 @@ pub(crate) mod serial_tests {
             UnixNanos::default(),
             None,
         );
+
         mass_status.add_order_reports(vec![report]);
         *source_state.mass_status.lock() = Some(mass_status);
 
@@ -3381,6 +3427,7 @@ pub(crate) mod serial_tests {
             UnixNanos::default(),
             None,
         );
+
         mass_status.add_order_reports(vec![test_order_report(
             AccountId::from(reported_account_id),
             client_order_id,
@@ -3450,6 +3497,7 @@ pub(crate) mod serial_tests {
             UnixNanos::default(),
             None,
         );
+
         mass_status.add_order_reports(vec![test_order_report(
             source_account_id,
             client_order_id,
@@ -3476,6 +3524,7 @@ pub(crate) mod serial_tests {
             .expect("untrusted cached order origin should warn, not abort startup");
 
         assert!(state.registered_external_orders.lock().is_empty());
+
         {
             let cache = node.kernel().cache();
             let cache = cache.borrow();
@@ -3510,6 +3559,7 @@ pub(crate) mod serial_tests {
             UnixNanos::default(),
             None,
         );
+
         mass_status.add_order_reports(vec![test_order_report(
             source_account_id,
             client_order_id,
@@ -3527,7 +3577,6 @@ pub(crate) mod serial_tests {
         add_accepted_test_order(&node, client_order_id, venue_order_id, source_client_id);
 
         let exec_engine = node.kernel().exec_engine().clone();
-
         let handler = ShareableMessageHandler::from_typed(move |_report: &OrderStatusReport| {
             exec_engine
                 .borrow_mut()
@@ -3747,10 +3796,9 @@ pub(crate) mod serial_tests {
             .expect_err("data client disconnect should fail");
         node.dispose();
 
-        assert!(
-            err.to_string()
-                .contains("simulated data client disconnect failure"),
-            "unexpected error: {err:#}"
+        assert_eq!(
+            err.to_string(),
+            "Failed to disconnect data clients: FAILING-DISCONNECT-DATA"
         );
         assert!(data_state.disconnect_attempted.load(Ordering::Relaxed));
         assert!(exec_state.disconnect_attempted.load(Ordering::Relaxed));
@@ -3789,68 +3837,6 @@ pub(crate) mod serial_tests {
         let result = node.run().await;
 
         assert!(result.is_ok(), "unexpected error: {result:#?}");
-        assert!(state.mass_status_requested.load(Ordering::Relaxed));
-        assert_eq!(handle.state(), NodeState::Stopped);
-        assert!(!state.connected.load(Ordering::Relaxed));
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_start_aborts_startup_when_mass_status_errors() {
-        let config = LiveNodeConfig {
-            exec_engine: LiveExecutionEngineConfig {
-                reconciliation: true,
-                ..Default::default()
-            },
-            timeout_disconnection: Duration::from_millis(50),
-            ..Default::default()
-        };
-
-        let (mut node, state) = live_node_with_startup_mass_status_client(
-            "StartStartupMassStatusErrorNode",
-            config,
-            StartupMassStatusBehavior::Error,
-        );
-        let handle = node.handle();
-
-        let err = node.start().await.expect_err("start should fail");
-        let err = format!("{err:#}");
-
-        assert!(
-            err.contains("Failed to get mass status from") && err.contains("mass status failed"),
-            "unexpected error: {err}"
-        );
-        assert!(state.mass_status_requested.load(Ordering::Relaxed));
-        assert_eq!(handle.state(), NodeState::Stopped);
-        assert!(!state.connected.load(Ordering::Relaxed));
-    }
-
-    #[rstest]
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_run_aborts_startup_when_mass_status_errors() {
-        let config = LiveNodeConfig {
-            exec_engine: LiveExecutionEngineConfig {
-                reconciliation: true,
-                ..Default::default()
-            },
-            timeout_disconnection: Duration::from_millis(50),
-            ..Default::default()
-        };
-
-        let (mut node, state) = live_node_with_startup_mass_status_client(
-            "StartupMassStatusErrorNode",
-            config,
-            StartupMassStatusBehavior::Error,
-        );
-        let handle = node.handle();
-
-        let err = node.run().await.expect_err("run should fail");
-        let err = format!("{err:#}");
-
-        assert!(
-            err.contains("Failed to get mass status from") && err.contains("mass status failed"),
-            "unexpected error: {err}"
-        );
         assert!(state.mass_status_requested.load(Ordering::Relaxed));
         assert_eq!(handle.state(), NodeState::Stopped);
         assert!(!state.connected.load(Ordering::Relaxed));
@@ -3923,50 +3909,81 @@ pub(crate) mod serial_tests {
         assert!(!state.connected.load(Ordering::Relaxed));
     }
 
-    // The maintenance dispatcher is a single `select!` arm in `LiveNode::run`
-    // that fires up to six periodic tasks. With reconciliation disabled, the
-    // only sub-second-cadenced task that can fire in a short test window is
-    // the own-books audit (interval is `Option<f64>` seconds). Configuring it
-    // at 0.1s and holding the node Running for ~250ms guarantees the
-    // maintenance arm is polled multiple times and dispatches at least one
-    // body. If the dispatcher panics, deadlocks the cache `borrow_mut()`, or
-    // otherwise breaks the loop, `run()` will not return cleanly.
     #[rstest]
     #[tokio::test(flavor = "current_thread")]
-    async fn test_maintenance_dispatcher_runs_while_running() {
+    async fn test_maintenance_dispatcher_audits_stale_own_book_orders() {
         let config = LiveNodeConfig {
             exec_engine: LiveExecutionEngineConfig {
                 reconciliation: false,
                 own_books_audit_interval_secs: Some(0.1),
                 ..Default::default()
             },
-            delay_post_stop: Duration::from_millis(50),
+            delay_post_stop: Duration::ZERO,
             ..Default::default()
         };
 
         let mut node = LiveNode::build("MaintenanceTestNode".to_string(), Some(config)).unwrap();
         let handle = node.handle();
+        let cache = node.kernel().cache();
+        let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+        let instrument_id = instrument.id();
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .instrument_id(instrument_id)
+            .client_order_id(ClientOrderId::from("O-STALE-OWN-BOOK"))
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("3000.00"))
+            .build();
+        let client_order_id = order.client_order_id();
 
-        let stop_handle = handle.clone();
+        let driver = async {
+            wait_until_async(|| async { handle.is_running() }, Duration::from_secs(2)).await;
 
-        tokio::spawn(async move {
+            {
+                let mut cache = cache.borrow_mut();
+                cache.add_instrument(instrument).unwrap();
+                // No cached order owns this entry, so the next audit must remove it
+                cache.update_own_order_book(&order);
+                assert!(
+                    cache
+                        .own_order_book(&instrument_id)
+                        .unwrap()
+                        .is_order_in_book(&client_order_id)
+                );
+            }
+
             wait_until_async(
-                || async { stop_handle.is_running() },
-                Duration::from_secs(5),
+                || async {
+                    !cache
+                        .borrow()
+                        .own_order_book(&instrument_id)
+                        .unwrap()
+                        .is_order_in_book(&client_order_id)
+                },
+                Duration::from_secs(2),
             )
             .await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            stop_handle.stop();
-        });
 
-        let result = tokio::time::timeout(Duration::from_secs(5), node.run()).await;
+            handle.stop();
+        };
 
-        assert!(result.is_ok(), "run() should complete within timeout");
-        assert!(
-            result.unwrap().is_ok(),
-            "run() should succeed after maintenance dispatcher fires"
-        );
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(node.run(), driver)
+        })
+        .await
+        .expect("maintenance removes the stale entry before shutdown");
+
+        result.unwrap();
+
         assert_eq!(handle.state(), NodeState::Stopped);
+        assert_eq!(
+            cache
+                .borrow()
+                .own_order_book(&instrument_id)
+                .unwrap()
+                .bids()
+                .count(),
+            0
+        );
     }
 
     #[rstest]
@@ -4499,6 +4516,8 @@ pub(crate) mod serial_tests {
         assert_eq!(handle.state(), NodeState::Stopped);
     }
 
+    const REPORT_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
     fn shutdown_report_test_config(
         open_check_interval_secs: Option<f64>,
         position_check_interval_secs: Option<f64>,
@@ -4528,8 +4547,14 @@ pub(crate) mod serial_tests {
         }
     }
 
-    async fn yield_to_report_completion() {
-        for _ in 0..10 {
+    async fn yield_until(mut condition: impl FnMut() -> bool) {
+        let started = std::time::Instant::now();
+
+        while !condition() {
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "Timed out waiting for condition"
+            );
             tokio::task::yield_now().await;
         }
     }
@@ -4551,7 +4576,7 @@ pub(crate) mod serial_tests {
         factory.report_release = Some(release.clone());
         let mut node = reconciliation_node(
             "ShutdownOpenReportNode",
-            shutdown_report_test_config(Some(0.1), None),
+            shutdown_report_test_config(Some(REPORT_CHECK_INTERVAL.as_secs_f64()), None),
             factory,
         );
         add_accepted_test_order(
@@ -4584,27 +4609,21 @@ pub(crate) mod serial_tests {
         let handle = node.handle();
         let driver_handle = handle.clone();
         let requested = state.bulk_order_report_requested.clone();
-        let response_returned = state.report_response_returned.clone();
+        let cache = node.kernel().cache();
 
         let driver = async move {
-            wait_until_async(
-                || async { requested.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
-            .await;
+            yield_until(|| driver_handle.is_running()).await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| requested.load(Ordering::Relaxed)).await;
             driver_handle.stop();
-            wait_until_async(
-                || async { driver_handle.state() == NodeState::ShuttingDown },
-                Duration::from_secs(1),
-            )
-            .await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| driver_handle.state() == NodeState::ShuttingDown).await;
             release.notify_one();
-            wait_until_async(
-                || async { response_returned.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
+            yield_until(|| {
+                cache.borrow().order(&client_order_id).unwrap().status() == OrderStatus::Canceled
+            })
             .await;
-            yield_to_report_completion().await;
+
             tokio::time::advance(Duration::from_secs(5)).await;
         };
 
@@ -4625,7 +4644,7 @@ pub(crate) mod serial_tests {
         assert!(state.targeted_order_report_ids.lock().is_empty());
 
         node.exec_manager_mut()
-            .register_inflight(missing_client_order_id);
+            .register_inflight(missing_client_order_id, UUID4::new());
         tokio::time::advance(Duration::from_millis(1)).await;
         let inflight = node.exec_manager_mut().check_inflight_orders();
         assert!(
@@ -4655,7 +4674,7 @@ pub(crate) mod serial_tests {
         .with_targeted_report_release(release.clone());
         let mut node = reconciliation_node(
             "ShutdownTargetedReportNode",
-            shutdown_report_test_config(Some(0.1), None),
+            shutdown_report_test_config(Some(REPORT_CHECK_INTERVAL.as_secs_f64()), None),
             factory,
         );
         add_accepted_test_order(
@@ -4667,30 +4686,21 @@ pub(crate) mod serial_tests {
         let handle = node.handle();
         let driver_handle = handle.clone();
         let targeted_ids = state.targeted_order_report_ids.clone();
-        let response_returned = state.report_response_returned.clone();
+        let cache = node.kernel().cache();
 
         let driver = async move {
-            wait_until_async(
-                || async { !targeted_ids.lock().is_empty() },
-                Duration::from_secs(1),
-            )
-            .await;
+            yield_until(|| driver_handle.is_running()).await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| !targeted_ids.lock().is_empty()).await;
             driver_handle.stop();
-            wait_until_async(
-                || async { driver_handle.state() == NodeState::ShuttingDown },
-                Duration::from_secs(1),
-            )
-            .await;
-            // The bulk-order response already set the flag; reset so the next
-            // observation is the targeted response released below.
-            response_returned.store(false, Ordering::Relaxed);
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| driver_handle.state() == NodeState::ShuttingDown).await;
             release.notify_one();
-            wait_until_async(
-                || async { response_returned.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
+            yield_until(|| {
+                cache.borrow().order(&client_order_id).unwrap().status() == OrderStatus::Canceled
+            })
             .await;
-            yield_to_report_completion().await;
+
             tokio::time::advance(Duration::from_secs(5)).await;
         };
 
@@ -4711,7 +4721,8 @@ pub(crate) mod serial_tests {
             &[client_order_id]
         );
 
-        node.exec_manager_mut().register_inflight(client_order_id);
+        node.exec_manager_mut()
+            .register_inflight(client_order_id, UUID4::new());
         tokio::time::advance(Duration::from_millis(1)).await;
         let inflight = node.exec_manager_mut().check_inflight_orders();
         assert!(
@@ -4724,9 +4735,17 @@ pub(crate) mod serial_tests {
     }
 
     #[rstest]
+    #[case::inline(false, 0)]
+    #[case::worker(true, 0)]
+    #[case::worker_delayed(true, 20_000_000)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_position_report_completed_during_shutdown_does_not_start_fill_report() {
+    async fn test_position_report_completed_during_shutdown_does_not_start_fill_report(
+        #[case] worker: bool,
+        #[case] report_cpu_ns: u64,
+    ) {
         let state = BlockingReportClientState::default();
+        state.report_worker.store(worker, Ordering::Relaxed);
+        state.report_cpu_ns.store(report_cpu_ns, Ordering::Relaxed);
         let release = Arc::new(tokio::sync::Notify::new());
         let factory = BlockingReportExecutionClientFactory::configurable(
             ClientId::from("BLOCKING-REPORT"),
@@ -4738,46 +4757,59 @@ pub(crate) mod serial_tests {
         factory.report_release = Some(release.clone());
         let mut node = reconciliation_node(
             "ShutdownPositionReportNode",
-            shutdown_report_test_config(None, Some(0.1)),
+            shutdown_report_test_config(None, Some(REPORT_CHECK_INTERVAL.as_secs_f64())),
             factory,
         );
         let handle = node.handle();
         let driver_handle = handle.clone();
         let requested = state.position_report_requested.clone();
-        let response_returned = state.report_response_returned.clone();
+        let disposed = state.position_reports_disposed.clone();
+        let finalized = state.position_reports_finalized.clone();
 
         let driver = async move {
-            wait_until_async(
-                || async { requested.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
-            .await;
+            yield_until(|| driver_handle.is_running()).await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| requested.load(Ordering::Relaxed)).await;
             driver_handle.stop();
-            wait_until_async(
-                || async { driver_handle.state() == NodeState::ShuttingDown },
-                Duration::from_secs(1),
-            )
-            .await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| driver_handle.state() == NodeState::ShuttingDown).await;
+            let shutdown_time = tokio::time::Instant::now();
             release.notify_one();
-            wait_until_async(
-                || async { response_returned.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
+            yield_until(|| {
+                if worker {
+                    disposed.load(Ordering::Acquire)
+                } else {
+                    finalized.load(Ordering::Relaxed) == 1
+                }
+            })
             .await;
-            yield_to_report_completion().await;
+
+            assert_eq!(tokio::time::Instant::now(), shutdown_time);
+
             tokio::time::advance(Duration::from_secs(5)).await;
         };
 
         let (result, ()) = tokio::join!(node.run(), driver);
 
         assert!(result.is_ok());
+        assert!(state.report_response_returned.load(Ordering::Relaxed));
         assert_eq!(state.fill_report_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            state.position_reports_finalized.load(Ordering::Relaxed),
+            usize::from(!worker)
+        );
+        assert!(state.position_reports_disposed.load(Ordering::Acquire));
+        assert_eq!(state.report_collections_active.load(Ordering::Relaxed), 0);
+        assert_eq!(handle.state(), NodeState::Stopped);
     }
 
     #[rstest]
+    #[case::inline(false)]
+    #[case::worker(true)]
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn test_position_fill_report_completed_during_shutdown_is_applied() {
+    async fn test_position_fill_report_completed_during_shutdown_is_applied(#[case] worker: bool) {
         let state = BlockingReportClientState::default();
+        state.report_worker.store(worker, Ordering::Relaxed);
         let fill_release = Arc::new(tokio::sync::Notify::new());
         let client_order_id = ClientOrderId::from("O-SHUTDOWN-FILL");
         let venue_order_id = VenueOrderId::from("V-SHUTDOWN-FILL");
@@ -4799,7 +4831,7 @@ pub(crate) mod serial_tests {
         .with_fill_reports_at_window_end();
         let mut node = reconciliation_node(
             "ShutdownPositionFillReportNode",
-            shutdown_report_test_config(None, Some(0.1)),
+            shutdown_report_test_config(None, Some(REPORT_CHECK_INTERVAL.as_secs_f64())),
             factory,
         );
         add_accepted_test_order(
@@ -4811,30 +4843,22 @@ pub(crate) mod serial_tests {
         let handle = node.handle();
         let driver_handle = handle.clone();
         let fill_count = state.fill_report_count.clone();
-        let response_returned = state.report_response_returned.clone();
+        let cache = node.kernel().cache();
 
         let driver = async move {
-            wait_until_async(
-                || async { fill_count.load(Ordering::Relaxed) == 1 },
-                Duration::from_secs(1),
-            )
-            .await;
+            yield_until(|| driver_handle.is_running()).await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| fill_count.load(Ordering::Relaxed) == 1).await;
             driver_handle.stop();
-            wait_until_async(
-                || async { driver_handle.state() == NodeState::ShuttingDown },
-                Duration::from_secs(1),
-            )
-            .await;
-            // The position response already set the flag; reset so the next
-            // observation is the fill response released below.
-            response_returned.store(false, Ordering::Relaxed);
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| driver_handle.state() == NodeState::ShuttingDown).await;
             fill_release.notify_one();
-            wait_until_async(
-                || async { response_returned.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
+            yield_until(|| {
+                cache.borrow().order(&client_order_id).unwrap().status()
+                    == OrderStatus::PartiallyFilled
+            })
             .await;
-            yield_to_report_completion().await;
+
             tokio::time::advance(Duration::from_secs(5)).await;
         };
 
@@ -4846,6 +4870,17 @@ pub(crate) mod serial_tests {
         let order = cache.order(&client_order_id).unwrap();
         assert_eq!(order.status(), OrderStatus::PartiallyFilled);
         assert_eq!(order.filled_qty(), Quantity::from("1.0"));
+        assert!(matches!(order.last_event(), OrderEventAny::Filled(event)
+            if event.trade_id == TradeId::from("T-SHUTDOWN-FILL") && event.last_qty == Quantity::from("1.0")));
+        assert_eq!(
+            *state.fill_reports_finalized.lock(),
+            if worker {
+                vec![TradeId::from("T-SHUTDOWN-FILL")]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(state.report_collections_active.load(Ordering::Relaxed), 0);
     }
 
     #[rstest]
@@ -4873,7 +4908,7 @@ pub(crate) mod serial_tests {
         .with_fill_reports_at_window_end();
         let mut node = reconciliation_node(
             "BeforeShutdownPositionFillReportNode",
-            shutdown_report_test_config(None, Some(0.1)),
+            shutdown_report_test_config(None, Some(REPORT_CHECK_INTERVAL.as_secs_f64())),
             factory,
         );
         add_accepted_test_order(
@@ -4885,24 +4920,19 @@ pub(crate) mod serial_tests {
         let handle = node.handle();
         let driver_handle = handle.clone();
         let fill_count = state.fill_report_count.clone();
-        let response_returned = state.report_response_returned.clone();
+        let cache = node.kernel().cache();
 
         let driver = async move {
-            wait_until_async(
-                || async { fill_count.load(Ordering::Relaxed) == 1 },
-                Duration::from_secs(1),
-            )
-            .await;
-            // The position response already set the flag; reset so the next
-            // observation is the fill response released below.
-            response_returned.store(false, Ordering::Relaxed);
+            yield_until(|| driver_handle.is_running()).await;
+            tokio::time::advance(REPORT_CHECK_INTERVAL).await;
+            yield_until(|| fill_count.load(Ordering::Relaxed) == 1).await;
             fill_release.notify_one();
-            wait_until_async(
-                || async { response_returned.load(Ordering::Relaxed) },
-                Duration::from_secs(1),
-            )
+            yield_until(|| {
+                cache.borrow().order(&client_order_id).unwrap().status()
+                    == OrderStatus::PartiallyFilled
+            })
             .await;
-            yield_to_report_completion().await;
+
             driver_handle.stop();
             tokio::time::advance(Duration::from_secs(5)).await;
         };
@@ -5331,7 +5361,8 @@ pub(crate) mod serial_tests {
             VenueOrderId::from("V-TARGETED-C"),
             client_id,
         );
-        node.exec_manager_mut().register_inflight(order_a);
+        node.exec_manager_mut()
+            .register_inflight(order_a, UUID4::new());
         assert_eq!(
             node.kernel()
                 .cache
@@ -5904,7 +5935,6 @@ pub(crate) mod serial_tests {
         };
 
         let mut config = reconciliation_node_config(1);
-
         if timeout_retry {
             config.timeout_reconciliation = Duration::from_millis(100);
         }
@@ -6056,6 +6086,7 @@ pub(crate) mod serial_tests {
             UnixNanos::default(),
             None,
         );
+
         mass_status.add_order_reports(vec![report]);
         mass_status.add_fill_reports(vec![fill]);
         *state.mass_status.lock() = Some(mass_status);
@@ -6287,7 +6318,6 @@ pub(crate) mod serial_tests {
         let mut order_reports = Vec::with_capacity(ORDER_COUNT);
         let mut fill_reports = Vec::with_capacity(ORDER_COUNT);
         let mut order_ids = Vec::with_capacity(ORDER_COUNT);
-
         for index in 0..ORDER_COUNT {
             let client_order_id = ClientOrderId::from(format!("O-STRESS-{index:02}").as_str());
             let venue_order_id = VenueOrderId::from(format!("V-STRESS-{index:02}").as_str());
@@ -6363,7 +6393,6 @@ pub(crate) mod serial_tests {
             .await;
             let sender = get_exec_event_sender();
             let mut sample = SEED;
-
             for index in 0..EXEC_BACKLOG {
                 sample ^= sample << 13;
                 sample ^= sample >> 7;

@@ -76,7 +76,7 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns `Error.Auth` if required environment variables are not set.
+    /// Returns an error if required environment variables are not set.
     #[staticmethod]
     #[pyo3(name = "from_env", signature = (environment=HyperliquidEnvironment::Mainnet, include_builder_attribution=true))]
     fn py_from_env(
@@ -92,7 +92,7 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns `Error.Auth` if the private key is invalid or cannot be parsed.
+    /// Returns an error if the private key is invalid or cannot be parsed.
     #[staticmethod]
     #[pyo3(name = "from_credentials", signature = (private_key, vault_address=None, environment=HyperliquidEnvironment::Mainnet, timeout_secs=60, proxy_url=None, include_builder_attribution=true))]
     fn py_from_credentials(
@@ -144,7 +144,7 @@ impl HyperliquidHttpClient {
     ///
     /// # Errors
     ///
-    /// Returns `Error.Auth` if the client has no signer configured.
+    /// Returns an error if the client has no signer configured.
     #[pyo3(name = "get_user_address")]
     fn py_get_user_address(&self) -> PyResult<String> {
         self.get_user_address().map_err(to_pyvalue_err)
@@ -874,6 +874,36 @@ impl HyperliquidHttpClient {
                 .await
                 .map_err(to_pyvalue_err)?;
             to_string(&json).map_err(to_pyvalue_err)
+        })
+    }
+
+    /// Arms, replaces, or clears the account-wide scheduled cancellation of all open orders.
+    ///
+    /// `time` is a Unix timestamp in milliseconds, at least five seconds after the local
+    /// clock when called. `None` clears the schedule. Allow extra time for rate limiting,
+    /// network latency, and clock skew. The venue can still reject a delayed request.
+    /// The schedule remains at the venue after disconnect or process exit; this method
+    /// does not start a refresh loop or close positions.
+    /// Convert Nautilus nanosecond timestamps to milliseconds before passing them here.
+    /// The venue requires $1,000,000 trading volume and permits at most ten schedule triggers
+    /// per day, resetting the trigger count at 00:00 UTC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The timestamp is less than five seconds ahead of the local clock.
+    /// - Credentials are missing or the request fails.
+    /// - The venue rejects the action or returns an unexpected acknowledgement.
+    #[pyo3(name = "schedule_cancel", signature = (time=None))]
+    fn py_schedule_cancel<'py>(
+        &self,
+        py: Python<'py>,
+        time: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.schedule_cancel(time).await.map_err(to_pyvalue_err)?;
+            Ok(Python::attach(|py| py.None()))
         })
     }
 

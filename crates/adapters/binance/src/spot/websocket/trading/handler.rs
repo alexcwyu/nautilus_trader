@@ -50,7 +50,7 @@ use crate::{
     common::credential::{SigningCredential, canonical_ws_query_string},
     spot::{
         enums::BinanceSpotUserDataEventType,
-        http::parse,
+        http::{models::BinanceCancelOpenOrdersResponse, parse},
         sbe::spot::{
             ReadBuf,
             error_response_codec::ErrorResponseDecoder,
@@ -527,8 +527,7 @@ impl BinanceSpotWsTradingHandler {
                         let subscription_id = json
                             .get("result")
                             .and_then(|r| r.get("subscriptionId"))
-                            .map(|v| v.to_string())
-                            .unwrap_or_default();
+                            .map_or_default(|v| v.to_string());
                         log::debug!("User data stream subscribed: id={subscription_id}");
                         self.emit(BinanceSpotWsTradingMessage::UserDataSubscribed {
                             subscription_id,
@@ -626,13 +625,12 @@ impl BinanceSpotWsTradingHandler {
                     }
                 }
                 606 => {
-                    log::debug!(
-                        "Received SBE ListStatusEvent ({} bytes), not yet decoded",
-                        data.len()
-                    );
-                    return Ok(BinanceSpotWsTradingMessage::Error(
-                        "SBE ListStatusEvent decoding not yet implemented".to_string(),
-                    ));
+                    return Ok(match super::decode_sbe::decode_list_status(data) {
+                        Ok(status) => BinanceSpotWsTradingMessage::ListStatus(status),
+                        Err(e) => BinanceSpotWsTradingMessage::Error(format!(
+                            "SBE ListStatusEvent decode failed: {e}"
+                        )),
+                    });
                 }
                 607 => {
                     log::debug!(
@@ -691,11 +689,7 @@ impl BinanceSpotWsTradingHandler {
                 })
             }
             BinanceSpotWsTradingRequestMeta::CancelOrder => {
-                let response = parse::decode_cancel_order(&result_data)?;
-                Ok(BinanceSpotWsTradingMessage::OrderCanceled {
-                    request_id,
-                    response,
-                })
+                Self::decode_cancel_order(request_id, &result_data)
             }
             BinanceSpotWsTradingRequestMeta::CancelReplaceOrder => {
                 let (cancel_response, new_order_response) =
@@ -721,6 +715,26 @@ impl BinanceSpotWsTradingHandler {
                 log::debug!("User data stream subscribed (SBE response)");
                 Ok(BinanceSpotWsTradingMessage::UserDataSubscribed {
                     subscription_id: request_id,
+                })
+            }
+        }
+    }
+
+    fn decode_cancel_order(
+        request_id: String,
+        result_data: &[u8],
+    ) -> Result<BinanceSpotWsTradingMessage, BinanceWsApiError> {
+        match parse::decode_cancel_order_or_list(result_data)? {
+            BinanceCancelOpenOrdersResponse::Order(response) => {
+                Ok(BinanceSpotWsTradingMessage::OrderCanceled {
+                    request_id,
+                    response,
+                })
+            }
+            response @ BinanceCancelOpenOrdersResponse::OrderList(_) => {
+                Ok(BinanceSpotWsTradingMessage::AllOrdersCanceled {
+                    request_id,
+                    responses: vec![response],
                 })
             }
         }
@@ -1059,6 +1073,51 @@ mod tests {
             .unwrap();
         handler.inner.as_ref().unwrap().disconnect().await;
         server.abort();
+    }
+
+    #[rstest]
+    #[case::valid(false)]
+    #[case::malformed(true)]
+    fn test_list_status_routes_typed_message_or_controlled_error(#[case] malformed: bool) {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut handler = BinanceSpotWsTradingHandler::new(
+            Arc::new(AtomicBool::new(false)),
+            cmd_rx,
+            raw_rx,
+            out_tx,
+            Arc::new(SigningCredential::new(
+                "api-key".to_owned(),
+                "secret".to_owned(),
+            )),
+        );
+        let mut data = crate::common::testing::load_fixture_bytes(
+            "spot/user_data_sbe/list_status_executing.sbe",
+        );
+
+        if malformed {
+            data.pop();
+        }
+
+        let message = handler.decode_ws_api_response(&data).unwrap();
+        if malformed {
+            let BinanceSpotWsTradingMessage::Error(reason) = message else {
+                panic!("Expected controlled error");
+            };
+
+            assert!(reason.starts_with("SBE ListStatusEvent decode failed:"));
+        } else {
+            let BinanceSpotWsTradingMessage::ListStatus(status) = message else {
+                panic!("Expected typed list status");
+            };
+
+            assert_eq!(
+                status,
+                super::super::decode_sbe::decode_list_status(&data).unwrap()
+            );
+        }
     }
 
     #[rstest]

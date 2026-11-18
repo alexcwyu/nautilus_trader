@@ -21,9 +21,10 @@ use std::{
     fmt::{Debug, Display},
 };
 
-use nautilus_core::UnixNanos;
-#[cfg(feature = "python")]
-use nautilus_core::correctness::{CorrectnessError, CorrectnessResult};
+use nautilus_core::{
+    UnixNanos,
+    correctness::{CorrectnessError, CorrectnessResult},
+};
 
 use crate::{
     data::order::{BookOrder, OrderId},
@@ -101,7 +102,7 @@ impl Display for BookPrice {
 /// an incomplete MBP stream (missing `F_LAST`) would leave batch state that
 /// incorrectly affects subsequent snapshot processing.
 ///
-/// The discriminants are serialized in Python `OrderBook` state and must remain stable.
+/// The discriminants are serialized in `OrderBook` state and must remain stable.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 enum L1BatchState {
@@ -120,6 +121,9 @@ pub(crate) struct BookLadder {
     pub side: OrderSide,
     pub book_type: BookType,
     pub levels: BTreeMap<BookPrice, BookLevel>,
+    // The standard hasher measured faster than ahash for this map's steady-state
+    // clear-and-insert pattern; see the 2026-11-02 rejection record in
+    // `crates/backtest/benches/BENCHMARKS.md` before changing hashers.
     pub cache: HashMap<u64, BookPrice>,
     batch_state: L1BatchState,
 }
@@ -151,7 +155,6 @@ impl BookLadder {
     }
 
     #[must_use]
-    #[cfg(feature = "python")]
     pub(crate) fn batch_state_code(&self) -> u8 {
         self.batch_state as u8
     }
@@ -160,8 +163,7 @@ impl BookLadder {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown state code or a batch state on a non-L1 ladder.
-    #[cfg(feature = "python")]
+    /// Returns an error if the state code is unknown or a batch state appears on a non-L1 ladder.
     pub(crate) fn set_batch_state_code(&mut self, code: u8) -> CorrectnessResult<()> {
         let batch_state = match code {
             0 => L1BatchState::None,
@@ -213,8 +215,26 @@ impl BookLadder {
 
         if let Some(mut level) = reusable_level {
             level.price = book_price;
-            level.orders.clear();
-            level.add(order);
+
+            // Same order ID replaces the value without rehashing, as L1 quote and trade
+            // ticks reuse side-constant IDs so this hits on every steady-state tick.
+            let same_id = level.orders.len() == 1
+                && level
+                    .orders
+                    .get_index(0)
+                    .is_some_and(|(id, _)| *id == order.order_id);
+
+            if same_id {
+                let (_, existing) = level
+                    .orders
+                    .get_index_mut(0)
+                    .expect("single L1 order exists");
+                *existing = order;
+            } else {
+                level.orders.clear();
+                level.add(order);
+            }
+
             self.levels.insert(book_price, level);
         } else {
             self.levels.insert(book_price, BookLevel::from_order(order));
@@ -549,9 +569,9 @@ impl BookLadder {
 
             for book_order in level.orders.values() {
                 let current = book_order.size;
-                if cumulative_denominator + current >= target {
+                let remainder = target - cumulative_denominator;
+                if current >= remainder {
                     // This order has filled us, add fill and return
-                    let remainder = target - cumulative_denominator;
                     if remainder.is_positive() {
                         fills.push((book_order.price, remainder));
                     }
@@ -590,7 +610,6 @@ impl BookLadder {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "python")]
     use nautilus_core::correctness::CorrectnessError;
     use rstest::rstest;
 
@@ -1905,7 +1924,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "python")]
     #[rstest]
     fn test_batch_state_code_round_trips_on_l1_ladder(#[values(0, 1, 2)] code: u8) {
         let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L1_MBP);
@@ -1915,7 +1933,6 @@ mod tests {
         assert_eq!(ladder.batch_state_code(), code);
     }
 
-    #[cfg(feature = "python")]
     #[rstest]
     #[case::unknown_code(BookType::L1_MBP, 3, "Invalid L1 batch state code: 3")]
     #[case::non_l1_batch(
@@ -1941,7 +1958,6 @@ mod tests {
         assert_eq!(ladder.batch_state_code(), 0);
     }
 
-    #[cfg(feature = "python")]
     #[rstest]
     fn test_set_batch_state_code_accepts_no_batch_on_non_l1_ladder() {
         let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L2_MBP);
@@ -2125,5 +2141,86 @@ mod tests {
             "Single-delta snapshot clears MBP state: best is 95, not stale 101"
         );
         assert_eq!(ladder.len(), 1);
+    }
+
+    #[rstest]
+    fn test_replace_l1_same_id_updates_price_in_place() {
+        let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L1_MBP);
+        let first = BookOrder::new(OrderSide::Buy, Price::from("10.00"), Quantity::from(20), 1);
+        ladder.replace_l1(first);
+        assert_eq!(ladder.len(), 1);
+
+        let second = BookOrder::new(OrderSide::Buy, Price::from("11.00"), Quantity::from(30), 1);
+        ladder.replace_l1(second);
+
+        assert_eq!(ladder.len(), 1);
+        let top = ladder.top().unwrap();
+        assert_eq!(top.price.value, Price::from("11.00"));
+        assert_eq!(top.len(), 1);
+        let orders = top.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, 1);
+        assert_eq!(orders[0].price, Price::from("11.00"));
+        assert_eq!(orders[0].size, Quantity::from(30));
+        assert_eq!(ladder.cache.len(), 1);
+        assert_eq!(ladder.cache.get(&1).unwrap().value, Price::from("11.00"));
+    }
+
+    #[rstest]
+    fn test_replace_l1_different_id_falls_back_to_clear_and_add() {
+        let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L1_MBP);
+        let first = BookOrder::new(OrderSide::Buy, Price::from("10.00"), Quantity::from(20), 1);
+        ladder.replace_l1(first);
+
+        let second = BookOrder::new(OrderSide::Buy, Price::from("11.00"), Quantity::from(30), 2);
+        ladder.replace_l1(second);
+
+        assert_eq!(ladder.len(), 1);
+        let top = ladder.top().unwrap();
+        assert_eq!(top.price.value, Price::from("11.00"));
+        assert_eq!(top.len(), 1);
+        let orders = top.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, 2);
+        assert_eq!(ladder.cache.len(), 1);
+        assert!(!ladder.cache.contains_key(&1));
+        assert_eq!(ladder.cache.get(&2).unwrap().value, Price::from("11.00"));
+    }
+
+    #[rstest]
+    fn test_replace_l1_multi_order_level_falls_back_to_clear_and_add() {
+        let mut ladder = BookLadder::new(OrderSide::Buy, BookType::L1_MBP);
+        let price = BookPrice::new(Price::from("10.00"), OrderSide::Buy);
+        let mut level = BookLevel::new(price);
+        level.add(BookOrder::new(
+            OrderSide::Buy,
+            Price::from("10.00"),
+            Quantity::from(20),
+            1,
+        ));
+        level.add(BookOrder::new(
+            OrderSide::Buy,
+            Price::from("10.00"),
+            Quantity::from(25),
+            2,
+        ));
+        ladder.levels.insert(price, level);
+        ladder.cache.insert(1, price);
+        ladder.cache.insert(2, price);
+        assert_eq!(ladder.top().unwrap().len(), 2);
+
+        let replacement =
+            BookOrder::new(OrderSide::Buy, Price::from("11.00"), Quantity::from(30), 1);
+        ladder.replace_l1(replacement);
+
+        assert_eq!(ladder.len(), 1);
+        let top = ladder.top().unwrap();
+        assert_eq!(top.price.value, Price::from("11.00"));
+        assert_eq!(top.len(), 1);
+        let orders = top.get_orders();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].order_id, 1);
+        assert_eq!(ladder.cache.len(), 1);
+        assert_eq!(ladder.cache.get(&1).unwrap().value, Price::from("11.00"));
     }
 }

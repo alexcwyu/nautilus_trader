@@ -85,7 +85,7 @@ impl<T> SharedCell<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`BorrowError`] if the value is currently mutably borrowed.
+    /// Returns an error if the value is currently mutably borrowed.
     #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         self.0.try_borrow()
@@ -95,8 +95,7 @@ impl<T> SharedCell<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`BorrowMutError`] if the value is currently borrowed
-    /// (mutably or immutably).
+    /// Returns an error if the value is currently borrowed (mutably or immutably).
     #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
         self.0.try_borrow_mut()
@@ -280,6 +279,7 @@ mod tests {
             let cell = SharedCell::new(10);
             cell.downgrade()
         };
+
         assert!(weak.is_dropped());
         assert!(weak.upgrade().is_none());
     }
@@ -376,6 +376,7 @@ mod tests {
     #[rstest]
     fn test_with_mut_drops_borrow_before_returning() {
         let cell = SharedCell::new(0);
+
         let returned = cell.with_mut(|v| {
             *v = 7;
             *v

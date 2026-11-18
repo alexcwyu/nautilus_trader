@@ -29,6 +29,8 @@ class DatabentoDataClient:
         publishers_filepath: str | os.PathLike | pathlib.Path,
         use_exchange_as_venue: bool = True,
         bars_timestamp_on_close: bool = True,
+        futures_year_digits: int | None = None,
+        share_class_space: bool = True,
     ) -> None: ...
     @property
     def client_id(self) -> model.ClientId: ...
@@ -55,6 +57,8 @@ class DatabentoDataClientConfig:
     def bars_timestamp_on_close(self) -> bool: ...
     @property
     def venue_dataset_map(self) -> dict[str, str]: ...
+    @property
+    def share_class_space(self) -> bool: ...
     def __init__(
         self,
         api_key: str,
@@ -64,7 +68,11 @@ class DatabentoDataClientConfig:
         venue_dataset_map: typing.Mapping[str, str] | None = None,
         historical_base_url: str | None = None,
         live_gateway_addr: str | None = None,
+        futures_year_digits: int | None = None,
+        share_class_space: bool = True,
     ) -> None: ...
+    @property
+    def futures_year_digits(self) -> int: ...
 
 @typing.final
 class DatabentoDataClientFactory:
@@ -82,7 +90,10 @@ class DatabentoDataClientFactory:
 @typing.final
 class DatabentoDataLoader:
     def __init__(
-        self, publishers_filepath: str | os.PathLike | pathlib.Path | None = None
+        self,
+        publishers_filepath: str | os.PathLike | pathlib.Path | None = None,
+        futures_year_digits: int | None = None,
+        share_class_space: bool = True,
     ) -> None: ...
     def load_publishers(self, publishers_filepath: str | os.PathLike | pathlib.Path) -> None: ...
     def get_publishers(self) -> dict[int, DatabentoPublisher]: ...
@@ -185,6 +196,8 @@ class DatabentoHistoricalClient:
         key: str,
         publishers_filepath: str | os.PathLike | pathlib.Path,
         use_exchange_as_venue: bool,
+        futures_year_digits: int | None = None,
+        share_class_space: bool = True,
     ) -> None: ...
     @property
     def api_key(self) -> str: ...
@@ -312,6 +325,8 @@ class DatabentoLiveClient:
         use_exchange_as_venue: bool,
         bars_timestamp_on_close: bool | None = None,
         reconnect_timeout_mins: int | None = None,
+        futures_year_digits: int | None = None,
+        share_class_space: bool = True,
     ) -> None: ...
     @property
     def dataset(self) -> str: ...

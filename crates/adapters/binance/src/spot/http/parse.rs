@@ -97,9 +97,7 @@ impl MessageHeader {
     /// instrument loading on a server-side bump. A different schema ID is a breaking
     /// change and is still rejected.
     ///
-    /// The decoders assume block layouts are stable within a schema ID.
-    /// `decode_exchange_info` verifies the symbol block length and fails loudly on a
-    /// mismatch; the market-data decoders read groups at a fixed offset, so a future
+    /// The market-data decoders read groups at a fixed offset, so a future
     /// version that adds fixed-block fields to those messages would need them updated
     /// to advance past the added bytes via `block_length`.
     fn validate(&self) -> Result<(), SbeDecodeError> {
@@ -119,7 +117,7 @@ impl MessageHeader {
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short or schema mismatch.
+/// Returns an error if buffer is too short or schema mismatch.
 pub fn decode_ping(buf: &[u8]) -> Result<(), SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -139,7 +137,7 @@ pub fn decode_ping(buf: &[u8]) -> Result<(), SbeDecodeError> {
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short or schema mismatch.
+/// Returns an error if buffer is too short or schema mismatch.
 pub fn decode_server_time(buf: &[u8]) -> Result<i64, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -152,13 +150,21 @@ pub fn decode_server_time(buf: &[u8]) -> Result<i64, SbeDecodeError> {
     cursor.read_i64_le()
 }
 
+const DEPTH_LEVEL_BLOCK_LENGTH: u16 = 16;
+const TRADE_BLOCK_LENGTH: u16 = 42;
+const AGG_TRADE_BLOCK_LENGTH: u16 = 50;
+
 /// Decode a depth response.
 ///
 /// Returns the order book depth with bids and asks.
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or group size exceeded.
+/// Returns an error if:
+/// - The buffer is too short.
+/// - The schema ID or template ID does not match.
+/// - The group count exceeds the limit.
+/// - A group block is shorter than its fixed entry width.
 pub fn decode_depth(buf: &[u8]) -> Result<BinanceDepth, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -172,16 +178,20 @@ pub fn decode_depth(buf: &[u8]) -> Result<BinanceDepth, SbeDecodeError> {
     let price_exponent = cursor.read_i8()?;
     let qty_exponent = cursor.read_i8()?;
 
-    let (block_len, count) = cursor.read_group_header()?;
+    let (block_len, count) = read_group_header(&mut cursor, DEPTH_LEVEL_BLOCK_LENGTH)?;
+
     let bids = cursor.read_group(block_len, count, |c| {
+        let mut c = SbeCursor::new(c.read_bytes(usize::from(DEPTH_LEVEL_BLOCK_LENGTH))?);
         Ok(BinancePriceLevel {
             price_mantissa: c.read_i64_le()?,
             qty_mantissa: c.read_i64_le()?,
         })
     })?;
 
-    let (block_len, count) = cursor.read_group_header()?;
+    let (block_len, count) = read_group_header(&mut cursor, DEPTH_LEVEL_BLOCK_LENGTH)?;
+
     let asks = cursor.read_group(block_len, count, |c| {
+        let mut c = SbeCursor::new(c.read_bytes(usize::from(DEPTH_LEVEL_BLOCK_LENGTH))?);
         Ok(BinancePriceLevel {
             price_mantissa: c.read_i64_le()?,
             qty_mantissa: c.read_i64_le()?,
@@ -203,7 +213,11 @@ pub fn decode_depth(buf: &[u8]) -> Result<BinanceDepth, SbeDecodeError> {
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or group size exceeded.
+/// Returns an error if:
+/// - The buffer is too short.
+/// - The schema ID or template ID does not match.
+/// - The group count exceeds the limit.
+/// - A group block is shorter than its fixed entry width.
 pub fn decode_trades(buf: &[u8]) -> Result<BinanceTrades, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -216,8 +230,10 @@ pub fn decode_trades(buf: &[u8]) -> Result<BinanceTrades, SbeDecodeError> {
     let price_exponent = cursor.read_i8()?;
     let qty_exponent = cursor.read_i8()?;
 
-    let (block_len, count) = cursor.read_group_header()?;
+    let (block_len, count) = read_group_header(&mut cursor, TRADE_BLOCK_LENGTH)?;
+
     let trades = cursor.read_group(block_len, count, |c| {
+        let mut c = SbeCursor::new(c.read_bytes(usize::from(TRADE_BLOCK_LENGTH))?);
         Ok(BinanceTrade {
             id: c.read_i64_le()?,
             price_mantissa: c.read_i64_le()?,
@@ -240,7 +256,11 @@ pub fn decode_trades(buf: &[u8]) -> Result<BinanceTrades, SbeDecodeError> {
 ///
 /// # Errors
 ///
-/// Returns an error for an invalid header, template, or group payload.
+/// Returns an error if:
+/// - The buffer is too short.
+/// - The schema ID or template ID does not match.
+/// - The group count exceeds the limit.
+/// - A group block is shorter than its fixed entry width.
 pub fn decode_agg_trades(buf: &[u8]) -> Result<BinanceAggTrades, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -252,8 +272,10 @@ pub fn decode_agg_trades(buf: &[u8]) -> Result<BinanceAggTrades, SbeDecodeError>
 
     let price_exponent = cursor.read_i8()?;
     let qty_exponent = cursor.read_i8()?;
-    let (block_len, count) = cursor.read_group_header()?;
+    let (block_len, count) = read_group_header(&mut cursor, AGG_TRADE_BLOCK_LENGTH)?;
+
     let trades = cursor.read_group(block_len, count, |c| {
+        let mut c = SbeCursor::new(c.read_bytes(usize::from(AGG_TRADE_BLOCK_LENGTH))?);
         Ok(BinanceAggTrade {
             id: c.read_i64_le()?,
             price_mantissa: c.read_i64_le()?,
@@ -273,6 +295,21 @@ pub fn decode_agg_trades(buf: &[u8]) -> Result<BinanceAggTrades, SbeDecodeError>
     })
 }
 
+fn read_group_header(
+    cursor: &mut SbeCursor<'_>,
+    minimum: u16,
+) -> Result<(u16, u32), SbeDecodeError> {
+    let (block_length, count) = cursor.read_group_header()?;
+    if block_length < minimum {
+        return Err(SbeDecodeError::InvalidBlockLength {
+            expected: minimum,
+            actual: block_length,
+        });
+    }
+
+    Ok((block_length, count))
+}
+
 /// Klines group item block length (from SBE codec).
 const KLINES_BLOCK_LENGTH: u16 = 120;
 
@@ -282,7 +319,7 @@ const KLINES_BLOCK_LENGTH: u16 = 120;
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or group size exceeded.
+/// Returns an error if buffer is too short, schema mismatch, or group size exceeded.
 pub fn decode_klines(buf: &[u8]) -> Result<BinanceKlines, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -423,7 +460,7 @@ fn read_trailing_expiry_reason(
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_new_order_full(buf: &[u8]) -> Result<BinanceNewOrderResponse, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
@@ -508,7 +545,7 @@ pub fn decode_new_order_full(buf: &[u8]) -> Result<BinanceNewOrderResponse, SbeD
 ///
 /// # Errors
 ///
-/// Returns an error for a malformed wrapper or an unsuccessful replacement.
+/// Returns an error if the wrapper is malformed or the replacement is unsuccessful.
 pub fn decode_cancel_replace(buf: &[u8]) -> Result<BinanceNewOrderResponse, SbeDecodeError> {
     let (_, replacement) = decode_cancel_replace_payloads(buf)?;
     decode_new_order_full(replacement)
@@ -560,7 +597,7 @@ fn decode_cancel_replace_payloads(buf: &[u8]) -> Result<(&[u8], &[u8]), SbeDecod
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_cancel_order(buf: &[u8]) -> Result<BinanceCancelOrderResponse, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
@@ -624,11 +661,27 @@ pub fn decode_cancel_order(buf: &[u8]) -> Result<BinanceCancelOrderResponse, Sbe
     })
 }
 
+pub(crate) fn decode_cancel_order_or_list(
+    buf: &[u8],
+) -> Result<BinanceCancelOpenOrdersResponse, SbeDecodeError> {
+    let mut cursor = SbeCursor::new(buf);
+    let header = MessageHeader::decode_cursor(&mut cursor)?;
+    header.validate()?;
+    match header.template_id {
+        CANCEL_ORDER_TEMPLATE_ID => Ok(BinanceCancelOpenOrdersResponse::Order(
+            decode_cancel_order(buf)?,
+        )),
+        CANCEL_ORDER_LIST_TEMPLATE_ID => Ok(BinanceCancelOpenOrdersResponse::OrderList(
+            decode_cancel_order_list(buf)?,
+        )),
+        template_id => Err(SbeDecodeError::UnknownTemplateId(template_id)),
+    }
+}
+
 fn decode_cancel_order_list(buf: &[u8]) -> Result<BinanceCancelOrderListResponse, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
     header.validate()?;
-
     if header.template_id != CANCEL_ORDER_LIST_TEMPLATE_ID {
         return Err(SbeDecodeError::UnknownTemplateId(header.template_id));
     }
@@ -748,7 +801,7 @@ fn decode_cancel_order_list(buf: &[u8]) -> Result<BinanceCancelOrderListResponse
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_order(buf: &[u8]) -> Result<BinanceOrderResponse, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
@@ -766,7 +819,7 @@ pub fn decode_order(buf: &[u8]) -> Result<BinanceOrderResponse, SbeDecodeError> 
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_orders(buf: &[u8]) -> Result<Vec<BinanceOrderResponse>, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
@@ -870,7 +923,7 @@ fn decode_order_block(
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_cancel_open_orders(
     buf: &[u8],
@@ -908,18 +961,7 @@ pub fn decode_cancel_open_orders(
     for _ in 0..count {
         let response_len = cursor.read_u16_le()? as usize;
         let embedded_bytes = cursor.read_bytes(response_len)?;
-        let mut embedded_cursor = SbeCursor::new(embedded_bytes);
-        let embedded_header = MessageHeader::decode_cursor(&mut embedded_cursor)?;
-        embedded_header.validate()?;
-        let response = match embedded_header.template_id {
-            CANCEL_ORDER_TEMPLATE_ID => {
-                BinanceCancelOpenOrdersResponse::Order(decode_cancel_order(embedded_bytes)?)
-            }
-            CANCEL_ORDER_LIST_TEMPLATE_ID => BinanceCancelOpenOrdersResponse::OrderList(
-                decode_cancel_order_list(embedded_bytes)?,
-            ),
-            template_id => return Err(SbeDecodeError::UnknownTemplateId(template_id)),
-        };
+        let response = decode_cancel_order_or_list(embedded_bytes)?;
         responses.push(response);
     }
 
@@ -936,7 +978,7 @@ const BALANCE_BLOCK_LENGTH: u16 = 17;
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_account(buf: &[u8]) -> Result<BinanceAccountInfo, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
@@ -1018,7 +1060,7 @@ const ACCOUNT_TRADE_BLOCK_LENGTH: u16 = 70;
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or decode error.
+/// Returns an error if buffer is too short, schema mismatch, or decode error.
 #[allow(dead_code)]
 pub fn decode_account_trades(buf: &[u8]) -> Result<Vec<BinanceAccountTrade>, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
@@ -1138,12 +1180,12 @@ const SYMBOL_BLOCK_LENGTH: usize = 19;
 ///
 /// # Errors
 ///
-/// Returns error if buffer is too short, schema mismatch, or template ID mismatch.
+/// Returns an error if buffer is too short, schema mismatch, or template ID mismatch.
 ///
 /// # Panics
 ///
-/// This function will panic if filter byte slices cannot be converted to fixed-size arrays,
-/// which should not occur if the SBE data is well-formed.
+/// Panics if filter byte slices cannot be converted to fixed-size arrays, which should not occur if
+/// the SBE data is well-formed.
 pub fn decode_exchange_info(buf: &[u8]) -> Result<BinanceExchangeInfoSbe, SbeDecodeError> {
     let mut cursor = SbeCursor::new(buf);
     let header = MessageHeader::decode_cursor(&mut cursor)?;
@@ -1167,7 +1209,7 @@ pub fn decode_exchange_info(buf: &[u8]) -> Result<BinanceExchangeInfoSbe, SbeDec
     // Decode symbols group
     let (symbols_block_len, symbols_count) = cursor.read_group_header()?;
 
-    if symbols_block_len != SYMBOL_BLOCK_LENGTH as u16 {
+    if symbols_block_len < SYMBOL_BLOCK_LENGTH as u16 {
         return Err(SbeDecodeError::InvalidBlockLength {
             expected: SYMBOL_BLOCK_LENGTH as u16,
             actual: symbols_block_len,
@@ -1198,6 +1240,7 @@ pub fn decode_exchange_info(buf: &[u8]) -> Result<BinanceExchangeInfoSbe, SbeDec
         let _default_self_trade_prevention_mode = cursor.read_u8()?;
         let _allowed_self_trade_prevention_modes = cursor.read_u8()?;
         let _peg_instructions_allowed = cursor.read_u8()?;
+        cursor.advance(usize::from(symbols_block_len) - SYMBOL_BLOCK_LENGTH)?;
 
         let (_filters_block_len, filters_count) = cursor.read_group_header()?;
         let mut filters = BinanceSymbolFiltersSbe::default();
@@ -1492,6 +1535,167 @@ mod tests {
         buf[0..2].copy_from_slice(&block_length.to_le_bytes());
         buf[2..6].copy_from_slice(&count.to_le_bytes());
         buf
+    }
+
+    #[rstest]
+    #[case::bids(DEPTH_TEMPLATE_ID, 16, false)]
+    #[case::asks(DEPTH_TEMPLATE_ID, 16, true)]
+    #[case::trades(TRADES_TEMPLATE_ID, 42, false)]
+    #[case::agg_trades(AGG_TRADES_TEMPLATE_ID, 50, false)]
+    fn test_market_data_rejects_undersized_groups(
+        #[case] template: u16,
+        #[case] minimum: u16,
+        #[case] asks: bool,
+        #[values(0, 1, 10_000)] count: u32,
+    ) {
+        let fixed_width = if template == DEPTH_TEMPLATE_ID { 10 } else { 2 };
+
+        for width in 0..minimum {
+            let mut buf =
+                create_header(fixed_width, template, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION).to_vec();
+            buf.resize(HEADER_LENGTH + usize::from(fixed_width), 0);
+            if asks {
+                buf.extend_from_slice(&create_group_header(minimum, 1));
+                buf.extend_from_slice(&[0; 16]);
+            }
+
+            buf.extend_from_slice(&create_group_header(width, count));
+            buf.extend_from_slice(&[0; 200]);
+            let result = match template {
+                DEPTH_TEMPLATE_ID => decode_depth(&buf).map(|_| ()),
+                TRADES_TEMPLATE_ID => decode_trades(&buf).map(|_| ()),
+                AGG_TRADES_TEMPLATE_ID => decode_agg_trades(&buf).map(|_| ()),
+                _ => unreachable!(),
+            };
+
+            assert_eq!(
+                result,
+                Err(SbeDecodeError::InvalidBlockLength {
+                    expected: minimum,
+                    actual: width,
+                })
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::depth(DEPTH_TEMPLATE_ID, 16)]
+    #[case::trades(TRADES_TEMPLATE_ID, 42)]
+    #[case::agg_trades(AGG_TRADES_TEMPLATE_ID, 50)]
+    fn test_market_data_group_extensions(#[case] template: u16, #[case] minimum: u16) {
+        let fixed_width = if template == DEPTH_TEMPLATE_ID { 10 } else { 2 };
+        let mut buf =
+            create_header(fixed_width, template, SBE_SCHEMA_ID, SBE_SCHEMA_VERSION).to_vec();
+        if template == DEPTH_TEMPLATE_ID {
+            buf.extend_from_slice(&999i64.to_le_bytes());
+        }
+
+        buf.extend_from_slice(&[(-2i8) as u8, (-8i8) as u8]);
+
+        let group_count = if template == DEPTH_TEMPLATE_ID { 2 } else { 1 };
+        for group in 0..group_count {
+            buf.extend_from_slice(&create_group_header(minimum + 3, 2));
+            for entry in 0..2 {
+                for field in 1..=minimum / 8 {
+                    let value = i64::from(group * 200 + entry * 100 + field + 100);
+                    buf.extend_from_slice(&value.to_le_bytes());
+                }
+
+                if template != DEPTH_TEMPLATE_ID {
+                    buf.extend_from_slice(&[1, 0]);
+                }
+
+                buf.extend_from_slice(&[0xFF; 3]);
+            }
+        }
+
+        match template {
+            DEPTH_TEMPLATE_ID => assert_eq!(
+                decode_depth(&buf).unwrap(),
+                BinanceDepth {
+                    last_update_id: 999,
+                    price_exponent: -2,
+                    qty_exponent: -8,
+                    bids: vec![
+                        BinancePriceLevel {
+                            price_mantissa: 101,
+                            qty_mantissa: 102
+                        },
+                        BinancePriceLevel {
+                            price_mantissa: 201,
+                            qty_mantissa: 202
+                        }
+                    ],
+                    asks: vec![
+                        BinancePriceLevel {
+                            price_mantissa: 301,
+                            qty_mantissa: 302
+                        },
+                        BinancePriceLevel {
+                            price_mantissa: 401,
+                            qty_mantissa: 402
+                        }
+                    ],
+                }
+            ),
+            TRADES_TEMPLATE_ID => assert_eq!(
+                decode_trades(&buf).unwrap(),
+                BinanceTrades {
+                    price_exponent: -2,
+                    qty_exponent: -8,
+                    trades: vec![
+                        BinanceTrade {
+                            id: 101,
+                            price_mantissa: 102,
+                            qty_mantissa: 103,
+                            quote_qty_mantissa: 104,
+                            time: 105,
+                            is_buyer_maker: true,
+                            is_best_match: false
+                        },
+                        BinanceTrade {
+                            id: 201,
+                            price_mantissa: 202,
+                            qty_mantissa: 203,
+                            quote_qty_mantissa: 204,
+                            time: 205,
+                            is_buyer_maker: true,
+                            is_best_match: false
+                        }
+                    ],
+                }
+            ),
+            AGG_TRADES_TEMPLATE_ID => assert_eq!(
+                decode_agg_trades(&buf).unwrap(),
+                BinanceAggTrades {
+                    price_exponent: -2,
+                    qty_exponent: -8,
+                    trades: vec![
+                        BinanceAggTrade {
+                            id: 101,
+                            price_mantissa: 102,
+                            qty_mantissa: 103,
+                            first_trade_id: 104,
+                            last_trade_id: 105,
+                            time: 106,
+                            is_buyer_maker: true,
+                            is_best_match: false
+                        },
+                        BinanceAggTrade {
+                            id: 201,
+                            price_mantissa: 202,
+                            qty_mantissa: 203,
+                            first_trade_id: 204,
+                            last_trade_id: 205,
+                            time: 206,
+                            is_buyer_maker: true,
+                            is_best_match: false
+                        }
+                    ],
+                }
+            ),
+            _ => unreachable!(),
+        }
     }
 
     #[rstest]
@@ -2422,7 +2626,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decode_exchange_info_multiple_symbols() {
+    fn test_decode_exchange_info_rejects_short_symbol_block() {
         let header = create_header(
             0,
             EXCHANGE_INFO_TEMPLATE_ID,
@@ -2439,8 +2643,42 @@ mod tests {
         // Empty exchange_filters group
         buf.extend_from_slice(&create_group_header(0, 0));
 
+        // Symbols group: 1 symbol with block_length=18
+        buf.extend_from_slice(&create_group_header(18, 1));
+        buf.resize(buf.len() + 18, 0);
+
+        let error = decode_exchange_info(&buf).unwrap_err();
+
+        assert_eq!(
+            error,
+            SbeDecodeError::InvalidBlockLength {
+                expected: 19,
+                actual: 18,
+            }
+        );
+    }
+
+    #[rstest]
+    fn test_decode_exchange_info_multiple_symbols(#[values(19, 22, 25)] block_length: u16) {
+        let header = create_header(
+            0,
+            EXCHANGE_INFO_TEMPLATE_ID,
+            SBE_SCHEMA_ID,
+            SBE_SCHEMA_VERSION,
+        );
+        let padding = usize::from(block_length) - SYMBOL_BLOCK_LENGTH;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&header);
+
+        // Empty rate_limits group
+        buf.extend_from_slice(&create_group_header(11, 0));
+
+        // Empty exchange_filters group
+        buf.extend_from_slice(&create_group_header(0, 0));
+
         // Symbols group: 2 symbols
-        buf.extend_from_slice(&create_group_header(SYMBOL_BLOCK_LENGTH as u16, 2));
+        buf.extend_from_slice(&create_group_header(block_length, 2));
 
         // Symbol 1: BTCUSDT
         buf.push(0); // status
@@ -2461,6 +2699,7 @@ mod tests {
         buf.push(0); // default_self_trade_prevention_mode
         buf.push(0); // allowed_self_trade_prevention_modes
         buf.push(0); // peg_instructions_allowed
+        buf.resize(buf.len() + padding, 0xFF);
         buf.extend_from_slice(&create_group_header(0, 0)); // No filters
         buf.extend_from_slice(&create_group_header(0, 0)); // No permission sets
         write_var_string(&mut buf, "BTCUSDT");
@@ -2486,6 +2725,7 @@ mod tests {
         buf.push(0); // default_self_trade_prevention_mode
         buf.push(0); // allowed_self_trade_prevention_modes
         buf.push(0); // peg_instructions_allowed
+        buf.resize(buf.len() + padding, 0xFF);
         buf.extend_from_slice(&create_group_header(0, 0)); // No filters
         buf.extend_from_slice(&create_group_header(0, 0)); // No permission sets
         write_var_string(&mut buf, "ETHUSDT");
@@ -2709,11 +2949,17 @@ mod tests {
     }
 
     #[rstest]
-    fn test_decode_cancel_open_orders_order_list() {
+    #[case::single_order_cancel(true)]
+    #[case::cancel_all(false)]
+    fn test_decode_cancel_open_orders_order_list(#[case] single: bool) {
         let order_list = create_cancel_order_list_response_buffer();
-        let buf = create_cancel_open_orders_buffer(&[order_list]);
 
-        let responses = decode_cancel_open_orders(&buf).unwrap();
+        let responses = if single {
+            vec![decode_cancel_order_or_list(&order_list).unwrap()]
+        } else {
+            let buf = create_cancel_open_orders_buffer(&[order_list]);
+            decode_cancel_open_orders(&buf).unwrap()
+        };
 
         let BinanceCancelOpenOrdersResponse::OrderList(response) = &responses[0] else {
             panic!("Expected order-list cancel response");

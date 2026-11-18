@@ -16,42 +16,30 @@
 //! CRC32 checksum validation for Kraken `level3` book updates.
 
 use ahash::AHashMap;
+use nautilus_core::nanos::UnixNanos;
 use nautilus_model::enums::OrderSide;
 use rust_decimal::Decimal;
 
 use super::parse::CachedL3Order;
-
-/// Formats a decimal string per Kraken L3 checksum rules.
-///
-/// Removes the decimal point then strips leading zeros, so `"0.12730000"` → `"12730000"`
-/// and `"79754.0"` → `"797540"`.
-fn format_raw(raw: &str) -> String {
-    let no_dot = raw.replace('.', "");
-    let trimmed = no_dot.trim_start_matches('0');
-    if trimmed.is_empty() {
-        "0".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
+use crate::websocket::spot_v2::checksum::{crc32_ieee, format_raw};
 
 /// Builds the checksum input string from the open-order cache.
 ///
 /// Iterates individual orders at the top-10 ask price levels (ascending) then the
 /// top-10 bid price levels (descending). Within each price level orders are sorted
-/// by insertion sequence (FIFO queue priority). Each order contributes
+/// by queue priority (order timestamp, then arrival order). Each order contributes
 /// `format_raw(price_raw) + format_raw(size_raw)` to the string.
 pub(crate) fn build_checksum_string(open_orders: &AHashMap<u64, CachedL3Order>) -> String {
-    let mut asks: Vec<(Decimal, u64, &str, &str)> = open_orders
+    let mut asks: Vec<CheckedOrder> = open_orders
         .iter()
         .filter(|(_, v)| v.side == OrderSide::Sell)
-        .map(|(_, v)| (v.price, v.seq, v.price_raw.as_str(), v.size_raw.as_str()))
+        .map(|(_, v)| checked_order(v))
         .collect();
 
-    let mut bids: Vec<(Decimal, u64, &str, &str)> = open_orders
+    let mut bids: Vec<CheckedOrder> = open_orders
         .iter()
         .filter(|(_, v)| v.side == OrderSide::Buy)
-        .map(|(_, v)| (v.price, v.seq, v.price_raw.as_str(), v.size_raw.as_str()))
+        .map(|(_, v)| checked_order(v))
         .collect();
 
     asks.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -64,14 +52,26 @@ pub(crate) fn build_checksum_string(open_orders: &AHashMap<u64, CachedL3Order>) 
     s
 }
 
+/// An order's price, queue priority (timestamp, arrival), and raw checksum fields.
+type CheckedOrder<'a> = (Decimal, (UnixNanos, u64), &'a str, &'a str);
+
+fn checked_order(order: &CachedL3Order) -> CheckedOrder<'_> {
+    (
+        order.price,
+        (order.timestamp, order.seq),
+        order.price_raw.as_str(),
+        order.size_raw.as_str(),
+    )
+}
+
 /// Computes the Kraken `level3` CRC32 checksum from the open-order cache.
 pub(crate) fn compute_checksum(open_orders: &AHashMap<u64, CachedL3Order>) -> u32 {
     let s = build_checksum_string(open_orders);
     crc32_ieee(s.as_bytes())
 }
 
-/// Appends the top-10 price levels (all orders per level, FIFO) to `s`.
-fn append_top_10_levels(sorted: &[(Decimal, u64, &str, &str)], s: &mut String) {
+/// Appends the top-10 price levels (all orders per level, in queue order) to `s`.
+fn append_top_10_levels(sorted: &[CheckedOrder], s: &mut String) {
     let mut level_count = 0u32;
     let mut last_price: Option<Decimal> = None;
 
@@ -86,22 +86,6 @@ fn append_top_10_levels(sorted: &[(Decimal, u64, &str, &str)], s: &mut String) {
         s.push_str(&format_raw(price_raw));
         s.push_str(&format_raw(size_raw));
     }
-}
-
-/// IEEE CRC32 polynomial (reflected), inline to avoid adding a new dependency.
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]
@@ -178,6 +162,7 @@ mod tests {
                     size: Decimal::ZERO,
                     size_raw: (*size_raw).to_string(),
                     side: OrderSide::Buy,
+                    timestamp: UnixNanos::default(),
                     seq: *seq,
                 },
             );
@@ -192,6 +177,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.3346877".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 9,
             },
         );
@@ -204,6 +190,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.35630000".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 10,
             },
         );
@@ -223,6 +210,7 @@ mod tests {
                     size: Decimal::ZERO,
                     size_raw: size_raw.to_string(),
                     side: OrderSide::Buy,
+                    timestamp: UnixNanos::default(),
                     seq,
                 },
             );
@@ -236,6 +224,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.105240".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 16,
             },
         );
@@ -248,6 +237,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.33870000".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 17,
             },
         );
@@ -260,6 +250,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.7610000".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 18,
             },
         );
@@ -272,6 +263,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.35630000".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 19,
             },
         );
@@ -284,6 +276,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.6690000".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 20,
             },
         );
@@ -296,6 +289,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.88982".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 21,
             },
         );
@@ -316,6 +310,7 @@ mod tests {
                     size: Decimal::ZERO,
                     size_raw: size_raw.to_string(),
                     side: OrderSide::Sell,
+                    timestamp: UnixNanos::default(),
                     seq,
                 },
             );
@@ -329,6 +324,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "1.0334926".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 26,
             },
         );
@@ -341,6 +337,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.64537".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 27,
             },
         );
@@ -353,6 +350,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.250000".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 28,
             },
         );
@@ -365,6 +363,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.35630000".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 29,
             },
         );
@@ -376,6 +375,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.35630000".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 30,
             },
         );
@@ -388,6 +388,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "3.38072".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 31,
             },
         );
@@ -400,6 +401,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.88967575".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 32,
             },
         );
@@ -412,6 +414,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "3.14392283".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 33,
             },
         );
@@ -424,6 +427,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.6778960".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 34,
             },
         );
@@ -436,6 +440,7 @@ mod tests {
                 size: Decimal::ZERO,
                 size_raw: "0.35630000".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 35,
             },
         );
@@ -463,6 +468,7 @@ mod tests {
                 size: dec!(0.5),
                 size_raw: "0.50000000".to_string(),
                 side: OrderSide::Sell,
+                timestamp: UnixNanos::default(),
                 seq: 0,
             },
         );
@@ -475,6 +481,7 @@ mod tests {
                 size: dec!(0.3),
                 size_raw: "0.30000000".to_string(),
                 side: OrderSide::Buy,
+                timestamp: UnixNanos::default(),
                 seq: 1,
             },
         );

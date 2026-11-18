@@ -71,10 +71,13 @@ alloy-primitives = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bon = { workspace = true }
 dashmap = { workspace = true }
 derive_builder = { workspace = true }
+flate2 = { workspace = true }
 futures-util = { workspace = true }
+indexmap = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -98,7 +101,8 @@ pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-live = { workspace = true, features = ["test-support"] }
+nautilus-execution = { workspace = true }
+nautilus-live = { workspace = true, features = ["node", "test-support"] }
 nautilus-persistence = { workspace = true }
 nautilus-testkit = { workspace = true, default-features = false, features = [
   "testers",
@@ -223,6 +227,12 @@ doc = false
 name = "hyperliquid-chained-modify-smoke"
 path = "examples/chained_modify_smoke.rs"
 required-features = ["examples"]
+doc = false
+
+# Run with `cargo run --example hyperliquid-scheduled-cancel --package nautilus-hyperliquid -- testnet`.
+[[example]]
+name = "hyperliquid-scheduled-cancel"
+path = "examples/scheduled_cancel.rs"
 doc = false
 
 # Public market-data validation; explicitly connects to Hyperliquid mainnet.

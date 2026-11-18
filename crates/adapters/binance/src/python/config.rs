@@ -59,14 +59,18 @@ impl BinanceInstrumentProviderConfig {
             .map(nautilus_live::python::config::coerce_json_config)
             .transpose()?
             .unwrap_or_default();
-        Ok(Self {
+
+        let config = Self {
             load_all,
             load_ids,
             filters,
             filter_callable,
             log_warnings,
             query_commission_rates,
-        })
+        };
+
+        config.validate_selections().map_err(to_pyvalue_err)?;
+        Ok(config)
     }
 
     fn __repr__(&self) -> String {
@@ -137,6 +141,7 @@ impl BinanceDataClientConfig {
         retry_delay_initial_ms = None,
         retry_delay_max_ms = None,
         book_snapshot_timeout_secs = None,
+        use_usdm_raw_trades = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -158,6 +163,7 @@ impl BinanceDataClientConfig {
         retry_delay_initial_ms: Option<u64>,
         retry_delay_max_ms: Option<u64>,
         book_snapshot_timeout_secs: Option<u64>,
+        use_usdm_raw_trades: bool,
     ) -> PyResult<Self> {
         let defaults = Self::default();
         let config = Self {
@@ -168,6 +174,7 @@ impl BinanceDataClientConfig {
             api_key: api_key.map(SecretString::from).or(defaults.api_key),
             api_secret: api_secret.map(SecretString::from).or(defaults.api_secret),
             spot_market_data_mode: spot_market_data_mode.unwrap_or(defaults.spot_market_data_mode),
+            use_usdm_raw_trades,
             instrument_provider: instrument_provider.unwrap_or(defaults.instrument_provider),
             instrument_refresh_interval_secs: instrument_refresh_interval_secs
                 .unwrap_or(defaults.instrument_refresh_interval_secs),
@@ -372,7 +379,7 @@ mod tests {
     fn test_data_client_py_new_uses_defaults_for_omitted_fields() {
         let config = BinanceDataClientConfig::py_new(
             None, None, None, None, None, None, None, None, None, None, None, None, false, None,
-            None, None, None, None,
+            None, None, None, None, false,
         )
         .unwrap();
         let defaults = BinanceDataClientConfig::default();
@@ -384,6 +391,7 @@ mod tests {
         assert_eq!(config.api_key, defaults.api_key);
         assert_eq!(config.api_secret, defaults.api_secret);
         assert_eq!(config.spot_market_data_mode, defaults.spot_market_data_mode);
+        assert!(!config.use_usdm_raw_trades);
         assert_eq!(config.instrument_provider, defaults.instrument_provider);
         assert_eq!(
             config.instrument_refresh_interval_secs,
@@ -423,6 +431,7 @@ mod tests {
             Some(123),
             Some(456),
             Some(0),
+            true,
         )
         .unwrap();
 
@@ -445,6 +454,7 @@ mod tests {
             config.spot_market_data_mode,
             BinanceSpotMarketDataMode::Json
         );
+        assert!(config.use_usdm_raw_trades);
         assert_eq!(config.instrument_refresh_interval_secs, 30);
         assert_eq!(config.instrument_status_poll_secs, 15);
         assert_eq!(
@@ -642,6 +652,90 @@ mod tests {
             );
             assert!(!config.log_warnings);
             assert!(config.query_commission_rates);
+        });
+    }
+
+    #[rstest]
+    #[case("load_ids")]
+    #[case("symbols")]
+    #[case("contract_types")]
+    fn test_python_provider_selection_uniqueness(
+        #[case] field: &str,
+        #[values(false, true)] duplicate: bool,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut values = vec!["first", "second"];
+            if duplicate {
+                values.push("first");
+            }
+
+            let kwargs = PyDict::new(py);
+            if field == "load_ids" {
+                kwargs.set_item("load_ids", &values).unwrap();
+            } else {
+                let filters = PyDict::new(py);
+                filters.set_item(field, &values).unwrap();
+                kwargs.set_item("filters", filters).unwrap();
+            }
+
+            let result = py
+                .get_type::<BinanceInstrumentProviderConfig>()
+                .call((), Some(&kwargs));
+
+            if duplicate {
+                let error = result.unwrap_err();
+
+                let expected = if field == "load_ids" {
+                    "instrument_provider.load_ids".to_string()
+                } else {
+                    format!("instrument_provider.filters.{field}")
+                };
+
+                assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+                assert_eq!(
+                    error.value(py).str().unwrap().to_str().unwrap(),
+                    format!("duplicate {expected}")
+                );
+            } else {
+                let config = result.unwrap();
+                let config = config
+                    .extract::<PyRef<BinanceInstrumentProviderConfig>>()
+                    .unwrap();
+
+                if field == "load_ids" {
+                    assert_eq!(config.load_ids.as_ref().unwrap(), &values);
+                } else {
+                    assert_eq!(config.filters.get(field), Some(&serde_json::json!(values)));
+                }
+            }
+        });
+    }
+
+    #[rstest]
+    #[case("symbols", vec!["BTCUSDT", " btcusdt "])]
+    #[case("bases", vec!["BTC", " btc "])]
+    #[case("quotes", vec!["USDT", " usdt "])]
+    #[case("contract_types", vec!["PERPETUAL", " perpetual "])]
+    fn test_python_provider_rejects_normalized_duplicates(
+        #[case] field: &str,
+        #[case] values: Vec<&str>,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let filters = PyDict::new(py);
+            filters.set_item(field, values).unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("filters", filters).unwrap();
+            let error = py
+                .get_type::<BinanceInstrumentProviderConfig>()
+                .call((), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(
+                error.value(py).str().unwrap().to_str().unwrap(),
+                format!("duplicate instrument_provider.filters.{field}")
+            );
         });
     }
 }

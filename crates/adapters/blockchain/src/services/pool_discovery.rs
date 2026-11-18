@@ -104,10 +104,10 @@ impl<'a> PoolDiscoveryService<'a> {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - HyperSync streaming fails
-    /// - Token RPC calls fail
-    /// - Database operations fail
-    /// - Sync is cancelled
+    /// - HyperSync streaming fails.
+    /// - Token RPC calls fail.
+    /// - Database operations fail.
+    /// - Sync is cancelled.
     pub async fn sync_pools(
         &mut self,
         dex: &DexExtended,
@@ -217,7 +217,7 @@ impl<'a> PoolDiscoveryService<'a> {
                 while let Some(item) = pools_stream.next().await {
                     let log = match item {
                         PoolEventStreamItem::Block(block) => {
-                            self.cache.cache_block_metadata(&block);
+                            self.cache.cache_block_metadata(&block)?;
                             block_db_buffer.push(block);
                             if block_db_buffer.len() >= POOL_EVENT_BLOCK_DB_BATCH_SIZE {
                                 self.flush_pool_event_blocks(&mut block_db_buffer).await?;
@@ -433,10 +433,8 @@ impl<'a> PoolDiscoveryService<'a> {
     ///
     /// Assumes all required tokens are already in the in-memory cache.
     ///
-    /// # Errors
-    ///
-    /// Logs errors for pools that cannot be constructed (missing tokens),
-    /// but does not fail the entire batch.
+    /// Logs errors for pools that cannot be constructed (missing tokens), but does not fail the
+    /// entire batch.
     async fn construct_pools_batch(
         &self,
         pool_events: &mut Vec<PoolCreatedEvent>,

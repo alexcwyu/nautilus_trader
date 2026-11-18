@@ -26,11 +26,15 @@ from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.backtest import BacktestEngineConfig
 from nautilus_trader.core import UUID4
 from nautilus_trader.execution import MakerTakerFeeModel
+from nautilus_trader.model import AccountBalance
 from nautilus_trader.model import AccountId
+from nautilus_trader.model import AccountState
 from nautilus_trader.model import AccountType
+from nautilus_trader.model import CashAccount
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import Currency
 from nautilus_trader.model import LiquiditySide
+from nautilus_trader.model import MarginAccount
 from nautilus_trader.model import MarketOrder
 from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
@@ -110,6 +114,7 @@ def _make_filled_order(
         quote_quantity=False,
         contingency_type=None,
     )
+
     submitted = OrderSubmitted(
         trader_id=TRADER_ID,
         strategy_id=STRATEGY_ID,
@@ -120,6 +125,7 @@ def _make_filled_order(
         ts_event=500_000_000,
         ts_init=500_000_000,
     )
+
     order.apply(submitted)
     fill = _make_fill(client_order_id=client_order_id, position_id=position_id)
     order.apply(fill)
@@ -213,6 +219,7 @@ def test_generate_order_fills_report_excludes_unfilled() -> None:
     Test generate order fills report excludes unfilled.
     """
     filled = _make_filled_order("O-001")
+
     unfilled = MarketOrder(
         trader_id=TRADER_ID,
         strategy_id=STRATEGY_ID,
@@ -263,6 +270,13 @@ def test_generate_positions_report_structure() -> None:
     assert "quote_currency" not in report.columns
     assert "base_currency" not in report.columns
     assert "settlement_currency" not in report.columns
+    assert report.loc[str(position.id), "venue_order_ids"] == [
+        str(value) for value in position.venue_order_ids()
+    ]
+    assert "replay_events" not in report.columns
+    assert "fill_voids" not in report.columns
+    assert "instrument_class" not in report.columns
+    assert "is_currency_pair" not in report.columns
 
 
 def test_generate_positions_report_snapshot_flag() -> None:
@@ -295,6 +309,74 @@ def test_generate_account_report_structure() -> None:
     assert "type" not in report.columns
     assert "event_id" not in report.columns
     assert isinstance(report.index[0], pd.Timestamp)
+
+
+@pytest.mark.parametrize(
+    ("account_class", "account_type"),
+    [(CashAccount, AccountType.CASH), (MarginAccount, AccountType.MARGIN)],
+)
+@pytest.mark.parametrize("multi_currency", [False, True])
+@pytest.mark.parametrize(
+    ("lookback_secs", "retained"),
+    [(0, 1), (86_400, 1), (172_800, 2), (259_200, 3)],
+)
+def test_generate_account_report_preserves_retained_rows(
+    account_class: type,
+    account_type: AccountType,
+    multi_currency: bool,
+    lookback_secs: int,
+    retained: int,
+) -> None:
+    """
+    Test account report fidelity after history purging.
+    """
+    states = []
+
+    for day, usd_total in enumerate(("1000.00", "1050.25", "1010.75")):
+        balances = [
+            AccountBalance(
+                Money.from_str(f"{usd_total} USD"),
+                Money.from_str("10.00 USD"),
+                Money.from_str(f"{Decimal(usd_total) - 10} USD"),
+            ),
+        ]
+
+        if multi_currency:
+            balances.append(
+                AccountBalance(
+                    Money.from_str("200.50 EUR"),
+                    Money.from_str("20.25 EUR"),
+                    Money.from_str("180.25 EUR"),
+                ),
+            )
+        timestamp = (day + 1) * 86_400_000_000_000
+        states.append(
+            AccountState(
+                account_id=ACCOUNT_ID,
+                account_type=account_type,
+                balances=balances,
+                margins=[],
+                is_reported=True,
+                event_id=UUID4(),
+                ts_event=timestamp,
+                ts_init=timestamp + 1,
+                base_currency=None if multi_currency else Currency.from_str("USD"),
+            ),
+        )
+    account = account_class(states[0], calculate_account_state=True)
+    for state in states[1:]:
+        account.apply(state)
+    full = ReportProvider.generate_account_report(account)
+
+    account.purge_account_events(ts_now=3 * 86_400_000_000_000, lookback_secs=lookback_secs)
+    truncated = ReportProvider.generate_account_report(account)
+    currencies = 2 if multi_currency else 1
+    expected = full.iloc[-retained * currencies :]
+
+    assert account.event_count == retained
+    assert len(full) == 3 * currencies
+    assert full[full["currency"] == "USD"]["total"].tolist() == ["1000.00", "1050.25", "1010.75"]
+    pd.testing.assert_frame_equal(truncated, expected)
 
 
 # End-to-end parity test: real backtest with fills and closed positions
@@ -357,10 +439,12 @@ def _run_small_backtest_with_fills() -> BacktestEngine:
 def _float_maps_equal(a: dict, b: dict) -> bool:
     if a.keys() != b.keys():
         return False
+
     for key in a:
         va, vb = a[key], b[key]
         if math.isnan(va) and math.isnan(vb):
             continue
+
         if va != vb:
             return False
     return True
@@ -369,6 +453,7 @@ def _float_maps_equal(a: dict, b: dict) -> bool:
 def _stats_equal(a: dict, b: dict) -> bool:
     if a.keys() != b.keys():
         return False
+
     for key in a:
         va, vb = a[key], b[key]
         if isinstance(va, dict) and isinstance(vb, dict):
@@ -429,3 +514,72 @@ def test_engine_generate_reports_match_reportprovider() -> None:
     assert isinstance(account, pd.DataFrame)
 
     engine.dispose()
+
+
+@pytest.mark.parametrize("is_snapshot", [False, True])
+def test_generate_positions_report_ts_closed_precision(is_snapshot: bool) -> None:
+    """
+    Test that ts_closed nanosecond values survive exactly.
+
+    See #5287.
+
+    """
+    ts_closed_exact = 1_760_000_000_123_456_789
+
+    opener = _make_fill(
+        client_order_id="O-001",
+        position_id="P-001",
+        order_side=OrderSide.BUY,
+        ts_event=1_760_000_000_000_000_000,
+    )
+    closed = Position(instrument=AUDUSD, fill=opener)
+    closer = _make_fill(
+        client_order_id="O-002",
+        position_id="P-001",
+        order_side=OrderSide.SELL,
+        ts_event=ts_closed_exact,
+    )
+    closed.apply(closer)
+
+    open_position = _make_position("O-003", "P-002")
+
+    positions = [open_position] if is_snapshot else [closed, open_position]
+    snapshots = [closed] if is_snapshot else None
+    report = ReportProvider.generate_positions_report(positions, snapshots=snapshots)
+
+    assert report.loc["P-001", "ts_closed"] == pd.Timestamp(ts_closed_exact, tz="UTC")
+    assert pd.isna(report.loc["P-002", "ts_closed"])
+    assert report.loc["P-001", "is_snapshot"] == is_snapshot
+    assert not report.loc["P-002", "is_snapshot"]
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_generate_positions_report_duplicate_ids(reverse: bool) -> None:
+    """
+    Test that duplicate position IDs retain each row's timestamps.
+    """
+    ts_opened = 1_760_000_000_000_000_000
+    ts_closed = 1_760_000_000_123_456_789
+    closed = Position(instrument=AUDUSD, fill=_make_fill(ts_event=ts_opened))
+    closed.apply(
+        _make_fill(
+            client_order_id="O-002",
+            order_side=OrderSide.SELL,
+            ts_event=ts_closed,
+        ),
+    )
+    open_position = _make_position("O-003", "P-001")
+    positions = [closed, open_position]
+    if reverse:
+        positions.reverse()
+
+    report = ReportProvider.generate_positions_report(positions)
+
+    assert report.index.tolist() == ["P-001", "P-001"]
+    assert report["ts_opened"].tolist() == [
+        pd.Timestamp(1_000_000_000, tz="UTC"),
+        pd.Timestamp(ts_opened, tz="UTC"),
+    ]
+    assert pd.isna(report["ts_closed"].iloc[0])
+    assert report["ts_closed"].iloc[1] == pd.Timestamp(ts_closed, tz="UTC")
+    assert report["is_snapshot"].tolist() == [False, False]

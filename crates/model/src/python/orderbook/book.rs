@@ -136,7 +136,8 @@ impl OrderBook {
     }
 
     #[staticmethod]
-    fn _safe_constructor(instrument_id: InstrumentId, book_type: &str) -> PyResult<Self> {
+    #[pyo3(name = "_safe_constructor")]
+    fn py_safe_constructor(instrument_id: InstrumentId, book_type: &str) -> PyResult<Self> {
         let book_type = BookType::from_str(book_type).map_err(to_pyvalue_err)?;
         Ok(Self::new(instrument_id, book_type))
     }
@@ -623,7 +624,7 @@ impl OrderBook {
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if the update operation fails.
+/// Returns an error if the update operation fails.
 #[pyfunction()]
 #[pyo3(name = "update_book_with_quote_tick")]
 pub fn py_update_book_with_quote_tick(book: &mut OrderBook, quote: &QuoteTick) -> PyResult<()> {
@@ -634,7 +635,7 @@ pub fn py_update_book_with_quote_tick(book: &mut OrderBook, quote: &QuoteTick) -
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if the update operation fails.
+/// Returns an error if the update operation fails.
 #[pyfunction()]
 #[pyo3(name = "update_book_with_trade_tick")]
 pub fn py_update_book_with_trade_tick(book: &mut OrderBook, trade: &TradeTick) -> PyResult<()> {

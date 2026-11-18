@@ -17,7 +17,10 @@ use anyhow::Context;
 use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_MICROSECOND};
 use nautilus_model::{
     data::BarSpecification,
-    enums::{AggressorSide, BarAggregation, BookAction, OptionKind, OrderSide, PriceType},
+    enums::{
+        AggressorSide, BarAggregation, BookAction, ExerciseStyle, OptionKind, OrderSide, PriceType,
+        SettlementType,
+    },
     identifiers::{InstrumentId, Symbol, TradeId},
     types::{PRICE_MAX, PRICE_MIN, Price, fixed::check_fixed_precision},
 };
@@ -47,7 +50,7 @@ const FNV_PRIME: u64 = 0x0100_0000_01b3;
 ///
 /// # Errors
 ///
-/// Returns a deserialization error if the input is not a valid string.
+/// Returns an error if the input is not a valid string.
 pub(crate) fn deserialize_uppercase<'de, D>(deserializer: D) -> Result<Ustr, D::Error>
 where
     D: Deserializer<'de>,
@@ -59,8 +62,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns a deserialization error if the input is not numeric or if the string cannot be parsed
-/// as `f64`.
+/// Returns an error if the input is not numeric or if the string cannot be parsed as `f64`.
 pub(crate) fn deserialize_f64_or_string<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: Deserializer<'de>,
@@ -96,8 +98,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns a deserialization error if a non-null input is not numeric or if the string cannot be
-/// parsed as `f64`.
+/// Returns an error if a non-null input is not numeric or if the string cannot be parsed as `f64`.
 pub(crate) fn deserialize_opt_f64_or_string<'de, D>(
     deserializer: D,
 ) -> Result<Option<f64>, D::Error>
@@ -313,6 +314,24 @@ pub const fn parse_option_kind(value: TardisOptionType) -> OptionKind {
     match value {
         TardisOptionType::Call => OptionKind::Call,
         TardisOptionType::Put => OptionKind::Put,
+    }
+}
+
+/// Returns the option exercise style and settlement type for the given Tardis `exchange`.
+///
+/// Tardis metadata carries neither attribute, so each value follows the venue's contract
+/// specification. A value is `None` for an exchange with no verified specification, and for
+/// Deribit settlement, which no single settlement type represents.
+#[must_use]
+pub const fn option_terms(
+    exchange: TardisExchange,
+) -> (Option<ExerciseStyle>, Option<SettlementType>) {
+    match exchange {
+        TardisExchange::Deribit => (Some(ExerciseStyle::European), None),
+        TardisExchange::BybitOptions | TardisExchange::OkexOptions => {
+            (Some(ExerciseStyle::European), Some(SettlementType::Cash))
+        }
+        _ => (None, None),
     }
 }
 
@@ -624,6 +643,29 @@ mod tests {
     #[case("random", AggressorSide::NoAggressor)]
     fn test_parse_aggressor_side(#[case] input: &str, #[case] expected: AggressorSide) {
         assert_eq!(parse_aggressor_side(input), expected);
+    }
+
+    #[rstest]
+    #[case::deribit(TardisExchange::Deribit, Some(ExerciseStyle::European), None)]
+    #[case::bybit_options(
+        TardisExchange::BybitOptions,
+        Some(ExerciseStyle::European),
+        Some(SettlementType::Cash)
+    )]
+    #[case::okex_options(
+        TardisExchange::OkexOptions,
+        Some(ExerciseStyle::European),
+        Some(SettlementType::Cash)
+    )]
+    #[case::binance_options(TardisExchange::BinanceOptions, None, None)]
+    #[case::binance_european_options(TardisExchange::BinanceEuropeanOptions, None, None)]
+    #[case::huobi_dm_options(TardisExchange::HuobiDmOptions, None, None)]
+    fn test_option_terms(
+        #[case] exchange: TardisExchange,
+        #[case] exercise_style: Option<ExerciseStyle>,
+        #[case] settlement_type: Option<SettlementType>,
+    ) {
+        assert_eq!(option_terms(exchange), (exercise_style, settlement_type));
     }
 
     #[rstest]

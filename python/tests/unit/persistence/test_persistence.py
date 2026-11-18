@@ -17,16 +17,19 @@ Test persistence behavior.
 """
 
 import datetime as dt
+import json
 import os
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from nautilus_trader.common import Cache
 from nautilus_trader.common import Clock
+from nautilus_trader.common import Environment
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarAggregation
 from nautilus_trader.model import BarSpecification
@@ -40,11 +43,14 @@ from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import MarkPriceUpdate
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import OrderBookDelta
+from nautilus_trader.model import OrderBookDeltas
 from nautilus_trader.model import OrderBookDepth
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
 from nautilus_trader.model import PriceType
 from nautilus_trader.model import Quantity
+from nautilus_trader.model import QuoteTick
+from nautilus_trader.model import RecordFlag
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import Venue
 from nautilus_trader.persistence import BarDataWrangler
@@ -57,6 +63,7 @@ from nautilus_trader.persistence import RotationConfig
 from nautilus_trader.persistence import StreamingFeatherWriter
 from nautilus_trader.persistence import StreamingWriter
 from nautilus_trader.persistence import TradeTickDataWrangler
+from nautilus_trader.serialization import trades_to_arrow_record_batch_bytes
 from tests.providers import TEST_DATA_DIR
 from tests.providers import TestInstrumentProvider
 from tests.stubs import TestDataProviderPyo3
@@ -66,6 +73,28 @@ AUDUSD_SIM = InstrumentId(Symbol("AUD/USD"), Venue("SIM"))
 ONE_MIN_BID = BarSpecification(1, BarAggregation.MINUTE, PriceType.BID)
 AUDUSD_1_MIN_BID = BarType(AUDUSD_SIM, ONE_MIN_BID)
 ARROW_FIXTURES = TEST_DATA_DIR / "nautilus" / "arrow"
+
+
+@pytest.mark.parametrize("precision", ["64-bit", "128-bit"])
+def test_migration_preserves_released_catalog_values(tmp_path: Path, precision: str) -> None:
+    """
+    Read released quote and instrument values through the wheel migration API.
+    """
+    source = TEST_DATA_DIR / "nautilus" / "catalog_1_231_0" / precision
+    expected = json.loads((source / "expected.json").read_text(encoding="utf-8"))
+    originals = {path: path.read_bytes() for path in source.rglob("*.parquet")}
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    catalog = ParquetDataCatalog(str(destination))
+
+    assert catalog.migrate_from_legacy_parquet_path(str(source), dry_run=True) == 0
+    assert list(destination.rglob("*.parquet")) == []
+    assert catalog.migrate_from_legacy_parquet_path(str(source)) == 4
+    quotes = [QuoteTick.from_dict(value).to_dict() for value in expected["quotes"]]
+    instrument = CurrencyPair.from_dict(expected["instrument"]).to_dict()
+    assert [row.to_dict() for row in catalog.query_quote_ticks()] == quotes
+    assert [row.to_dict() for row in catalog.instruments()] == [instrument]
+    assert {path: path.read_bytes() for path in originals} == originals
 
 
 def _make_bar(ts: int) -> Bar:
@@ -162,6 +191,7 @@ def test_catalog_write_and_read_quotes(tmp_path: Path) -> None:
         TestDataProviderPyo3.quote_tick(instrument_id=AUDUSD_SIM, ts_event=1, ts_init=1),
         TestDataProviderPyo3.quote_tick(instrument_id=AUDUSD_SIM, ts_event=2, ts_init=2),
     ]
+
     catalog.write_quote_ticks(quotes)
 
     intervals = catalog.get_intervals(NautilusDataType.QuoteTick, "AUD/USD.SIM")
@@ -183,6 +213,7 @@ def test_catalog_write_and_read_trades(tmp_path: Path) -> None:
         TestDataProviderPyo3.trade_tick(instrument_id=AUDUSD_SIM, ts_event=1, ts_init=1),
         TestDataProviderPyo3.trade_tick(instrument_id=AUDUSD_SIM, ts_event=2, ts_init=2),
     ]
+
     catalog.write_trade_ticks(trades)
 
     intervals = catalog.get_intervals(NautilusDataType.TradeTick, "AUD/USD.SIM")
@@ -199,6 +230,7 @@ def test_catalog_write_and_read_order_book_deltas(tmp_path: Path) -> None:
     path = str(tmp_path / "catalog")
     os.makedirs(path, exist_ok=True)
     catalog = ParquetDataCatalog(path)
+
     deltas = [
         OrderBookDelta(
             instrument_id=AUDUSD_SIM,
@@ -229,6 +261,7 @@ def test_catalog_write_and_read_order_book_deltas(tmp_path: Path) -> None:
             ts_init=4,
         ),
     ]
+
     catalog.write_order_book_deltas(deltas)
 
     loaded = catalog.query_order_book_deltas(["AUD/USD.SIM"])
@@ -273,6 +306,7 @@ def test_catalog_write_and_read_order_book_depths(tmp_path: Path) -> None:
         )
         for level in range(10)
     ]
+
     depths = [
         OrderBookDepth(
             instrument_id=AUDUSD_SIM,
@@ -286,6 +320,7 @@ def test_catalog_write_and_read_order_book_depths(tmp_path: Path) -> None:
             ts_init=6,
         ),
     ]
+
     catalog.write_order_book_depths(depths)
 
     loaded = catalog.query_order_book_depths(["AUD/USD.SIM"])
@@ -361,7 +396,11 @@ def test_catalog_file_operations_take_identifier_keyword(tmp_path: Path) -> None
     extended = catalog.get_intervals(NautilusDataType.Bar, identifier=bar_type)
     catalog.reset_data_file_names(NautilusDataType.Bar, identifier=bar_type)
     reset = catalog.get_intervals(NautilusDataType.Bar, identifier=bar_type)
-    catalog.consolidate_data(NautilusDataType.Bar, identifier=bar_type)
+    catalog.consolidate_data(
+        NautilusDataType.Bar,
+        identifier=bar_type,
+        ensure_contiguous_files=False,
+    )
     consolidated = catalog.get_intervals(NautilusDataType.Bar, identifier=bar_type)
     missing = catalog.get_missing_intervals_for_request(
         0,
@@ -409,6 +448,7 @@ def test_catalog_list_parquet_files_with_typed_selectors(tmp_path: Path) -> None
     quotes = [
         TestDataProviderPyo3.quote_tick(instrument_id=AUDUSD_SIM, ts_event=1, ts_init=1),
     ]
+
     catalog.write_quote_ticks(quotes)
     currency_pair = TestInstrumentProvider.default_fx_ccy("AUD/USD")
     equity = TestInstrumentProvider.aapl_equity()
@@ -485,11 +525,13 @@ def test_catalog_query_handles_multiple_instrument_identifier_patterns(tmp_path:
     path = str(tmp_path / "catalog")
     os.makedirs(path, exist_ok=True)
     catalog = ParquetDataCatalog(path)
+
     instrument_ids = [
         InstrumentId.from_str("EUR/USD.SIM"),
         InstrumentId.from_str("BTC-USD.COINBASE"),
         InstrumentId.from_str("ETH/USDT.BINANCE"),
     ]
+
     quotes = [
         TestDataProviderPyo3.quote_tick(instrument_id=instrument_id, ts_event=i, ts_init=i)
         for i, instrument_id in enumerate(instrument_ids, start=1)
@@ -531,6 +573,51 @@ def test_trade_tick_wrangler_construction() -> None:
     assert wrangler.instrument_id == "ETHUSDT.BINANCE"
     assert wrangler.price_precision == 2
     assert wrangler.size_precision == 5
+
+
+@pytest.mark.parametrize("string_type", [pa.string(), pa.string_view()])
+@pytest.mark.parametrize(
+    ("trade_id", "message"),
+    [
+        ("", "row 1: String is empty"),
+        ("A" * 37, "row 1: String exceeds maximum length of 36 characters, was 37"),
+        ("é", "row 1: String contains non-ASCII character"),
+        (" ", "row 1: String contains only whitespace"),
+        ("a\0b", "row 1: String contains interior NUL byte"),
+        (None, "NULL value at row 1"),
+    ],
+)
+def test_trade_tick_wrangler_rejects_malformed_trade_ids_and_recovers(
+    string_type: pa.DataType,
+    trade_id: str | None,
+    message: str,
+) -> None:
+    """
+    Reject invalid IPC trade IDs without leaving the wrangler unusable.
+    """
+    wrangler = TradeTickDataWrangler("ETHUSDT.BINANCE", 2, 5)
+
+    ticks = [
+        TestDataProviderPyo3.trade_tick(price="1234.56", size="1.23456", ts_event=12, ts_init=34),
+        TestDataProviderPyo3.trade_tick(price="2345.67", size="8.90123", ts_event=56, ts_init=78),
+    ]
+
+    valid_bytes = trades_to_arrow_record_batch_bytes(ticks)
+    batch = next(pa.ipc.open_stream(valid_bytes))
+    batch = batch.set_column(
+        batch.schema.get_field_index("trade_id"),
+        pa.field("trade_id", string_type, nullable=True),
+        pa.array(["1", trade_id], type=string_type),
+    )
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+
+    with pytest.raises(ValueError, match="trade_id") as exc_info:
+        wrangler.process_record_batch_bytes(sink.getvalue().to_pybytes())
+
+    assert str(exc_info.value) == f"Error parsing `trade_id`: {message}"
+    assert wrangler.process_record_batch_bytes(valid_bytes) == ticks
 
 
 def test_bar_wrangler_construction() -> None:
@@ -607,6 +694,7 @@ def test_streaming_feather_writer_write_and_flush(tmp_path: Path) -> None:
         cache=Cache(),
         clock=Clock.new_test(),
     )
+
     quote = TestDataProviderPyo3.quote_tick()
     writer.write(quote)
     writer.flush()
@@ -624,6 +712,7 @@ def test_streaming_feather_writer_write_trade(tmp_path: Path) -> None:
         cache=Cache(),
         clock=Clock.new_test(),
     )
+
     trade = TestDataProviderPyo3.trade_tick()
     writer.write(trade)
     writer.flush()
@@ -678,6 +767,7 @@ def test_streaming_feather_writer_uses_one_file_per_type(
     """
     path = tmp_path / f"streaming_{data_name}"
     path.mkdir()
+
     writer = StreamingFeatherWriter(
         path=str(path),
         cache=Cache(),
@@ -701,12 +791,14 @@ def test_streaming_feather_writer_replace_removes_local_files(tmp_path: Path) ->
     path = tmp_path / "streaming_replace"
     path.mkdir()
     instrument_id = InstrumentId.from_str("ETHUSDT.BINANCE")
+
     writer = StreamingFeatherWriter(
         path=str(path),
         cache=Cache(),
         clock=Clock.new_test(),
         include_types=[NautilusDataType.QuoteTick],
     )
+
     writer.write(TestDataProviderPyo3.quote_tick(instrument_id=instrument_id))
     writer.close()
     assert len(list(path.glob("quotes/*.feather"))) == 1
@@ -718,6 +810,7 @@ def test_streaming_feather_writer_replace_removes_local_files(tmp_path: Path) ->
         include_types=[NautilusDataType.QuoteTick],
         replace=True,
     )
+
     replacement.close()
 
     assert list(path.glob("quotes/*.feather")) == []
@@ -730,12 +823,14 @@ def test_streaming_feather_writer_recovers_partial_files_on_start(tmp_path: Path
     path = tmp_path / "streaming_recover"
     path.mkdir()
     instrument_id = InstrumentId.from_str("ETHUSDT.BINANCE")
+
     writer = StreamingFeatherWriter(
         path=str(path),
         cache=Cache(),
         clock=Clock.new_test(),
         include_types=[NautilusDataType.QuoteTick],
     )
+
     writer.write(TestDataProviderPyo3.quote_tick(instrument_id=instrument_id))
     writer.close()
 
@@ -749,6 +844,7 @@ def test_streaming_feather_writer_recovers_partial_files_on_start(tmp_path: Path
         clock=Clock.new_test(),
         include_types=[NautilusDataType.QuoteTick],
     )
+
     files = [file.relative_to(path).as_posix() for file in path.rglob("*.feather*")]
     restarted.close()
 
@@ -788,11 +884,13 @@ def test_streaming_writer_promotes_into_catalog(tmp_path: Path) -> None:
     Test streaming writer with a catalog promotes its Feather files into that catalog.
     """
     catalog_path = tmp_path / "catalog"
+
     writer = StreamingWriter(
         str(tmp_path / "stream" / "backtest" / "run-1"),
         Clock.new_test(),
         catalog=DataCatalogConfig(path=str(catalog_path)),
     )
+
     quote = TestDataProviderPyo3.quote_tick()
 
     writer.write(quote)
@@ -800,6 +898,81 @@ def test_streaming_writer_promotes_into_catalog(tmp_path: Path) -> None:
 
     assert writer.backend == "Parquet"
     assert ParquetDataCatalog(str(catalog_path)).query_quote_ticks() == [quote]
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("batched", [False, True])
+def test_streaming_clear_snapshots_preserve_rows(
+    tmp_path: Path,
+    automatic: bool,
+    batched: bool,
+) -> None:
+    """
+    Preserve snapshot values and source order through both promotion paths.
+    """
+    catalog_path = tmp_path / "catalog"
+    catalog_path.mkdir()
+    source = tmp_path / "stream" if automatic else catalog_path
+
+    writer = StreamingWriter(
+        str(source / "live" / "run-clear"),
+        Clock.new_test(),
+        DataCatalogConfig(path=str(catalog_path)) if automatic else None,
+    )
+
+    ts = 1_700_000_000_000_000_123
+    clear = OrderBookDelta.clear(AUDUSD_SIM, 7, ts, ts)
+
+    add = OrderBookDelta(
+        AUDUSD_SIM,
+        BookAction.ADD,
+        BookOrder(OrderSide.BUY, Price.from_str("1.23456"), Quantity.from_str("7.890"), 19),
+        RecordFlag.F_SNAPSHOT.value | RecordFlag.F_LAST.value,
+        7,
+        ts,
+        ts,
+    )
+
+    second_add = OrderBookDelta(
+        AUDUSD_SIM,
+        BookAction.ADD,
+        BookOrder(OrderSide.BUY, Price.from_str("1.34567"), Quantity.from_str("8.901"), 29),
+        RecordFlag.F_SNAPSHOT.value | RecordFlag.F_LAST.value,
+        7,
+        ts,
+        ts,
+    )
+
+    rows = [clear, add, clear, second_add]
+    if batched:
+        writer.write(OrderBookDeltas(AUDUSD_SIM, rows))
+    else:
+        for row in rows:
+            writer.write(row)
+    writer.close()
+    originals = {path: path.read_bytes() for path in source.rglob("*.feather")}
+    catalog = ParquetDataCatalog(str(catalog_path))
+    if not automatic:
+        catalog.convert_stream_to_data(
+            "run-clear",
+            NautilusDataType.OrderBookDelta,
+            Environment.LIVE,
+        )
+    actual = catalog.query_order_book_deltas()
+    actual_values = [row.to_dict() for row in actual]
+    expected_values = [row.to_dict() for row in rows]
+    for value in [*actual_values, *expected_values]:
+        value["order"]["price"] = Decimal(value["order"]["price"])
+        value["order"]["size"] = Decimal(value["order"]["size"])
+    assert actual_values == expected_values
+    assert [(row.order.price.precision, row.order.size.precision) for row in actual] == [
+        (5, 3),
+        (5, 3),
+        (5, 3),
+        (5, 3),
+    ]
+    assert len(originals) == 1
+    assert {path: path.read_bytes() for path in originals} == originals
 
 
 def test_streaming_writer_rejects_unknown_catalog_param(tmp_path: Path) -> None:
@@ -847,6 +1020,7 @@ def test_streaming_feather_writer_close(tmp_path: Path) -> None:
         cache=Cache(),
         clock=Clock.new_test(),
     )
+
     quote = TestDataProviderPyo3.quote_tick()
     writer.write(quote)
     writer.close()
@@ -871,12 +1045,14 @@ def test_streaming_feather_writer_rotation_modes(tmp_path: Path) -> None:
     ):
         path = str(tmp_path / f"streaming_{index}")
         os.makedirs(path, exist_ok=True)
+
         writer = StreamingFeatherWriter(
             path=path,
             cache=cache,
             clock=clock,
             rotation_config=rotation_config,
         )
+
         assert writer is not None
 
 
@@ -904,8 +1080,10 @@ def test_streaming_feather_writer_scheduled_rotation_matches_python_across_dst(
     """
     path = str(tmp_path / "streaming")
     os.makedirs(path, exist_ok=True)
+    now_ns = pd.Timestamp(now).value
     clock = Clock.new_test()
-    clock.set_time(pd.Timestamp(now).value)
+    clock.set_time(now_ns)
+
     writer = StreamingFeatherWriter(
         path=path,
         cache=Cache(),
@@ -916,7 +1094,9 @@ def test_streaming_feather_writer_scheduled_rotation_matches_python_across_dst(
             timezone="America/New_York",
         ),
     )
-    quote = TestDataProviderPyo3.quote_tick()
+
+    # The file's first row sets its rotation from its own ts_init
+    quote = TestDataProviderPyo3.quote_tick(ts_event=now_ns, ts_init=now_ns)
 
     writer.write(quote)
 
@@ -933,7 +1113,6 @@ def _next_rotation_python(now: object) -> object:
     rotation_timezone = ZoneInfo("America/New_York")
     rotation_time = pd.Timestamp.combine(now.date(), dt.time(0, 30))
     next_rotation = pd.Timestamp(rotation_time, tz=rotation_timezone).tz_convert("UTC")
-
     while next_rotation <= now:
         next_rotation += pd.Timedelta(days=1)
 

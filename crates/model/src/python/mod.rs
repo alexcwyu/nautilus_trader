@@ -41,6 +41,11 @@ pub mod types;
 pub mod defi;
 
 use crate::{
+    data::{
+        CustomDataTrait, ensure_py_extractor_registered, ensure_rust_extractor_registered,
+        get_rust_extractor,
+        greeks::{GreeksData, PortfolioGreeks, YieldCurve},
+    },
     identifiers::{InstrumentIdError, OptionSeriesIdError},
     types::CurrencyLookupError,
 };
@@ -79,9 +84,23 @@ pub fn currency_lookup_error_to_pyvalue_err(e: CurrencyLookupError) -> PyErr {
 ///
 /// # Errors
 ///
-/// Returns a `PyErr` if registering any module components fails.
+/// Returns an error if registering any module components fails.
 #[pymodule]
 pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    let _result = ensure_rust_extractor_registered::<GreeksData>();
+    let _result = ensure_rust_extractor_registered::<PortfolioGreeks>();
+    let _result = ensure_rust_extractor_registered::<YieldCurve>();
+
+    for type_name in [
+        GreeksData::type_name_static(),
+        PortfolioGreeks::type_name_static(),
+        YieldCurve::type_name_static(),
+    ] {
+        if let Some(extractor) = get_rust_extractor(type_name) {
+            let _result = ensure_py_extractor_registered(type_name, extractor);
+        }
+    }
+
     // Types
     m.add("HIGH_PRECISION", crate::types::fixed::HIGH_PRECISION_MODE)?;
     m.add("FIXED_SCALAR", crate::types::fixed::FIXED_SCALAR)?;
@@ -150,6 +169,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::data::greeks::BlackScholesGreeksResult>()?;
     m.add_class::<crate::data::greeks::GreeksData>()?;
     m.add_class::<crate::data::greeks::PortfolioGreeks>()?;
+    m.add_class::<crate::data::greeks::YieldCurve>()?;
     m.add_class::<crate::data::option_chain::OptionGreeks>()?;
     m.add_class::<crate::data::option_chain::OptionChainSlice>()?;
     m.add_class::<crate::data::option_chain::OptionStrikeData>()?;
@@ -184,6 +204,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::ContingencyType>()?;
     m.add_class::<crate::enums::ContinuousFutureAdjustmentType>()?;
     m.add_class::<crate::enums::CurrencyType>()?;
+    m.add_class::<crate::enums::ExerciseStyle>()?;
     m.add_class::<crate::enums::GreeksConvention>()?;
     m.add_class::<crate::enums::InstrumentClass>()?;
     m.add_class::<crate::enums::InstrumentCloseType>()?;
@@ -201,6 +222,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::enums::PositionSide>()?;
     m.add_class::<crate::enums::PriceType>()?;
     m.add_class::<crate::enums::RecordFlag>()?;
+    m.add_class::<crate::enums::SettlementType>()?;
     m.add_class::<crate::enums::TimeInForce>()?;
     m.add_class::<crate::enums::TradingState>()?;
     m.add_class::<crate::enums::TrailingOffsetType>()?;
@@ -313,8 +335,10 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::events::OrderUpdated>()?;
     m.add_class::<crate::events::OrderPendingUpdate>()?;
     m.add_class::<crate::events::OrderPendingCancel>()?;
+    m.add_class::<crate::events::OrderModifyDenied>()?;
     m.add_class::<crate::events::OrderModifyRejected>()?;
     m.add_class::<crate::events::OrderAccepted>()?;
+    m.add_class::<crate::events::OrderCancelDenied>()?;
     m.add_class::<crate::events::OrderCancelRejected>()?;
     m.add_class::<crate::events::OrderCanceled>()?;
     m.add_class::<crate::events::OrderExpired>()?;
@@ -330,6 +354,7 @@ pub fn model(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::accounts::CashAccount>()?;
     m.add_class::<crate::accounts::MarginAccount>()?;
     m.add_class::<crate::accounts::WalletAccount>()?;
+    m.add_class::<account::margin_model::PyMarginModel>()?;
     m.add_class::<crate::accounts::margin_model::StandardMarginModel>()?;
     m.add_class::<crate::accounts::margin_model::LeveragedMarginModel>()?;
     m.add_function(wrap_pyfunction!(

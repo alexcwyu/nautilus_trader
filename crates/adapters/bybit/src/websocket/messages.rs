@@ -122,6 +122,8 @@ pub enum BybitWsMessage {
     Auth(BybitWsAuthResponse),
     /// Order operation response (create/amend/cancel) from trade WebSocket.
     OrderResponse(BybitWsOrderResponse),
+    /// An order command fails before the transport writes it.
+    OrderNotSent { request_id: String, reason: String },
     /// Orderbook snapshot or delta.
     Orderbook(BybitWsOrderbookDepthMsg),
     /// Trade updates.
@@ -566,7 +568,7 @@ impl BybitWsOrderResponse {
             .as_ref()
             .and_then(|ext| ext.get("list"))
             .and_then(|list| list.as_array())
-            .map(|arr| {
+            .map_or_default(|arr| {
                 arr.iter()
                     .filter_map(|item| {
                         let code = item.get("code")?.as_i64()?;
@@ -575,7 +577,6 @@ impl BybitWsOrderResponse {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     }
 }
 
@@ -593,11 +594,12 @@ pub struct BybitBatchOrderError {
 #[serde(rename_all = "camelCase")]
 pub struct BybitWsAuthResponse {
     pub op: BybitWsOperation,
-    #[serde(default)]
+    // The private stream sends snake_case names, the trade stream camelCase
+    #[serde(default, alias = "conn_id")]
     pub conn_id: Option<String>,
     #[serde(default)]
     pub ret_code: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "ret_msg")]
     pub ret_msg: Option<String>,
     #[serde(default)]
     pub success: Option<bool>,
@@ -950,11 +952,13 @@ pub struct BybitWsAccountExecutionMsg {
 /// Slim execution payload delivered on the `execution.fast` private channel.
 ///
 /// The fast stream omits fee/exec-type metadata that the standard `execution`
-/// channel provides; subscribe to both if you need full fill data.
+/// channel provides. The execution client selects one stream; use the standard
+/// channel for venue-authoritative fees and all execution types.
 ///
 /// Note: `orderLinkId` is documented as always empty for maker fills (and for
 /// option maker fills); identity correlation by `orderLinkId` works only for
-/// taker fast fills.
+/// taker fast fills. The execution client correlates maker fills by venue order ID,
+/// deferring them until the corresponding order update arrives when necessary.
 ///
 /// # References
 /// - <https://bybit-exchange.github.io/docs/v5/websocket/private/fast-execution>

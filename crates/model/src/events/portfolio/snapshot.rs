@@ -33,7 +33,7 @@ use crate::{
 /// UTC midnight, and at shutdown, including while the account is flat. An optional
 /// fine-grained stream records additional snapshots while positions are open.
 /// Totals span every venue the account holds positions on, so multi-venue
-/// accounts (e.g., a prime broker routing across exchanges) produce a single
+/// accounts (e.g., an execution provider routing across exchanges) produce a single
 /// account-wide snapshot rather than per-venue slices.
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +63,10 @@ pub struct PortfolioSnapshot {
     /// The per-currency total equity (mark-to-market).
     ///
     /// For cash accounts: `balance.total + Σ mark_value(open positions)` in the same currency.
-    /// For margin accounts: `balance.total + Σ unrealized_pnl(open positions)` in the same currency.
+    /// For calculated margin accounts: balance total plus signed mark values of premium-based positions
+    /// and unrealized PnL of other open positions, in the same currency.
+    /// For reported margin accounts: balance total plus unrealized PnL of all open positions.
+    /// Calculated accounts have `calculate_account_state` enabled and update balances from fills.
     pub total_equity: Vec<Money>,
     /// The resolved total equity in the account base currency, when conversion is enabled.
     #[serde(default)]

@@ -21,7 +21,8 @@
 #
 # Use '// dst-ok' inline comment to allow specific exceptions.
 # Test modules (files under tests/, matching *_tests.rs, or lines inside an
-# inline `#[cfg(test)]` module) are excluded.
+# item gated by `#[cfg(test)]` or `#[cfg(all(..., test, ...))]`) are excluded.
+# A cfg(all(...)) gate requires test before any nested predicate.
 
 set -euo pipefail
 
@@ -44,7 +45,7 @@ IN_SCOPE_CRATES=(
   "risk" "serialization" "system" "trading"
 )
 
-# Audited OKX DST-path production files. Static coverage alone does not
+# Audited adapter DST-path production files. Static coverage alone does not
 # establish runtime eligibility for every capability those files serve.
 #
 # A file is gated when it carries DST-path runtime logic that could grow a
@@ -52,6 +53,40 @@ IN_SCOPE_CRATES=(
 # Files under src/python/ are skipped separately by the /python/ path rule,
 # per the repo-wide Python/FFI policy.
 #
+# CoinAPI excludes module declarations (lib.rs, common/mod.rs, http/mod.rs,
+# websocket/mod.rs), common/consts.rs (pure identity constants),
+# common/credential.rs (API key resolution from config or environment and
+# character validation), factories.rs (construction wiring only),
+# common/symbol.rs (pure symbol mapping), http/error.rs (pure error
+# classification and retry-delay conversion), http/parse.rs (pure instrument parsing with caller-provided
+# timestamps), and websocket/error.rs (pure error variants).
+#
+# Kalshi gates config, the HTTP client, quota, the data client, book sync,
+# execution collection, account, context, reports, settlement, client, stream,
+# submit, mutation, and batch, and the WebSocket client and handler.
+# Exclusions are module declarations, python/, factories.rs (construction
+# wiring), common/consts.rs, common/enums.rs, common/urls.rs, and
+# common/parse.rs. common/credential.rs takes a caller-provided timestamp;
+# Ed25519 signing is deterministic, but RSA-PSS uses SystemRandom and is not
+# seed-stable, so the file stays excluded rather than pretending the RNG is a
+# gated seam. http/models.rs, http/query.rs, http/parse.rs, http/error.rs,
+# http/history.rs, websocket/messages.rs, websocket/parse.rs,
+# websocket/error.rs, data/parse.rs, data/history.rs, and data/lifecycle.rs
+# are types or pure mapping. WebSocket simulation stays unclaimed: production
+# rejects Tungstenite, and the required Sockudo backend is native-only.
+#
+# Derive additionally gates signing clocks, credentials derived from those clocks,
+# native parsing, rate limits, and instrument collection. Its remaining module
+# declarations, constants, enums, errors, URLs, factories, retry classifiers,
+# configuration/credential/signing-context resolvers, and WebSocket context
+# container carry no async/time/RNG boundary. Python bindings stay excluded.
+#
+# FinFeed excludes module declarations, identity constants, credential resolution,
+# factories.rs (construction wiring), common/symbol.rs (pure symbol mapping),
+# http/parse.rs (pure instrument parsing with caller-provided timestamps), and
+# pure error classification.
+#
+# The following exclusions apply to OKX:
 # - Module declarations: lib.rs and the common/http/websocket mod.rs files.
 # - Pure venue types: common/enums.rs, websocket/enums.rs, both error.rs
 #   files, common/models.rs.
@@ -63,6 +98,69 @@ IN_SCOPE_CRATES=(
 # - Test-only or placeholder: common/testing.rs, http/parse.rs.
 
 ADAPTER_PATHS=(
+  "crates/adapters/coinapi/src/config.rs"
+  "crates/adapters/coinapi/src/data.rs"
+  "crates/adapters/coinapi/src/loaders.rs"
+  "crates/adapters/coinapi/src/http/client.rs"
+  "crates/adapters/coinapi/src/http/models.rs"
+  "crates/adapters/coinapi/src/http/query.rs"
+  "crates/adapters/coinapi/src/websocket/client.rs"
+  "crates/adapters/coinapi/src/websocket/messages.rs"
+  "crates/adapters/coinapi/src/websocket/parse.rs"
+
+  "crates/adapters/derive/src/book/recovery.rs"
+  "crates/adapters/derive/src/book/sync.rs"
+  "crates/adapters/derive/src/common/parse.rs"
+  "crates/adapters/derive/src/common/rate_limit.rs"
+  "crates/adapters/derive/src/config.rs"
+  "crates/adapters/derive/src/data.rs"
+  "crates/adapters/derive/src/execution.rs"
+  "crates/adapters/derive/src/http/client.rs"
+  "crates/adapters/derive/src/http/models.rs"
+  "crates/adapters/derive/src/http/query.rs"
+  "crates/adapters/derive/src/http/parse.rs"
+  "crates/adapters/derive/src/signing/encoding.rs"
+  "crates/adapters/derive/src/signing/nonce.rs"
+  "crates/adapters/derive/src/signing/auth.rs"
+  "crates/adapters/derive/src/signing/eip712.rs"
+  "crates/adapters/derive/src/signing/modules/trade.rs"
+  "crates/adapters/derive/src/providers.rs"
+  "crates/adapters/derive/src/websocket/client.rs"
+  "crates/adapters/derive/src/websocket/dispatch.rs"
+  "crates/adapters/derive/src/websocket/handler.rs"
+  "crates/adapters/derive/src/websocket/messages.rs"
+  "crates/adapters/derive/src/websocket/parse.rs"
+
+  "crates/adapters/finfeed/src/config.rs"
+  "crates/adapters/finfeed/src/data.rs"
+  "crates/adapters/finfeed/src/history.rs"
+  "crates/adapters/finfeed/src/parse.rs"
+  "crates/adapters/finfeed/src/data/poll.rs"
+  "crates/adapters/finfeed/src/http/client.rs"
+  "crates/adapters/finfeed/src/http/models.rs"
+  "crates/adapters/finfeed/src/http/query.rs"
+  "crates/adapters/finfeed/src/instruments.rs"
+  "crates/adapters/finfeed/src/loaders.rs"
+
+  "crates/adapters/kalshi/src/book/sync.rs"
+  "crates/adapters/kalshi/src/config.rs"
+  "crates/adapters/kalshi/src/data.rs"
+  "crates/adapters/kalshi/src/execution.rs"
+  "crates/adapters/kalshi/src/execution/account.rs"
+  "crates/adapters/kalshi/src/execution/batch.rs"
+  "crates/adapters/kalshi/src/execution/context.rs"
+  "crates/adapters/kalshi/src/execution/mutation.rs"
+  "crates/adapters/kalshi/src/execution/reports.rs"
+  "crates/adapters/kalshi/src/execution/settlement.rs"
+  "crates/adapters/kalshi/src/execution/snapshot.rs"
+  "crates/adapters/kalshi/src/execution/stream.rs"
+  "crates/adapters/kalshi/src/execution/submit.rs"
+  "crates/adapters/kalshi/src/http/client.rs"
+  "crates/adapters/kalshi/src/http/quota.rs"
+  "crates/adapters/kalshi/src/providers.rs"
+  "crates/adapters/kalshi/src/websocket/client.rs"
+  "crates/adapters/kalshi/src/websocket/handler.rs"
+
   "crates/adapters/okx/src/book/mod.rs"
   "crates/adapters/okx/src/book/recovery.rs"
   "crates/adapters/okx/src/book/sync.rs"
@@ -153,31 +251,8 @@ is_doc_comment() {
   return 1
 }
 
-# Return 0 if the given line number falls after an inline `#[cfg(test)]`
-# attribute in the same file. Inline test modules live at the bottom of many
-# Rust source files; violations beyond that boundary are test-only.
-#
-# Matches arrive grouped by file, so the last scan is cached. A precomputed
-# repo-wide map is not the answer here: bash pattern matching over a string
-# that large is quadratic whenever a lookup misses.
-CFG_TEST_SCANNED_FILE=""
-CFG_TEST_FIRST_LINE=""
-
-is_in_test_module() {
-  local file="$1"
-  local line_num="$2"
-
-  if [[ "$file" != "$CFG_TEST_SCANNED_FILE" ]]; then
-    local first_hit
-    first_hit=$(rg -n -m1 '^\s*#\[cfg\(test\)\]' "$file" 2> /dev/null || true)
-    CFG_TEST_SCANNED_FILE="$file"
-    CFG_TEST_FIRST_LINE="${first_hit%%:*}"
-  fi
-
-  [[ -z "$CFG_TEST_FIRST_LINE" ]] && return 1
-  [[ "$line_num" -ge "$CFG_TEST_FIRST_LINE" ]] && return 0
-  return 1
-}
+# shellcheck source=.pre-commit-hooks/rust_test_scope.bash
+source "$(dirname "${BASH_SOURCE[0]}")/rust_test_scope.bash"
 
 is_in_rule1_allowlist() {
   local file
@@ -232,7 +307,7 @@ jiff_clock_aliases() {
 }
 
 # Return 0 if any of the 15 lines preceding `line_num` in `file` carry a cfg
-# attribute that excludes madsim or restricts to test builds.
+# attribute that excludes madsim. Test gates are bounded by is_in_test_module.
 has_preceding_dst_cfg() {
   local file="$1"
   local line_num="$2"
@@ -240,7 +315,7 @@ has_preceding_dst_cfg() {
   ((start_line < 1)) && start_line=1
 
   sed -n "${start_line},$((line_num - 1))p" "$file" 2> /dev/null |
-    grep -qE '#\[cfg\(not\(all\(feature[[:space:]]*=[[:space:]]*"simulation"[[:space:]]*,[[:space:]]*madsim\)\)\)\]|#\[cfg\(test\)\]|#\[cfg\(not\(madsim\)\)\]'
+    grep -qE '#\[cfg\(not\(all\(feature[[:space:]]*=[[:space:]]*"simulation"[[:space:]]*,[[:space:]]*madsim\)\)\)\]|#\[cfg\(not\(madsim\)\)\]'
 }
 
 report() {
@@ -259,7 +334,7 @@ report() {
 }
 
 ################################################################################
-# Adapter path coverage: every audited OKX file must exist
+# Adapter path coverage: every audited adapter file must exist
 ################################################################################
 
 # Fail loudly instead of silently skipping a moved file
@@ -402,7 +477,7 @@ while IFS=: read -r file line_num content; do
 
   # Check the three lines after the select! opening for `biased;`.
   next_window=$(sed -n "$((line_num + 1)),$((line_num + 3))p" "$file" 2> /dev/null)
-  if echo "$next_window" | grep -q 'biased;'; then
+  if [[ "$next_window" == *'biased;'* ]]; then
     continue
   fi
 
@@ -457,6 +532,7 @@ for rule5_file in "${RULE5_FILES[@]}"; do
   # ripgrep omits the path when it searches one explicit file
   while IFS=: read -r line_num content; do
     [[ -z "$line_num" ]] && continue
+    is_in_test_module "$rule5_file" "$line_num" && continue
     is_doc_comment "$content" && continue
     [[ "$content" =~ $ALLOW_MARKER ]] && continue
 

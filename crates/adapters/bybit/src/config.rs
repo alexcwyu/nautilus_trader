@@ -17,15 +17,18 @@
 
 use std::collections::HashMap;
 
+use nautilus_common::config::{ConfigError, ConfigResult, check_unique_values};
 #[cfg(test)]
 use nautilus_core::string::secret::REDACTED;
 use nautilus_core::string::secret::SecretString;
 use nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS;
-use nautilus_model::identifiers::AccountId;
+use nautilus_model::identifiers::{AccountId, InstrumentId};
 use nautilus_network::websocket::TransportBackend;
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
+    consts::BYBIT_VENUE,
+    credential::credential_env_vars,
     enums::{
         BybitEnvironment, BybitMarginMode, BybitOrderSmpType, BybitPositionMode, BybitProductType,
     },
@@ -45,9 +48,18 @@ use crate::common::{
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.bybit")
 )]
 pub struct BybitDataClientConfig {
-    /// Optional API key for authenticated REST/WebSocket requests.
+    /// API key.
+    ///
+    /// When omitted, the client loads `BYBIT_API_KEY`, `BYBIT_DEMO_API_KEY`, or
+    /// `BYBIT_TESTNET_API_KEY` for the selected [`BybitEnvironment`]. An explicit
+    /// value takes precedence. Public market-data requests stay unsigned.
     pub api_key: Option<SecretString>,
-    /// Optional API secret for authenticated REST/WebSocket requests.
+    /// API secret.
+    ///
+    /// When omitted, the client loads `BYBIT_API_SECRET`, `BYBIT_DEMO_API_SECRET`,
+    /// or `BYBIT_TESTNET_API_SECRET` for the selected [`BybitEnvironment`]. An
+    /// explicit value takes precedence. A missing key or secret leaves the client
+    /// without credentials.
     pub api_secret: Option<SecretString>,
     /// Product types to subscribe to (e.g., Linear, Spot, Inverse, Option).
     #[builder(default = vec![BybitProductType::Linear])]
@@ -66,13 +78,13 @@ pub struct BybitDataClientConfig {
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
-    /// Maximum retry attempts for REST requests.
+    /// Maximum retry attempts for REST reads.
     #[builder(default = 3)]
     pub max_retries: u32,
-    /// Initial retry backoff in milliseconds.
+    /// Initial retry backoff for REST reads, in milliseconds.
     #[builder(default = 1_000)]
     pub retry_delay_initial_ms: u64,
-    /// Maximum retry backoff in milliseconds.
+    /// Maximum retry backoff for REST reads, in milliseconds.
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
     /// Heartbeat interval in seconds for WebSocket clients.
@@ -135,10 +147,34 @@ impl BybitDataClientConfig {
         Self::default()
     }
 
-    /// Returns `true` if both API key and secret are available.
+    /// Validates that configured selections contain no duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `product_types` repeats a value.
+    pub fn validate(&self) -> ConfigResult<()> {
+        check_unique_values("product_types", &self.product_types)
+    }
+
+    /// Returns `true` if both API key and secret fields are set.
     #[must_use]
     pub fn has_api_credentials(&self) -> bool {
         self.api_key.is_some() && self.api_secret.is_some()
+    }
+
+    pub(crate) fn resolved_api_credentials(&self) -> Option<(String, String)> {
+        let (key_var, secret_var) = credential_env_vars(self.environment);
+        // Keep each side in a zeroizing owner until both exist. An incomplete
+        // pair must not leave a plaintext secret on the heap.
+        let key = self
+            .api_key
+            .clone()
+            .or_else(|| std::env::var(key_var).ok().map(SecretString::from))?;
+        let secret = self
+            .api_secret
+            .clone()
+            .or_else(|| std::env::var(secret_var).ok().map(SecretString::from))?;
+        Some((key.into_inner(), secret.into_inner()))
     }
 
     /// Returns the REST base URL, considering overrides and environment.
@@ -220,13 +256,13 @@ pub struct BybitExecutionClientConfig {
     /// REST timeout in seconds.
     #[builder(default = 60)]
     pub http_timeout_secs: u64,
-    /// Maximum retry attempts for REST requests.
+    /// Maximum retry attempts for REST reads.
     #[builder(default = 3)]
     pub max_retries: u32,
-    /// Initial retry backoff in milliseconds.
+    /// Initial REST read retry backoff, in milliseconds. Also the cancel-all polling interval.
     #[builder(default = 1_000)]
     pub retry_delay_initial_ms: u64,
-    /// Maximum retry backoff in milliseconds.
+    /// Maximum retry backoff for REST reads, in milliseconds.
     #[builder(default = 10_000)]
     pub retry_delay_max_ms: u64,
     /// Heartbeat interval in seconds for WebSocket clients.
@@ -251,6 +287,13 @@ pub struct BybitExecutionClientConfig {
     /// fully fill.
     #[builder(default)]
     pub auto_repay_spot_borrows: bool,
+    /// Whether to subscribe to the lower-latency `execution.fast` channel instead of the
+    /// standard `execution` channel. Fast fills derive commissions from cached account fee
+    /// rates; derived values are not venue-authoritative. The client skips a fast fill whose
+    /// commission it cannot derive. Demo mode and the Option product type do not support
+    /// this option.
+    #[builder(default)]
+    pub use_ws_execution_fast: bool,
     /// Leverage configuration for futures (symbol -> leverage).
     pub futures_leverages: Option<HashMap<String, u32>>,
     /// Position mode configuration for symbols (symbol -> mode).
@@ -264,6 +307,9 @@ pub struct BybitExecutionClientConfig {
     /// WebSocket transport backend (defaults to `Tungstenite`).
     #[builder(default)]
     pub transport_backend: TransportBackend,
+    /// Instruments included in reconciliation. `None` or empty includes all configured product types.
+    /// IDs must use the `BYBIT` venue, an uppercase symbol, and a configured product-type suffix.
+    pub load_ids: Option<Vec<InstrumentId>>,
 }
 
 #[cfg(feature = "python")]
@@ -283,8 +329,10 @@ nautilus_core::impl_pyo3_config_getters!(BybitExecutionClientConfig {
     account_id: Option<AccountId>,
     use_spot_position_reports: bool,
     auto_repay_spot_borrows: bool,
+    use_ws_execution_fast: bool,
     margin_mode: Option<BybitMarginMode>,
     transport_backend: TransportBackend,
+    load_ids: Option<Vec<InstrumentId>>,
 });
 
 impl Default for BybitExecutionClientConfig {
@@ -298,6 +346,67 @@ impl BybitExecutionClientConfig {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Validates configured product types, reconciliation scope, and execution-stream selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `product_types` repeats a value.
+    /// - Fast execution is enabled in Demo mode.
+    /// - Fast execution is enabled with the Option product type.
+    /// - `load_ids` contains duplicate or invalid instruments.
+    pub fn validate(&self) -> ConfigResult<()> {
+        if self.use_ws_execution_fast && self.environment == BybitEnvironment::Demo {
+            return Err(ConfigError::unsupported_value(
+                "use_ws_execution_fast",
+                "execution.fast is not supported in demo mode",
+            ));
+        }
+
+        if self.use_ws_execution_fast && self.product_types.contains(&BybitProductType::Option) {
+            return Err(ConfigError::unsupported_value(
+                "use_ws_execution_fast",
+                "execution.fast carries no fee inputs for the Option product type",
+            ));
+        }
+
+        check_unique_values("product_types", &self.product_types)?;
+
+        if let Some(load_ids) = &self.load_ids {
+            check_unique_values("load_ids", load_ids)?;
+
+            for instrument_id in load_ids {
+                let product_type = BybitProductType::from_suffix(instrument_id.symbol.as_str());
+                let configured = product_type.is_some_and(|product_type| {
+                    instrument_id.symbol.as_str().len() > product_type.suffix().len()
+                        && if self.product_types.is_empty() {
+                            product_type == BybitProductType::Linear
+                        } else {
+                            self.product_types.contains(&product_type)
+                        }
+                });
+
+                if instrument_id.venue != *BYBIT_VENUE
+                    || instrument_id
+                        .symbol
+                        .as_str()
+                        .bytes()
+                        .any(|b| b.is_ascii_lowercase())
+                    || !configured
+                {
+                    return Err(ConfigError::invalid_value(
+                        "load_ids",
+                        format!(
+                            "{instrument_id} is not an uppercase BYBIT instrument in a configured product type"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns `true` if both API key and secret are available.
@@ -332,9 +441,158 @@ impl BybitExecutionClientConfig {
 }
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_common::{cache::Cache, config::ConfigError};
+    use nautilus_live::ExecutionClientCore;
+    use nautilus_model::{
+        enums::{AccountType, OmsType},
+        identifiers::{ClientId, TraderId, Venue},
+    };
     use rstest::rstest;
 
     use super::*;
+    use crate::{data::BybitDataClient, execution::BybitExecutionClient};
+
+    #[rstest]
+    #[case::none(None, vec![BybitProductType::Linear], true)]
+    #[case::empty(Some(vec![]), vec![], true)]
+    #[case::linear(Some(vec!["BTCUSDT-LINEAR.BYBIT"]), vec![], true)]
+    #[case::spot(Some(vec!["ETHUSDT-SPOT.BYBIT"]), vec![BybitProductType::Spot], true)]
+    #[case::foreign_venue(Some(vec!["BTCUSDT-LINEAR.BINANCE"]), vec![], false)]
+    #[case::unconfigured(Some(vec!["ETHUSDT-SPOT.BYBIT"]), vec![], false)]
+    #[case::no_suffix(Some(vec!["BTCUSDT.BYBIT"]), vec![], false)]
+    #[case::empty_linear_symbol(Some(vec!["-LINEAR.BYBIT"]), vec![], false)]
+    #[case::empty_spot_symbol(Some(vec!["-SPOT.BYBIT"]), vec![BybitProductType::Spot], false)]
+    #[case::empty_inverse_symbol(Some(vec!["-INVERSE.BYBIT"]), vec![BybitProductType::Inverse], false)]
+    #[case::empty_option_symbol(Some(vec!["-OPTION.BYBIT"]), vec![BybitProductType::Option], false)]
+    #[case::lowercase(Some(vec!["btcusdt-LINEAR.BYBIT"]), vec![], false)]
+    #[case::duplicate(Some(vec!["BTCUSDT-LINEAR.BYBIT", "BTCUSDT-LINEAR.BYBIT"]), vec![], false)]
+    fn test_execution_reconciliation_scope_validation(
+        #[case] ids: Option<Vec<&str>>,
+        #[case] product_types: Vec<BybitProductType>,
+        #[case] valid: bool,
+    ) {
+        let load_ids = ids.map(|ids| ids.into_iter().map(InstrumentId::from).collect());
+
+        let config = BybitExecutionClientConfig {
+            product_types,
+            load_ids,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+
+        let expected = if valid {
+            Ok(())
+        } else if config.load_ids.as_ref().unwrap().len() > 1 {
+            Err(ConfigError::duplicate("load_ids", None))
+        } else {
+            let instrument_id = config.load_ids.as_ref().unwrap()[0];
+            Err(ConfigError::invalid_value(
+                "load_ids",
+                format!(
+                    "{instrument_id} is not an uppercase BYBIT instrument in a configured product type"
+                ),
+            ))
+        };
+
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    fn test_data_client_rejects_duplicate_types() {
+        let config = BybitDataClientConfig {
+            product_types: vec![BybitProductType::Linear, BybitProductType::Linear],
+            ..Default::default()
+        };
+
+        let error = BybitDataClient::new(ClientId::from("BYBIT"), config)
+            .expect_err("duplicate config must fail before client setup");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("product_types", None)),
+        );
+    }
+
+    #[rstest]
+    #[case::empty(vec![], false)]
+    #[case::distinct(vec![BybitProductType::Spot, BybitProductType::Linear], false)]
+    #[case::adjacent(vec![BybitProductType::Linear, BybitProductType::Linear], true)]
+    #[case::separated(vec![BybitProductType::Linear, BybitProductType::Spot, BybitProductType::Linear], true)]
+    fn test_config_duplicate_types(#[case] values: Vec<BybitProductType>, #[case] duplicate: bool) {
+        let data = BybitDataClientConfig {
+            product_types: values.clone(),
+            ..Default::default()
+        };
+
+        let execution = BybitExecutionClientConfig {
+            product_types: values.clone(),
+            ..Default::default()
+        };
+
+        let expected = if duplicate {
+            Err(ConfigError::duplicate("product_types", None))
+        } else {
+            Ok(())
+        };
+
+        let data_result = data.validate();
+        let execution_result = execution.validate();
+
+        assert_eq!(data_result, expected);
+        assert_eq!(execution_result, expected);
+        assert_eq!(data.product_types, values);
+        assert_eq!(execution.product_types, values);
+    }
+
+    #[rstest]
+    #[case::demo_fast(
+        BybitEnvironment::Demo,
+        vec![BybitProductType::Linear],
+        true,
+        Some("execution.fast is not supported in demo mode")
+    )]
+    #[case::demo_standard(BybitEnvironment::Demo, vec![BybitProductType::Linear], false, None)]
+    #[case::mainnet_fast(BybitEnvironment::Mainnet, vec![BybitProductType::Linear], true, None)]
+    #[case::testnet_fast(BybitEnvironment::Testnet, vec![BybitProductType::Linear], true, None)]
+    #[case::option_fast(
+        BybitEnvironment::Mainnet,
+        vec![BybitProductType::Linear, BybitProductType::Option],
+        true,
+        Some("execution.fast carries no fee inputs for the Option product type")
+    )]
+    #[case::option_standard(
+        BybitEnvironment::Mainnet,
+        vec![BybitProductType::Linear, BybitProductType::Option],
+        false,
+        None
+    )]
+    fn test_exec_config_fast_validation(
+        #[case] environment: BybitEnvironment,
+        #[case] product_types: Vec<BybitProductType>,
+        #[case] use_ws_execution_fast: bool,
+        #[case] rejection: Option<&str>,
+    ) {
+        let config = BybitExecutionClientConfig {
+            product_types,
+            environment,
+            use_ws_execution_fast,
+            ..Default::default()
+        };
+
+        let result = config.validate();
+
+        let expected = rejection.map_or(Ok(()), |reason| {
+            Err(ConfigError::unsupported_value(
+                "use_ws_execution_fast",
+                reason,
+            ))
+        });
+
+        assert_eq!(result, expected);
+    }
 
     #[rstest]
     fn test_config_debug_redacts_credentials() {
@@ -635,5 +893,32 @@ http_timeout_secs = 45
         );
         assert_eq!(config.recv_window_ms, expected.recv_window_ms);
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_execution_client_rejects_duplicate_types() {
+        let core = ExecutionClientCore::new(
+            TraderId::from("TESTER-001"),
+            ClientId::from("BYBIT"),
+            Venue::from("BYBIT"),
+            OmsType::Netting,
+            AccountId::from("BYBIT-001"),
+            AccountType::Margin,
+            None,
+            Rc::new(RefCell::new(Cache::default())),
+        );
+
+        let config = BybitExecutionClientConfig {
+            product_types: vec![BybitProductType::Linear, BybitProductType::Linear],
+            ..Default::default()
+        };
+
+        let error = BybitExecutionClient::new(core, config)
+            .expect_err("duplicate config must fail before credentials or client setup");
+
+        assert_eq!(
+            error.downcast_ref::<ConfigError>(),
+            Some(&ConfigError::duplicate("product_types", None))
+        );
     }
 }

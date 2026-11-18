@@ -24,7 +24,7 @@ default = ["transport-sockudo"]
 extension-module = ["python", "pyo3/extension-module"]
 python = ["pyo3", "pyo3-stub-gen"]
 simulation = ["dep:madsim", "nautilus-core/simulation"]
-turmoil = ["dep:turmoil"]
+turmoil = ["dep:turmoil", "sockudo-ws?/test-util"]
 # Backend selection for the WebSocket transport abstraction.
 # `tokio-tungstenite` is always compiled; `transport-sockudo` (enabled by
 # default) adds the `sockudo-ws` backend, selectable at runtime via
@@ -48,6 +48,7 @@ base64 = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
+flate2 = { workspace = true }
 futures-util = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
@@ -61,6 +62,7 @@ hyper-util = { workspace = true, features = [
   "http1",
   "http2",
 ] }
+jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
@@ -82,11 +84,13 @@ url = { workspace = true }
 ustr = { workspace = true }
 webpki-roots = { workspace = true }
 
-madsim = { workspace = true, optional = true }
 pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 sockudo-ws = { workspace = true, optional = true }
 turmoil = { workspace = true, optional = true }
+
+[target.'cfg(madsim)'.dependencies]
+madsim = { workspace = true, optional = true }
 
 [dev-dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
@@ -119,5 +123,11 @@ required-features = ["transport-sockudo"]
 [[bench]]
 name = "websocket_latency"
 path = "benches/websocket_latency.rs"
+harness = false
+required-features = ["transport-sockudo"]
+
+[[bench]]
+name = "websocket_client"
+path = "benches/websocket_client.rs"
 harness = false
 required-features = ["transport-sockudo"]

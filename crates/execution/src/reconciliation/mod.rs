@@ -40,6 +40,13 @@
 //!
 //! See `docs/concepts/execution/reconciliation.md` for the operator-facing description.
 
+use nautilus_core::correctness::CorrectnessResult;
+use nautilus_model::{
+    instruments::{Instrument, InstrumentAny},
+    types::{Price, fixed::FIXED_PRECISION},
+};
+use rust_decimal::Decimal;
+
 mod ids;
 mod orders;
 mod positions;
@@ -62,9 +69,10 @@ pub use orders::{
     generate_reconciliation_order_pre_fill_events, generate_reconciliation_order_snapshot_events,
     generate_reconciliation_order_snapshot_events_with_commission,
     incremental_inferred_fill_price_and_liquidity, inferred_fill_price_and_liquidity,
-    reconcile_fill_report, reconcile_order_report, reconcile_order_report_with_commission,
-    should_reconciliation_update,
+    preserve_order_amendment, reconcile_fill_report, reconcile_order_report,
+    reconcile_order_report_with_commission, should_reconciliation_update,
 };
+pub(crate) use positions::fill_precedes_reconciled_position;
 pub use positions::{
     calculate_reconciliation_price, check_position_reconciliation,
     fill_precedes_snapshot_reconciled_position, position_prices_match,
@@ -75,3 +83,11 @@ pub use types::ReconciliationResult;
 
 /// Order tag marking a synthetic order that reconciliation creates to align a position.
 pub const RECONCILIATION_ORDER_TAG: &str = "RECONCILIATION";
+
+fn reconciliation_price(value: Decimal, instrument: &InstrumentAny) -> CorrectnessResult<Price> {
+    // Reconstructed averages need not lie on price ticks, keep their representable precision
+    let precision = instrument
+        .price_precision()
+        .max(value.normalize().scale().min(u32::from(FIXED_PRECISION)) as u8);
+    Price::from_decimal_dp(value, precision)
+}

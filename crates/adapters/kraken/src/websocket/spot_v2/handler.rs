@@ -117,10 +117,20 @@ impl SpotFeedHandler {
                         }
                         SpotHandlerCommand::Subscribe { payload }
                         | SpotHandlerCommand::Unsubscribe { payload } => {
-                            if let Some(client) = &self.inner
-                                && let Err(e) = client.send_text(payload.expose_secret().to_owned(), Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice())).await
-                            {
-                                log::error!("Failed to send text: {e}");
+                            if let Some(client) = &self.inner {
+                                if let Err(e) = client
+                                    .send_text(
+                                        payload.expose_secret().to_owned(),
+                                        Some(KRAKEN_RATE_LIMIT_KEY_SUBSCRIPTION.as_slice()),
+                                    )
+                                    .await
+                                {
+                                    log::error!("Failed to send text: {e}");
+                                }
+                            } else {
+                                log::error!(
+                                    "Kraken WS subscribe or unsubscribe dropped, no active client"
+                                );
                             }
                         }
                         SpotHandlerCommand::Ping { payload } => {
@@ -248,8 +258,7 @@ impl SpotFeedHandler {
                 Ok(None) => {}
                 Err(e) => log::warn!("Failed to parse order response: {e}"),
             }
-            self.handle_control_message(value);
-            return None;
+            return self.handle_control_message(value);
         }
 
         if value.get("channel").is_some() && value.get("data").is_some() {
@@ -266,7 +275,9 @@ impl SpotFeedHandler {
         None
     }
 
-    fn handle_control_message(&self, value: Value) {
+    /// Logs a control response and yields every `subscribe` answer to the stream, so a consumer
+    /// holding a subscription can see the venue reject it rather than infer it from silence.
+    fn handle_control_message(&self, value: Value) -> Option<KrakenSpotWsMessage> {
         match serde_json::from_value::<KrakenWsResponse>(value) {
             Ok(response) => match response {
                 KrakenWsResponse::Subscribe(sub) => {
@@ -282,32 +293,45 @@ impl SpotFeedHandler {
                         }
                     } else {
                         log::warn!(
-                            "Subscription failed: error={:?}, req_id={:?}",
+                            "Subscription failed: error={:?}, req_id={:?}, symbol={:?}",
                             sub.error,
-                            sub.req_id
+                            sub.req_id,
+                            sub.symbol
                         );
                     }
+
+                    Some(KrakenSpotWsMessage::SubscriptionAck {
+                        req_id: sub.req_id,
+                        symbol: sub.symbol,
+                        success: sub.success,
+                        error: sub.error,
+                    })
                 }
                 KrakenWsResponse::Unsubscribe(unsub) => {
                     if unsub.success {
                         log::debug!("Unsubscription confirmed: req_id={:?}", unsub.req_id);
                     } else {
                         log::warn!(
-                            "Unsubscription failed: error={:?}, req_id={:?}",
+                            "Unsubscription failed: error={:?}, req_id={:?}, symbol={:?}",
                             unsub.error,
-                            unsub.req_id
+                            unsub.req_id,
+                            unsub.symbol
                         );
                     }
+                    None
                 }
                 KrakenWsResponse::Pong(pong) => {
                     log::trace!("Received pong: req_id={:?}", pong.req_id);
+                    None
                 }
                 KrakenWsResponse::Other => {
                     log::debug!("Received unknown control response");
+                    None
                 }
             },
             Err(_) => {
                 log::debug!("Received control message (failed to parse details)");
+                None
             }
         }
     }
@@ -320,7 +344,10 @@ impl SpotFeedHandler {
             KrakenWsChannel::Ohlc => self.handle_ohlc_message(msg),
             KrakenWsChannel::Executions => self.handle_executions_message(msg),
             KrakenWsChannel::Level3 => {
-                unreachable!("level3 messages routed via fast-path in parse_message",)
+                // Well-formed level3 messages take the fast path in `parse_message`, so
+                // reaching here means the venue sent one that failed to parse
+                log::warn!("Dropping malformed level3 message");
+                None
             }
             _ => {
                 log::warn!("Unhandled channel: {:?}", msg.channel);
@@ -484,6 +511,9 @@ impl SpotFeedHandler {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use parking_lot::Mutex;
     use rstest::rstest;
     use rust_decimal_macros::dec;
 
@@ -754,6 +784,79 @@ mod tests {
         );
     }
 
+    struct DroppedCommandLogCapture {
+        messages: Mutex<Vec<String>>,
+    }
+
+    static DROPPED_COMMAND_LOG_CAPTURE: DroppedCommandLogCapture = DroppedCommandLogCapture {
+        messages: Mutex::new(Vec::new()),
+    };
+
+    impl log::Log for DroppedCommandLogCapture {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() == log::Level::Error
+                && metadata.target() == "nautilus_kraken::websocket::spot_v2::handler"
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                self.messages.lock().push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// A subscribe that reaches the handler before its `SetClient` is dropped with an error
+    /// naming the lost command, rather than vanishing while the client already answered `Ok`.
+    #[rstest]
+    #[tokio::test]
+    async fn test_subscribe_without_active_client_logs_dropped_command() {
+        log::set_logger(&DROPPED_COMMAND_LOG_CAPTURE).expect("test logger already installed");
+        log::set_max_level(log::LevelFilter::Error);
+
+        let signal = Arc::new(AtomicBool::new(false));
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        // The raw stream stays open so `next` cannot return early: the only ready
+        // branch is the command channel, so the queued subscribe is handled first.
+        let (_raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+        let subscriptions = SubscriptionState::new(':');
+
+        let mut handler = SpotFeedHandler::new(signal, cmd_rx, raw_rx, subscriptions);
+
+        cmd_tx
+            .send(SpotHandlerCommand::Subscribe {
+                payload: SecretString::from(
+                    r#"{"method":"subscribe","token":"SUBSCRIBE_SECRET_MARKER"}"#.to_string(),
+                ),
+            })
+            .unwrap();
+
+        drop(cmd_tx);
+
+        let mut next = std::pin::pin!(handler.next());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+
+        while DROPPED_COMMAND_LOG_CAPTURE.messages.lock().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "handler never processed the queued subscribe"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(10), next.as_mut()).await;
+        }
+
+        let messages = DROPPED_COMMAND_LOG_CAPTURE.messages.lock().clone();
+        assert_eq!(
+            messages,
+            vec!["Kraken WS subscribe or unsubscribe dropped, no active client".to_string()],
+            "a subscribe without an active client must log the dropped command"
+        );
+        assert!(
+            !messages.join("\n").contains("SUBSCRIBE_SECRET_MARKER"),
+            "dropped-command log must not leak the payload"
+        );
+    }
+
     #[rstest]
     fn test_quotes_and_book_subscriptions_independent() {
         let handler = create_test_handler();
@@ -823,6 +926,120 @@ mod tests {
         }
     }
 
+    /// A rejected `subscribe` reaches the stream with the request id, the pair and the venue's
+    /// reason, so the holder of the subscription can act on it.
+    #[rstest]
+    fn test_parse_message_yields_a_subscribe_rejection() {
+        let handler = create_test_handler();
+        let json = r#"{"error":"Currency pair not supported BOGUS/NOPE","method":"subscribe","req_id":7,"success":false,"symbol":"BOGUS/NOPE","time_in":"2026-05-05T10:00:00.123Z","time_out":"2026-05-05T10:00:00.125Z"}"#;
+
+        let result = handler.parse_message(json);
+
+        let Some(KrakenSpotWsMessage::SubscriptionAck {
+            req_id,
+            symbol,
+            success,
+            error,
+        }) = result
+        else {
+            panic!("expected a SubscriptionAck, was {result:?}");
+        };
+        assert_eq!(req_id, Some(7));
+        assert_eq!(symbol, Some(ustr::Ustr::from("BOGUS/NOPE")));
+        assert!(!success);
+        assert_eq!(
+            error.as_deref(),
+            Some("Currency pair not supported BOGUS/NOPE")
+        );
+    }
+
+    /// A confirmed `subscribe` reaches the stream too, so the consumer can retire the request.
+    #[rstest]
+    fn test_parse_message_yields_a_subscribe_confirmation() {
+        let handler = create_test_handler();
+        let json = r#"{"method":"subscribe","result":{"channel":"book","symbol":"BTC/USD","depth":10,"snapshot":true},"success":true,"time_in":"2026-05-05T10:00:00.123Z","time_out":"2026-05-05T10:00:00.125Z","req_id":3}"#;
+
+        let result = handler.parse_message(json);
+
+        let Some(KrakenSpotWsMessage::SubscriptionAck {
+            req_id,
+            symbol,
+            success,
+            error,
+        }) = result
+        else {
+            panic!("expected a SubscriptionAck, was {result:?}");
+        };
+        assert_eq!(req_id, Some(3));
+        assert_eq!(symbol, None, "a confirmation names the pair in result only");
+        assert!(success);
+        assert!(error.is_none());
+
+        let unsubscribe = r#"{"method":"unsubscribe","result":{"channel":"book","symbol":"BTC/USD"},"success":true,"time_in":"2026-05-05T10:00:00.123Z","time_out":"2026-05-05T10:00:00.125Z","req_id":4}"#;
+        assert!(
+            handler.parse_message(unsubscribe).is_none(),
+            "only subscribe answers reach the stream"
+        );
+    }
+
+    /// The handler yields a subscribe answer and the book frames after it in wire order, and a
+    /// failed unsubscribe, which the venue reports under the subscribe method with the
+    /// unsubscribe's request id, reaches the stream as a subscribe answer.
+    #[rstest]
+    #[tokio::test]
+    async fn test_next_yields_answers_and_book_frames_in_wire_order() {
+        let signal = Arc::new(AtomicBool::new(false));
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscriptions = SubscriptionState::new(':');
+        subscriptions.mark_subscribe("book:BTC/USD");
+        subscriptions.confirm_subscribe("book:BTC/USD");
+        let mut handler = SpotFeedHandler::new(signal, cmd_rx, raw_rx, subscriptions);
+
+        for text in [
+            r#"{"method":"subscribe","result":{"channel":"book","symbol":"BTC/USD","depth":10,"snapshot":true},"success":true,"time_in":"2026-05-05T10:00:00.123Z","time_out":"2026-05-05T10:00:00.125Z","req_id":3}"#,
+            r#"{"channel":"book","type":"snapshot","data":[{"symbol":"BTC/USD","bids":[{"price":105944.20,"qty":2.5}],"asks":[{"price":105944.30,"qty":3.2}],"checksum":12345,"timestamp":"2023-10-06T17:35:55.440295Z"}]}"#,
+            r#"{"channel":"book","type":"update","data":[{"symbol":"BTC/USD","bids":[{"price":105944.20,"qty":2.0}],"asks":[],"checksum":12346,"timestamp":"2023-10-06T17:35:55.540295Z"}]}"#,
+            r#"{"error":"Subscription with depth 10 not Found BTC/USD","method":"subscribe","req_id":502,"success":false,"symbol":"BTC/USD","time_in":"2026-05-05T10:00:01.123Z","time_out":"2026-05-05T10:00:01.125Z"}"#,
+        ] {
+            raw_tx.send(Message::Text(text.into())).unwrap();
+        }
+
+        let Some(KrakenSpotWsMessage::SubscriptionAck {
+            req_id: Some(3),
+            success: true,
+            ..
+        }) = handler.next().await
+        else {
+            panic!("expected the confirmation first");
+        };
+        let Some(KrakenSpotWsMessage::Book {
+            is_snapshot: true, ..
+        }) = handler.next().await
+        else {
+            panic!("expected the snapshot second");
+        };
+        let Some(KrakenSpotWsMessage::Book {
+            is_snapshot: false, ..
+        }) = handler.next().await
+        else {
+            panic!("expected the update third");
+        };
+        let failed_unsubscribe = handler.next().await;
+        let Some(KrakenSpotWsMessage::SubscriptionAck {
+            req_id: Some(502),
+            symbol: Some(symbol),
+            success: false,
+            ..
+        }) = failed_unsubscribe
+        else {
+            panic!(
+                "expected the failed unsubscribe as a subscribe answer, was {failed_unsubscribe:?}"
+            );
+        };
+        assert_eq!(symbol, ustr::Ustr::from("BTC/USD"));
+    }
+
     #[rstest]
     fn test_parse_level3_snapshot_with_subscription_passes() {
         let handler = create_test_handler();
@@ -859,6 +1076,21 @@ mod tests {
                 "timestamp": "2024-01-01T00:00:00Z"
             }]
         }"#;
+
+        let result = handler.parse_message(json);
+        assert!(result.is_none());
+    }
+
+    #[rstest]
+    #[case::empty_data(r#"{"channel":"level3","type":"update","data":[]}"#)]
+    #[case::snapshot_missing_bids(
+        r#"{"channel":"level3","type":"snapshot","data":[{"symbol":"BTC/USD","asks":[],"checksum":0,"timestamp":"2024-01-01T00:00:00Z"}]}"#
+    )]
+    #[case::unexpected_type(r#"{"channel":"level3","type":"error","data":[{}]}"#)]
+    fn test_parse_level3_malformed_message_is_dropped(#[case] json: &str) {
+        let handler = create_test_handler();
+        handler.subscriptions.mark_subscribe("level3:BTC/USD");
+        handler.subscriptions.confirm_subscribe("level3:BTC/USD");
 
         let result = handler.parse_message(json);
         assert!(result.is_none());

@@ -24,7 +24,7 @@ use nautilus_model::{
         AggregationSource, AggressorSide, BarAggregation, BookAction, LiquiditySide, OrderSide,
         OrderStatus, OrderType, PriceType, RecordFlag, TimeInForce, TriggerType,
     },
-    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId},
     instruments::{Instrument, any::InstrumentAny},
     reports::{FillReport, OrderStatusReport},
     types::{Money, Price, Quantity},
@@ -40,7 +40,7 @@ use super::{
 };
 use crate::common::{
     enums::{KrakenOrderSide, KrakenOrderType, KrakenTimeInForce},
-    parse::get_currency,
+    parse::{get_currency, parse_venue_order_id},
 };
 
 /// Parses Kraken WebSocket ticker data into a Nautilus quote tick.
@@ -419,7 +419,10 @@ pub fn parse_ws_order_status_report(
     ts_init: UnixNanos,
 ) -> anyhow::Result<OrderStatusReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(&exec.order_id);
+    let venue_order_id = parse_venue_order_id(
+        &exec.order_id,
+        format_args!("execution, cl_ord_id={:?}", exec.cl_ord_id),
+    )?;
     let order_side = exec.side.map(Into::into);
     let order_type = parse_order_type(exec.order_type);
     let time_in_force = parse_time_in_force(exec.time_in_force, exec.post_only);
@@ -476,16 +479,9 @@ pub fn parse_ws_order_status_report(
         report = report.with_client_order_id(ClientOrderId::new(cl_ord_id));
     }
 
-    // Price fallback: limit_price -> avg_price -> last_price
-    // Note: pending_new messages may not include any price fields, which is fine for
-    // orders we submitted (engine already has the price from submission)
-    let price_value = exec
-        .limit_price
-        .filter(|p| *p > Decimal::ZERO)
-        .or(exec.avg_price.filter(|p| *p > Decimal::ZERO))
-        .or(exec.last_price.filter(|p| *p > Decimal::ZERO));
-
-    if let Some(px) = price_value {
+    // The order's price is its limit alone: a fill price is `avg_px`, and a frame without the
+    // limit states no price
+    if let Some(px) = exec.limit_price.filter(|p| *p > Decimal::ZERO) {
         let price =
             Price::from_decimal_dp(px, price_precision).context("Failed to parse order price")?;
         report = report.with_price(price);
@@ -549,7 +545,6 @@ pub fn parse_ws_fill_report(
     ts_init: UnixNanos,
 ) -> anyhow::Result<FillReport> {
     let instrument_id = instrument.id();
-    let venue_order_id = VenueOrderId::new(&exec.order_id);
 
     let exec_id = exec
         .exec_id
@@ -557,6 +552,8 @@ pub fn parse_ws_fill_report(
         .context("Missing exec_id for trade execution")?;
     let trade_id =
         TradeId::new_checked(exec_id).context("Invalid exec_id in Kraken trade execution")?;
+    let venue_order_id =
+        parse_venue_order_id(&exec.order_id, format_args!("trade execution {exec_id}"))?;
 
     let order_side = exec
         .side
@@ -801,7 +798,7 @@ mod tests {
         assert_eq!(first_delta.instrument_id, instrument.id());
         assert_eq!(first_delta.action, BookAction::Update);
         assert_eq!(first_delta.order.side, OrderSide::Buy.into());
-        assert_eq!(first_delta.order.price, Price::from("105944.20"));
+        assert_eq!(first_delta.order.price, Price::from("45283.5"));
         assert!(RecordFlag::F_MBP.matches(first_delta.flags));
         assert!(RecordFlag::F_LAST.matches(first_delta.flags));
         assert!(!RecordFlag::F_SNAPSHOT.matches(first_delta.flags));
@@ -904,6 +901,82 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.order_side, None);
+    }
+
+    /// A report's price is the order's limit alone, never a fill price. Kraken's executions
+    /// example places a sell limit at 26500.0, then fills part of it at 26599.9 in a trade frame,
+    /// which carries no limit and so states no price.
+    #[rstest]
+    #[case::pending_new_frame("ws_executions_pending_new_doc_example.json", Some("26500.0"), None)]
+    #[case::trade_frame(
+        "ws_executions_trade_doc_example.json",
+        None,
+        Some(dec!(26599.9))
+    )]
+    fn test_parse_ws_order_status_report_prices_the_order_at_its_limit(
+        #[case] filename: &str,
+        #[case] expected_price: Option<&str>,
+        #[case] expected_avg_px: Option<Decimal>,
+    ) {
+        let message: KrakenWsRawMessage = serde_json::from_str(&load_test_json(filename)).unwrap();
+        let execution: KrakenWsExecutionData = serde_json::from_str(message.data[0].get()).unwrap();
+
+        let report = parse_ws_order_status_report(
+            &execution,
+            &create_mock_instrument(),
+            AccountId::from("KRAKEN-001"),
+            None,
+            TS,
+        )
+        .unwrap();
+
+        assert_eq!(report.price, expected_price.map(Price::from));
+        assert_eq!(report.avg_px, expected_avg_px);
+    }
+
+    #[rstest]
+    fn test_parse_ws_order_status_report_fails_on_an_invalid_order_id() {
+        let mut execution = ws_execution_data(Some(KrakenOrderSide::Buy));
+        execution.order_id = String::new();
+        execution.cl_ord_id = Some("cl-1".to_string());
+
+        let error = parse_ws_order_status_report(
+            &execution,
+            &create_mock_instrument(),
+            AccountId::from("KRAKEN-001"),
+            None,
+            TS,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid order_id '' in Kraken execution, cl_ord_id=Some(\"cl-1\")"
+        );
+    }
+
+    /// The dispatch logs only this message for the fill it drops, so the message names the fill.
+    #[rstest]
+    fn test_parse_ws_fill_report_names_the_execution_of_an_invalid_order_id() {
+        let mut execution = ws_execution_data(Some(KrakenOrderSide::Buy));
+        execution.order_id = String::new();
+        execution.exec_type = KrakenExecType::Trade;
+        execution.exec_id = Some("TRADE-1".to_string());
+        execution.last_qty = Some(dec!(1));
+        execution.last_price = Some(dec!(100));
+
+        let error = parse_ws_fill_report(
+            &execution,
+            &create_mock_instrument(),
+            AccountId::from("KRAKEN-001"),
+            TS,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid order_id '' in Kraken trade execution TRADE-1"
+        );
     }
 
     #[rstest]

@@ -16,7 +16,7 @@
 //! HTTP client for the Kraken Spot REST API.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
     num::NonZeroU32,
     sync::{
@@ -48,6 +48,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use nautilus_network::{
+    ConnectionUrl,
     http::{
         HttpClient, HttpRedirectPolicy, HttpResponse, Method, create_standard_nautilus_headers,
     },
@@ -70,19 +71,21 @@ use crate::{
         credential::KrakenCredential,
         enums::{
             KrakenAssetClass, KrakenEnvironment, KrakenOrderSide, KrakenOrderType,
-            KrakenProductType,
+            KrakenProductType, product_type_from_symbol,
         },
         parse::{
             bar_type_to_spot_interval, normalize_currency_code, normalize_spot_symbol, parse_bar,
             parse_fill_report, parse_order_status_report, parse_spot_instrument,
-            parse_tokenized_instrument, parse_trade_tick_from_array, truncate_cl_ord_id,
+            parse_tokenized_instrument, parse_trade_tick_from_array, parse_venue_order_id,
+            truncate_cl_ord_id,
         },
         urls::get_kraken_http_base_url,
     },
     http::{
         apply_count_limit,
+        coverage::ReportCoverage,
         error::{
-            KrakenBatchOrderError, KrakenHttpError, KrakenModifyOrderError, KrakenSubmitOrderError,
+            KrakenBatchOrderError, KrakenHttpError, KrakenSubmitOrderError,
             kraken_http_should_retry,
         },
     },
@@ -111,7 +114,7 @@ const BATCH_SUBMIT_LIMIT: usize = 15;
 /// This client handles request/response operations with the Kraken Spot API,
 /// returning venue-specific response types. It does not parse to Nautilus domain types.
 pub struct KrakenSpotRawHttpClient {
-    base_url: String,
+    base_url: ConnectionUrl,
     client: HttpClient,
     credential: Option<KrakenCredential>,
     retry_manager: RetryManager<KrakenHttpError>,
@@ -176,7 +179,7 @@ impl KrakenSpotRawHttpClient {
         });
 
         Ok(Self {
-            base_url,
+            base_url: base_url.into(),
             client: HttpClient::builder()
                 .headers(Self::default_headers())
                 .keyed_quotas(Self::rate_limiter_quotas(max_requests_per_second)?)
@@ -224,7 +227,7 @@ impl KrakenSpotRawHttpClient {
         });
 
         Ok(Self {
-            base_url,
+            base_url: base_url.into(),
             client: HttpClient::builder()
                 .redirect_policy(HttpRedirectPolicy::Reject)
                 .headers(Self::default_headers())
@@ -252,7 +255,7 @@ impl KrakenSpotRawHttpClient {
 
     /// Returns the base URL for this client.
     pub fn base_url(&self) -> &str {
-        &self.base_url
+        self.base_url.expose()
     }
 
     /// Returns the credential for this client, if set.
@@ -523,7 +526,7 @@ impl KrakenSpotRawHttpClient {
             self.send_order_request(method, endpoint, headers, final_body, cancellation_token)
                 .await?
         } else {
-            let url = format!("{}{endpoint}", self.base_url);
+            let url = format!("{}{endpoint}", self.base_url.expose());
             let rate_limit_keys = Self::rate_limit_keys(endpoint);
             self.client
                 .request(
@@ -536,7 +539,12 @@ impl KrakenSpotRawHttpClient {
                     Some(rate_limit_keys),
                 )
                 .await
-                .map_err(|e| KrakenHttpError::NetworkError(e.to_string()))?
+                .map_err(|e| {
+                    KrakenHttpError::NetworkError(format!(
+                        "Request to {} failed: {e}",
+                        self.base_url.origin()
+                    ))
+                })?
         };
 
         let status = response.status.as_u16();
@@ -580,7 +588,7 @@ impl KrakenSpotRawHttpClient {
         }
 
         let request_started = AtomicBool::new(false);
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
         let rate_limit_keys = Self::rate_limit_keys(endpoint);
         let request = async {
             request_started.store(true, Ordering::Relaxed);
@@ -612,7 +620,7 @@ impl KrakenSpotRawHttpClient {
                 }
             }
             response = &mut request => response
-                .map_err(|e| KrakenHttpError::NetworkError(e.to_string())),
+                .map_err(|e| KrakenHttpError::NetworkError(format!("Request to {} failed: {e}", self.base_url.origin()))),
         }
     }
 
@@ -1042,9 +1050,7 @@ impl KrakenSpotRawHttpClient {
         params: &KrakenSpotCancelOrderParams,
     ) -> anyhow::Result<SpotCancelOrderResponse, KrakenHttpError> {
         if self.credential.is_none() {
-            return Err(KrakenHttpError::AuthenticationError(
-                "API credentials required for canceling orders".to_string(),
-            ));
+            return Err(KrakenHttpError::MissingCredentials);
         }
 
         let param_string = serde_urlencoded::to_string(params)
@@ -1053,7 +1059,7 @@ impl KrakenSpotRawHttpClient {
         let body = Some(param_string.into_bytes());
 
         let response: KrakenResponse<SpotCancelOrderResponse> = self
-            .send_request(Method::POST, "/0/private/CancelOrder", body, true)
+            .send_request_once(Method::POST, "/0/private/CancelOrder", body, true)
             .await?;
 
         response
@@ -1066,11 +1072,10 @@ impl KrakenSpotRawHttpClient {
         &self,
         params: &KrakenSpotCancelOrderBatchParams,
     ) -> anyhow::Result<SpotCancelOrderBatchResponse, KrakenHttpError> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            KrakenHttpError::AuthenticationError(
-                "API credentials required for canceling orders".to_string(),
-            )
-        })?;
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or(KrakenHttpError::MissingCredentials)?;
 
         // Serialize authenticated requests to ensure nonces arrive at Kraken in order
         let _guard = self.auth_mutex.lock().await;
@@ -1094,14 +1099,14 @@ impl KrakenSpotRawHttpClient {
 
         let signature = credential
             .sign_spot_json(endpoint, nonce, &json_str)
-            .map_err(|e| KrakenHttpError::AuthenticationError(format!("Failed to sign: {e}")))?;
+            .map_err(|e| KrakenHttpError::RequestNotStarted(format!("Failed to sign: {e}")))?;
 
         let mut headers = Self::default_headers();
         headers.insert("API-Key".to_string(), credential.api_key().to_string());
         headers.insert("API-Sign".to_string(), signature);
         headers.insert("Content-Type".to_string(), "application/json".to_string());
 
-        let url = format!("{}{endpoint}", self.base_url);
+        let url = format!("{}{endpoint}", self.base_url.expose());
         let rate_limit_keys = Self::rate_limit_keys(endpoint);
 
         let response = self
@@ -1116,7 +1121,12 @@ impl KrakenSpotRawHttpClient {
                 Some(rate_limit_keys),
             )
             .await
-            .map_err(|e| KrakenHttpError::NetworkError(e.to_string()))?;
+            .map_err(|e| {
+                KrakenHttpError::NetworkError(format!(
+                    "Request to {} failed: {e}",
+                    self.base_url.origin()
+                ))
+            })?;
 
         if response.status.as_u16() >= 400 {
             let status = response.status.as_u16();
@@ -1154,13 +1164,11 @@ impl KrakenSpotRawHttpClient {
         &self,
     ) -> anyhow::Result<SpotCancelOrderResponse, KrakenHttpError> {
         if self.credential.is_none() {
-            return Err(KrakenHttpError::AuthenticationError(
-                "API credentials required for canceling orders".to_string(),
-            ));
+            return Err(KrakenHttpError::MissingCredentials);
         }
 
         let response: KrakenResponse<SpotCancelOrderResponse> = self
-            .send_request(Method::POST, "/0/private/CancelAll", None, true)
+            .send_request_once(Method::POST, "/0/private/CancelAll", None, true)
             .await?;
 
         response
@@ -1185,7 +1193,7 @@ impl KrakenSpotRawHttpClient {
         let body = Some(param_string.into_bytes());
 
         let response: KrakenResponse<SpotEditOrderResponse> = self
-            .send_request(Method::POST, "/0/private/EditOrder", body, true)
+            .send_request_once(Method::POST, "/0/private/EditOrder", body, true)
             .await?;
 
         response
@@ -1712,6 +1720,8 @@ impl KrakenSpotHttpClient {
         let ts_init = self.generate_ts_init();
         let asset_pairs = self.inner.get_asset_pairs(pairs.clone(), None).await?;
         self.record_pair_aliases(&asset_pairs);
+        let mut leverage_tiers = AHashMap::new();
+
         let mut instruments: Vec<InstrumentAny> = asset_pairs
             .iter()
             .filter_map(|(pair_name, definition)| {
@@ -1729,12 +1739,20 @@ impl KrakenSpotHttpClient {
                     definition.leverage_buy.clone(),
                     definition.leverage_sell.clone(),
                 );
-                self.leverage_tiers_cache.rcu(|m| {
-                    m.insert(key, tiers.clone());
-                });
+                leverage_tiers.insert(key, tiers);
                 instrument
             })
             .collect();
+
+        if !leverage_tiers.is_empty() {
+            self.leverage_tiers_cache.rcu(|cache| {
+                cache.extend(
+                    leverage_tiers
+                        .iter()
+                        .map(|(key, tiers)| (*key, tiers.clone())),
+                );
+            });
+        }
 
         // Also fetch tokenized asset pairs (xStocks). When loading all pairs this
         // picks up tokenized equities; when loading specific pairs it covers the
@@ -2215,10 +2233,16 @@ impl KrakenSpotHttpClient {
             .map(|(reports, _)| reports)
     }
 
-    /// Requests order status reports, also reporting whether the set is complete.
+    /// Requests order status reports, also reporting what the read covered.
     ///
-    /// The flag is `false` when a historical record was skipped because its instrument could not
-    /// be resolved, which `ExecutionMassStatus::set_report_window` records for bounded history.
+    /// An in-scope open order whose pair cannot be resolved, or that cannot be parsed, fails the
+    /// read, except that a read scoped to one instrument skips an order whose pair it cannot
+    /// resolve, since that order may be on another instrument. The coverage records each such
+    /// skip, each closed order that cannot be resolved, each in-scope one that cannot be parsed,
+    /// and a closed-order read that stops at its page cap, which it cannot place in time. A read
+    /// scoped to an unheld spot instrument reads nothing and rules out no order.
+    /// `ExecutionMassStatus::set_report_window` records whether it is complete for bounded history,
+    /// and the single-order lookup whether it rules out an order it did not return.
     pub(crate) async fn request_order_status_reports_checked(
         &self,
         account_id: AccountId,
@@ -2226,21 +2250,26 @@ impl KrakenSpotHttpClient {
         start: Option<Timestamp>,
         end: Option<Timestamp>,
         open_only: bool,
-    ) -> anyhow::Result<(Vec<OrderStatusReport>, bool)> {
+    ) -> anyhow::Result<(Vec<OrderStatusReport>, ReportCoverage)> {
         const PAGE_SIZE: i32 = 50;
 
         let ts_init = self.generate_ts_init();
         let mut all_reports = Vec::new();
-        let mut complete = true;
+        let mut coverage = ReportCoverage::default();
 
         // A scoped read for an instrument this client does not hold can match nothing, so return
         // before the request rather than falling through and reporting every instrument's rows.
+        // A futures instrument names none of this client's orders, so that read is complete; a
+        // spot one the listing lacks read nothing, so it rules out none of its orders.
         if let Some(ref target_id) = instrument_id
             && self
                 .get_cached_instrument(&target_id.symbol.inner())
                 .is_none()
         {
-            return Ok((all_reports, complete));
+            if product_type_from_symbol(target_id.symbol.as_str()) == KrakenProductType::Spot {
+                coverage.truncate(None);
+            }
+            return Ok((all_reports, coverage));
         }
 
         let open_orders = self.inner.get_open_orders(Some(true), None).await?;
@@ -2249,10 +2278,16 @@ impl KrakenSpotHttpClient {
             // Kraken spells a pair two ways, so resolve the row and compare instrument ids rather
             // than the row's spelling against the cached `raw_symbol`.
             let resolved = self.get_instrument_by_raw_symbol(order.descr.pair.as_str());
-            if let Some(ref target_id) = instrument_id
-                && resolved.as_ref().is_none_or(|inst| inst.id() != *target_id)
-            {
-                continue;
+            if let Some(ref target_id) = instrument_id {
+                match &resolved {
+                    Some(inst) if inst.id() != *target_id => continue,
+                    // Unresolved, the row may be the scoped instrument's own
+                    None => {
+                        coverage.skip(order_id);
+                        continue;
+                    }
+                    Some(_) => {}
+                }
             }
 
             let instrument = resolved.ok_or_else(|| {
@@ -2262,17 +2297,18 @@ impl KrakenSpotHttpClient {
                 )
             })?;
 
-            match parse_order_status_report(order_id, order, &instrument, account_id, ts_init) {
-                Ok(report) => all_reports.push(report),
-                Err(e) => {
-                    log::warn!("Failed to parse order {order_id}: {e}");
-                    complete = false;
-                }
-            }
+            // An in-scope open order the client cannot parse fails the read: dropped, it reads to
+            // reconciliation as an order the venue does not have.
+            let report =
+                parse_order_status_report(order_id, order, &instrument, account_id, ts_init)
+                    .map_err(|e| {
+                        anyhow::anyhow!("OpenOrders: failed to parse order {order_id}: {e}")
+                    })?;
+            all_reports.push(report);
         }
 
         if open_only {
-            return Ok((all_reports, complete));
+            return Ok((all_reports, coverage));
         }
 
         // Kraken API expects Unix timestamps in seconds
@@ -2285,9 +2321,9 @@ impl KrakenSpotHttpClient {
         loop {
             if pages >= MAX_REPORT_PAGES {
                 log::warn!(
-                    "ClosedOrders pagination hit the cap of {MAX_REPORT_PAGES} pages; returning a truncated set and marking it incomplete, which only mass status surfaces"
+                    "ClosedOrders pagination hit the cap of {MAX_REPORT_PAGES} pages; returning a truncated set and marking it incomplete"
                 );
-                complete = false;
+                coverage.truncate(None);
                 break;
             }
 
@@ -2304,10 +2340,16 @@ impl KrakenSpotHttpClient {
 
             for (order_id, order) in &closed_orders {
                 let resolved = self.get_instrument_by_raw_symbol(order.descr.pair.as_str());
-                if let Some(ref target_id) = instrument_id
-                    && resolved.as_ref().is_none_or(|inst| inst.id() != *target_id)
-                {
-                    continue;
+                if let Some(ref target_id) = instrument_id {
+                    match &resolved {
+                        Some(inst) if inst.id() != *target_id => continue,
+                        // Unresolved, the row may be the scoped instrument's own
+                        None => {
+                            coverage.skip(order_id);
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
                 }
 
                 // A historical record can reference an instrument absent from the current
@@ -2317,7 +2359,7 @@ impl KrakenSpotHttpClient {
                         "ClosedOrders: instrument not in cache for pair {}, skipping order {order_id}",
                         order.descr.pair
                     );
-                    complete = false;
+                    coverage.skip(order_id);
                     continue;
                 };
 
@@ -2325,7 +2367,7 @@ impl KrakenSpotHttpClient {
                     Ok(report) => all_reports.push(report),
                     Err(e) => {
                         log::warn!("Failed to parse order {order_id}: {e}");
-                        complete = false;
+                        coverage.skip(order_id);
                     }
                 }
             }
@@ -2333,7 +2375,7 @@ impl KrakenSpotHttpClient {
             offset += PAGE_SIZE;
         }
 
-        Ok((all_reports, complete))
+        Ok((all_reports, coverage))
     }
 
     /// Requests fill/trade reports from Kraken.
@@ -2351,7 +2393,8 @@ impl KrakenSpotHttpClient {
 
     /// Requests fill reports, also reporting whether the set is complete.
     ///
-    /// See [`Self::request_order_status_reports_checked`] for what the flag means.
+    /// The flag is `false` when an in-scope trade cannot be resolved or parsed, or the read stops
+    /// at its page cap, which `ExecutionMassStatus::set_report_window` records for bounded history.
     pub(crate) async fn request_fill_reports_checked(
         &self,
         account_id: AccountId,
@@ -2460,6 +2503,124 @@ impl KrakenSpotHttpClient {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    /// Requests wallet position reports for the startup mass status, adding a FLAT report for
+    /// each of `flat_candidates` whose base asset the `Balance` read establishes as flat.
+    ///
+    /// Every row that counts toward a candidate's base, suffixed and staked rows included, must
+    /// parse and be non-negative. A candidate is flat when the sum of its base's rows rounds to
+    /// zero at the instrument's size precision, so an absent, zero or dust balance qualifies. A
+    /// nonzero sum with no LONG report withholds the FLAT with a warning. Tokenized assets never
+    /// get a FLAT, since their `Balance` key and units are undocumented.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, or if a row that counts toward a candidate's base
+    /// cannot be parsed or is negative.
+    pub(crate) async fn request_wallet_position_reports_with_flats(
+        &self,
+        account_id: AccountId,
+        quote_currency: Ustr,
+        flat_candidates: &[InstrumentId],
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
+        let balances_raw = self.inner.get_balance().await?;
+        let ts_init = self.generate_ts_init();
+
+        let mut candidates: Vec<(InstrumentId, Ustr, u8)> = Vec::new();
+
+        for instrument_id in flat_candidates {
+            let Some((instrument, base_currency)) = self
+                .get_cached_instrument(&instrument_id.symbol.inner())
+                .and_then(|instrument| {
+                    wallet_report_base_currency(&instrument, quote_currency)
+                        .map(|base_currency| (instrument, base_currency))
+                })
+            else {
+                log::warn!(
+                    "Withholding flat position report for {instrument_id}: not covered by the wallet read"
+                );
+                continue;
+            };
+
+            if matches!(instrument, InstrumentAny::TokenizedAsset(_)) {
+                log::warn!(
+                    "Withholding flat position report for {instrument_id}: tokenized asset balances are not read"
+                );
+                continue;
+            }
+
+            candidates.push((
+                *instrument_id,
+                base_currency.code,
+                instrument.size_precision(),
+            ));
+        }
+
+        let candidate_bases: HashSet<Ustr> = candidates.iter().map(|(_, base, _)| *base).collect();
+        let mut rows_by_base: HashMap<Ustr, Vec<(&str, Decimal)>> = HashMap::new();
+
+        for (key, amount) in &balances_raw {
+            let Some(base) = covered_balance_base(key, &candidate_bases) else {
+                continue;
+            };
+            let amount = Decimal::from_str_exact(amount)
+                .with_context(|| format!("Balance: failed to parse '{amount}' for {key}"))?;
+            anyhow::ensure!(
+                amount >= Decimal::ZERO,
+                "Balance: negative balance '{amount}' for {key}"
+            );
+            rows_by_base
+                .entry(base)
+                .or_default()
+                .push((key.as_str(), amount));
+        }
+
+        let mut reports = self.spot_position_reports_from_balances(
+            &balances_raw,
+            account_id,
+            None,
+            quote_currency,
+            ts_init,
+        )?;
+
+        for (instrument_id, base, size_precision) in candidates {
+            let rows = rows_by_base.get(&base).map_or_default(Vec::as_slice);
+            let total: Decimal = rows.iter().map(|(_, amount)| *amount).sum();
+            let held = Quantity::from_decimal_dp(total, size_precision)?;
+
+            if !held.is_zero() {
+                if !reports
+                    .iter()
+                    .any(|report| report.instrument_id == instrument_id)
+                {
+                    let keys: Vec<&str> = rows
+                        .iter()
+                        .filter(|(_, amount)| !amount.is_zero())
+                        .map(|(key, _)| *key)
+                        .collect();
+                    log::warn!(
+                        "Withholding flat position report for {instrument_id}: {base} balance {held} held in {}",
+                        keys.join(", "),
+                    );
+                }
+                continue;
+            }
+
+            reports.push(PositionStatusReport::new(
+                account_id,
+                instrument_id,
+                PositionSide::Flat,
+                Quantity::zero(size_precision),
+                ts_init,
+                ts_init,
+                None,
+                None,
+                None,
+            ));
+        }
+
+        Ok(reports)
     }
 
     /// Returns whether a bulk position read covers `instrument_id`, so that an absent report is
@@ -2653,9 +2814,10 @@ impl KrakenSpotHttpClient {
 
     /// Generates SPOT position reports from wallet balances.
     ///
-    /// Kraken spot balances are simple totals (no borrowing concept).
-    /// Positive balances are reported as LONG positions.
-    /// Zero balances are reported as FLAT.
+    /// Kraken spot balances are simple totals (no borrowing concept). A requested instrument is
+    /// reported LONG for a positive balance and FLAT otherwise. The bulk read reports LONG for each
+    /// covered instrument whose balance is nonzero at its size precision and omits every other
+    /// instrument.
     async fn generate_spot_position_reports_from_wallet(
         &self,
         account_id: AccountId,
@@ -2664,9 +2826,26 @@ impl KrakenSpotHttpClient {
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         let balances_raw = self.inner.get_balance().await?;
         let ts_init = self.generate_ts_init();
+        self.spot_position_reports_from_balances(
+            &balances_raw,
+            account_id,
+            instrument_id,
+            quote_currency,
+            ts_init,
+        )
+    }
+
+    fn spot_position_reports_from_balances(
+        &self,
+        balances_raw: &BalanceResponse,
+        account_id: AccountId,
+        instrument_id: Option<InstrumentId>,
+        quote_currency: Ustr,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Vec<PositionStatusReport>> {
         let mut wallet_by_coin: HashMap<Ustr, Decimal> = HashMap::new();
 
-        for (currency_code, amount_str) in &balances_raw {
+        for (currency_code, amount_str) in balances_raw {
             let balance = match Decimal::from_str_exact(amount_str) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -2775,6 +2954,7 @@ impl KrakenSpotHttpClient {
     /// - The order type or time in force is not supported.
     /// - The request fails.
     /// - The order is rejected.
+    /// - The response carries an invalid order ID.
     #[expect(clippy::too_many_arguments)]
     pub async fn submit_order(
         &self,
@@ -2828,7 +3008,12 @@ impl KrakenSpotHttpClient {
                     detail: "transaction ID was absent".to_string(),
                 })?;
 
-        Ok(VenueOrderId::new(venue_order_id))
+        parse_venue_order_id(venue_order_id, "spot submit response").map_err(|e| {
+            KrakenSubmitOrderError::InvalidOrderId {
+                detail: format!("{e:#}"),
+            }
+            .into()
+        })
     }
 
     /// Submits multiple orders to the Kraken Spot exchange.
@@ -3022,6 +3207,9 @@ impl KrakenSpotHttpClient {
     /// Uses the AmendOrder endpoint which modifies the order in-place,
     /// keeping the same order ID and queue position.
     ///
+    /// Returns the supplied `venue_order_id` as `Some`, or `None` when amending
+    /// by `client_order_id` alone.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
@@ -3036,7 +3224,7 @@ impl KrakenSpotHttpClient {
         quantity: Option<Quantity>,
         price: Option<Price>,
         trigger_price: Option<Price>,
-    ) -> anyhow::Result<VenueOrderId> {
+    ) -> anyhow::Result<Option<VenueOrderId>> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
@@ -3073,10 +3261,8 @@ impl KrakenSpotHttpClient {
 
         let _response = self.inner.amend_order(&params).await?;
 
-        // AmendOrder modifies in-place, so the order keeps its original ID
-        let order_id = venue_order_id.ok_or(KrakenModifyOrderError::MissingOrderId)?;
-
-        Ok(order_id)
+        // AmendOrder modifies in-place, so the order keeps its original ID if provided
+        Ok(venue_order_id)
     }
 
     /// Cancels an order on the Kraken Spot exchange.
@@ -3436,6 +3622,28 @@ fn wallet_report_base_currency(
     instrument.base_currency()
 }
 
+/// Returns the covered base currency that a `Balance` row counts toward, or `None`.
+///
+/// The whole key matches first, so a dotted code such as `BRK.Bx` stays whole. Otherwise a dotted
+/// key counts toward the code before its last dot, as is or with trailing digits stripped, so
+/// `XBT.F`, `L3.F`, `DOT28.S` and `EUR.HOLD` count toward `BTC`, `L3`, `DOT` and `EUR`.
+fn covered_balance_base(key: &str, covered_bases: &HashSet<Ustr>) -> Option<Ustr> {
+    let whole = Ustr::from(normalize_currency_code(key));
+    if covered_bases.contains(&whole) {
+        return Some(whole);
+    }
+
+    let (code, _) = key.rsplit_once('.')?;
+    let base = Ustr::from(normalize_currency_code(code));
+    if covered_bases.contains(&base) {
+        return Some(base);
+    }
+
+    let stripped = code.trim_end_matches(|c: char| c.is_ascii_digit());
+    let base = Ustr::from(normalize_currency_code(stripped));
+    covered_bases.contains(&base).then_some(base)
+}
+
 /// Parses an optional `BalanceEx` credit amount, treating an absent field as zero.
 ///
 /// Kraken only includes `credit` and `credit_used` for accounts holding a credit line, so their
@@ -3486,8 +3694,15 @@ fn compute_time_in_force(
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
+    use axum::{Router, http::header, routing::post};
     use nautilus_model::instruments::CurrencyPair;
     use nautilus_testkit::http::assert_http_redirect_rejected;
     use rstest::rstest;
@@ -3903,6 +4118,387 @@ mod tests {
         assert!(!other);
     }
 
+    /// A `Balance` row counts toward the covered base it names, in any spelling or suffix, and a
+    /// dotted base code stays whole when it is itself covered.
+    #[rstest]
+    #[case::legacy("XXBT", &["BTC"], Some("BTC"))]
+    #[case::standard("XBT", &["BTC"], Some("BTC"))]
+    #[case::suffixed("XBT.F", &["BTC"], Some("BTC"))]
+    #[case::legacy_suffixed("XXBT.F", &["BTC"], Some("BTC"))]
+    #[case::margin_suffix("XBT.M", &["BTC"], Some("BTC"))]
+    #[case::staked("DOT.S", &["DOT"], Some("DOT"))]
+    #[case::staked_term("DOT28.S", &["DOT"], Some("DOT"))]
+    #[case::staked_digit_code("ETH2.S", &["ETH"], Some("ETH"))]
+    #[case::staked_term_atom("ATOM21.S", &["ATOM"], Some("ATOM"))]
+    #[case::hold("EUR.HOLD", &["EUR"], Some("EUR"))]
+    #[case::hold_uncovered("EUR.HOLD", &["BTC"], None)]
+    #[case::bare_digit_code("ETH2", &["ETH"], None)]
+    #[case::bare_digit_code_luna("LUNA2", &["LUNA"], None)]
+    #[case::fee_credit("KFEE", &["BTC"], None)]
+    #[case::uncovered("XXBT", &["ETH"], None)]
+    #[case::digit_base_suffixed("L3.F", &["L3"], Some("L3"))]
+    #[case::digit_base_before_stripped("LUNA2.S", &["LUNA2", "LUNA"], Some("LUNA2"))]
+    #[case::digit_base_stripped("LUNA2.S", &["LUNA"], Some("LUNA"))]
+    #[case::dotted_base_whole("BRK.Bx", &["BRK.Bx", "BRK"], Some("BRK.Bx"))]
+    #[case::dotted_base_prefix("BRK.Bx", &["BRK"], Some("BRK"))]
+    fn test_covered_balance_base(
+        #[case] key: &str,
+        #[case] covered: &[&str],
+        #[case] expected: Option<&str>,
+    ) {
+        let covered_bases: HashSet<Ustr> = covered.iter().map(|code| Ustr::from(code)).collect();
+
+        assert_eq!(
+            covered_balance_base(key, &covered_bases),
+            expected.map(Ustr::from)
+        );
+    }
+
+    /// An order the venue placed, answered with a transaction ID the model cannot hold, returns the
+    /// typed error: an untyped one would read as a command never sent and reject a live order.
+    #[rstest]
+    #[tokio::test]
+    async fn test_submit_order_returns_a_typed_error_for_an_invalid_order_id() {
+        use axum::{Router, http::header, routing::any};
+
+        let body = include_str!("../../../test_data/http_add_order_spot.json")
+            .replace("OUF4EM-FRGI2-MQMWZD", "");
+        let app = Router::new().route(
+            "/0/private/AddOrder",
+            any(move || {
+                let body = body.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KrakenSpotHttpClient::with_credentials(
+            "test".to_string(),
+            "c2VjcmV0".to_string(),
+            KrakenEnvironment::Live,
+            Some(format!("http://{addr}")),
+            10,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        let instrument_id = cache_test_spot_instrument(&client);
+
+        let error = client
+            .submit_order(
+                AccountId::from("KRAKEN-001"),
+                instrument_id,
+                ClientOrderId::from("O-SUBMIT"),
+                OrderSide::Buy,
+                OrderType::Limit,
+                Quantity::from("0.00100000"),
+                TimeInForce::Gtc,
+                None,
+                Some(Price::from("50000.0")),
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+                AccountType::Cash,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error.downcast_ref::<KrakenSubmitOrderError>(),
+                Some(KrakenSubmitOrderError::InvalidOrderId { detail })
+                    if detail.starts_with("Invalid order_id '' in Kraken spot submit response")
+            ),
+            "{error:#}"
+        );
+    }
+
+    /// A spot command that can change venue state, with the endpoint it writes to.
+    #[derive(Clone, Copy, Debug)]
+    enum StateChangingSpotCommand {
+        CancelOrder,
+        CancelAll,
+        EditOrder,
+    }
+
+    impl StateChangingSpotCommand {
+        fn endpoint(self) -> &'static str {
+            match self {
+                Self::CancelOrder => "/0/private/CancelOrder",
+                Self::CancelAll => "/0/private/CancelAll",
+                Self::EditOrder => "/0/private/EditOrder",
+            }
+        }
+
+        async fn send(
+            self,
+            client: &KrakenSpotRawHttpClient,
+        ) -> anyhow::Result<(), KrakenHttpError> {
+            match self {
+                Self::CancelOrder => {
+                    let params = KrakenSpotCancelOrderParamsBuilder::default()
+                        .txid("V-001".to_string())
+                        .build()
+                        .expect("cancel params should build");
+                    client.cancel_order(&params).await.map(|_| ())
+                }
+                Self::CancelAll => client.cancel_all_orders().await.map(|_| ()),
+                Self::EditOrder => {
+                    let params = KrakenSpotEditOrderParamsBuilder::default()
+                        .pair(Ustr::from("XXBTZUSD"))
+                        .txid("V-001".to_string())
+                        .volume("0.00100000".to_string())
+                        .build()
+                        .expect("edit params should build");
+                    client.edit_order(&params).await.map(|_| ())
+                }
+            }
+        }
+    }
+
+    /// A retryable transport failure as the mock venue presents it.
+    #[derive(Clone, Copy, Debug)]
+    enum RetryableTransportFailure {
+        /// Accepted connections are dropped before any response, failing at the transport layer.
+        DroppedConnection,
+        /// HTTP 429, which the client classifies as a retryable network error.
+        Http429,
+        /// HTTP 500, which the client classifies as a retryable network error.
+        Http500,
+        /// HTTP 200 carrying a rate-limit error array, Kraken's other retryable class.
+        ApiRateLimit,
+    }
+
+    /// Serves `endpoint` with the given failure and counts the requests that reach it.
+    async fn spawn_failing_spot_mock(
+        endpoint: &'static str,
+        failure: RetryableTransportFailure,
+    ) -> (String, Arc<AtomicUsize>) {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        match failure {
+            RetryableTransportFailure::DroppedConnection => {
+                let handler_count = request_count.clone();
+
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok((socket, _)) => {
+                                handler_count.fetch_add(1, Ordering::Relaxed);
+                                drop(socket);
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                });
+            }
+            RetryableTransportFailure::ApiRateLimit => {
+                let handler_count = request_count.clone();
+                let router = Router::new().route(
+                    endpoint,
+                    post(move || {
+                        let handler_count = handler_count.clone();
+
+                        async move {
+                            use axum::response::IntoResponse;
+
+                            handler_count.fetch_add(1, Ordering::Relaxed);
+
+                            (
+                                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                                r#"{"error":["EAPI:Rate limit exceeded"],"result":null}"#,
+                            )
+                                .into_response()
+                        }
+                    }),
+                );
+
+                tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                });
+            }
+            RetryableTransportFailure::Http429 | RetryableTransportFailure::Http500 => {
+                let status = match failure {
+                    RetryableTransportFailure::Http429 => StatusCode::TOO_MANY_REQUESTS,
+                    RetryableTransportFailure::Http500 => StatusCode::INTERNAL_SERVER_ERROR,
+                    RetryableTransportFailure::DroppedConnection
+                    | RetryableTransportFailure::ApiRateLimit => unreachable!(),
+                };
+
+                let handler_count = request_count.clone();
+                let router = Router::new().route(
+                    endpoint,
+                    post(move || {
+                        let handler_count = handler_count.clone();
+                        async move {
+                            handler_count.fetch_add(1, Ordering::Relaxed);
+                            status
+                        }
+                    }),
+                );
+
+                tokio::spawn(async move {
+                    axum::serve(listener, router).await.unwrap();
+                });
+            }
+        }
+
+        (format!("http://{addr}"), request_count)
+    }
+
+    /// Builds a client with retries enabled (three retries, millisecond backoff) so send-once
+    /// behavior comes from the command's transport, not from the retry configuration.
+    fn retry_enabled_spot_client(base_url: String) -> KrakenSpotRawHttpClient {
+        KrakenSpotRawHttpClient::with_credentials(
+            "test".to_string(),
+            "c2VjcmV0".to_string(),
+            KrakenEnvironment::Live,
+            Some(base_url),
+            10,
+            Some(3),
+            Some(1),
+            Some(2),
+            None,
+            100,
+        )
+        .unwrap()
+    }
+
+    /// A spot command that can change venue state reaches the venue exactly once on a retryable
+    /// failure: a retransmitted cancel or edit may act on venue state twice.
+    #[rstest]
+    #[case::cancel_order_dropped_connection(
+        StateChangingSpotCommand::CancelOrder,
+        RetryableTransportFailure::DroppedConnection
+    )]
+    #[case::cancel_order_http_429(
+        StateChangingSpotCommand::CancelOrder,
+        RetryableTransportFailure::Http429
+    )]
+    #[case::cancel_order_http_500(
+        StateChangingSpotCommand::CancelOrder,
+        RetryableTransportFailure::Http500
+    )]
+    #[case::cancel_order_api_rate_limit(
+        StateChangingSpotCommand::CancelOrder,
+        RetryableTransportFailure::ApiRateLimit
+    )]
+    #[case::cancel_all_dropped_connection(
+        StateChangingSpotCommand::CancelAll,
+        RetryableTransportFailure::DroppedConnection
+    )]
+    #[case::cancel_all_http_429(
+        StateChangingSpotCommand::CancelAll,
+        RetryableTransportFailure::Http429
+    )]
+    #[case::cancel_all_http_500(
+        StateChangingSpotCommand::CancelAll,
+        RetryableTransportFailure::Http500
+    )]
+    #[case::cancel_all_api_rate_limit(
+        StateChangingSpotCommand::CancelAll,
+        RetryableTransportFailure::ApiRateLimit
+    )]
+    #[case::edit_order_dropped_connection(
+        StateChangingSpotCommand::EditOrder,
+        RetryableTransportFailure::DroppedConnection
+    )]
+    #[case::edit_order_http_429(
+        StateChangingSpotCommand::EditOrder,
+        RetryableTransportFailure::Http429
+    )]
+    #[case::edit_order_http_500(
+        StateChangingSpotCommand::EditOrder,
+        RetryableTransportFailure::Http500
+    )]
+    #[case::edit_order_api_rate_limit(
+        StateChangingSpotCommand::EditOrder,
+        RetryableTransportFailure::ApiRateLimit
+    )]
+    #[tokio::test]
+    async fn test_state_changing_spot_command_sends_once_on_retryable_failure(
+        #[case] command: StateChangingSpotCommand,
+        #[case] failure: RetryableTransportFailure,
+    ) {
+        let (base_url, request_count) = spawn_failing_spot_mock(command.endpoint(), failure).await;
+        let client = retry_enabled_spot_client(base_url);
+
+        let result = command.send(&client).await;
+
+        // The failing attempt must be retryable-class, so the single request count below
+        // proves the command's transport is send-once rather than the failure being final.
+        assert!(
+            result.as_ref().is_err_and(kraken_http_should_retry),
+            "{command:?} on {failure:?} must fail retryably, received {result:?}"
+        );
+        assert_eq!(
+            request_count.load(Ordering::Relaxed),
+            1,
+            "{command:?} on {failure:?} must reach the venue exactly once"
+        );
+    }
+
+    /// Reads keep the retrying transport: a transient HTTP 500 is retried and then succeeds.
+    #[tokio::test]
+    async fn test_spot_read_request_still_retries_transient_failure() {
+        use axum::{
+            Router,
+            http::{StatusCode, header},
+            routing::any,
+        };
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let handler_count = request_count.clone();
+        let body = include_str!("../../../test_data/http_server_time.json").to_string();
+
+        let router = Router::new().route(
+            "/0/public/Time",
+            any(move || {
+                let handler_count = handler_count.clone();
+                let body = body.clone();
+                async move {
+                    use axum::response::IntoResponse;
+
+                    if handler_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                    } else {
+                        ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+                    }
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = retry_enabled_spot_client(format!("http://{addr}"));
+
+        let server_time = client.get_server_time().await.unwrap();
+
+        assert_eq!(request_count.load(Ordering::Relaxed), 2);
+        assert_eq!(server_time.unixtime, 1_762_820_224);
+        assert_eq!(server_time.rfc1123, "Tue, 11 Nov 25 00:17:04 +0000");
+    }
+
     fn cache_test_spot_instrument(client: &KrakenSpotHttpClient) -> InstrumentId {
         let instrument_id = InstrumentId::from("XBT/USD.KRAKEN");
 
@@ -4170,6 +4766,85 @@ mod tests {
         assert!(
             err.to_string().contains("Leverage tiers not loaded"),
             "expected cache-miss rejection: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case::venue_id(None, Some(VenueOrderId::from("V-ORDER-001")))]
+    #[case::client_id(Some(ClientOrderId::new("C-ORDER-001")), None)]
+    #[tokio::test]
+    async fn test_modify_order_returns_supplied_venue_id(
+        #[case] client_order_id: Option<ClientOrderId>,
+        #[case] venue_order_id: Option<VenueOrderId>,
+    ) {
+        let app = Router::new().route(
+            "/0/private/AmendOrder",
+            post(|| async {
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    include_str!("../../../test_data/http_amend_order_spot.json"),
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = KrakenSpotHttpClient::with_credentials(
+            "test".to_string(),
+            "c2VjcmV0".to_string(),
+            KrakenEnvironment::Live,
+            Some(format!("http://{addr}")),
+            10,
+            None,
+            None,
+            None,
+            None,
+            10,
+        )
+        .unwrap();
+        let instrument_id = cache_test_spot_instrument(&client);
+
+        let result = client
+            .modify_order(
+                instrument_id,
+                client_order_id,
+                venue_order_id,
+                Some(Quantity::from("0.02")),
+                Some(Price::from("51000.0")),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, venue_order_id);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_modify_order_without_ids_fails() {
+        let client = KrakenSpotHttpClient::default();
+        let instrument_id = cache_test_spot_instrument(&client);
+
+        let err = client
+            .modify_order(
+                instrument_id,
+                None,
+                None,
+                Some(Quantity::from("0.02")),
+                Some(Price::from("51000.0")),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Either client_order_id or venue_order_id must be provided"),
+            "expected missing ID rejection: {err}"
         );
     }
 }

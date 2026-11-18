@@ -39,11 +39,11 @@ use nautilus_model::{
         close::InstrumentClose,
     },
     events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted,
-        PositionChanged, PositionClosed, PositionOpened, PositionSnapshot,
+        AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
+        OrderDenied, OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyDenied, OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate,
+        OrderRejected, OrderReleased, OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated,
+        PositionAdjusted, PositionChanged, PositionClosed, PositionOpened, PositionSnapshot,
     },
     python::instruments::pyobject_to_instrument_any,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -329,11 +329,13 @@ impl PyStreamingFeatherWriter {
         try_write!(OrderRejected, "OrderRejected");
         try_write!(OrderPendingCancel, "OrderPendingCancel");
         try_write!(OrderCanceled, "OrderCanceled");
+        try_write!(OrderCancelDenied, "OrderCancelDenied");
         try_write!(OrderCancelRejected, "OrderCancelRejected");
         try_write!(OrderExpired, "OrderExpired");
         try_write!(OrderTriggered, "OrderTriggered");
         try_write!(OrderPendingUpdate, "OrderPendingUpdate");
         try_write!(OrderReleased, "OrderReleased");
+        try_write!(OrderModifyDenied, "OrderModifyDenied");
         try_write!(OrderModifyRejected, "OrderModifyRejected");
         try_write!(OrderUpdated, "OrderUpdated");
         try_write!(OrderFilled, "OrderFilled");
@@ -466,11 +468,14 @@ impl PyStreamingFeatherWriter {
 
 fn run_environment_and_instance_id_from_path(path: &str) -> Option<(Environment, String)> {
     let normalized = normalize_path_separators(path);
-    let parsed_url = url::Url::parse(&normalized).ok();
-
-    let path = parsed_url.as_ref().map_or(normalized.as_str(), |url| {
-        url.path().trim_start_matches('/')
-    });
+    let parsed_url = normalized
+        .split_once("://")
+        .filter(|(scheme, _)| *scheme != "file")
+        .and_then(|_| url::Url::parse(&normalized).ok());
+    let path = parsed_url.as_ref().map_or_else(
+        || normalized.strip_prefix("file://").unwrap_or(&normalized),
+        |url| url.path().trim_start_matches('/'),
+    );
 
     let components: Vec<&str> = path
         .trim_matches('/')
@@ -501,6 +506,18 @@ mod tests {
     #[case(r"\\server\share\live\run-2", Environment::Live, "run-2")]
     #[case("/tmp/catalog/sandbox/run-3", Environment::Sandbox, "run-3")]
     #[case("file:///C:/catalog/backtest/run-1", Environment::Backtest, "run-1")]
+    #[case(r"C:\C# work\backtest\run-1", Environment::Backtest, "run-1")]
+    #[case("file:///C:/C# work/backtest/run-1", Environment::Backtest, "run-1")]
+    #[case("/tmp/a?b/live/run-2", Environment::Live, "run-2")]
+    #[case("file:///tmp/a?b/live/run-2", Environment::Live, "run-2")]
+    #[case(
+        "file:///tmp/a%20b/backtest/run%20id",
+        Environment::Backtest,
+        "run%20id"
+    )]
+    #[case::file_uri_space("file:///tmp/catalog/backtest/run 1", Environment::Backtest, "run 1")]
+    #[case::windows_drive_space(r"C:\catalog\backtest\run 1", Environment::Backtest, "run 1")]
+    #[case("s3://bucket/catalog/sandbox/run-3", Environment::Sandbox, "run-3")]
     fn run_environment_and_instance_id_handles_platform_paths(
         #[case] path: &str,
         #[case] environment: Environment,

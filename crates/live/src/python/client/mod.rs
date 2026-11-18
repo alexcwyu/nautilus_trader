@@ -51,14 +51,14 @@ use nautilus_common::{
     messages::{
         DataEvent, ExecutionEvent, ExecutionReport,
         data::{
-            RequestBars, RequestBookDeltas, RequestBookDepth, RequestBookSnapshot,
-            RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments,
-            RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBars,
-            SubscribeBookDeltas, SubscribeBookDepth, SubscribeCustomData, SubscribeFundingRates,
-            SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
-            SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
-            SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
-            UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData,
+            DataRequestFailed, DataResponseEnvelope, RequestBars, RequestBookDeltas,
+            RequestBookDepth, RequestBookSnapshot, RequestCustomData, RequestFundingRates,
+            RequestInstrument, RequestInstruments, RequestOptionChainReferencePrice, RequestQuotes,
+            RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth,
+            SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData,
             UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
             UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
             UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
@@ -73,7 +73,7 @@ use nautilus_common::{
     python::clock::PyClock,
 };
 use nautilus_core::{
-    Params, UnixNanos,
+    Params, UUID4, UnixNanos,
     python::{params::pydict_to_params, to_pyruntime_err, to_pytype_err},
 };
 use nautilus_model::{
@@ -106,7 +106,10 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use parking_lot::Mutex;
-use pyo3::{prelude::*, types::PyDict};
+use pyo3::{
+    prelude::*,
+    types::{PyCFunction, PyDict, PyTuple},
+};
 use rust_decimal::Decimal;
 
 use self::{
@@ -162,6 +165,7 @@ impl PyClientCache {
             .quote_at_index(&instrument_id, index)
             .copied())
     }
+
     #[pyo3(name = "get")]
     fn py_get(&self, key: &str) -> PyResult<Option<Vec<u8>>> {
         self.read(|cache| {
@@ -467,9 +471,9 @@ impl ClientOutput {
     #[pyo3(name = "instrument")]
     fn py_instrument(&self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
         self.sender()?;
-        self.send(DataEvent::Instrument(pyobject_to_instrument_any(
-            py, instrument,
-        )?))
+        self.send(DataEvent::Data(
+            pyobject_to_instrument_any(py, instrument)?.into(),
+        ))
     }
 
     #[pyo3(name = "data")]
@@ -477,8 +481,14 @@ impl ClientOutput {
         self.sender()?;
         self.send(DataEvent::Data(extract_data(data)?))
     }
-    #[pyo3(name = "response")]
-    fn py_response(&self, response: &Bound<'_, PyAny>) -> PyResult<()> {
+
+    #[pyo3(name = "response", signature = (response, completed=None, sub_correlation_id=None))]
+    fn py_response(
+        &self,
+        response: &Bound<'_, PyAny>,
+        completed: Option<bool>,
+        sub_correlation_id: Option<nautilus_core::UUID4>,
+    ) -> PyResult<()> {
         self.sender()?;
         let (client_id, response) = extract_response(response)?;
         if self.state.lock().client_id != Some(client_id) {
@@ -487,7 +497,35 @@ impl ClientOutput {
             ));
         }
 
-        self.send(DataEvent::Response(response))
+        let envelope =
+            DataResponseEnvelope::new(response, completed.unwrap_or(true), sub_correlation_id);
+        self.send(DataEvent::ResponseEnvelope(envelope))
+    }
+
+    /// Completes a failed data request, preserving an optional partial response.
+    #[pyo3(name = "request_failed", signature = (request_id, reason, response=None))]
+    fn py_request_failed(
+        &self,
+        request_id: nautilus_core::UUID4,
+        reason: String,
+        response: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        self.sender()?;
+        let response = response.map(extract_response).transpose()?;
+        if let Some((client_id, response)) = &response
+            && (self.state.lock().client_id != Some(*client_id)
+                || response.correlation_id() != &request_id)
+        {
+            return Err(to_pytype_err(
+                "Partial response identity does not match the failed request",
+            ));
+        }
+
+        self.send(DataEvent::RequestFailed(DataRequestFailed {
+            request_id,
+            reason,
+            response: response.map(|(_, response)| response),
+        }))
     }
 
     #[pyo3(name = "event")]
@@ -509,7 +547,6 @@ impl ClientOutput {
 
         let report = if report.is_instance_of::<OrderStatusReport>() {
             let order = Box::new(report.extract()?);
-
             match fills {
                 Some(fills) => ExecutionReport::OrderWithFills(order, fills),
                 None => ExecutionReport::Order(order),
@@ -651,7 +688,33 @@ impl ClientOutput {
         self.send_exec(ExecutionEvent::Order(event))
     }
 
-    #[pyo3(name = "order_modify_rejected", signature = (order, venue_order_id, reason, ts_event, ts_init))]
+    #[pyo3(name = "order_modify_denied", signature = (order, reason, ts_event, ts_init, causation_id=None))]
+    fn py_order_modify_denied(
+        &self,
+        py: Python<'_>,
+        order: Py<PyAny>,
+        reason: &str,
+        ts_event: u64,
+        ts_init: u64,
+        causation_id: Option<UUID4>,
+    ) -> PyResult<()> {
+        let factory = self.event_factory()?;
+        let order = pyobject_to_order_any(py, order)?;
+        let event = factory.generate_order_modify_denied(
+            &order,
+            reason,
+            causation_id,
+            ts_event.into(),
+            ts_init.into(),
+        );
+        self.send_exec(ExecutionEvent::Order(event))
+    }
+
+    #[pyo3(name = "order_modify_rejected", signature = (order, venue_order_id, reason, ts_event, ts_init, causation_id=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Python event emission retains its optional command correlation"
+    )]
     fn py_order_modify_rejected(
         &self,
         py: Python<'_>,
@@ -660,6 +723,7 @@ impl ClientOutput {
         reason: &str,
         ts_event: u64,
         ts_init: u64,
+        causation_id: Option<UUID4>,
     ) -> PyResult<()> {
         let factory = self.event_factory()?;
         let order = pyobject_to_order_any(py, order)?;
@@ -669,11 +733,38 @@ impl ClientOutput {
             reason,
             ts_event.into(),
             ts_init.into(),
+            causation_id,
         );
         self.send_exec(ExecutionEvent::Order(event))
     }
 
-    #[pyo3(name = "order_cancel_rejected", signature = (order, venue_order_id, reason, ts_event, ts_init))]
+    #[pyo3(name = "order_cancel_denied", signature = (order, reason, ts_event, ts_init, causation_id=None))]
+    fn py_order_cancel_denied(
+        &self,
+        py: Python<'_>,
+        order: Py<PyAny>,
+        reason: &str,
+        ts_event: u64,
+        ts_init: u64,
+        causation_id: Option<UUID4>,
+    ) -> PyResult<()> {
+        let factory = self.event_factory()?;
+        let order = pyobject_to_order_any(py, order)?;
+        let event = factory.generate_order_cancel_denied(
+            &order,
+            reason,
+            causation_id,
+            ts_event.into(),
+            ts_init.into(),
+        );
+        self.send_exec(ExecutionEvent::Order(event))
+    }
+
+    #[pyo3(name = "order_cancel_rejected", signature = (order, venue_order_id, reason, ts_event, ts_init, causation_id=None))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Python event emission retains its optional command correlation"
+    )]
     fn py_order_cancel_rejected(
         &self,
         py: Python<'_>,
@@ -682,6 +773,7 @@ impl ClientOutput {
         reason: &str,
         ts_event: u64,
         ts_init: u64,
+        causation_id: Option<UUID4>,
     ) -> PyResult<()> {
         let factory = self.event_factory()?;
         let order = pyobject_to_order_any(py, order)?;
@@ -691,6 +783,7 @@ impl ClientOutput {
             reason,
             ts_event.into(),
             ts_init.into(),
+            causation_id,
         );
         self.send_exec(ExecutionEvent::Order(event))
     }
@@ -885,6 +978,7 @@ impl ClientOutput {
         let trader_id = factory.trader_id();
 
         let valid = match &event {
+            ExecutionEvent::Data(_) => true,
             ExecutionEvent::Account(event) => event.account_id == account_id,
             ExecutionEvent::Order(event) => {
                 event.trader_id() == trader_id
@@ -1054,6 +1148,7 @@ impl DataClientFactory for PythonDataFactory {
     fn name(&self) -> &'static str {
         "Python"
     }
+
     fn config_type(&self) -> &'static str {
         "DataClientConfig"
     }
@@ -1086,9 +1181,11 @@ impl ExecutionClientFactory for PythonExecutionFactory {
     fn name(&self) -> &'static str {
         "Python"
     }
+
     fn config_type(&self) -> &'static str {
         "ExecutionClientConfig"
     }
+
     fn create(
         &self,
         trader_id: TraderId,
@@ -1141,7 +1238,6 @@ impl PythonClients {
                 kwargs.set_item("config", &config.0)?;
                 kwargs.set_item("cache", PyClientCache { id: cache_id })?;
                 kwargs.set_item("clock", PyClock::from_rc(clock.clone()))?;
-
                 if let Some(trader_id) = trader_id {
                     kwargs.set_item("trader_id", trader_id)?;
                 }
@@ -1300,21 +1396,27 @@ impl DataClient for PythonClient {
     fn client_id(&self) -> ClientId {
         self.client_id
     }
+
     fn venue(&self) -> Option<Venue> {
         self.venue
     }
+
     fn start(&mut self) -> anyhow::Result<()> {
         self.output.bind().map_err(Into::into)
     }
+
     fn stop(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
     fn reset(&mut self) -> anyhow::Result<()> {
         anyhow::bail!("Python clients are single-use")
     }
+
     fn dispose(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
     fn is_connected(&self) -> bool {
         Python::attach(|py| {
             self.runtime
@@ -1323,15 +1425,19 @@ impl DataClient for PythonClient {
                 .unwrap_or(false)
         })
     }
+
     fn is_disconnected(&self) -> bool {
         !self.is_connected()
     }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         self.lifecycle("connect").await
     }
+
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         self.lifecycle("disconnect").await
     }
+
     fn subscribe(&mut self, command: SubscribeCustomData) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1340,6 +1446,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_instruments(&mut self, command: SubscribeInstruments) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1348,6 +1455,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_instrument(&mut self, command: SubscribeInstrument) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1356,6 +1464,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_book_deltas(&mut self, command: SubscribeBookDeltas) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1364,6 +1473,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_book_depth(&mut self, command: SubscribeBookDepth) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1372,6 +1482,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_quotes(&mut self, command: SubscribeQuotes) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1380,6 +1491,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_trades(&mut self, command: SubscribeTrades) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1388,6 +1500,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_mark_prices(&mut self, command: SubscribeMarkPrices) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1396,6 +1509,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_index_prices(&mut self, command: SubscribeIndexPrices) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1404,6 +1518,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_funding_rates(&mut self, command: SubscribeFundingRates) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1412,6 +1527,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_bars(&mut self, command: SubscribeBars) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1420,6 +1536,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_instrument_status(
         &mut self,
         command: SubscribeInstrumentStatus,
@@ -1431,6 +1548,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_instrument_close(
         &mut self,
         command: SubscribeInstrumentClose,
@@ -1442,6 +1560,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn subscribe_option_greeks(&mut self, command: SubscribeOptionGreeks) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1450,6 +1569,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe(&mut self, command: &UnsubscribeCustomData) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1458,6 +1578,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_instruments(&mut self, command: &UnsubscribeInstruments) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime.call_method1(
@@ -1469,6 +1590,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_instrument(&mut self, command: &UnsubscribeInstrument) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1477,6 +1599,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_book_deltas(&mut self, command: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime.call_method1(
@@ -1488,6 +1611,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_book_depth(&mut self, command: &UnsubscribeBookDepth) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1496,6 +1620,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_quotes(&mut self, command: &UnsubscribeQuotes) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1504,6 +1629,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_trades(&mut self, command: &UnsubscribeTrades) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1512,6 +1638,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_mark_prices(&mut self, command: &UnsubscribeMarkPrices) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime.call_method1(
@@ -1523,6 +1650,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_index_prices(&mut self, command: &UnsubscribeIndexPrices) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime.call_method1(
@@ -1534,6 +1662,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_funding_rates(
         &mut self,
         command: &UnsubscribeFundingRates,
@@ -1548,6 +1677,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_bars(&mut self, command: &UnsubscribeBars) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.runtime
@@ -1556,6 +1686,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_instrument_status(
         &mut self,
         command: &UnsubscribeInstrumentStatus,
@@ -1570,6 +1701,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_instrument_close(
         &mut self,
         command: &UnsubscribeInstrumentClose,
@@ -1584,6 +1716,7 @@ impl DataClient for PythonClient {
 
         Ok(())
     }
+
     fn unsubscribe_option_greeks(
         &mut self,
         command: &UnsubscribeOptionGreeks,
@@ -1600,90 +1733,70 @@ impl DataClient for PythonClient {
     }
 
     fn request_data(&self, request: RequestCustomData) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_data", (PyRequestCustomData { request },)),
-            )
+            let argument = Py::new(py, PyRequestCustomData { request })?.into_any();
+            self.call_request(py, "_request_data", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_instruments", (PyRequestInstruments { request },)),
-            )
+            let argument = Py::new(py, PyRequestInstruments { request })?.into_any();
+            self.call_request(py, "_request_instruments", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_instrument", (PyRequestInstrument { request },)),
-            )
+            let argument = Py::new(py, PyRequestInstrument { request })?.into_any();
+            self.call_request(py, "_request_instrument", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_book_snapshot(&self, request: RequestBookSnapshot) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                (
-                    "_request_book_snapshot",
-                    (PyRequestBookSnapshot { request },),
-                ),
-            )
+            let argument = Py::new(py, PyRequestBookSnapshot { request })?.into_any();
+            self.call_request(py, "_request_book_snapshot", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_quotes(&self, request: RequestQuotes) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_quotes", (PyRequestQuotes { request },)),
-            )
+            let argument = Py::new(py, PyRequestQuotes { request })?.into_any();
+            self.call_request(py, "_request_quotes", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_trades", (PyRequestTrades { request },)),
-            )
+            let argument = Py::new(py, PyRequestTrades { request })?.into_any();
+            self.call_request(py, "_request_trades", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_funding_rates(&self, request: RequestFundingRates) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                (
-                    "_request_funding_rates",
-                    (PyRequestFundingRates { request },),
-                ),
-            )
+            let argument = Py::new(py, PyRequestFundingRates { request })?.into_any();
+            self.call_request(py, "_request_funding_rates", request_id, argument)
         })?;
 
         Ok(())
@@ -1693,14 +1806,14 @@ impl DataClient for PythonClient {
         &self,
         request: RequestOptionChainReferencePrice,
     ) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
+            let argument = Py::new(py, PyRequestOptionChainReferencePrice { request })?.into_any();
+            self.call_request(
                 py,
-                "call",
-                (
-                    "_request_option_chain_reference_price",
-                    (PyRequestOptionChainReferencePrice { request },),
-                ),
+                "_request_option_chain_reference_price",
+                request_id,
+                argument,
             )
         })?;
 
@@ -1708,33 +1821,30 @@ impl DataClient for PythonClient {
     }
 
     fn request_bars(&self, request: RequestBars) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime
-                .call_method1(py, "call", ("_request_bars", (PyRequestBars { request },)))
+            let argument = Py::new(py, PyRequestBars { request })?.into_any();
+            self.call_request(py, "_request_bars", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_book_depth(&self, request: RequestBookDepth) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_book_depth", (PyRequestBookDepth { request },)),
-            )
+            let argument = Py::new(py, PyRequestBookDepth { request })?.into_any();
+            self.call_request(py, "_request_book_depth", request_id, argument)
         })?;
 
         Ok(())
     }
 
     fn request_book_deltas(&self, request: RequestBookDeltas) -> anyhow::Result<()> {
+        let request_id = request.request_id;
         Python::attach(|py| {
-            self.runtime.call_method1(
-                py,
-                "call",
-                ("_request_book_deltas", (PyRequestBookDeltas { request },)),
-            )
+            let argument = Py::new(py, PyRequestBookDeltas { request })?.into_any();
+            self.call_request(py, "_request_book_deltas", request_id, argument)
         })?;
 
         Ok(())
@@ -1791,23 +1901,81 @@ struct PythonExecutionClient {
     cache: CacheView,
 }
 
+impl PythonClient {
+    fn call_request(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        request_id: nautilus_core::UUID4,
+        argument: Py<PyAny>,
+    ) -> PyResult<()> {
+        let task = self
+            .runtime
+            .call_method1(py, "call", (operation, (argument,)))?;
+        let output = self.output.clone();
+
+        let callback = PyCFunction::new_closure(
+            py,
+            None,
+            None,
+            move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| {
+                let task = args.get_item(0)?;
+                let reason = if task.call_method0("cancelled")?.extract::<bool>()? {
+                    Some("Python data request canceled".to_owned())
+                } else {
+                    let exception = task.call_method0("exception")?;
+                    if exception.is_none() {
+                        None
+                    } else {
+                        Some(exception.str()?.to_str()?.to_owned())
+                    }
+                };
+
+                if let Some(reason) = reason {
+                    if output.state.lock().disposed {
+                        return Ok(());
+                    }
+
+                    if let Err(e) = output.send(DataEvent::RequestFailed(DataRequestFailed {
+                        request_id,
+                        reason,
+                        response: None,
+                    })) {
+                        log::error!("Failed to deliver Python data request failure: {e}");
+                    }
+                }
+
+                Ok::<(), PyErr>(())
+            },
+        )?;
+
+        task.call_method1(py, "add_done_callback", (callback,))?;
+        Ok(())
+    }
+}
+
 #[async_trait(?Send)]
 impl ExecutionClient for PythonExecutionClient {
     fn client_id(&self) -> ClientId {
         self.client.client_id
     }
+
     fn account_id(&self) -> AccountId {
         self.identity.account_id
     }
+
     fn venue(&self) -> Venue {
         self.identity.venue
     }
+
     fn oms_type(&self) -> OmsType {
         self.identity.oms_type
     }
+
     fn position_reconciliation_tolerance(&self) -> Decimal {
         self.identity.tolerance
     }
+
     fn handles_order_venue(&self, venue: Venue) -> bool {
         Python::attach(|py| {
             self.client
@@ -1823,6 +1991,7 @@ impl ExecutionClient for PythonExecutionClient {
             false
         })
     }
+
     fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
         Python::attach(|py| {
             self.client
@@ -1838,6 +2007,7 @@ impl ExecutionClient for PythonExecutionClient {
             false
         })
     }
+
     fn calculate_commission(
         &self,
         instrument: &InstrumentAny,
@@ -1859,6 +2029,7 @@ impl ExecutionClient for PythonExecutionClient {
         })
         .map_err(Into::into)
     }
+
     fn register_external_order(
         &self,
         client_order_id: ClientOrderId,
@@ -1889,6 +2060,7 @@ impl ExecutionClient for PythonExecutionClient {
             );
         }
     }
+
     fn on_instrument(&mut self, instrument: InstrumentAny) {
         if let Err(e) = Python::attach(|py| -> PyResult<()> {
             let instrument = instrument_any_to_pyobject(py, instrument)?;
@@ -1903,6 +2075,7 @@ impl ExecutionClient for PythonExecutionClient {
             );
         }
     }
+
     fn get_account(&self) -> Option<AccountAny> {
         match self.cache.try_borrow() {
             Ok(cache) => cache.account_owned(&self.identity.account_id),
@@ -1912,6 +2085,7 @@ impl ExecutionClient for PythonExecutionClient {
             }
         }
     }
+
     fn generate_account_state(
         &self,
         balances: Vec<AccountBalance>,
@@ -1929,27 +2103,35 @@ impl ExecutionClient for PythonExecutionClient {
             .send_exec(ExecutionEvent::Account(event))
             .map_err(Into::into)
     }
+
     fn start(&mut self) -> anyhow::Result<()> {
         self.client.output.bind().map_err(Into::into)
     }
+
     fn stop(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
     fn reset(&mut self) -> anyhow::Result<()> {
         anyhow::bail!("Python clients are single-use")
     }
+
     fn dispose(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+
     fn is_connected(&self) -> bool {
         DataClient::is_connected(&self.client)
     }
+
     async fn connect(&mut self) -> anyhow::Result<()> {
         self.client.lifecycle("connect").await
     }
+
     async fn disconnect(&mut self) -> anyhow::Result<()> {
         self.client.lifecycle("disconnect").await
     }
+
     fn submit_order(&self, command: SubmitOrder) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -1959,6 +2141,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn submit_order_list(&self, command: SubmitOrderList) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -1968,6 +2151,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn modify_order(&self, command: ModifyOrder) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -1977,6 +2161,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn batch_modify_orders(&self, command: BatchModifyOrders) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -1986,6 +2171,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn cancel_order(&self, command: CancelOrder) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -1995,6 +2181,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn cancel_all_orders(&self, command: CancelAllOrders) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -2004,6 +2191,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn batch_cancel_orders(&self, command: BatchCancelOrders) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -2013,6 +2201,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn query_account(&self, command: QueryAccount) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -2022,6 +2211,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     fn query_order(&self, command: QueryOrder) -> anyhow::Result<()> {
         Python::attach(|py| {
             self.client
@@ -2031,6 +2221,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(())
     }
+
     async fn generate_mass_status(
         &self,
         lookback_mins: Option<u64>,
@@ -2069,6 +2260,7 @@ impl ExecutionClient for PythonExecutionClient {
             Ok(report)
         }
     }
+
     async fn generate_order_status_report(
         &self,
         command: &GenerateOrderStatusReport,
@@ -2084,7 +2276,6 @@ impl ExecutionClient for PythonExecutionClient {
         })?;
 
         let result = operation.await?;
-
         let report = Python::attach(|py| -> PyResult<Option<OrderStatusReport>> {
             Ok(result.extract(py)?)
         })?;
@@ -2098,6 +2289,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(report)
     }
+
     async fn generate_order_status_reports(
         &self,
         command: &GenerateOrderStatusReports,
@@ -2123,6 +2315,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(reports)
     }
+
     async fn generate_fill_reports(
         &self,
         command: GenerateFillReports,
@@ -2148,6 +2341,7 @@ impl ExecutionClient for PythonExecutionClient {
 
         Ok(reports)
     }
+
     async fn generate_position_status_reports(
         &self,
         command: &GeneratePositionStatusReports,
@@ -2202,7 +2396,7 @@ fn mass_status_matches(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::{clock::VirtualClock, enums::LogLevel};
+    use nautilus_common::{clock::VirtualClock, enums::LogLevel, messages::data::DataResponse};
     use nautilus_core::python::to_pyvalue_err;
     use nautilus_model::{
         enums::{OrderStatus, OrderType, TimeInForce},
@@ -2220,6 +2414,7 @@ mod tests {
         Python::initialize();
         let output = ClientOutput::py_new();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+
         {
             let mut state = output.state.lock();
             state.exec_sender = Some(sender.into());
@@ -2260,7 +2455,7 @@ class Runtime:
             task.set_result(self.result)
         return task
     def call(self, operation, args):
-        self.calls.append((operation, args))
+        return self.call_awaited(operation, args)
     def _handles_order_venue(self, venue):
         self.calls.append(('venue', venue))
         if self.failure is not None:
@@ -2327,7 +2522,6 @@ class Runtime:
     ) {
         let client = native_execution_client;
         let mut expected = order_report();
-
         if result_kind == "foreign" {
             expected.account_id = AccountId::from("OTHER-001");
         }
@@ -2341,9 +2535,9 @@ class Runtime:
             None,
             Some(nautilus_core::UUID4::new()),
         );
+
         Python::attach(|py| {
             let runtime = client.client.runtime.bind(py);
-
             match result_kind {
                 "valid" | "foreign" => runtime
                     .setattr("result", Py::new(py, expected.clone()).unwrap())
@@ -2400,12 +2594,81 @@ class Runtime:
     }
 
     #[rstest]
+    #[case::success(false, false, false, None)]
+    #[case::failure(true, false, false, Some("History unavailable"))]
+    #[case::canceled(false, true, false, Some("Python data request canceled"))]
+    #[case::disposed(true, false, true, None)]
+    fn test_data_request_task_delivers_terminal_failure(
+        native_execution_client: PythonExecutionClient,
+        #[case] failed: bool,
+        #[case] canceled: bool,
+        #[case] disposed: bool,
+        #[case] expected_reason: Option<&str>,
+    ) {
+        let client = native_execution_client.client;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        client.output.state.lock().sender = Some(sender.into());
+        let request_id = nautilus_core::UUID4::new();
+        Python::attach(|py| {
+            let runtime = client.runtime.bind(py);
+            if failed {
+                runtime
+                    .setattr("failure", to_pyvalue_err("History unavailable").value(py))
+                    .unwrap();
+            }
+
+            runtime.setattr("cancelled", canceled).unwrap();
+
+            let request = RequestQuotes::new(
+                InstrumentId::from("AUD/USD.SIM"),
+                None,
+                None,
+                None,
+                Some(client.client_id),
+                request_id,
+                UnixNanos::from(179),
+                None,
+            );
+
+            client.request_quotes(request).unwrap();
+            if disposed {
+                client.output.invalidate();
+            }
+
+            let event_loop = runtime.getattr("loop").unwrap();
+            let tick = py
+                .import("asyncio")
+                .unwrap()
+                .call_method1("sleep", (0,))
+                .unwrap();
+            event_loop
+                .call_method1("run_until_complete", (tick,))
+                .unwrap();
+        });
+
+        if let Some(reason) = expected_reason {
+            let DataEvent::RequestFailed(failure) = receiver.try_recv().unwrap() else {
+                panic!("expected request failure");
+            };
+
+            assert_eq!(failure.request_id, request_id);
+            assert_eq!(failure.reason, reason);
+            assert!(failure.response.is_none());
+        }
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty
+                | tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
+    #[rstest]
     #[case(false)]
     #[case(true)]
     fn test_output_rebinding_is_rejected(#[case] disposed: bool) {
         Python::initialize();
         let output = ClientOutput::py_new();
-
         if disposed {
             output.invalidate();
         } else {
@@ -2584,6 +2847,102 @@ class Runtime:
     }
 
     #[rstest]
+    #[case("order_modify_denied", "OrderModifyDenied", false)]
+    #[case("order_cancel_denied", "OrderCancelDenied", false)]
+    #[case("order_modify_rejected", "OrderModifyRejected", true)]
+    #[case("order_cancel_rejected", "OrderCancelRejected", true)]
+    fn test_python_command_refusal_emission_preserves_fields(
+        execution_output: (
+            ClientOutput,
+            tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+        ),
+        #[case] method: &str,
+        #[case] event_type: &str,
+        #[case] rejected: bool,
+        #[values(false, true)] with_cause: bool,
+    ) {
+        use nautilus_model::orders::{Order, OrderTestBuilder, stubs::TestOrderEventStubs};
+        let (output, mut receiver) = execution_output;
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(TraderId::from("TESTER-001"))
+            .strategy_id(StrategyId::from("S-PY-019"))
+            .client_order_id(ClientOrderId::from("O-PY-023"))
+            .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+            .quantity(Quantity::from(17))
+            .price(Price::from("0.71231"))
+            .build();
+        let account = AccountId::from("SIM-001");
+        let cached_venue = VenueOrderId::from("V-CACHED-029");
+        let explicit_venue = VenueOrderId::from("V-OVERRIDE-031");
+        order
+            .apply(TestOrderEventStubs::accepted(&order, account, cached_venue))
+            .unwrap();
+        let cause = UUID4::new();
+        let reason = "refusal for Python caller";
+
+        let output = Python::attach(|py| {
+            let py_order = order_any_to_pyobject(py, order.clone()).unwrap();
+            let output = Py::new(py, output).unwrap();
+
+            let result = if rejected {
+                if with_cause {
+                    output.call_method1(
+                        py,
+                        method,
+                        (py_order, explicit_venue, reason, 73u64, 79u64, cause),
+                    )
+                } else {
+                    output.call_method1(
+                        py,
+                        method,
+                        (py_order, explicit_venue, reason, 73u64, 79u64),
+                    )
+                }
+            } else if with_cause {
+                output.call_method1(py, method, (py_order, reason, 73u64, 79u64, cause))
+            } else {
+                output.call_method1(py, method, (py_order, reason, 73u64, 79u64))
+            };
+
+            assert!(result.unwrap().is_none(py));
+            output
+        });
+
+        let ExecutionEvent::Order(event) = receiver.try_recv().unwrap() else {
+            panic!("expected command refusal");
+        };
+
+        let value = serde_json::to_value(&event).unwrap();
+        let value = value
+            .get(event_type.strip_prefix("Order").unwrap())
+            .unwrap()
+            .clone();
+        let event_id = value.get("event_id").unwrap().as_str().unwrap();
+        assert_ne!(UUID4::from(event_id), order.init_event().event_id);
+        let mut expected = serde_json::json!({
+            "type":event_type, "trader_id":order.trader_id(), "strategy_id":order.strategy_id(),
+            "instrument_id":order.instrument_id(), "client_order_id":order.client_order_id(),
+            "reason":reason, "event_id":event_id, "ts_event":UnixNanos::from(73), "ts_init":UnixNanos::from(79),
+            "venue_order_id": if rejected { explicit_venue } else { cached_venue }, "account_id":account,
+        });
+
+        if rejected {
+            expected["reconciliation"] = serde_json::json!(false);
+        }
+
+        if with_cause {
+            expected["causation_id"] = serde_json::json!(cause);
+        }
+
+        assert_eq!(value, expected);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(output);
+    }
+
+    #[rstest]
     fn test_closed_execution_channel_reports_failure(
         execution_output: (
             ClientOutput,
@@ -2627,6 +2986,7 @@ class Runtime:
             "RuntimeError: Client cache is disposed or accessed from a foreign thread"
         );
     }
+
     #[rstest]
     #[case(None)]
     #[case(Some(Price::from("123.456")))]
@@ -2652,6 +3012,7 @@ class Runtime:
             199.into(),
             None,
         );
+
         client
             .request_option_chain_reference_price(request.clone())
             .unwrap();
@@ -2688,6 +3049,7 @@ class Runtime:
 
             let output = ClientOutput::py_new();
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
             {
                 let mut state = output.state.lock();
                 state.sender = Some(sender.into());
@@ -2704,10 +3066,16 @@ class Runtime:
                     211_u64,
                 ))
                 .unwrap();
-            output.py_response(&response).unwrap();
+            output.py_response(&response, None, None).unwrap();
 
-            let DataEvent::Response(DataResponse::OptionChainReferencePrice(response)) =
-                receiver.try_recv().unwrap()
+            let DataEvent::ResponseEnvelope(envelope) = receiver.try_recv().unwrap() else {
+                panic!("Expected completed response");
+            };
+
+            assert!(envelope.completed());
+            assert_eq!(envelope.failure_reason(), None);
+
+            let Some(DataResponse::OptionChainReferencePrice(response)) = envelope.response()
             else {
                 panic!("Expected option reference response");
             };
@@ -2729,7 +3097,10 @@ class Runtime:
                 ))
                 .unwrap();
             assert_eq!(
-                output.py_response(&foreign).unwrap_err().to_string(),
+                output
+                    .py_response(&foreign, None, None)
+                    .unwrap_err()
+                    .to_string(),
                 "TypeError: Response client identity does not match its owner"
             );
             assert!(matches!(
@@ -2737,6 +3108,140 @@ class Runtime:
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ));
         });
+    }
+
+    #[rstest]
+    #[case::intermediate(Some(false), false, false)]
+    #[case::completed(Some(true), false, false)]
+    #[case::provenance(None, true, false)]
+    #[case::partial_failure(None, false, true)]
+    fn test_data_output_preserves_completion_and_partial_payload(
+        #[case] completed: Option<bool>,
+        #[case] provenance: bool,
+        #[case] failed: bool,
+    ) {
+        use crate::python::client::responses::PyQuotesResponse;
+        Python::initialize();
+        let output = ClientOutput::py_new();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let client_id = ClientId::from("HISTORY");
+        let root = nautilus_core::UUID4::new();
+        let source = provenance.then(nautilus_core::UUID4::new);
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+
+        let quote = QuoteTick::new(
+            instrument_id,
+            Price::from("1.00000"),
+            Price::from("1.00010"),
+            Quantity::from("13"),
+            Quantity::from("17"),
+            UnixNanos::from(19),
+            UnixNanos::from(23),
+        );
+
+        {
+            let mut state = output.state.lock();
+            state.sender = Some(sender.into());
+            state.client_id = Some(client_id);
+        }
+
+        Python::attach(|py| {
+            let response = py
+                .get_type::<PyQuotesResponse>()
+                .call1((client_id, instrument_id, vec![quote], root, 227_u64))
+                .unwrap();
+
+            if failed {
+                output
+                    .py_request_failed(root, "Missing sibling".to_owned(), Some(&response))
+                    .unwrap();
+            } else {
+                output.py_response(&response, completed, source).unwrap();
+            }
+        });
+
+        let event = receiver.try_recv().unwrap();
+        let response = match event {
+            DataEvent::ResponseEnvelope(envelope) => {
+                assert_eq!(envelope.correlation_id(), &root);
+                assert_eq!(envelope.completed(), completed.unwrap_or(true));
+                assert_eq!(envelope.sub_correlation_id(), source);
+                assert_eq!(envelope.failure_reason(), None);
+                envelope.response().unwrap().clone()
+            }
+            DataEvent::RequestFailed(failure) if failed => {
+                assert_eq!(failure.request_id, root);
+                assert_eq!(failure.reason, "Missing sibling");
+                failure.response.unwrap()
+            }
+            _ => panic!("expected envelope or partial failure"),
+        };
+
+        let DataResponse::Quotes(response) = response else {
+            panic!("expected quotes");
+        };
+
+        assert_eq!(response.correlation_id, root);
+        assert_eq!(response.client_id, client_id);
+        assert_eq!(response.instrument_ids, vec![instrument_id]);
+        assert_eq!(response.data.as_ref(), &vec![quote]);
+        assert_eq!(response.start, None);
+        assert_eq!(response.end, None);
+        assert_eq!(response.ts_init, UnixNanos::from(227));
+        assert_eq!(response.params, None);
+        assert_eq!(
+            receiver.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty
+        );
+    }
+
+    #[rstest]
+    #[case::foreign_client(true)]
+    #[case::foreign_request(false)]
+    fn test_data_output_rejects_foreign_partial_response(#[case] foreign_client: bool) {
+        use crate::python::client::responses::PyQuotesResponse;
+        Python::initialize();
+        let output = ClientOutput::py_new();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let root = nautilus_core::UUID4::new();
+
+        {
+            let mut state = output.state.lock();
+            state.sender = Some(sender.into());
+            state.client_id = Some(ClientId::from("HISTORY"));
+        }
+
+        Python::attach(|py| {
+            let client_id = ClientId::from(if foreign_client { "OTHER" } else { "HISTORY" });
+            let correlation_id = if foreign_client {
+                root
+            } else {
+                nautilus_core::UUID4::new()
+            };
+
+            let response = py
+                .get_type::<PyQuotesResponse>()
+                .call1((
+                    client_id,
+                    InstrumentId::from("AUD/USD.SIM"),
+                    Vec::<QuoteTick>::new(),
+                    correlation_id,
+                    229_u64,
+                ))
+                .unwrap();
+            assert_eq!(
+                output
+                    .py_request_failed(root, "History failed".to_owned(), Some(&response))
+                    .unwrap_err()
+                    .to_string(),
+                "TypeError: Partial response identity does not match the failed request"
+            );
+        });
+
+        assert_eq!(
+            receiver.try_recv().unwrap_err(),
+            tokio::sync::mpsc::error::TryRecvError::Empty
+        );
     }
 
     #[rstest]
@@ -2844,7 +3349,6 @@ class Runtime:
         let client = native_execution_client;
         Python::attach(|py| {
             let runtime = client.client.runtime.bind(py);
-
             match mode {
                 "true" => runtime.setattr("result", true).unwrap(),
                 "false" => runtime.setattr("result", false).unwrap(),
@@ -2903,7 +3407,6 @@ class Runtime:
         let commission = Money::from("0.17 USD");
         Python::attach(|py| {
             let runtime = client.client.runtime.bind(py);
-
             if mode == "money" {
                 runtime.setattr("result", commission).unwrap();
             } else if mode == "exception" {
@@ -2978,8 +3481,7 @@ class Runtime:
                 command.correlation_id = Some(nautilus_core::UUID4::new());
                 command.causation_id = Some(nautilus_core::UUID4::new());
                 command.log_receipt_level = LogLevel::Debug;
-                let mut params = Params::default();
-                params.insert("probe".to_owned(), serde_json::Value::from(17));
+                let params = Params::new([("probe".to_owned(), serde_json::Value::from(17))].into());
                 command.params = Some(params);
                 let first = $report;
                 let mut second = first.clone();
@@ -3062,6 +3564,7 @@ class Runtime:
             Some(InstrumentId::from("AUD/USD.SIM")), Some(229.into()), Some(239.into()), None, None),
         position_report()
     );
+
     #[rstest]
     #[case("order")]
     #[case("fill")]
@@ -3079,6 +3582,7 @@ class Runtime:
         #[case] kind: &str,
     ) {
         let (output, mut receiver) = execution_output;
+
         {
             let mut state = output.state.lock();
             state.client_id = Some(ClientId::from("SIM"));
@@ -3092,6 +3596,7 @@ class Runtime:
             257.into(),
             None,
         );
+
         mass.add_order_reports(vec![order_report.clone()]);
         mass.add_fill_reports(vec![fill_report.clone()]);
         mass.add_position_reports(vec![position_report.clone()]);
@@ -3189,6 +3694,7 @@ class Runtime:
             Some(Decimal::new(71231, 5)),
         )
     }
+
     #[rstest]
     #[case("none")]
     #[case("valid")]
@@ -3209,7 +3715,6 @@ class Runtime:
     ) {
         let client = native_execution_client;
         let account = AccountId::from("OTHER-001");
-
         if kind == "order" {
             order_report.account_id = account;
         }
@@ -3281,6 +3786,7 @@ class Runtime:
             );
         });
     }
+
     #[rstest]
     fn test_cache_bytes_and_order_lists_are_owned_snapshots() {
         Python::initialize();
@@ -3301,6 +3807,7 @@ class Runtime:
             ],
             UnixNanos::from(173),
         );
+
         cache
             .borrow_mut()
             .add("probe", vec![0, 17, 255].into())
@@ -3324,6 +3831,7 @@ class Runtime:
         );
         CLIENT_CACHES.with_borrow_mut(|caches| caches.remove(&id));
     }
+
     #[rstest]
     fn test_factory_metadata() {
         Python::initialize();
@@ -3364,6 +3872,7 @@ class Runtime:
                 correlation_id,
                 None,
             );
+
             let command_py = Py::new(py, command).unwrap();
             assert_eq!(
                 command_py

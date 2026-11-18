@@ -19,6 +19,7 @@ Test cache behavior.
 import pytest
 
 from nautilus_trader.common import Cache
+from nautilus_trader.common import CacheConfig
 from nautilus_trader.common import FifoCache
 from nautilus_trader.core import UUID4
 from nautilus_trader.model import AccountId
@@ -26,6 +27,8 @@ from nautilus_trader.model import AggregationSource
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import Currency
+from nautilus_trader.model import CustomData
+from nautilus_trader.model import DataType
 from nautilus_trader.model import ExecAlgorithmId
 from nautilus_trader.model import LiquiditySide
 from nautilus_trader.model import Money
@@ -44,6 +47,7 @@ from nautilus_trader.model import TradeId
 from nautilus_trader.model import TraderId
 from nautilus_trader.model import Venue
 from nautilus_trader.model import VenueOrderId
+from nautilus_trader.model import YieldCurve
 from tests.providers import TestInstrumentProvider
 
 
@@ -244,6 +248,32 @@ def test_cache_constructor_accepts_default_config() -> None:
     assert isinstance(Cache(), Cache)
 
 
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [
+        ("purge_order", (CLIENT_ORDER_ID,)),
+        ("purge_position", (POSITION_ID,)),
+        ("purge_closed_orders", (0, 0)),
+        ("purge_closed_positions", (0, 0)),
+        ("purge_account_events", (0, 0)),
+    ],
+)
+def test_cache_database_purge_option_without_backing(
+    method_name: str,
+    args: tuple[object, ...],
+) -> None:
+    """
+    Test purge options without a backing database.
+    """
+    cache = Cache()
+
+    result = getattr(cache, method_name)(*args, purge_from_database=True)
+
+    assert result is None
+    assert cache.orders_total_count() == 0
+    assert cache.positions_total_count() == 0
+
+
 @pytest.mark.parametrize(("method_name", "args"), CACHE_NONE_CASES)
 def test_cache_empty_methods_return_none(method_name: str, args: tuple[object, ...]) -> None:
     """
@@ -333,6 +363,7 @@ def _make_position(position_id: str = "P-SNAP-1", account_id: str = "SIM-000") -
         position_id=PositionId(position_id),
         commission=Money.from_str("2.00 USD"),
     )
+
     return Position(instrument=AUDUSD_SIM, fill=fill)
 
 
@@ -392,3 +423,33 @@ def test_cache_position_snapshots_account_filter() -> None:
 
     missing = cache.position_snapshots(None, AccountId("MISSING-000"))
     assert missing == []
+
+
+def test_custom_data_history_uses_data_capacity_and_insertion_order() -> None:
+    """
+    Retain the last two insertions through the Python cache bindings.
+    """
+    cache = Cache(CacheConfig(data_capacity=2))
+    data_type = DataType("YieldCurve", {"curve_name": "USD"})
+    data = [
+        CustomData(data_type, YieldCurve("USD", [0.0], [rate], ts, ts))
+        for rate, ts in [(0.03, 30), (0.01, 10), (0.02, 20)]
+    ]
+    assert cache.custom_data(data_type) is None
+    assert cache.custom_data_at_index(data_type, 0) is None
+    assert cache.custom_data_history(data_type) == []
+    for item in data:
+        cache.add_custom_data(item)
+
+    assert cache.custom_data(data_type) == data[2]
+    assert cache.custom_data_at_index(data_type, 0) == data[2]
+    assert cache.custom_data_at_index(data_type, 1) == data[1]
+    assert cache.custom_data_at_index(data_type, 2) is None
+    assert cache.custom_data_history(data_type) == [data[2], data[1]]
+    with pytest.raises(OverflowError):
+        cache.custom_data_at_index(data_type, -1)
+
+    cache.reset()
+
+    assert cache.custom_data(data_type) is None
+    assert cache.custom_data_history(data_type) == []

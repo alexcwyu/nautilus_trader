@@ -22,17 +22,23 @@ to guarantee correctness of matching, fills, and liquidations.
 Trading is non-custodial: users hold their assets in Lighter's smart contracts
 and authorize trades with their own keys.
 
+The official Lighter API reference can be found at <https://docs.lighter.xyz/api>.
+
 ## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
-engine for multi-asset, multi-venue trading systems.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native trading engine
+with a deterministic, event-driven architecture for multi-asset, multi-venue systems.
 
-The system spans research, deterministic simulation, and live execution within a single
-event-driven architecture, providing research-to-live semantic parity.
+The system spans research, simulation, and live execution, providing research-to-live semantic parity.
+
+## Configuration
+
+See the [integration guide](../../../docs/integrations/lighter.md) for client settings,
+credentials, and connection setup.
 
 ## Feature flags
 
-This crate provides feature flags to control source code inclusion during compilation:
+Feature flags control code inclusion for Rust builds and Python bindings:
 
 - `examples`: Enables the crate's example binaries.
 - `extension-module`: Builds as a Python extension module.
@@ -48,34 +54,12 @@ trait surface.
 
 ## Integrator attribution
 
-On Lighter Mainnet, submitted create and modify order transactions from Plus and Premium accounts
-carry the NautilusTrader integrator account index in Lighter's `L2TxAttributes`. This helps us gauge
-real usage of the integration and prioritize ongoing maintenance. Maker and taker integrator fees
-are set to zero, so attribution adds no trading cost. All other account tiers, sessions without an
-account snapshot, Lighter Testnet, and both Robinhood environments leave `L2TxAttributes` empty.
+On Lighter and Robinhood mainnets, the execution client adds NautilusTrader's integrator account index
+to create and modify transactions with zero integrator fees. At startup it attempts to approve the
+integrator and apply the `NAUTILUS` referral code. Both testnets omit attribution.
 
-Lighter requires an `ApproveIntegrator` approval before these attributes can be attached to orders.
-During startup, the Lighter Mainnet execution client submits the required **zero-fee** approval for
-a configured Plus or Premium L2 account. Other Lighter account tiers, sessions without an account
-snapshot, Lighter Testnet, and Robinhood clients do not submit an approval.
-
-Robinhood Mainnet uses separate account-level referral attribution. During startup, the
-execution client applies the `NAUTILUS` code to the account's public L1 address. Selecting the
-Robinhood Mainnet opts the account into this attribution. Application failures log a
-warning and do not block trading. Robinhood Testnet does not apply a referral.
-
-See the [Lighter integration guide](https://nautilustrader.io/docs/nightly/integrations/lighter/#integrator-attribution)
-for full attribution and revocation details.
-
-### Maker-only API keys
-
-On Lighter Mainnet, Lighter restricts maker-only API keys to the 0ms speed-bump lane (PostOnly
-orders, modifies on ALO orders, and cancels), so they cannot submit `ApproveIntegrator` themselves.
-The execution client detects maker-only keys at startup via `getMakerOnlyApiKeys` and skips the
-approval with a WARN log. Approval is account-scoped: a single `ApproveIntegrator` from any
-non-maker-only key on the same account permanently unlocks orders for every key on that account,
-including maker-only ones. Lighter Testnet and both Robinhood environments do not query
-`getMakerOnlyApiKeys` for integrator approval.
+See [attribution details](../../../docs/integrations/lighter.md#integrator-attribution)
+for approval, maker-only keys, and revocation.
 
 ## L2 transaction signer
 
@@ -85,9 +69,8 @@ gated by independent layers:
 
 - **Vector parity** with the upstream Go reference (`elliottech/poseidon_crypto`)
   for every algebra layer.
-- **Compiled-signer oracle parity** with the signer distributed by the official
-  `lighter-python` SDK, covering end-to-end outputs for the four supported tx
-  kinds.
+- **Compiled-signer oracle parity** with `lighter-go` v1.0.12, covering end-to-end outputs for
+  create, cancel, modify, cancel-all, leverage, integrator approval, and grouped orders.
 - **Differential parity** with Thomas Pornin's MIT-licensed Rust reference
   (`pornin/ecgfp5`), kept in the publish=false fuzz crate so the crates.io
   package graph has no git dependencies. The fuzz targets assert every public
@@ -114,7 +97,10 @@ root with `make install-tools` and `rustup toolchain install nightly`.
 
 ## Documentation
 
-See [the docs](https://docs.rs/nautilus-lighter) for more detailed usage.
+- [Rust API reference](https://docs.rs/nautilus-lighter)
+- [Integration guide](../../../docs/integrations/lighter.md)
+- [Rust examples](examples/)
+- [Python examples](../../../examples/live/lighter/)
 
 ## License
 

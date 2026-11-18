@@ -37,16 +37,19 @@ const UNRESERVED: [bool; 256] = {
         table[i as usize] = true;
         i += 1;
     }
+
     i = b'A';
     while i <= b'Z' {
         table[i as usize] = true;
         i += 1;
     }
+
     i = b'a';
     while i <= b'z' {
         table[i as usize] = true;
         i += 1;
     }
+
     table[b'-' as usize] = true;
     table[b'.' as usize] = true;
     table[b'_' as usize] = true;
@@ -62,6 +65,7 @@ const ENCODE_PAIR: [[u8; 2]; 256] = {
         table[i as usize] = [NIBBLE[(i >> 4) as usize], NIBBLE[(i & 0x0f) as usize]];
         i += 1;
     }
+
     table
 };
 
@@ -73,12 +77,14 @@ const DECODE_NIBBLE: [u8; 256] = {
         table[(b'0' + i) as usize] = i;
         i += 1;
     }
+
     i = 0;
     while i < 6 {
         table[(b'a' + i) as usize] = 10 + i;
         table[(b'A' + i) as usize] = 10 + i;
         i += 1;
     }
+
     table
 };
 
@@ -87,11 +93,12 @@ const DECODE_NIBBLE: [u8; 256] = {
 /// Returns the input borrowed when every byte is already in the unreserved
 /// set, otherwise an owned encoded copy.
 ///
-/// # Panics
-///
-/// Never panics in practice: [`encode_bytes`] only emits ASCII bytes
-/// (unreserved characters or `%HH` pairs), so [`String::from_utf8`] always
-/// succeeds.
+/// [`encode_bytes`] only emits ASCII bytes (unreserved characters or `%HH` pairs), so
+/// [`String::from_utf8`] always succeeds.
+#[allow(
+    clippy::missing_panics_doc,
+    reason = "percent-encoded output contains only ASCII bytes"
+)]
 #[must_use]
 pub fn encode(input: &str) -> Cow<'_, str> {
     match encode_bytes(input.as_bytes()) {
@@ -130,6 +137,7 @@ pub fn encode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
             rest = &rest[1..];
         }
     }
+
     Cow::Owned(out)
 }
 
@@ -141,8 +149,7 @@ pub fn encode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError::InvalidUtf8`] if the decoded bytes are not valid
-/// UTF-8.
+/// Returns an error if the decoded bytes are not valid UTF-8.
 pub fn decode(input: &str) -> Result<Cow<'_, str>, DecodeError> {
     match decode_bytes(input.as_bytes()) {
         Cow::Borrowed(_) => Ok(Cow::Borrowed(input)),
@@ -167,27 +174,31 @@ pub fn decode_bytes(input: &[u8]) -> Cow<'_, [u8]> {
 
     let mut i = first;
     while i < input.len() {
-        if input[i] == b'%' {
-            if i + 2 < input.len() {
-                let hi = DECODE_NIBBLE[input[i + 1] as usize];
-                let lo = DECODE_NIBBLE[input[i + 2] as usize];
-                if (hi | lo) & 0xF0 == 0 {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                    continue;
-                }
-            }
-            // Malformed or trailing `%`: pass through literally.
-            out.push(b'%');
-            i += 1;
-        } else {
+        if input[i] != b'%' {
             let run_start = i;
             while i < input.len() && input[i] != b'%' {
                 i += 1;
             }
+
             out.extend_from_slice(&input[run_start..i]);
+            continue;
         }
+
+        if i + 2 < input.len() {
+            let hi = DECODE_NIBBLE[input[i + 1] as usize];
+            let lo = DECODE_NIBBLE[input[i + 2] as usize];
+            if (hi | lo) & 0xF0 == 0 {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+
+        // Malformed or trailing `%`: pass through literally
+        out.push(b'%');
+        i += 1;
     }
+
     Cow::Owned(out)
 }
 
@@ -248,6 +259,7 @@ mod tests {
         let out = encode(RESERVED_CHARS);
         // Each of the 18 chars becomes a 3-byte `%HH` sequence.
         assert_eq!(out.len(), RESERVED_CHARS.len() * 3);
+
         // None of the unreserved chars, `%`, or digits A-F should appear raw
         // in the output except as part of a `%HH` triple.
         for byte in out.bytes() {
@@ -464,6 +476,7 @@ mod tests {
                 out.extend_from_slice(format!("{b:02X}").as_bytes());
             }
         }
+
         out
     }
 
@@ -480,19 +493,23 @@ mod tests {
                     } else {
                         (a | 0x20) - b'a' + 10
                     };
+
                     let lo = if b.is_ascii_digit() {
                         b - b'0'
                     } else {
                         (b | 0x20) - b'a' + 10
                     };
+
                     out.push((hi << 4) | lo);
                     i += 3;
                     continue;
                 }
             }
+
             out.push(input[i]);
             i += 1;
         }
+
         out
     }
 

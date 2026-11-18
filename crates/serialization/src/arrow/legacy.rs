@@ -131,9 +131,9 @@ pub fn schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
 ///
 /// # Errors
 ///
-/// Returns [`LegacyArrowError::UnknownSchema`] when a registered Nautilus type matches neither its
-/// current schema nor a known v1 schema. Returns [`LegacyArrowError::Transcode`] when a known v1
-/// batch contains values that cannot be converted without loss.
+/// Returns an error if a registered Nautilus type matches neither its current schema nor a known v1
+/// schema. Returns an error if a known v1 batch contains values that cannot be converted without
+/// loss.
 pub fn transcode_legacy_record_batch(
     type_name: &str,
     file_path: &str,
@@ -151,9 +151,9 @@ pub fn transcode_legacy_record_batch(
 ///
 /// # Errors
 ///
-/// Returns [`LegacyArrowError::UnknownSchema`] when a registered Nautilus type matches neither its
-/// current schema nor a known v1 schema. Returns [`LegacyArrowError::Transcode`] when a known v1
-/// batch contains values that cannot be converted without loss.
+/// Returns an error if a registered Nautilus type matches neither its current schema nor a known v1
+/// schema. Returns an error if a known v1 batch contains values that cannot be converted without
+/// loss.
 pub fn transcode_legacy_record_batch_with_state(
     type_name: &str,
     file_path: &str,
@@ -189,7 +189,7 @@ pub fn transcode_legacy_record_batch_with_state(
 ///
 /// # Errors
 ///
-/// Returns [`LegacyArrowError::UnknownSchema`] for an unregistered schema of a built-in type.
+/// Returns an error if the schema of a built-in type is unregistered.
 pub fn resolve_legacy_schema(
     type_name: &str,
     file_path: &str,
@@ -722,7 +722,7 @@ pub fn normalized_legacy_data_type(name: &str, data_type: &DataType) -> DataType
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a column has an invalid physical array or value.
+/// Returns an error if a column has an invalid physical array or value.
 pub fn normalize_legacy_fixed_columns(batch: &RecordBatch) -> Result<RecordBatch, ArrowError> {
     let mut changed = false;
     let mut fields = Vec::with_capacity(batch.num_columns());
@@ -871,8 +871,18 @@ pub(super) fn legacy_enum_dictionary_column(
         .as_any()
         .downcast_ref::<UInt8Array>()
         .ok_or_else(|| ArrowError::CastError(format!("Column '{}' is not UInt8", field.name())))?;
+
     let names = (0..values.len())
-        .map(|row| legacy_enum_name(field.name(), values.value(row)))
+        .map(|row| {
+            if values.is_null(row) {
+                return Err(ArrowError::CastError(format!(
+                    "Legacy enum column '{}' is null at row {row}",
+                    field.name()
+                )));
+            }
+
+            legacy_enum_name(field.name(), values.value(row))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Arc::new(enum_dictionary_array(names)?) as ArrayRef)
 }
@@ -1425,13 +1435,61 @@ mod tests {
     use nautilus_model::{
         data::{FundingRateUpdate, InstrumentClose},
         enums::{InstrumentCloseType, MarketStatusAction},
+        types::fixed::{FIXED_PRECISION, FIXED_PRECISION_STANDARD},
     };
     use rstest::rstest;
 
     use super::*;
     use crate::arrow::{
         DecodeFromRecordBatch, DecodeTypedFromRecordBatch, EncodeToRecordBatch, StringColumnRef,
+        decode_decimal_price, decode_decimal_quantity,
     };
+
+    #[rstest]
+    #[case("price", false)]
+    #[case("size", true)]
+    fn legacy_fixed_conversion_preserves_spurious_digits_for_checked_rejection(
+        #[case] field: &'static str,
+        #[case] quantity: bool,
+        #[values(8, 16)] width: i32,
+    ) {
+        let bytes = if width == 8 {
+            1_i64.to_le_bytes().to_vec()
+        } else {
+            STANDARD_TO_DECIMAL_SCALE.to_le_bytes().to_vec()
+        };
+
+        let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            [Some(bytes.as_slice())].into_iter(),
+            width,
+        )
+        .unwrap();
+        let normalized = normalize_legacy_fixed_array(field, &array, width).unwrap();
+        let error = if quantity {
+            decode_decimal_quantity(&normalized, 0, field, 0).unwrap_err()
+        } else {
+            decode_decimal_price(&normalized, 0, field, 0).unwrap_err()
+        };
+
+        let raw = if FIXED_PRECISION == FIXED_PRECISION_STANDARD {
+            1
+        } else {
+            STANDARD_TO_DECIMAL_SCALE
+        };
+
+        let scale = 10_i128.pow(u32::from(FIXED_PRECISION));
+
+        assert_eq!(normalized.value(0), STANDARD_TO_DECIMAL_SCALE);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Error parsing `{field}`: row 0: Invalid fixed-point raw value {raw} for precision 0: \
+             remainder {raw} when divided by scale {scale}. \
+             Raw value should be a multiple of {scale}. \
+             This indicates data corruption or incorrect precision/scaling upstream"
+            )
+        );
+    }
 
     #[rstest]
     #[case("size", true)]
@@ -1512,6 +1570,19 @@ mod tests {
         assert_eq!(
             normalized.column_by_name("ts_init").unwrap().data_type(),
             &timestamp_data_type(),
+        );
+    }
+
+    #[rstest]
+    fn legacy_enum_normalization_rejects_null_with_field_and_row() {
+        let field = Field::new("aggressor_side", DataType::UInt8, true);
+        let values = UInt8Array::from(vec![Some(AggressorSide::Buy as u8), None]);
+
+        let error = legacy_enum_dictionary_column(&field, &values).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Cast error: Legacy enum column 'aggressor_side' is null at row 1"
         );
     }
 

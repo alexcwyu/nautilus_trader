@@ -17,8 +17,12 @@
 
 use std::str::FromStr;
 
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_core::{python::to_pyvalue_err, string::secret::SecretString};
-use nautilus_model::identifiers::InstrumentId;
+use nautilus_model::{
+    identifiers::{InstrumentId, futures::FuturesYearDigits},
+    types::Currency,
+};
 use pyo3::prelude::*;
 
 use crate::{
@@ -50,7 +54,7 @@ fn validate_order_id_client_slot(client_id: i32) -> PyResult<()> {
 impl InteractiveBrokersDataClientConfig {
     /// Creates a new `InteractiveBrokersDataClientConfig` instance.
     #[new]
-    #[pyo3(signature = (host=None, port=None, client_id=None, use_regular_trading_hours=None, market_data_type=None, ignore_quote_tick_size_updates=None, connection_timeout=None, request_timeout=None, handle_revised_bars=None, batch_quotes=None, instrument_provider=None, dockerized_gateway=None, all_last_trades=None, subscription_idle_timeout_secs=None))]
+    #[pyo3(signature = (host=None, port=None, client_id=None, use_regular_trading_hours=None, market_data_type=None, ignore_quote_tick_size_updates=None, connection_timeout=None, request_timeout=None, handle_revised_bars=None, batch_quotes=None, instrument_provider=None, dockerized_gateway=None, all_last_trades=None, subscription_idle_timeout_secs=None, max_reconnect_attempts=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         host: Option<String>,
@@ -67,6 +71,7 @@ impl InteractiveBrokersDataClientConfig {
         dockerized_gateway: Option<&DockerizedIBGatewayConfig>,
         all_last_trades: Option<bool>,
         subscription_idle_timeout_secs: Option<u64>,
+        max_reconnect_attempts: Option<u32>,
     ) -> PyResult<Self> {
         if dockerized_gateway.is_some() {
             return Err(to_pyvalue_err(
@@ -92,6 +97,7 @@ impl InteractiveBrokersDataClientConfig {
             batch_quotes: batch_quotes.unwrap_or(true),
             all_last_trades: all_last_trades.unwrap_or_else(|| Self::default().all_last_trades),
             subscription_idle_timeout_secs,
+            max_reconnect_attempts,
             instrument_provider: instrument_provider.unwrap_or_default(),
         };
 
@@ -171,6 +177,12 @@ impl InteractiveBrokersDataClientConfig {
         self.subscription_idle_timeout_secs
     }
 
+    /// Returns the optional bound on ibapi's automatic reconnect attempts.
+    #[getter]
+    fn max_reconnect_attempts(&self) -> Option<u32> {
+        self.max_reconnect_attempts
+    }
+
     /// Returns the instrument provider configuration.
     #[getter]
     fn instrument_provider(&self) -> InteractiveBrokersInstrumentProviderConfig {
@@ -192,7 +204,7 @@ impl InteractiveBrokersDataClientConfig {
 impl InteractiveBrokersExecutionClientConfig {
     /// Creates a new `InteractiveBrokersExecutionClientConfig` instance.
     #[new]
-    #[pyo3(signature = (host=None, port=None, client_id=None, account_id=None, connection_timeout=None, request_timeout=None, fetch_all_open_orders=None, track_option_exercise_from_position_update=None, instrument_provider=None, dockerized_gateway=None))]
+    #[pyo3(signature = (host=None, port=None, client_id=None, account_id=None, connection_timeout=None, request_timeout=None, fetch_all_open_orders=None, track_option_exercise_from_position_update=None, instrument_provider=None, dockerized_gateway=None, base_currency=None, max_reconnect_attempts=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         host: Option<String>,
@@ -205,6 +217,8 @@ impl InteractiveBrokersExecutionClientConfig {
         track_option_exercise_from_position_update: Option<bool>,
         instrument_provider: Option<InteractiveBrokersInstrumentProviderConfig>,
         dockerized_gateway: Option<&DockerizedIBGatewayConfig>,
+        base_currency: Option<Currency>,
+        max_reconnect_attempts: Option<u32>,
     ) -> PyResult<Self> {
         if dockerized_gateway.is_some() {
             return Err(to_pyvalue_err(
@@ -218,18 +232,23 @@ impl InteractiveBrokersExecutionClientConfig {
         validate_order_id_client_slot(client_id)?;
         let request_timeout = request_timeout.unwrap_or(60);
 
-        Ok(Self {
+        let config = Self {
             host,
             port,
             client_id,
             account_id,
+            base_currency,
             connection_timeout: connection_timeout.unwrap_or(300),
             request_timeout,
             fetch_all_open_orders: fetch_all_open_orders.unwrap_or(false),
             track_option_exercise_from_position_update: track_option_exercise_from_position_update
                 .unwrap_or(false),
+            max_reconnect_attempts,
             instrument_provider: instrument_provider.unwrap_or_default(),
-        })
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     /// Returns the host.
@@ -256,6 +275,12 @@ impl InteractiveBrokersExecutionClientConfig {
         self.account_id.clone()
     }
 
+    /// Returns the account base currency.
+    #[getter]
+    fn base_currency(&self) -> Option<Currency> {
+        self.base_currency
+    }
+
     /// Returns the connection timeout in seconds.
     #[getter]
     fn connection_timeout(&self) -> u64 {
@@ -280,6 +305,12 @@ impl InteractiveBrokersExecutionClientConfig {
         self.track_option_exercise_from_position_update
     }
 
+    /// Returns the optional bound on ibapi's automatic reconnect attempts.
+    #[getter]
+    fn max_reconnect_attempts(&self) -> Option<u32> {
+        self.max_reconnect_attempts
+    }
+
     /// Returns the instrument provider configuration.
     #[getter]
     fn instrument_provider(&self) -> InteractiveBrokersInstrumentProviderConfig {
@@ -301,7 +332,7 @@ impl InteractiveBrokersExecutionClientConfig {
 impl InteractiveBrokersInstrumentProviderConfig {
     /// Creates a new `InteractiveBrokersInstrumentProviderConfig` instance.
     #[new]
-    #[pyo3(signature = (symbology_method=None, load_ids=None, load_contracts=None, min_expiry_days=None, max_expiry_days=None, build_options_chain=None, build_futures_chain=None, cache_validity_days=None, convert_exchange_to_mic_venue=None, symbol_to_mic_venue=None, filter_sec_types=None, filter_callable=None, cache_path=None))]
+    #[pyo3(signature = (symbology_method=None, load_ids=None, load_contracts=None, min_expiry_days=None, max_expiry_days=None, build_options_chain=None, build_futures_chain=None, cache_validity_days=None, convert_exchange_to_mic_venue=None, symbol_to_mic_venue=None, filter_sec_types=None, filter_callable=None, cache_path=None, futures_year_digits=None, share_class_space=None))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         py: Python<'_>,
@@ -318,8 +349,16 @@ impl InteractiveBrokersInstrumentProviderConfig {
         filter_sec_types: Option<std::collections::HashSet<String>>,
         filter_callable: Option<String>,
         cache_path: Option<String>,
+        futures_year_digits: Option<u8>,
+        share_class_space: Option<bool>,
     ) -> PyResult<Self> {
-        Ok(Self {
+        let futures_year_digits = futures_year_digits
+            .map(FuturesYearDigits::try_from)
+            .transpose()
+            .map_err(to_pyvalue_err)?
+            .unwrap_or_default();
+
+        let config = Self {
             symbology_method: symbology_method.unwrap_or_default(),
             load_ids: load_ids.unwrap_or_default(),
             load_contracts: if let Some(c) = load_contracts {
@@ -351,7 +390,23 @@ impl InteractiveBrokersInstrumentProviderConfig {
                 .collect::<PyResult<_>>()?,
             filter_callable,
             cache_path,
-        })
+            futures_year_digits,
+            share_class_space: share_class_space.unwrap_or(true),
+        };
+
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
+    }
+
+    #[getter]
+    fn futures_year_digits(&self) -> u8 {
+        self.futures_year_digits.into()
+    }
+
+    /// Returns whether simplified stock IDs keep IB's share-class space.
+    #[getter]
+    fn share_class_space(&self) -> bool {
+        self.share_class_space
     }
 
     /// Returns the symbology method.
@@ -517,5 +572,91 @@ impl DockerizedIBGatewayConfig {
     #[getter]
     fn vnc_port(&self) -> Option<u16> {
         self.vnc_port
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::{prelude::*, types::PyDict};
+    use rstest::rstest;
+
+    use super::InteractiveBrokersInstrumentProviderConfig;
+
+    #[rstest]
+    #[case(None, 2)]
+    #[case(Some(1), 1)]
+    #[case(Some(2), 2)]
+    fn test_python_futures_year_digits(#[case] configured: Option<u8>, #[case] expected: u8) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            if let Some(digits) = configured {
+                kwargs.set_item("futures_year_digits", digits).unwrap();
+            }
+
+            let config = py
+                .get_type::<InteractiveBrokersInstrumentProviderConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            assert_eq!(
+                config
+                    .getattr("futures_year_digits")
+                    .unwrap()
+                    .extract::<u8>()
+                    .unwrap(),
+                expected
+            );
+        });
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(3)]
+    #[case(4)]
+    #[case(u8::MAX)]
+    fn test_python_rejects_invalid_futures_year_digits(#[case] digits: u8) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("futures_year_digits", digits).unwrap();
+            let error = py
+                .get_type::<InteractiveBrokersInstrumentProviderConfig>()
+                .call((), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyValueError>(py));
+            assert_eq!(
+                error.value(py).to_string(),
+                "`futures_year_digits` must be either 1 or 2"
+            );
+        });
+    }
+
+    #[rstest]
+    #[case(None, true)]
+    #[case(Some(true), true)]
+    #[case(Some(false), false)]
+    fn test_python_share_class_space(#[case] configured: Option<bool>, #[case] expected: bool) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            if let Some(share_class_space) = configured {
+                kwargs
+                    .set_item("share_class_space", share_class_space)
+                    .unwrap();
+            }
+
+            let config = py
+                .get_type::<InteractiveBrokersInstrumentProviderConfig>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            assert_eq!(
+                config
+                    .getattr("share_class_space")
+                    .unwrap()
+                    .extract::<bool>()
+                    .unwrap(),
+                expected
+            );
+        });
     }
 }

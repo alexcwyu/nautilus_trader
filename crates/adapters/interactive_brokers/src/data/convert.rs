@@ -15,21 +15,188 @@
 
 //! Conversion utilities for Interactive Brokers data types.
 
+use std::str::FromStr;
+
 use ibapi::market_data::{
     historical::{
-        BarSize as HistoricalBarSize, BarTimestamp, Duration as IBDuration, ToDuration,
-        WhatToShow as HistoricalWhatToShow,
+        BarSize as HistoricalBarSize, BarTimestamp, Duration as IBDuration, HistoricalDataBuilder,
+        ToDuration, WhatToShow as HistoricalWhatToShow,
     },
     realtime::WhatToShow as RealtimeWhatToShow,
 };
-use jiff::Timestamp;
+use jiff::{RoundMode, SignedDuration, Timestamp, TimestampRound, Unit};
 use nautilus_core::{DurationNanos, UnixNanos};
 use nautilus_model::{
     data::{Bar, BarSpecification, BarType},
-    enums::{BarAggregation, PriceType},
+    enums::{AssetClass, BarAggregation, PriceType},
+    instruments::{Instrument, InstrumentAny},
     types::{Price, Quantity},
 };
+use rust_decimal::{Decimal, RoundingStrategy};
 use time::OffsetDateTime;
+
+use super::cache::is_sentinel_price;
+
+/// Converts the prices IB reports for an instrument into the instrument's prices.
+///
+/// IB reports a magnified contract's prices in a sub-unit of its currency (CBOT grains in cents,
+/// LSE stocks in pence), so these are divided by the contract's price magnifier. IB also reports
+/// an FX pair's prices in steps finer than the pair's price increment, its order tick, so these
+/// are rounded to the increment: a bid down, an ask up, and any other price to the nearest, ties to
+/// the even multiple. A quote then never locks or crosses unless IB's did, and an ask is never
+/// below IB's ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IbPriceConverter {
+    precision: u8,
+    increment: Option<Price>,
+    magnifier: i32,
+}
+
+impl IbPriceConverter {
+    /// Creates a converter that applies the precision only, with no magnifier and no rounding to
+    /// an increment.
+    #[must_use]
+    pub const fn new(precision: u8) -> Self {
+        Self {
+            precision,
+            increment: None,
+            magnifier: 1,
+        }
+    }
+
+    /// Returns the converter with the contract's price magnifier, where a value below 1 means 1.
+    #[must_use]
+    pub const fn with_price_magnifier(mut self, magnifier: i32) -> Self {
+        self.magnifier = if magnifier < 1 { 1 } else { magnifier };
+        self
+    }
+
+    /// Creates the converter for `instrument` and its contract's `price_magnifier`, rounding to
+    /// the price increment for FX pairs.
+    #[must_use]
+    pub fn for_instrument(instrument: &InstrumentAny, price_magnifier: i32) -> Self {
+        let increment = match instrument {
+            InstrumentAny::CurrencyPair(pair) if pair.asset_class() == AssetClass::FX => {
+                Some(pair.price_increment())
+            }
+            _ => None,
+        };
+
+        Self {
+            precision: instrument.price_precision(),
+            increment,
+            magnifier: 1,
+        }
+        .with_price_magnifier(price_magnifier)
+    }
+
+    /// Returns the price precision.
+    #[must_use]
+    pub const fn precision(&self) -> u8 {
+        self.precision
+    }
+
+    /// Returns whether `ib_price` is IB's no-quote value for a side: -1 without a size, which IB
+    /// reports multiplied by the price magnifier for a magnified contract (-100 for a ZC
+    /// option on delayed data).
+    #[must_use]
+    pub fn is_sentinel(&self, ib_price: f64, size: Option<f64>) -> bool {
+        is_sentinel_price(ib_price, size)
+            || is_sentinel_price(ib_price / f64::from(self.magnifier), size)
+    }
+
+    /// Converts a price reported by IB into the instrument's price, rounding to the nearest
+    /// multiple of the price increment, ties to the even multiple.
+    ///
+    /// Use this for a trade, midpoint, last, or index price. A quote's bid and ask use
+    /// [`Self::bid_price`] and [`Self::ask_price`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the price is not finite or cannot be represented at the converter's
+    /// precision.
+    pub fn price(&self, ib_price: f64) -> anyhow::Result<Price> {
+        self.convert(ib_price, RoundingStrategy::MidpointNearestEven)
+    }
+
+    /// Converts a bid price reported by IB, rounding down to a multiple of the price increment.
+    ///
+    /// A published bid is never above IB's bid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the price is not finite or cannot be represented at the converter's
+    /// precision.
+    pub fn bid_price(&self, ib_price: f64) -> anyhow::Result<Price> {
+        self.convert(ib_price, RoundingStrategy::ToNegativeInfinity)
+    }
+
+    /// Converts an ask price reported by IB, rounding up to a multiple of the price increment.
+    ///
+    /// A published ask is never below IB's ask, so a limit order priced at it can fill, and the
+    /// published bid stays below the published ask whenever IB's does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the price is not finite or cannot be represented at the converter's
+    /// precision.
+    pub fn ask_price(&self, ib_price: f64) -> anyhow::Result<Price> {
+        self.convert(ib_price, RoundingStrategy::ToPositiveInfinity)
+    }
+
+    /// Converts a price of a bar of `price_type`: a bid bar rounds down, an ask bar rounds up,
+    /// and any other bar to the nearest multiple of the price increment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the price is not finite or cannot be represented at the converter's
+    /// precision.
+    pub fn bar_price(&self, price_type: PriceType, ib_price: f64) -> anyhow::Result<Price> {
+        match price_type {
+            PriceType::Bid => self.bid_price(ib_price),
+            PriceType::Ask => self.ask_price(ib_price),
+            _ => self.price(ib_price),
+        }
+    }
+
+    /// Converts `ib_price` once, in `Decimal`, so that a midpoint is rounded a single time.
+    ///
+    /// With no increment and no magnifier the price is built as is. Otherwise the shortest
+    /// round-trip decimal form of the `f64` is divided by the magnifier and rounded to the
+    /// increment with `strategy`, or to the precision when there is no increment.
+    fn convert(&self, ib_price: f64, strategy: RoundingStrategy) -> anyhow::Result<Price> {
+        if self.increment.is_none() && self.magnifier == 1 {
+            return Price::new_checked(ib_price, self.precision)
+                .map_err(|e| anyhow::anyhow!("invalid price={ib_price}: {e}"));
+        }
+
+        if !ib_price.is_finite() {
+            anyhow::bail!("invalid price={ib_price}: not finite");
+        }
+
+        let overflow = || anyhow::anyhow!("invalid price={ib_price}: out of range");
+        let value = Decimal::from_str(&ib_price.to_string())
+            .map_err(|e| anyhow::anyhow!("invalid price={ib_price}: {e}"))?
+            .checked_div(Decimal::from(self.magnifier))
+            .ok_or_else(overflow)?;
+
+        let value = match self.increment {
+            Some(increment) if increment.raw() > 0 => {
+                let step = increment.as_decimal();
+                value
+                    .checked_div(step)
+                    .ok_or_else(overflow)?
+                    .round_dp_with_strategy(0, strategy)
+                    .checked_mul(step)
+                    .ok_or_else(overflow)?
+            }
+            _ => value,
+        };
+
+        Price::from_decimal_dp(value, self.precision)
+            .map_err(|e| anyhow::anyhow!("invalid price={ib_price}: {e}"))
+    }
+}
 
 /// Convert Nautilus BarType to IB HistoricalBarSize.
 ///
@@ -141,32 +308,6 @@ pub fn price_type_to_ib_realtime_what_to_show_for_security(
     price_type_to_ib_realtime_what_to_show(price_type)
 }
 
-#[must_use]
-pub fn apply_price_magnifier(price: f64, price_magnifier: i32) -> f64 {
-    if price_magnifier > 0 {
-        price / f64::from(price_magnifier)
-    } else {
-        price
-    }
-}
-
-#[must_use]
-pub fn apply_bar_price_magnifier(
-    ib_bar: &ibapi::market_data::historical::Bar,
-    price_magnifier: i32,
-) -> ibapi::market_data::historical::Bar {
-    ibapi::market_data::historical::Bar {
-        date: ib_bar.date,
-        open: apply_price_magnifier(ib_bar.open, price_magnifier),
-        high: apply_price_magnifier(ib_bar.high, price_magnifier),
-        low: apply_price_magnifier(ib_bar.low, price_magnifier),
-        close: apply_price_magnifier(ib_bar.close, price_magnifier),
-        volume: ib_bar.volume,
-        wap: apply_price_magnifier(ib_bar.wap, price_magnifier),
-        count: ib_bar.count,
-    }
-}
-
 /// Implement bar price validation logic.
 /// Matches Python's `_validate_bar_prices` behavior.
 fn _validate_bar_prices(open: &mut f64, high: &mut f64, low: &mut f64, close: &f64) {
@@ -194,7 +335,7 @@ fn _validate_bar_prices(open: &mut f64, high: &mut f64, low: &mut f64, close: &f
 pub fn ib_bar_to_nautilus_bar(
     ib_bar: &ibapi::market_data::historical::Bar,
     bar_type: BarType,
-    price_precision: u8,
+    prices: IbPriceConverter,
     size_precision: u8,
 ) -> anyhow::Result<Bar> {
     let ts_event = bar_close_from_open(
@@ -211,10 +352,11 @@ pub fn ib_bar_to_nautilus_bar(
     _validate_bar_prices(&mut open, &mut high, &mut low, &close);
 
     // Create prices
-    let open_price = Price::new(open, price_precision);
-    let high_price = Price::new(high, price_precision);
-    let low_price = Price::new(low, price_precision);
-    let close_price = Price::new(close, price_precision);
+    let price_type = bar_type.spec().price_type;
+    let open_price = prices.bar_price(price_type, open)?;
+    let high_price = prices.bar_price(price_type, high)?;
+    let low_price = prices.bar_price(price_type, low)?;
+    let close_price = prices.bar_price(price_type, close)?;
 
     // Volume: IB uses -1 for unavailable volume, convert to 0
     let volume = if ib_bar.volume < 0.0 {
@@ -286,8 +428,8 @@ pub fn jiff_to_ib_datetime(dt: &Timestamp) -> OffsetDateTime {
 
 /// Calculate duration segments for IB historical data request.
 ///
-/// This is used to break down a large time range into multiple requests
-/// to comply with IB's duration limits for specific bar sizes.
+/// Splits the range into year, day and second durations ending at calendar-time
+/// offsets from `end`.
 pub fn calculate_duration_segments(
     start: Option<Timestamp>,
     end: Option<Timestamp>,
@@ -354,7 +496,15 @@ pub(crate) fn should_continue_historical_tick_pagination(
             .is_none_or(|(start, end)| end > start)
 }
 
-/// Add a historical tick page and advance the next request before its earliest tick.
+/// Returns the end of the first backward historical tick request covering ticks up to `end`.
+///
+/// IB reads a historical ticks end at whole seconds and leaves out ticks in that second, so the
+/// request ends at the second after the one holding `end`.
+pub(crate) fn historical_tick_request_end(end: Timestamp) -> Timestamp {
+    truncate_to_second(end).unwrap_or(end) + SignedDuration::from_secs(1)
+}
+
+/// Add a historical tick page and move the next request's end to its earliest tick's second.
 #[allow(clippy::too_many_arguments)] // The parameters describe one pagination transition.
 pub(crate) fn extend_historical_tick_batch<T>(
     all_ticks: &mut Vec<T>,
@@ -366,52 +516,47 @@ pub(crate) fn extend_historical_tick_batch<T>(
     limit: Option<usize>,
     ts_event: impl Fn(&T) -> UnixNanos,
 ) -> bool {
-    if batch_ticks.is_empty() {
-        return false;
-    }
-
-    // The IB wire encodes the request end at second resolution and treats it as
-    // inclusive, so each page re-delivers ticks from the boundary second that a
-    // previous page already collected. Drop everything at or past the requested
-    // end before extending; an entirely re-delivered page means the end second
-    // cannot retreat (a single second holds a full page) and pagination must stop.
-    let mut batch_ticks = batch_ticks;
-
-    if let Some(end) = *current_end_date {
-        let end_bound_nanos = end.as_nanosecond();
-        batch_ticks.retain(|tick| i128::from(ts_event(tick).as_u64()) <= end_bound_nanos);
-        if batch_ticks.is_empty() {
-            tracing::warn!(
-                "Historical tick pagination pinned at {end}; a single second exceeds the page \
-                 size, earlier ticks within that second cannot be requested"
-            );
-            retain_historical_ticks_in_range(all_ticks, start_nanos, end_nanos, &ts_event);
-            return false;
-        }
-    }
-
+    // IB returns every tick of a page's earliest second and leaves out the end second of a
+    // request, so the next page ends at that earliest second without overlapping this one
     let Some(min_ts_nanos) = batch_ticks.iter().map(&ts_event).min() else {
         return false;
     };
-
-    let new_end_nanos = min_ts_nanos.as_u64().saturating_sub(1);
-
-    let Ok(new_end) = Timestamp::from_nanosecond(i128::from(new_end_nanos)) else {
+    let Some(new_end) = Timestamp::from_nanosecond(i128::from(min_ts_nanos.as_u64()))
+        .ok()
+        .and_then(truncate_to_second)
+    else {
         return false;
     };
+
+    // A page at or past the requested end cannot move the end back
+    if current_end_date.is_some_and(|end| new_end >= end) {
+        tracing::warn!(
+            "Historical tick pagination stopped: page starting {new_end} does not precede the \
+             requested end"
+        );
+        retain_historical_ticks_in_range(all_ticks, start_nanos, end_nanos, &ts_event);
+        return false;
+    }
 
     *current_end_date = Some(new_end);
 
     all_ticks.extend(batch_ticks);
-    if current_start_date
-        .zip(*current_end_date)
-        .is_some_and(|(start, end)| end <= start)
-    {
+    if current_start_date.is_some_and(|start| new_end <= start) {
         retain_historical_ticks_in_range(all_ticks, start_nanos, end_nanos, &ts_event);
         return false;
     }
 
     limit.is_none_or(|limit| all_ticks.len() < limit)
+}
+
+fn truncate_to_second(timestamp: Timestamp) -> Option<Timestamp> {
+    timestamp
+        .round(
+            TimestampRound::new()
+                .smallest(Unit::Second)
+                .mode(RoundMode::Trunc),
+        )
+        .ok()
 }
 
 /// Retain historical ticks within the inclusive requested range.
@@ -428,15 +573,196 @@ pub(crate) fn retain_historical_ticks_in_range<T>(
     });
 }
 
-/// Adapt duration segments for an IB historical bars request.
+/// The time range of an IB historical bars request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum BarRequestRange {
+    /// The bars closing in `[start, end]`, or from `start` on when the end is `None`.
+    Between(Timestamp, Option<Timestamp>),
+    /// The bars over a duration ending at an end time, or at the current time when `None`.
+    Ending(Option<Timestamp>, IBDuration),
+}
+
+impl BarRequestRange {
+    /// Returns the requests fetching this range of bars of `spec`, latest first.
+    ///
+    /// Each request keeps only the bars IB stamps within its own bounds, so consecutive requests
+    /// fetch every bar of the range once.
+    #[must_use]
+    pub(crate) fn requests(self, spec: &BarSpecification) -> Vec<BarRequest> {
+        match self {
+            Self::Between(start, end) => {
+                let (from, to) = between_bounds(start, end, spec);
+                between_requests(from, to, max_request_span(spec))
+            }
+            Self::Ending(end, duration) => vec![BarRequest::Ending(end, duration)],
+        }
+    }
+
+    /// Returns whether this range keeps a bar closing at `ts_event`.
+    ///
+    /// A duration range keeps every bar IB returns.
+    #[must_use]
+    pub(crate) fn contains(self, ts_event: UnixNanos) -> bool {
+        match self {
+            Self::Between(start, end) => {
+                let ts_event = Timestamp::from(ts_event);
+                ts_event >= start && end.is_none_or(|end| ts_event <= end)
+            }
+            Self::Ending(..) => true,
+        }
+    }
+}
+
+/// One IB historical bars request of a [`BarRequestRange`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum BarRequest {
+    /// The bars IB stamps in `[from, to)`, fetched with [`HistoricalDataBuilder::between`].
+    Between(Timestamp, Timestamp),
+    /// The bars over a duration ending at an end time, or at the current time when `None`.
+    Ending(Option<Timestamp>, IBDuration),
+}
+
+impl BarRequest {
+    /// Returns `request` set to fetch these bars.
+    pub(crate) fn apply<'a, C>(
+        self,
+        request: HistoricalDataBuilder<'a, C>,
+    ) -> HistoricalDataBuilder<'a, C> {
+        match self {
+            Self::Between(from, to) => {
+                request.between(jiff_to_ib_datetime(&from), jiff_to_ib_datetime(&to))
+            }
+            Self::Ending(Some(end), duration) => {
+                request.duration(duration).ending(jiff_to_ib_datetime(&end))
+            }
+            Self::Ending(None, duration) => request.duration(duration),
+        }
+    }
+}
+
+/// The longest span IB serves in one request for one-second bars.
+const MAX_ONE_SECOND_BARS_SPAN: SignedDuration = SignedDuration::from_secs(2000);
+
+/// Returns the longest span IB serves in one request for bars of `spec`, or `None` when the
+/// adapter applies no cap.
+fn max_request_span(spec: &BarSpecification) -> Option<SignedDuration> {
+    (spec.aggregation == BarAggregation::Second && spec.step.get() == 1)
+        .then_some(MAX_ONE_SECOND_BARS_SPAN)
+}
+
+/// The shortest span of a request: the shortest duration in IB's step-size table, for bars from one
+/// second to one minute. IB refuses `29 S` of one-second bars.
+const MIN_REQUEST_SPAN: SignedDuration = SignedDuration::from_secs(60);
+
+/// Returns the `between` requests for the bars IB stamps in `[from, to)`, latest first.
 ///
-/// For continuous futures the end date is dropped and only the first segment is
-/// kept (IB rejects an explicit end date with error 10339), logging a warning
-/// when the requested range cannot be honored.
-pub fn bar_request_segments(
-    segments: Vec<(Timestamp, IBDuration)>,
+/// A range holding no bar, with `to` at or before `from`, needs no request. A range shorter than
+/// [`MIN_REQUEST_SPAN`] starts earlier, and [`BarRequestRange::contains`] drops the bars this adds.
+/// A range longer than `max_span` is split into the fewest requests within it, of equal
+/// whole-second spans with the latest taking any extra seconds, so none falls below the minimum.
+fn between_requests(
+    from: Timestamp,
+    to: Timestamp,
+    max_span: Option<SignedDuration>,
+) -> Vec<BarRequest> {
+    if to <= from {
+        return Vec::new();
+    }
+
+    let from = from.min(to - MIN_REQUEST_SPAN);
+
+    let Some(max_span) = max_span else {
+        return vec![BarRequest::Between(from, to)];
+    };
+    debug_assert_eq!(
+        to.duration_since(from).subsec_nanos(),
+        0,
+        "Invariant: one-second request bounds are whole seconds"
+    );
+
+    let max_seconds = max_span.as_secs();
+    let mut remaining = (to.duration_since(from).as_secs() + max_seconds - 1) / max_seconds;
+    let mut requests = Vec::new();
+    let mut upper = to;
+
+    while remaining > 0 {
+        let seconds = upper.duration_since(from).as_secs();
+        let lower = upper - SignedDuration::from_secs((seconds + remaining - 1) / remaining);
+        requests.push(BarRequest::Between(lower, upper));
+        upper = lower;
+        remaining -= 1;
+    }
+
+    requests
+}
+
+/// Returns the bounds of the `between` requests for the bars of `spec` closing in `[start, end]`,
+/// with an absent `end` read as the current time.
+///
+/// `between` keeps the bars IB stamps in `[from, to)`. IB stamps intraday and daily bars at their
+/// open (a daily bar at midnight UTC) and weekly and monthly bars at their period end, so `from` is
+/// one bar before `start`, to keep the bar opening before `start`, and `to` is just past `end`, to
+/// keep a bar stamped at `end`. [`BarRequestRange::contains`] then keeps the bars closing in range.
+///
+/// ibapi rounds a fractional span up a second and IB reads the end time to the second, so the
+/// bounds are whole seconds: `from` rounded up and, for intraday bars, which close on whole
+/// seconds, `to` is `end` rounded down, dropping only bars closing after `end`. For intraday bars
+/// `to` is also capped at the current time, as IB answers a request lying wholly after it with no
+/// data. A range holding no bar then has `to` at or before `from`.
+#[must_use]
+fn between_bounds(
+    start: Timestamp,
+    end: Option<Timestamp>,
+    spec: &BarSpecification,
+) -> (Timestamp, Timestamp) {
+    let now = Timestamp::now();
+    let end = end.unwrap_or(now);
+    let from = round_to_second(start - spec.timedelta(), RoundMode::Ceil);
+
+    let to = match spec.aggregation {
+        BarAggregation::Second | BarAggregation::Minute | BarAggregation::Hour => {
+            round_to_second(end.min(now), RoundMode::Floor)
+        }
+        _ => end + SignedDuration::from_nanos(1),
+    };
+
+    (from, to)
+}
+
+/// Returns `timestamp` rounded to a whole second by `mode`.
+fn round_to_second(timestamp: Timestamp, mode: RoundMode) -> Timestamp {
+    timestamp
+        .round(TimestampRound::new().smallest(Unit::Second).mode(mode))
+        .expect("a request bound rounds to a second within range")
+}
+
+/// Returns the time range of an IB historical bars request, or `None` when it holds no time. An
+/// absent `end` is the current time.
+///
+/// A request with a start fetches the bars closing in `[start, end]` through `between` requests
+/// (see [`BarRequestRange::requests`]): IB counts durations in trading time, so durations ending
+/// at calendar-time offsets leave gaps between them.
+///
+/// For continuous futures the end date is dropped and only the first duration segment is
+/// kept (IB rejects an explicit end date with error 10339), logging a warning when the
+/// requested range cannot be honored.
+#[must_use]
+pub(crate) fn bar_request_range(
+    start: Option<Timestamp>,
+    end: Option<Timestamp>,
+    duration: Option<IBDuration>,
     is_continuous_future: bool,
-) -> Vec<(Option<Timestamp>, IBDuration)> {
+) -> Option<BarRequestRange> {
+    if !is_continuous_future
+        && duration.is_none()
+        && let Some(start) = start
+    {
+        return (start < end.unwrap_or_else(Timestamp::now))
+            .then_some(BarRequestRange::Between(start, end));
+    }
+
+    let segments = calculate_duration_segments(start, end, duration);
+
     if is_continuous_future {
         // Treat end dates within the last second as "now" so requests whose
         // end defaults to the current time do not trigger a spurious warning.
@@ -453,30 +779,32 @@ pub fn bar_request_segments(
             );
         }
 
-        segments
-            .into_iter()
-            .take(1)
-            .map(|(_, d)| (None, d))
-            .collect()
-    } else {
-        segments
-            .into_iter()
-            .map(|(end, d)| (Some(end), d))
-            .collect()
+        return segments
+            .first()
+            .map(|(_, duration)| BarRequestRange::Ending(None, *duration));
     }
+
+    segments
+        .first()
+        .map(|(end, duration)| BarRequestRange::Ending(Some(*end), *duration))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use nautilus_model::{
         data::{BarSpecification, BarType},
         enums::{AggregationSource, BarAggregation, PriceType},
         identifiers::{InstrumentId, Symbol, Venue},
+        instruments::Equity,
+        types::Currency,
     };
     use rstest::rstest;
     use time::macros::datetime;
 
     use super::*;
+    use crate::stubs::currency_pair;
 
     fn create_test_instrument_id() -> InstrumentId {
         InstrumentId::new(Symbol::from("AAPL"), Venue::from("NASDAQ"))
@@ -705,7 +1033,7 @@ mod tests {
             BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
             AggregationSource::External,
         );
-        let result = ib_bar_to_nautilus_bar(&ib_bar, bar_type, 2, 0);
+        let result = ib_bar_to_nautilus_bar(&ib_bar, bar_type, IbPriceConverter::new(2), 0);
         assert!(result.is_ok());
         let bar = result.unwrap();
         assert_eq!(bar.open.as_f64(), 150.0);
@@ -738,7 +1066,7 @@ mod tests {
             BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
             AggregationSource::External,
         );
-        let result = ib_bar_to_nautilus_bar(&ib_bar, bar_type, 2, 0);
+        let result = ib_bar_to_nautilus_bar(&ib_bar, bar_type, IbPriceConverter::new(2), 0);
         assert!(result.is_ok());
         let bar = result.unwrap();
         // Negative volume should be converted to 0
@@ -886,18 +1214,32 @@ mod tests {
         );
     }
 
+    fn seconds(value: i64) -> UnixNanos {
+        UnixNanos::from(u64::try_from(value).unwrap() * 1_000_000_000)
+    }
+
     #[rstest]
-    fn test_extend_historical_tick_batch_retreats_one_nanosecond() {
-        let mut ticks = vec![UnixNanos::from(30)];
-        let mut end = Some(Timestamp::from_nanosecond(100).unwrap());
+    #[case::whole_second("2026-11-13T14:30:00Z", "2026-11-13T14:30:01Z")]
+    #[case::within_second("2026-11-13T14:30:00.5Z", "2026-11-13T14:30:01Z")]
+    fn test_historical_tick_request_end(#[case] end: &str, #[case] expected: &str) {
+        assert_eq!(
+            historical_tick_request_end(timestamp(end)),
+            timestamp(expected)
+        );
+    }
+
+    #[rstest]
+    fn test_extend_historical_tick_batch_ends_next_page_at_earliest_second() {
+        let mut ticks = vec![seconds(30)];
+        let mut end = Some(Timestamp::from_second(30).unwrap());
 
         let should_continue = extend_historical_tick_batch(
             &mut ticks,
-            vec![UnixNanos::from(20), UnixNanos::from(10)],
-            Some(Timestamp::from_nanosecond(1).unwrap()),
+            vec![seconds(20), seconds(10), seconds(10)],
+            Some(Timestamp::from_second(1).unwrap()),
             &mut end,
-            Some(UnixNanos::from(1)),
-            Some(UnixNanos::from(100)),
+            Some(seconds(1)),
+            Some(seconds(100)),
             Some(10),
             |ts| *ts,
         );
@@ -905,69 +1247,40 @@ mod tests {
         assert!(should_continue);
         assert_eq!(
             ticks,
-            vec![
-                UnixNanos::from(30),
-                UnixNanos::from(20),
-                UnixNanos::from(10)
-            ]
+            vec![seconds(30), seconds(20), seconds(10), seconds(10)]
         );
-        assert_eq!(end, Some(Timestamp::from_nanosecond(9).unwrap()));
+        assert_eq!(end, Some(Timestamp::from_second(10).unwrap()));
     }
 
     #[rstest]
     fn test_extend_historical_tick_batch_stops_and_trims_at_start() {
         let mut ticks = Vec::new();
-        let mut end = Some(Timestamp::from_nanosecond(100).unwrap());
+        let mut end = Some(Timestamp::from_second(100).unwrap());
 
         let should_continue = extend_historical_tick_batch(
             &mut ticks,
-            vec![UnixNanos::from(20), UnixNanos::from(10)],
-            Some(Timestamp::from_nanosecond(10).unwrap()),
+            vec![seconds(20), seconds(10)],
+            Some(Timestamp::from_second(10).unwrap()),
             &mut end,
-            Some(UnixNanos::from(10)),
-            Some(UnixNanos::from(15)),
+            Some(seconds(10)),
+            Some(seconds(15)),
             Some(10),
             |ts| *ts,
         );
 
         assert!(!should_continue);
-        assert_eq!(ticks, vec![UnixNanos::from(10)]);
-        assert_eq!(end, Some(Timestamp::from_nanosecond(9).unwrap()));
-    }
-
-    #[rstest]
-    fn test_extend_historical_tick_batch_drops_boundary_duplicates() {
-        let mut ticks = vec![UnixNanos::from(30)];
-        let mut end = Some(Timestamp::from_nanosecond(29).unwrap());
-
-        let should_continue = extend_historical_tick_batch(
-            &mut ticks,
-            vec![
-                UnixNanos::from(35),
-                UnixNanos::from(30),
-                UnixNanos::from(20),
-            ],
-            None,
-            &mut end,
-            None,
-            None,
-            Some(10),
-            |ts| *ts,
-        );
-
-        assert!(should_continue);
-        assert_eq!(ticks, vec![UnixNanos::from(30), UnixNanos::from(20)]);
-        assert_eq!(end, Some(Timestamp::from_nanosecond(19).unwrap()));
+        assert_eq!(ticks, vec![seconds(10)]);
+        assert_eq!(end, Some(Timestamp::from_second(10).unwrap()));
     }
 
     #[rstest]
     fn test_extend_historical_tick_batch_stops_when_end_cannot_retreat() {
-        let mut ticks = vec![UnixNanos::from(30)];
-        let mut end = Some(Timestamp::from_nanosecond(29).unwrap());
+        let mut ticks = vec![seconds(30)];
+        let mut end = Some(Timestamp::from_second(30).unwrap());
 
         let should_continue = extend_historical_tick_batch(
             &mut ticks,
-            vec![UnixNanos::from(35), UnixNanos::from(30)],
+            vec![seconds(35), seconds(30)],
             None,
             &mut end,
             None,
@@ -977,39 +1290,741 @@ mod tests {
         );
 
         assert!(!should_continue);
-        assert_eq!(ticks, vec![UnixNanos::from(30)]);
-        assert_eq!(end, Some(Timestamp::from_nanosecond(29).unwrap()));
+        assert_eq!(ticks, vec![seconds(30)]);
+        assert_eq!(end, Some(Timestamp::from_second(30).unwrap()));
+    }
+
+    fn timestamp(value: &str) -> Timestamp {
+        value.parse().unwrap()
     }
 
     #[rstest]
-    fn test_bar_request_segments_attaches_end_dates_when_not_continuous() {
-        let end = "2025-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
-        let earlier = "2024-06-01T00:00:00Z".parse::<Timestamp>().unwrap();
-        let segments = vec![(end, IBDuration::years(1)), (earlier, IBDuration::days(30))];
+    #[case::start_spans_sessions(
+        Some(timestamp("2026-10-05T00:00:00Z")),
+        None,
+        false,
+        Some(BarRequestRange::Between(
+            timestamp("2026-10-05T00:00:00Z"),
+            Some(timestamp("2026-10-07T18:00:00Z")),
+        ))
+    )]
+    #[case::no_start(
+        None,
+        None,
+        false,
+        Some(BarRequestRange::Ending(
+            Some(timestamp("2026-10-07T18:00:00Z")),
+            IBDuration::days(1),
+        ))
+    )]
+    #[case::duration(
+        None,
+        Some(IBDuration::weeks(2)),
+        false,
+        Some(BarRequestRange::Ending(
+            Some(timestamp("2026-10-07T18:00:00Z")),
+            IBDuration::weeks(2),
+        ))
+    )]
+    #[case::start_at_end(Some(timestamp("2026-10-07T18:00:00Z")), None, false, None)]
+    #[case::start_after_end(Some(timestamp("2026-10-08T00:00:00Z")), None, false, None)]
+    #[case::continuous_future_start(
+        Some(timestamp("2025-07-03T10:00:00Z")),
+        None,
+        true,
+        Some(BarRequestRange::Ending(None, IBDuration::years(1)))
+    )]
+    #[case::continuous_future_no_start(
+        None,
+        None,
+        true,
+        Some(BarRequestRange::Ending(None, IBDuration::days(1)))
+    )]
+    #[case::continuous_future_start_after_end(
+        Some(timestamp("2026-10-08T00:00:00Z")),
+        None,
+        true,
+        None
+    )]
+    fn test_bar_request_range(
+        #[case] start: Option<Timestamp>,
+        #[case] duration: Option<IBDuration>,
+        #[case] is_continuous_future: bool,
+        #[case] expected: Option<BarRequestRange>,
+    ) {
+        let end = timestamp("2026-10-07T18:00:00Z");
 
-        let result = bar_request_segments(segments, false);
+        let range = bar_request_range(start, Some(end), duration, is_continuous_future);
 
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, Some(end));
-        assert_eq!(result[1].0, Some(earlier));
+        assert_eq!(range, expected);
     }
 
     #[rstest]
-    fn test_bar_request_segments_drops_end_date_and_keeps_only_first_for_continuous() {
-        let end = "2025-01-01T00:00:00Z".parse::<Timestamp>().unwrap();
-        let earlier = "2024-06-01T00:00:00Z".parse::<Timestamp>().unwrap();
-        let segments = vec![(end, IBDuration::years(1)), (earlier, IBDuration::days(30))];
+    #[case::start_before_now(
+        timestamp("2026-10-05T00:00:00Z"),
+        Some(BarRequestRange::Between(timestamp("2026-10-05T00:00:00Z"), None))
+    )]
+    #[case::start_after_now(timestamp("2999-01-01T00:00:00Z"), None)]
+    fn test_bar_request_range_without_end(
+        #[case] start: Timestamp,
+        #[case] expected: Option<BarRequestRange>,
+    ) {
+        let range = bar_request_range(Some(start), None, None, false);
 
-        let result = bar_request_segments(segments, true);
-
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, None);
-        assert_eq!(result[0].1, IBDuration::years(1));
+        assert_eq!(range, expected);
     }
 
     #[rstest]
-    fn test_bar_request_segments_empty_input_yields_nothing_for_continuous() {
-        let result = bar_request_segments(vec![], true);
-        assert!(result.is_empty());
+    #[case::before_start(Some(2_000), 1_000 - 1, false)]
+    #[case::start(Some(2_000), 1_000, true)]
+    #[case::end(Some(2_000), 2_000, true)]
+    #[case::after_end(Some(2_000), 2_000 + 1, false)]
+    #[case::no_end_before_start(None, 1_000 - 1, false)]
+    #[case::no_end(None, u64::MAX, true)]
+    fn test_bar_request_range_between_contains_closes_in_inclusive_range(
+        #[case] end: Option<i128>,
+        #[case] ts_event: u64,
+        #[case] expected: bool,
+    ) {
+        let range = BarRequestRange::Between(
+            Timestamp::from_nanosecond(1_000).unwrap(),
+            end.map(|end| Timestamp::from_nanosecond(end).unwrap()),
+        );
+
+        assert_eq!(range.contains(UnixNanos::from(ts_event)), expected);
+    }
+
+    #[rstest]
+    #[case::minute(BarAggregation::Minute, "2026-10-05T09:59:00Z", "2026-10-07T18:00:00Z")]
+    #[case::day(
+        BarAggregation::Day,
+        "2026-10-04T10:00:00Z",
+        "2026-10-07T18:00:00.000000001Z"
+    )]
+    #[case::week(
+        BarAggregation::Week,
+        "2026-09-28T10:00:00Z",
+        "2026-10-07T18:00:00.000000001Z"
+    )]
+    fn test_between_bounds_by_aggregation(
+        #[case] aggregation: BarAggregation,
+        #[case] from: &str,
+        #[case] to: &str,
+    ) {
+        let spec = BarSpecification::new(1, aggregation, PriceType::Last);
+        let start = timestamp("2026-10-05T10:00:00Z");
+        let end = timestamp("2026-10-07T18:00:00Z");
+
+        let bounds = between_bounds(start, Some(end), &spec);
+
+        assert_eq!(bounds, (timestamp(from), timestamp(to)));
+    }
+
+    /// Returns the duration ibapi asks IB for to fetch `request`, a `between` request's span in
+    /// seconds when its bounds are whole seconds up to a day apart.
+    fn ib_duration(request: BarRequest) -> IBDuration {
+        match request {
+            BarRequest::Between(from, to) => {
+                let span = to.duration_since(from);
+                assert!(
+                    span.subsec_nanos() == 0 && span.as_secs() <= 86_400,
+                    "span {span:?} is not whole seconds up to a day"
+                );
+                IBDuration::seconds(i32::try_from(span.as_secs()).unwrap())
+            }
+            BarRequest::Ending(_, duration) => duration,
+        }
+    }
+
+    /// IB serves at most `2000 S` of one-second bars in one request, so a range holding more
+    /// one-second bars is fetched by consecutive requests of equal spans, and no other bar size
+    /// is capped.
+    #[rstest]
+    #[case::one_second_2000_bars(
+        1,
+        BarAggregation::Second,
+        "2026-10-07T10:33:19Z",
+        &["2000 S"]
+    )]
+    #[case::one_second_2001_bars(
+        1,
+        BarAggregation::Second,
+        "2026-10-07T10:33:20Z",
+        &["1001 S", "1000 S"]
+    )]
+    #[case::one_second_4001_bars(
+        1,
+        BarAggregation::Second,
+        "2026-10-07T11:06:40Z",
+        &["1334 S", "1334 S", "1333 S"]
+    )]
+    #[case::five_second(5, BarAggregation::Second, "2026-10-07T10:33:20Z", &["2005 S"])]
+    #[case::one_minute(1, BarAggregation::Minute, "2026-10-07T10:33:20Z", &["2060 S"])]
+    fn test_bar_request_range_requests_durations(
+        #[case] step: usize,
+        #[case] aggregation: BarAggregation,
+        #[case] end: &str,
+        #[case] durations: &[&str],
+    ) {
+        let spec = BarSpecification::new(step, aggregation, PriceType::Last);
+        let range =
+            BarRequestRange::Between(timestamp("2026-10-07T10:00:00Z"), Some(timestamp(end)));
+
+        let requests = range.requests(&spec);
+
+        let requested: Vec<String> = requests
+            .into_iter()
+            .map(|request| ib_duration(request).to_string())
+            .collect();
+        assert_eq!(requested, durations);
+    }
+
+    /// IB refuses short durations, so a range spanning under `60 S` starts earlier to span it,
+    /// ending where it did.
+    #[rstest]
+    #[case::one_second_within_seconds(
+        1,
+        "2026-10-07T10:00:00.2Z",
+        "2026-10-07T10:00:29.5Z",
+        "2026-10-07T09:59:29Z",
+        "2026-10-07T10:00:29Z"
+    )]
+    #[case::one_second_on_seconds(
+        1,
+        "2026-10-07T10:00:00Z",
+        "2026-10-07T10:00:10Z",
+        "2026-10-07T09:59:10Z",
+        "2026-10-07T10:00:10Z"
+    )]
+    #[case::five_second(
+        5,
+        "2026-10-07T10:00:00Z",
+        "2026-10-07T10:00:10Z",
+        "2026-10-07T09:59:10Z",
+        "2026-10-07T10:00:10Z"
+    )]
+    fn test_bar_request_range_requests_short_range_spans_minimum(
+        #[case] step: usize,
+        #[case] start: &str,
+        #[case] end: &str,
+        #[case] from: &str,
+        #[case] to: &str,
+    ) {
+        let spec = BarSpecification::new(step, BarAggregation::Second, PriceType::Last);
+        let range = BarRequestRange::Between(timestamp(start), Some(timestamp(end)));
+
+        let requests = range.requests(&spec);
+
+        assert_eq!(
+            requests,
+            vec![BarRequest::Between(timestamp(from), timestamp(to))]
+        );
+        assert_eq!(ib_duration(requests[0]).to_string(), "60 S");
+    }
+
+    const SECOND: i128 = 1_000_000_000;
+
+    /// Sweeps one-second ranges around 2000 and 4000 bars, each bound on, just past, halfway past
+    /// and just before a whole second: the requests, latest first, each span at most `2000 S`,
+    /// within a second of each other, each ends where the next starts, and together they run from
+    /// the open of the first bar closing in the range to its last close, in as few requests as
+    /// IB's limit allows.
+    #[rstest]
+    fn test_bar_request_range_one_second_bars_requests_cover_range_within_ib_limit(
+        #[values(0, 1, SECOND / 2, SECOND - 1)] start_offset: i128,
+        #[values(1998, 1999, 2000, 2001, 3999, 4000, 4001)] seconds: i128,
+        #[values(0, 1, SECOND / 2, SECOND - 1)] end_offset: i128,
+    ) {
+        let spec = BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
+        let base = timestamp("2026-10-07T10:00:00Z").as_nanosecond();
+        let start = base + start_offset;
+        let end = base + seconds * SECOND + end_offset;
+        let first_open = (start + SECOND - 1).div_euclid(SECOND) * SECOND - SECOND;
+        let last_close = end.div_euclid(SECOND) * SECOND;
+        let range = BarRequestRange::Between(
+            Timestamp::from_nanosecond(start).unwrap(),
+            Some(Timestamp::from_nanosecond(end).unwrap()),
+        );
+
+        let bounds: Vec<(i128, i128)> = range
+            .requests(&spec)
+            .into_iter()
+            .map(|request| match request {
+                BarRequest::Between(from, to) => (from.as_nanosecond(), to.as_nanosecond()),
+                BarRequest::Ending(..) => panic!("unexpected {request:?}"),
+            })
+            .collect();
+
+        let bars = usize::try_from((last_close - first_open) / SECOND).unwrap();
+        assert_eq!(bounds.first().map(|b| b.1), Some(last_close));
+        assert_eq!(bounds.last().map(|b| b.0), Some(first_open));
+        assert_eq!(bounds.len(), bars.div_ceil(2000));
+        assert!(
+            bounds
+                .iter()
+                .all(|(from, to)| to > from && to - from <= 2000 * SECOND),
+            "{bounds:?}"
+        );
+        assert!(
+            bounds.windows(2).all(|pair| pair[0].0 == pair[1].1),
+            "{bounds:?}"
+        );
+        let spans = bounds.iter().map(|(from, to)| to - from);
+        assert!(
+            spans.clone().max().unwrap() - spans.min().unwrap() <= SECOND,
+            "{bounds:?}"
+        );
+    }
+
+    /// IB answers a request lying wholly after the current time with no data, so the requests for
+    /// intraday bars end by the current time.
+    #[rstest]
+    fn test_bar_request_range_requests_end_by_now() {
+        let spec = BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
+        let now = Timestamp::now();
+        let range = BarRequestRange::Between(
+            now - SignedDuration::from_secs(3000),
+            Some(now + SignedDuration::from_secs(3000)),
+        );
+
+        let requests = range.requests(&spec);
+
+        let latest = Timestamp::now();
+        assert!(
+            !requests.is_empty()
+                && requests
+                    .iter()
+                    .all(|request| matches!(request, BarRequest::Between(_, to) if *to <= latest)),
+            "{requests:?}"
+        );
+    }
+
+    /// A range of one-second bars within one second holds no bar, so it is fetched by no request
+    /// rather than by one IB refuses.
+    #[rstest]
+    fn test_bar_request_range_holding_no_bar_is_no_request() {
+        let spec = BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
+        let range = BarRequestRange::Between(
+            timestamp("2026-10-07T10:00:00.2Z"),
+            Some(timestamp("2026-10-07T10:00:00.7Z")),
+        );
+
+        assert!(range.requests(&spec).is_empty());
+    }
+
+    #[rstest]
+    fn test_bar_request_range_ending_is_one_request() {
+        let spec = BarSpecification::new(1, BarAggregation::Hour, PriceType::Last);
+        let range = BarRequestRange::Ending(None, IBDuration::days(1));
+
+        assert_eq!(
+            range.requests(&spec),
+            vec![BarRequest::Ending(None, IBDuration::days(1))]
+        );
+    }
+
+    #[rstest]
+    fn test_bar_request_range_ending_contains_every_bar() {
+        let range = BarRequestRange::Ending(None, IBDuration::days(1));
+
+        assert!(range.contains(UnixNanos::from(1)));
+    }
+
+    fn create_equity() -> InstrumentAny {
+        let equity = Equity::builder()
+            .instrument_id(create_test_instrument_id())
+            .raw_symbol(Symbol::from("AAPL"))
+            .currency(Currency::from("USD"))
+            .price_precision(2)
+            .price_increment(Price::from("0.05"))
+            .lot_size(Quantity::from("1"))
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        InstrumentAny::from(equity)
+    }
+
+    #[rstest]
+    #[case(1.12097, "1.12095")]
+    #[case(1.12098, "1.12100")]
+    #[case(1.12100, "1.12100")]
+    #[case(1.12095, "1.12095")]
+    #[case(-1.12097, "-1.12095")]
+    fn test_price_converter_rounds_fx_pair_to_increment(
+        #[case] ib_price: f64,
+        #[case] expected: &str,
+    ) {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        let price = prices.price(ib_price).unwrap();
+
+        assert_eq!(price, Price::from(expected));
+        assert_eq!(price.precision, 5);
+    }
+
+    #[rstest]
+    #[case(1e25)]
+    #[case(-1e25)]
+    #[case(7.9e28)]
+    #[case(1e300)]
+    fn test_price_converter_returns_error_for_out_of_range_price(#[case] ib_price: f64) {
+        let fx = IbPriceConverter::for_instrument(&currency_pair("EUR", "USD", 5, "0.00005"), 1);
+        let magnified = IbPriceConverter::new(4).with_price_magnifier(100);
+
+        assert!(fx.price(ib_price).is_err());
+        assert!(fx.bid_price(ib_price).is_err());
+        assert!(fx.ask_price(ib_price).is_err());
+        assert!(magnified.price(ib_price).is_err());
+    }
+
+    #[rstest]
+    fn test_price_converter_rounds_jpy_pair_to_increment() {
+        let instrument = currency_pair("USD", "JPY", 3, "0.005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.price(151.234).unwrap(), Price::from("151.235"));
+        assert_eq!(prices.price(151.232).unwrap(), Price::from("151.230"));
+    }
+
+    #[rstest]
+    #[case(1.000025, "1.00000")]
+    #[case(1.000075, "1.00010")]
+    #[case(1.000125, "1.00010")]
+    #[case(1.000026, "1.00005")]
+    #[case(1.120025, "1.12000")]
+    #[case(1.120175, "1.12020")]
+    fn test_price_converter_ties_go_to_even_multiple(
+        #[case] ib_price: f64,
+        #[case] expected: &str,
+    ) {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        let price = prices.price(ib_price).unwrap();
+
+        assert_eq!(price, Price::from(expected));
+        assert_eq!(price.precision, 5);
+    }
+
+    #[rstest]
+    #[case(151.0025, "151.000")]
+    #[case(151.0075, "151.010")]
+    #[case(151.0125, "151.010")]
+    fn test_price_converter_ties_go_to_even_multiple_for_jpy_pair(
+        #[case] ib_price: f64,
+        #[case] expected: &str,
+    ) {
+        let instrument = currency_pair("USD", "JPY", 3, "0.005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.price(ib_price).unwrap(), Price::from(expected));
+    }
+
+    #[rstest]
+    fn test_price_converter_rounds_every_fx_midpoint_like_exact_ties_to_even() {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        // IB prices in steps of 0.000005 around 1.12, half of the 0.00005 increment
+        for n in 223_850_i64..=224_150 {
+            let micros = n * 5;
+            let ib_price: f64 = format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
+                .parse()
+                .unwrap();
+
+            // The expectation is in integers: n steps of 5 micros against a step of 10 micros
+            let (quotient, remainder) = (n / 10, n % 10);
+            let steps = match remainder.cmp(&5) {
+                Ordering::Less => quotient,
+                Ordering::Greater => quotient + 1,
+                Ordering::Equal => quotient + quotient % 2,
+            };
+            let hundred_thousandths = steps * 5;
+            let expected = Price::from(
+                format!(
+                    "{}.{:05}",
+                    hundred_thousandths / 100_000,
+                    hundred_thousandths % 100_000
+                )
+                .as_str(),
+            );
+
+            assert_eq!(
+                prices.price(ib_price).unwrap(),
+                expected,
+                "ib_price={ib_price}"
+            );
+        }
+    }
+
+    #[rstest]
+    fn test_price_converter_does_not_round_crypto_pair() {
+        let instrument = currency_pair("BTC", "USD", 2, "0.05");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.price(100.03).unwrap(), Price::from("100.03"));
+    }
+
+    #[rstest]
+    fn test_price_converter_does_not_round_equity() {
+        let instrument = create_equity();
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.precision(), 2);
+        assert_eq!(prices.price(100.03).unwrap(), Price::from("100.03"));
+    }
+
+    #[rstest]
+    fn test_price_converter_new_applies_precision_only() {
+        let prices = IbPriceConverter::new(5);
+
+        assert_eq!(prices.precision(), 5);
+        assert_eq!(prices.price(1.12097).unwrap(), Price::from("1.12097"));
+    }
+
+    #[rstest]
+    fn test_price_converter_rejects_non_finite_price() {
+        let prices = IbPriceConverter::new(2);
+
+        assert!(prices.price(f64::NAN).is_err());
+    }
+
+    #[rstest]
+    fn test_ib_bar_to_nautilus_bar_rounds_fx_prices_to_increment() {
+        let ib_bar = ibapi::market_data::historical::Bar {
+            date: datetime!(2024-01-01 10:00:00 UTC).into(),
+            open: 1.12097,
+            high: 1.12103,
+            low: 1.12091,
+            close: 1.12098,
+            volume: 0.0,
+            wap: 0.0,
+            count: 0,
+        };
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let bar_type = BarType::new(
+            instrument.id(),
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Mid),
+            AggregationSource::External,
+        );
+
+        let bar = ib_bar_to_nautilus_bar(
+            &ib_bar,
+            bar_type,
+            IbPriceConverter::for_instrument(&instrument, 1),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(bar.open, Price::from("1.12095"));
+        assert_eq!(bar.high, Price::from("1.12105"));
+        assert_eq!(bar.low, Price::from("1.12090"));
+        assert_eq!(bar.close, Price::from("1.12100"));
+    }
+
+    #[rstest]
+    #[case(1.12098, "1.12095", "1.12100")]
+    #[case(1.12099, "1.12095", "1.12100")]
+    #[case(1.12097, "1.12095", "1.12100")]
+    #[case(1.12095, "1.12095", "1.12095")]
+    #[case(-1.12097, "-1.12100", "-1.12095")]
+    fn test_price_converter_rounds_bid_down_and_ask_up(
+        #[case] ib_price: f64,
+        #[case] bid: &str,
+        #[case] ask: &str,
+    ) {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.bid_price(ib_price).unwrap(), Price::from(bid));
+        assert_eq!(prices.ask_price(ib_price).unwrap(), Price::from(ask));
+    }
+
+    #[rstest]
+    fn test_price_converter_rounds_bid_down_and_ask_up_for_jpy_pair() {
+        let instrument = currency_pair("USD", "JPY", 3, "0.005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.bid_price(151.0049).unwrap(), Price::from("151.000"));
+        assert_eq!(prices.ask_price(151.0001).unwrap(), Price::from("151.005"));
+    }
+
+    #[rstest]
+    #[case(PriceType::Bid, "1.12095")]
+    #[case(PriceType::Ask, "1.12100")]
+    #[case(PriceType::Mid, "1.12095")]
+    #[case(PriceType::Last, "1.12095")]
+    fn test_price_converter_bar_price_follows_price_type(
+        #[case] price_type: PriceType,
+        #[case] expected: &str,
+    ) {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(
+            prices.bar_price(price_type, 1.12097).unwrap(),
+            Price::from(expected)
+        );
+    }
+
+    #[rstest]
+    fn test_price_converter_bid_and_ask_do_not_round_equity() {
+        let instrument = create_equity();
+        let prices = IbPriceConverter::for_instrument(&instrument, 1);
+
+        assert_eq!(prices.bid_price(100.03).unwrap(), Price::from("100.03"));
+        assert_eq!(prices.ask_price(100.03).unwrap(), Price::from("100.03"));
+    }
+
+    #[rstest]
+    #[case(PriceType::Bid, "1.12095", "1.12105", "1.12090", "1.12095")]
+    #[case(PriceType::Ask, "1.12100", "1.12110", "1.12095", "1.12100")]
+    fn test_ib_bar_to_nautilus_bar_rounds_fx_bid_and_ask_bars(
+        #[case] price_type: PriceType,
+        #[case] open: &str,
+        #[case] high: &str,
+        #[case] low: &str,
+        #[case] close: &str,
+    ) {
+        let ib_bar = ibapi::market_data::historical::Bar {
+            date: datetime!(2024-01-01 10:00:00 UTC).into(),
+            open: 1.12097,
+            high: 1.12109,
+            low: 1.12091,
+            close: 1.12096,
+            volume: 0.0,
+            wap: 0.0,
+            count: 0,
+        };
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let bar_type = BarType::new(
+            instrument.id(),
+            BarSpecification::new(1, BarAggregation::Minute, price_type),
+            AggregationSource::External,
+        );
+
+        let bar = ib_bar_to_nautilus_bar(
+            &ib_bar,
+            bar_type,
+            IbPriceConverter::for_instrument(&instrument, 1),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(bar.open, Price::from(open));
+        assert_eq!(bar.high, Price::from(high));
+        assert_eq!(bar.low, Price::from(low));
+        assert_eq!(bar.close, Price::from(close));
+        assert!(bar.high >= bar.low);
+    }
+
+    #[rstest]
+    #[case(425.25, "4.2525")]
+    #[case(486.25, "4.8625")]
+    #[case(-100.0, "-1.0000")]
+    fn test_price_converter_divides_by_price_magnifier(
+        #[case] ib_price: f64,
+        #[case] expected: &str,
+    ) {
+        let prices = IbPriceConverter::new(4).with_price_magnifier(100);
+
+        assert_eq!(prices.price(ib_price).unwrap(), Price::from(expected));
+    }
+
+    #[rstest]
+    fn test_price_converter_converts_magnified_quarter_cent_steps_exactly() {
+        let prices = IbPriceConverter::new(4).with_price_magnifier(100);
+
+        // A quarter-cent step of 0.25 cents is 0.0025 in the contract's currency
+        for n in 0_i64..=2000 {
+            let ib_price = n as f64 * 0.25;
+            let ten_thousandths = n * 25;
+            let expected = Price::from(
+                format!(
+                    "{}.{:04}",
+                    ten_thousandths / 10_000,
+                    ten_thousandths % 10_000
+                )
+                .as_str(),
+            );
+
+            assert_eq!(
+                prices.price(ib_price).unwrap(),
+                expected,
+                "ib_price={ib_price}"
+            );
+        }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(-5)]
+    #[case(1)]
+    fn test_price_converter_treats_magnifier_below_one_as_one(#[case] magnifier: i32) {
+        let prices = IbPriceConverter::new(2).with_price_magnifier(magnifier);
+
+        assert_eq!(prices.price(150.25).unwrap(), Price::from("150.25"));
+    }
+
+    #[rstest]
+    #[case::magnified_sentinel(100, -100.0, None, true)]
+    #[case::magnified_sentinel_zero_size(100, -100.0, Some(0.0), true)]
+    #[case::magnified_price_with_size(100, -100.0, Some(5.0), false)]
+    #[case::unmagnified_sentinel(100, -1.0, None, true)]
+    #[case::magnified_price(100, 5.5, None, false)]
+    #[case::other_negative_price(100, -1.25, None, false)]
+    #[case::plain_sentinel(1, -1.0, None, true)]
+    #[case::plain_negative_price(1, -100.0, None, false)]
+    fn test_price_converter_detects_magnified_sentinel(
+        #[case] magnifier: i32,
+        #[case] ib_price: f64,
+        #[case] size: Option<f64>,
+        #[case] expected: bool,
+    ) {
+        let prices = IbPriceConverter::new(5).with_price_magnifier(magnifier);
+
+        assert_eq!(prices.is_sentinel(ib_price, size), expected);
+    }
+
+    #[rstest]
+    fn test_price_converter_divides_before_rounding_fx_to_increment() {
+        let instrument = currency_pair("EUR", "USD", 5, "0.00005");
+        let prices = IbPriceConverter::for_instrument(&instrument, 100);
+
+        assert_eq!(prices.price(112.097).unwrap(), Price::from("1.12095"));
+    }
+
+    #[rstest]
+    fn test_ib_bar_to_nautilus_bar_divides_magnified_prices() {
+        let ib_bar = ibapi::market_data::historical::Bar {
+            date: datetime!(2024-01-01 10:00:00 UTC).into(),
+            open: 425.25,
+            high: 430.0,
+            low: 424.5,
+            close: 428.5,
+            volume: 10.0,
+            wap: 0.0,
+            count: 1,
+        };
+        let bar_type = BarType::new(
+            create_test_instrument_id(),
+            BarSpecification::new(1, BarAggregation::Minute, PriceType::Last),
+            AggregationSource::External,
+        );
+
+        let bar = ib_bar_to_nautilus_bar(
+            &ib_bar,
+            bar_type,
+            IbPriceConverter::new(4).with_price_magnifier(100),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(bar.open, Price::from("4.2525"));
+        assert_eq!(bar.high, Price::from("4.3000"));
+        assert_eq!(bar.low, Price::from("4.2450"));
+        assert_eq!(bar.close, Price::from("4.2850"));
     }
 }

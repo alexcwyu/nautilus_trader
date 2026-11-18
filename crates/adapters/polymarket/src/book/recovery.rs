@@ -27,8 +27,9 @@
 use std::sync::Arc;
 
 use ahash::AHashSet;
+use dashmap::DashSet;
 use nautilus_common::live::dst::time::{self, Duration, Instant};
-use nautilus_core::{AtomicMap, AtomicSet};
+use nautilus_core::AtomicMap;
 use nautilus_live::{book::recovery::BookRecovery as Recovery, task::TaskSpawner};
 use nautilus_model::{
     identifiers::InstrumentId,
@@ -44,14 +45,10 @@ pub(crate) type BookRecovery = Recovery<PolymarketWsError>;
 
 /// Spawns a one-shot monitor that retries recovery for every listed instrument
 /// whose armed snapshot deadline expires.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "monitor needs shared adapter state"
-)]
 pub(crate) fn spawn_recovery_monitor(
     book_sync: BookSyncTracker,
     pool: PolymarketMarketPoolHandle,
-    active_delta_subs: Arc<AtomicSet<InstrumentId>>,
+    active_delta_subs: Arc<DashSet<InstrumentId>>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     instrument_ids: Vec<InstrumentId>,
     snapshot_timeout: Duration,
@@ -90,14 +87,10 @@ pub(crate) fn spawn_recovery_monitor(
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "recovery needs shared adapter state"
-)]
 pub(crate) fn start_recovery(
     instrument_id: InstrumentId,
     token_id: Option<String>,
-    active_delta_subs: &Arc<AtomicSet<InstrumentId>>,
+    active_delta_subs: &Arc<DashSet<InstrumentId>>,
     book_sync: &BookSyncTracker,
     pool: &PolymarketMarketPoolHandle,
     snapshot_timeout: Duration,
@@ -127,7 +120,7 @@ pub(crate) fn start_recovery(
     );
 }
 
-pub(crate) fn spawn_recovery_task(
+fn spawn_recovery_task(
     instrument_id: InstrumentId,
     token_id: String,
     recovery: Arc<BookRecovery>,
@@ -231,7 +224,7 @@ mod tests {
     #[rstest]
     fn start_recovery_ignores_unsubscribed_instrument() {
         let book_sync = BookSyncTracker::default();
-        let active_delta_subs = Arc::new(AtomicSet::new());
+        let active_delta_subs = Arc::new(DashSet::new());
         let (ws_tx, _ws_rx) = tokio::sync::mpsc::unbounded_channel();
         let pool = PolymarketMarketPoolHandle::test_single_shard(ws_tx, &[]);
         let (_tasks, spawner) = test_tasks();
@@ -248,8 +241,11 @@ mod tests {
         );
 
         assert!(!book_sync.book_gated(instrument_id));
+        active_delta_subs.insert(instrument_id);
         assert!(
-            book_sync.claim_recovery(instrument_id).is_some(),
+            book_sync
+                .claim_recovery_if_subscribed(&active_delta_subs, instrument_id)
+                .is_some(),
             "unsubscribed instrument must not consume recovery ownership"
         );
     }
@@ -257,7 +253,7 @@ mod tests {
     #[rstest]
     fn start_recovery_without_token_leaves_book_unowned() {
         let book_sync = BookSyncTracker::default();
-        let active_delta_subs = Arc::new(AtomicSet::new());
+        let active_delta_subs = Arc::new(DashSet::new());
         active_delta_subs.insert(instrument_id());
         let (ws_tx, _ws_rx) = tokio::sync::mpsc::unbounded_channel();
         let pool = PolymarketMarketPoolHandle::test_single_shard(ws_tx, &[]);
@@ -284,20 +280,26 @@ mod tests {
             ),
             "missing token must not suppress book output"
         );
-        assert!(book_sync.claim_recovery(instrument_id).is_some());
+        assert!(
+            book_sync
+                .claim_recovery_if_subscribed(&active_delta_subs, instrument_id)
+                .is_some()
+        );
     }
 
     #[rstest]
     #[tokio::test]
     async fn start_recovery_skips_when_recovery_owned() {
         let book_sync = BookSyncTracker::default();
-        let active_delta_subs = Arc::new(AtomicSet::new());
+        let active_delta_subs = Arc::new(DashSet::new());
         active_delta_subs.insert(instrument_id());
         let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
         let pool = PolymarketMarketPoolHandle::test_single_shard(ws_tx, &["0xTOKEN"]);
         let (tasks, spawner) = test_tasks();
         let instrument_id = instrument_id();
-        let owned = book_sync.claim_recovery(instrument_id).unwrap();
+        let owned = book_sync
+            .claim_recovery_if_subscribed(&active_delta_subs, instrument_id)
+            .unwrap();
 
         start_recovery(
             instrument_id,
@@ -322,14 +324,18 @@ mod tests {
             "owned recovery must not resubscribe"
         );
         assert!(!owned.cancellation.is_cancelled());
-        assert!(book_sync.claim_recovery(instrument_id).is_none());
+        assert!(
+            book_sync
+                .claim_recovery_if_subscribed(&active_delta_subs, instrument_id)
+                .is_none()
+        );
     }
 
     #[rstest]
     #[tokio::test]
     async fn recovery_task_keeps_ownership_after_non_retryable_failure() {
         let book_sync = BookSyncTracker::default();
-        let active_delta_subs = AtomicSet::new();
+        let active_delta_subs = DashSet::new();
         active_delta_subs.insert(instrument_id());
         let (ws_tx, _ws_rx) = tokio::sync::mpsc::unbounded_channel();
         // The token is unowned, so the replacement send fails fast with a
@@ -337,7 +343,9 @@ mod tests {
         let pool = PolymarketMarketPoolHandle::test_single_shard(ws_tx, &[]);
         let (tasks, spawner) = test_tasks();
         let instrument_id = instrument_id();
-        let recovery = book_sync.claim_recovery(instrument_id).unwrap();
+        let recovery = book_sync
+            .claim_recovery_if_subscribed(&active_delta_subs, instrument_id)
+            .unwrap();
 
         spawn_recovery_task(
             instrument_id,
@@ -356,7 +364,8 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(200)).await;
 
         let running = recovery.is_running();
-        let second_owner = book_sync.claim_recovery(instrument_id);
+        let second_owner =
+            book_sync.claim_recovery_if_subscribed(&active_delta_subs, instrument_id);
         recovery.gate.open();
         let accepted = book_sync.record_snapshot_if_subscribed(
             &active_delta_subs,

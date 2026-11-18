@@ -16,10 +16,9 @@
 //! Streaming HTTP responses with the request's original deadline and connection ownership.
 
 use bytes::Bytes;
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use url::Url;
 
 use super::{HttpClientError, client::REQUEST_TIMEOUT_MESSAGE, error::transport_error};
 use crate::dst::time::Instant;
@@ -33,7 +32,7 @@ use crate::dst::time::Instant;
 pub struct HttpResponseStream {
     pub(super) response: http::Response<Incoming>,
     pub(super) deadline: Option<Instant>,
-    pub(super) url: Option<Url>,
+    pub(super) origin: Option<String>,
     #[cfg(all(feature = "simulation", madsim))]
     pub(super) _connection: super::simulation::Connection,
 }
@@ -45,15 +44,21 @@ impl HttpResponseStream {
         self.response.status()
     }
 
+    /// Returns the response headers without consuming the body.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        self.response.headers()
+    }
+
     /// Reads the next body chunk, or returns `None` at the end of the body.
     ///
     /// # Errors
     ///
-    /// Returns an error on a transport failure or when the original request deadline expires.
+    /// Returns an error if the transport fails or the original request deadline expires.
     pub async fn chunk(&mut self) -> Result<Option<Bytes>, HttpClientError> {
         read_chunk(self.response.body_mut(), self.deadline)
             .await
-            .map_err(|e| response_error(e, self.url.as_ref()))
+            .map_err(|e| response_error(e, self.origin.as_deref()))
     }
 }
 
@@ -66,13 +71,10 @@ where
     B::Error: std::error::Error + 'static,
 {
     loop {
+        check_deadline(deadline)?;
+
         let frame = match deadline {
             Some(deadline) => {
-                if Instant::now() >= deadline {
-                    return Err(HttpClientError::TimeoutError(
-                        REQUEST_TIMEOUT_MESSAGE.into(),
-                    ));
-                }
                 tokio::select! {
                     biased;
                     () = crate::dst::time::sleep_until(deadline) => return Err(HttpClientError::TimeoutError(REQUEST_TIMEOUT_MESSAGE.into())),
@@ -81,6 +83,7 @@ where
             }
             None => body.frame().await,
         };
+
         let Some(frame) = frame else {
             return Ok(None);
         };
@@ -91,10 +94,20 @@ where
     }
 }
 
-pub(super) fn response_error(error: HttpClientError, url: Option<&Url>) -> HttpClientError {
-    match (error, url) {
-        (HttpClientError::TransportError(message), Some(url)) => {
-            HttpClientError::TransportError(format!("{message} for url ({url})"))
+pub(super) fn check_deadline(deadline: Option<Instant>) -> Result<(), HttpClientError> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(HttpClientError::TimeoutError(
+            REQUEST_TIMEOUT_MESSAGE.into(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(super) fn response_error(error: HttpClientError, origin: Option<&str>) -> HttpClientError {
+    match (error, origin) {
+        (HttpClientError::TransportError(message), Some(origin)) => {
+            HttpClientError::TransportError(format!("{message} for origin ({origin})"))
         }
         (error, _) => error,
     }

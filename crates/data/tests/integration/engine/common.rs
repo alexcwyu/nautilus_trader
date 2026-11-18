@@ -13,6 +13,10 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#[cfg(feature = "streaming")]
+use indexmap::IndexMap;
+use nautilus_common::messages::data::IntoInstrumentIds;
+
 use super::*;
 
 #[fixture]
@@ -47,7 +51,7 @@ pub(super) fn data_engine(
 ) -> Rc<RefCell<DataEngine>> {
     let data_engine = Rc::new(RefCell::new(DataEngine::new(clock, cache, None)));
 
-    let data_engine_clone = data_engine.clone();
+    let data_engine_clone = Rc::clone(&data_engine);
 
     let handler = TypedIntoHandler::from(move |cmd: DataCommand| {
         data_engine_clone.borrow_mut().execute(cmd);
@@ -97,7 +101,7 @@ pub(super) fn register_mock_client(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(recorder)),
     );
     let adapter = DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client));
     data_engine.register_client(adapter, routing);
@@ -117,7 +121,7 @@ pub(super) fn register_failing_subscribe_client(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(recorder)),
     )
     .with_subscribe_failure(failure);
     let adapter = DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client));
@@ -202,17 +206,22 @@ impl DataClient for FailingRequestDataClient {
 }
 
 pub(super) fn parent_params() -> Params {
-    let mut params = Params::new();
-    params.insert(PARAMS_IS_PARENT.to_string(), json!(true));
-    params
+    Params::new([(PARAMS_IS_PARENT.to_string(), json!(true))].into())
 }
 
+#[cfg_attr(
+    feature = "streaming",
+    allow(
+        clippy::needless_pass_by_value,
+        reason = "returns owned params when streaming is disabled"
+    )
+)]
 pub(super) fn client_subscription_params(params: Params) -> Params {
     #[cfg(feature = "streaming")]
     {
-        let mut params = params;
+        let mut params = IndexMap::clone(&params);
         params.insert("start_ns".to_string(), Value::Null);
-        params
+        Params::new(params)
     }
 
     #[cfg(not(feature = "streaming"))]
@@ -388,13 +397,13 @@ pub(super) fn data_engine_clock_at(now: u64) -> Rc<RefCell<dyn Clock>> {
 
 pub(super) fn execute_book_snapshot_subscribe(
     data_engine: &Rc<RefCell<DataEngine>>,
-    instrument_id: InstrumentId,
+    instrument_ids: impl IntoInstrumentIds,
     client_id: ClientId,
     venue: Venue,
     interval_ms: NonZeroUsize,
 ) {
     let subscribe = SubscribeBookSnapshots::new(
-        instrument_id,
+        instrument_ids,
         BookType::L2_MBP,
         Some(client_id),
         Some(venue),
@@ -415,13 +424,13 @@ pub(super) fn execute_book_snapshot_subscribe(
 
 pub(super) fn execute_book_snapshot_unsubscribe(
     data_engine: &Rc<RefCell<DataEngine>>,
-    instrument_id: InstrumentId,
+    instrument_ids: impl IntoInstrumentIds,
     client_id: ClientId,
     venue: Venue,
     interval_ms: NonZeroUsize,
 ) {
     let unsubscribe = UnsubscribeBookSnapshots::new(
-        instrument_id,
+        instrument_ids,
         interval_ms,
         Some(client_id),
         Some(venue),
@@ -467,7 +476,7 @@ pub(super) fn create_snapshot_test_engine(
         MessageBus::new(TraderId::test_default(), UUID4::new(), None, None).register_message_bus();
 
     let data_engine = Rc::new(RefCell::new(DataEngine::new(clock, cache, None)));
-    let data_engine_clone = data_engine.clone();
+    let data_engine_clone = Rc::clone(&data_engine);
 
     let handler = TypedIntoHandler::from(move |cmd: DataCommand| {
         data_engine_clone.borrow_mut().execute(cmd);
@@ -576,9 +585,11 @@ pub(super) fn subscribe_synthetic_quotes_cmd(instrument_id: InstrumentId) -> Dat
     )))
 }
 
-pub(super) fn subscribe_synthetic_trades_cmd(instrument_id: InstrumentId) -> DataCommand {
+pub(super) fn subscribe_synthetic_trades_cmd(
+    instrument_ids: impl IntoInstrumentIds,
+) -> DataCommand {
     DataCommand::Subscribe(SubscribeCommand::Trades(SubscribeTrades::new(
-        instrument_id,
+        instrument_ids,
         None,
         Some(Venue::synthetic()),
         UUID4::new(),
@@ -706,7 +717,7 @@ pub(super) fn register_time_range_recorder(
         cache,
         client_id,
         Some(venue),
-        Some(recorder.clone()),
+        Some(Rc::clone(&recorder)),
     );
     let adapter = DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(mock_client));
     data_engine.register_client(adapter, None);
@@ -788,6 +799,20 @@ pub(super) fn split_delta(instrument_id: InstrumentId, ts: u64) -> OrderBookDelt
         .build()
 }
 
+// A terminal envelope without a payload yields an empty entry
+pub(super) fn delivered_book_deltas(
+    saver: &TypedMessageSavingHandler<DataResponseEnvelope>,
+) -> Vec<Vec<OrderBookDelta>> {
+    saver
+        .get_messages()
+        .iter()
+        .map(|envelope| match envelope.response() {
+            Some(DataResponse::BookDeltas(response)) => response.data.to_vec(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
 #[cfg(feature = "streaming")]
 pub(super) fn register_deltas_catalog_with_deltas(
     data_engine: &mut DataEngine,
@@ -824,11 +849,11 @@ pub(super) fn managed_book_engine(
     client_id: ClientId,
     venue: Venue,
 ) -> Rc<RefCell<DataEngine>> {
-    let engine = create_snapshot_test_engine(clock.clone(), cache.clone());
+    let engine = create_snapshot_test_engine(Rc::clone(&clock), Rc::clone(&cache));
     let recorder = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
         clock,
-        cache.clone(),
+        Rc::clone(&cache),
         client_id,
         venue,
         None,

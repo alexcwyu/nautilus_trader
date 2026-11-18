@@ -42,7 +42,7 @@ pub trait FromU16 {
         Self: Sized;
 }
 
-/// An account type provided by a trading venue or broker.
+/// An account type provided by a trading venue or execution provider.
 #[repr(C)]
 #[derive(
     Copy,
@@ -731,6 +731,49 @@ pub enum CurrencyType {
     CommodityBacked = 3,
 }
 
+/// The exercise style of an option, independent of its kind and settlement type.
+#[repr(C)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    AsRefStr,
+    FromRepr,
+    EnumIter,
+    EnumString,
+)]
+#[strum(ascii_case_insensitive)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        frozen,
+        eq,
+        eq_int,
+        module = "nautilus_trader.model",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
+)]
+pub enum ExerciseStyle {
+    /// Exercisable at any time up to expiration.
+    American = 1,
+    /// Exercisable only at expiration.
+    European = 2,
+    /// Exercisable only on specified dates up to expiration.
+    Bermudan = 3,
+}
+
 /// The instrument class.
 #[repr(C)]
 #[derive(
@@ -776,7 +819,7 @@ pub enum InstrumentClass {
     FuturesSpread = 4,
     /// A forward derivative instrument class. A customized contract between two parties to buy or sell an asset at a specified price on a future date.
     Forward = 5,
-    /// A contract-for-difference (CFD) instrument class. A contract between an investor and a CFD broker to exchange the difference in the value of a financial product between the time the contract opens and closes.
+    /// A contract-for-difference (CFD) instrument class. A contract between an investor and a CFD provider to exchange the difference in the value of a financial product between the time the contract opens and closes.
     Cfd = 6,
     /// A bond instrument class. A type of debt investment where an investor loans money to an entity (typically corporate or governmental) which borrows the funds for a defined period of time at a variable or fixed interest rate.
     Bond = 7,
@@ -815,7 +858,9 @@ impl InstrumentClass {
         )
     }
 
-    pub(crate) const fn is_premium_based(&self) -> bool {
+    /// Returns whether fills for this instrument class exchange the notional value as premium cash.
+    #[must_use]
+    pub const fn is_premium_based(&self) -> bool {
         matches!(
             self,
             Self::Option | Self::OptionSpread | Self::BinaryOption | Self::Warrant
@@ -2025,6 +2070,47 @@ impl RecordFlag {
     }
 }
 
+/// The contractual settlement of an option, independent of its exercise style.
+#[repr(C)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Display,
+    Hash,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    AsRefStr,
+    FromRepr,
+    EnumIter,
+    EnumString,
+)]
+#[strum(ascii_case_insensitive)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        frozen,
+        eq,
+        eq_int,
+        module = "nautilus_trader.model",
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE",
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.model")
+)]
+pub enum SettlementType {
+    /// Pays the option's intrinsic value in its settlement currency.
+    Cash = 1,
+    /// Delivers a position in the contractual underlying instrument.
+    Physical = 2,
+}
+
 /// The 'Time in Force' instruction for an order.
 #[repr(C)]
 #[derive(
@@ -2238,6 +2324,7 @@ enum_strum_serde!(BookType);
 enum_strum_serde!(ContingencyType);
 enum_strum_serde!(ContinuousFutureAdjustmentType);
 enum_strum_serde!(CurrencyType);
+enum_strum_serde!(ExerciseStyle);
 enum_strum_serde!(GreeksConvention);
 enum_strum_serde!(InstrumentClass);
 enum_strum_serde!(InstrumentCloseType);
@@ -2255,6 +2342,7 @@ enum_strum_serde!(PositionAdjustmentType);
 enum_strum_serde!(PositionSide);
 enum_strum_serde!(PriceType);
 enum_strum_serde!(RecordFlag);
+enum_strum_serde!(SettlementType);
 enum_strum_serde!(TimeInForce);
 enum_strum_serde!(TradingState);
 enum_strum_serde!(TrailingOffsetType);
@@ -2695,6 +2783,7 @@ mod tests {
             ContingencyType,
             ContinuousFutureAdjustmentType,
             CurrencyType,
+            ExerciseStyle,
             GreeksConvention,
             InstrumentClass,
             InstrumentCloseType,
@@ -2711,6 +2800,7 @@ mod tests {
             PositionSide,
             PriceType,
             RecordFlag,
+            SettlementType,
             TimeInForce,
             TradingState,
             TrailingOffsetType,
@@ -2780,6 +2870,9 @@ mod tests {
         "CurrencyType::CommodityBacked=COMMODITY_BACKED",
         "CurrencyType::Crypto=CRYPTO",
         "CurrencyType::Fiat=FIAT",
+        "ExerciseStyle::American=AMERICAN",
+        "ExerciseStyle::Bermudan=BERMUDAN",
+        "ExerciseStyle::European=EUROPEAN",
         "GreeksConvention::BlackScholes=BLACK_SCHOLES",
         "GreeksConvention::PriceAdjusted=PRICE_ADJUSTED",
         "InstrumentClass::BinaryOption=BINARY_OPTION",
@@ -2870,6 +2963,8 @@ mod tests {
         "RecordFlag::F_TOB=F_TOB",
         "RecordFlag::RESERVED_1=RESERVED_1",
         "RecordFlag::RESERVED_2=RESERVED_2",
+        "SettlementType::Cash=CASH",
+        "SettlementType::Physical=PHYSICAL",
         "TimeInForce::AtTheClose=AT_THE_CLOSE",
         "TimeInForce::AtTheOpen=AT_THE_OPEN",
         "TimeInForce::Day=DAY",
@@ -2920,6 +3015,7 @@ mod tests {
             ContingencyType,
             ContinuousFutureAdjustmentType,
             CurrencyType,
+            ExerciseStyle,
             GreeksConvention,
             InstrumentClass,
             InstrumentCloseType,
@@ -2936,6 +3032,7 @@ mod tests {
             PositionSide,
             PriceType,
             RecordFlag,
+            SettlementType,
             TimeInForce,
             TradingState,
             TrailingOffsetType,

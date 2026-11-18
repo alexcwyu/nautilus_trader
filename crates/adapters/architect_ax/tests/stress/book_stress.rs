@@ -33,6 +33,7 @@
 //! every snapshot episode was verified. The sandbox market maker quotes only some instruments, and
 //! a book that stops streaming fails the run, so `--symbols` selects books that stream.
 
+mod initial_replacements;
 #[path = "../../../../live/tests/book/stress/mod.rs"]
 mod stress;
 
@@ -46,6 +47,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use initial_replacements::BUDGET;
 use nautilus_architect_ax::{
     common::{
         consts::{AX_CLIENT_ID, AX_WS_SANDBOX_PUBLIC_URL},
@@ -78,8 +80,6 @@ const STREAM: &str = "md";
 const ENDPOINT: &str = "architect-ax-data-streams";
 // AX sends every aggregated level, so the comparison depth only needs to exceed the deepest book
 const DEPTH: usize = 100;
-// Replacement attempts in the shared retry budget, including the first
-const BUDGET: usize = 8;
 // A held snapshot released this long after a reconnect beats a deadline of twice this length
 const LATE_SECS: u64 = 4;
 
@@ -231,6 +231,7 @@ async fn initial(args: &StressArgs, ids: &[InstrumentId]) -> String {
 
     for round in 0..args.rounds() {
         let mut session = AxSession::connect(args).await;
+        let started = Instant::now();
 
         for id in ids {
             let mut fault = session.fault(id);
@@ -259,15 +260,25 @@ async fn initial(args: &StressArgs, ids: &[InstrumentId]) -> String {
             reconnect(&mut session);
         }
 
-        session
-            .healthy_within(ids, Duration::from_secs(timeout + 60))
-            .await;
+        let recovery_timeout = Duration::from_secs(timeout + 60);
+        session.healthy_within(ids, recovery_timeout).await;
+        if timeout > 0 {
+            session
+                .until(recovery_timeout, "initial unsubscribe acknowledged", |s| {
+                    ids.iter().all(|id| s.fault(id).unsubscribes > 0)
+                })
+                .await;
+        }
 
         for id in ids {
             let fault = session.fault(id).clone();
             assert_eq!(fault.corrupted, 0);
             assert_eq!(fault.dropped, 1);
-            assert_eq!(fault.unsubscribes, usize::from(timeout > 0));
+            assert!(
+                initial_replacements::within_limit(fault.unsubscribes, timeout, started.elapsed()),
+                "{id} made {} initial recovery replacements with snapshot timeout {timeout}s",
+                fault.unsubscribes,
+            );
             assert!(session.book(id).snapshots >= 1);
         }
 

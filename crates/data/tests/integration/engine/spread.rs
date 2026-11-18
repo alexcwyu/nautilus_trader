@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use indexmap::IndexMap;
+
 use super::*;
 
 #[rstest]
@@ -22,11 +24,11 @@ fn test_subscribe_spread_quotes_default_interval_publishes_on_timer(
     client_id: ClientId,
     venue: Venue,
 ) {
-    let data_engine = create_snapshot_test_engine(clock.clone(), cache.clone());
+    let data_engine = create_snapshot_test_engine(Rc::clone(&clock), Rc::clone(&cache));
     let mut data_engine = data_engine.borrow_mut();
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
-        clock.clone(),
+        Rc::clone(&clock),
         cache,
         client_id,
         venue,
@@ -167,7 +169,9 @@ fn test_subscribe_spread_quotes_with_zero_interval_publishes_spread_quote(
         .borrow()
         .iter()
         .filter_map(|cmd| match cmd {
-            DataCommand::Subscribe(SubscribeCommand::Quotes(cmd)) => Some(cmd.instrument_id),
+            DataCommand::Subscribe(SubscribeCommand::Quotes(cmd)) => {
+                Some(cmd.single_instrument_id().unwrap())
+            }
             _ => None,
         })
         .collect();
@@ -217,7 +221,7 @@ fn test_subscribe_spread_quotes_without_exchange_endpoint_publishes_spread_quote
     client_id: ClientId,
     venue: Venue,
 ) {
-    let data_engine = create_snapshot_test_engine(clock.clone(), cache.clone());
+    let data_engine = create_snapshot_test_engine(Rc::clone(&clock), Rc::clone(&cache));
     let mut data_engine = data_engine.borrow_mut();
     let recorder: Rc<RefCell<Vec<DataCommand>>> = Rc::new(RefCell::new(Vec::new()));
     register_mock_client(
@@ -259,7 +263,7 @@ fn test_subscribe_spread_quotes_without_exchange_endpoint_publishes_spread_quote
     data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Quotes(sub)));
 
     let tap = Rc::new(RecordingSendTap::default());
-    msgbus::set_bus_tap(tap.clone());
+    msgbus::set_bus_tap(Rc::clone(&tap) as Rc<dyn BusTap>);
 
     let quote_a = QuoteTick::new(
         leg_a,
@@ -426,7 +430,9 @@ fn test_unsubscribe_spread_quotes_removes_leg_handlers(
         .borrow()
         .iter()
         .filter_map(|cmd| match cmd {
-            DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(cmd)) => Some(cmd.instrument_id),
+            DataCommand::Unsubscribe(UnsubscribeCommand::Quotes(cmd)) => {
+                Some(cmd.single_instrument_id().unwrap())
+            }
             _ => None,
         })
         .collect();
@@ -481,10 +487,12 @@ fn test_spread_quotes_release_after_final_owner_with_first_route(
     let spread_id = spread.id();
     let (leg_a, leg_b) = generic_futures_spread_legs();
     data_engine.process(&InstrumentAny::FuturesSpread(spread) as &dyn Any);
-    let mut first_params = spread_quote_params();
+    let mut first_params = IndexMap::clone(&spread_quote_params());
     first_params.insert("owner".to_string(), serde_json::json!(1));
-    let mut second_params = spread_quote_params();
+    let first_params = Params::new(first_params);
+    let mut second_params = IndexMap::clone(&spread_quote_params());
     second_params.insert("owner".to_string(), serde_json::json!(2));
+    let second_params = Params::new(second_params);
 
     for params in [first_params.clone(), second_params.clone()] {
         data_engine.execute(DataCommand::Subscribe(SubscribeCommand::Quotes(
@@ -538,8 +546,8 @@ fn test_spread_quotes_release_after_final_owner_with_first_route(
         .collect::<Vec<_>>();
 
     assert_eq!(released.len(), 2);
-    assert_eq!(released[0].instrument_id, leg_a);
-    assert_eq!(released[1].instrument_id, leg_b);
+    assert_eq!(released[0].instrument_ids, vec![leg_a]);
+    assert_eq!(released[1].instrument_ids, vec![leg_b]);
     assert_eq!(released[0].params.as_ref(), Some(&first_params));
     assert_eq!(released[1].params.as_ref(), Some(&first_params));
     assert_eq!(
@@ -605,8 +613,8 @@ fn test_shared_spread_quotes_retry_failed_leg(
         .collect::<Vec<_>>();
 
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].instrument_id, leg_b);
-    assert_eq!(commands[1].instrument_id, leg_a);
+    assert_eq!(commands[0].instrument_ids, vec![leg_b]);
+    assert_eq!(commands[1].instrument_ids, vec![leg_a]);
 
     for command in commands {
         assert_eq!(command.client_id, Some(client_id));
@@ -648,8 +656,8 @@ fn test_shared_spread_quotes_retry_failed_leg(
         .collect::<Vec<_>>();
 
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].instrument_id, leg_a);
-    assert_eq!(commands[1].instrument_id, leg_b);
+    assert_eq!(commands[0].instrument_ids, vec![leg_a]);
+    assert_eq!(commands[1].instrument_ids, vec![leg_b]);
 
     for command in commands {
         assert_eq!(command.client_id, Some(client_id));
@@ -752,8 +760,8 @@ fn test_spread_quotes_retain_existing_leg_sources(
         .collect::<Vec<_>>();
 
     assert_eq!(commands.len(), 2);
-    assert_eq!(commands[0].instrument_id, leg_a);
-    assert_eq!(commands[1].instrument_id, leg_b);
+    assert_eq!(commands[0].instrument_ids, vec![leg_a]);
+    assert_eq!(commands[1].instrument_ids, vec![leg_b]);
 
     for command in commands {
         assert_eq!(command.client_id, Some(client_id));

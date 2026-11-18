@@ -43,11 +43,11 @@ use ustr::Ustr;
 use zeroize::Zeroize;
 
 use crate::{
-    common::enums::LighterCandleResolution,
+    common::enums::{LighterCandleResolution, LighterTxStatus},
     http::models::{LighterOrder, LighterPriceLevel, LighterTrade},
 };
 
-pub(crate) const CANCEL_BATCH_ID_PREFIX: &str = "cancel-batch:";
+pub(crate) const TX_BATCH_ID_PREFIX: &str = "tx-batch:";
 
 /// Inbound message produced by the Lighter feed handler and consumed by the
 /// data and execution clients.
@@ -97,6 +97,10 @@ pub enum NautilusWsMessage {
         message: String,
         tx_hashes: Vec<String>,
     },
+    AccountTx {
+        connection_epoch: u64,
+        txs: Vec<LighterWsTx>,
+    },
     Raw(serde_json::Value),
     Reconnected {
         connection_epoch: u64,
@@ -113,6 +117,10 @@ impl NautilusWsMessage {
     #[must_use]
     pub(crate) fn with_connection_epoch(self, connection_epoch: u64) -> Self {
         match self {
+            Self::AccountTx { txs, .. } => Self::AccountTx {
+                connection_epoch,
+                txs,
+            },
             Self::SendTxAck { tx_hash, code, .. } => Self::SendTxAck {
                 connection_epoch,
                 tx_hash,
@@ -149,8 +157,7 @@ impl NautilusWsMessage {
     }
 }
 
-/// Identifier for one of the five account-scoped WebSocket streams the
-/// execution client subscribes to on connect.
+/// Account snapshot stream used to establish execution readiness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AccountStream {
     Orders,
@@ -289,6 +296,7 @@ pub enum LighterWsChannelKind {
     AccountAllTrades,
     AccountAllPositions,
     AccountAllAssets,
+    AccountTx,
     UserStats,
     Height,
 }
@@ -310,6 +318,7 @@ impl LighterWsChannelKind {
             Self::AccountAllTrades => "account_all_trades",
             Self::AccountAllPositions => "account_all_positions",
             Self::AccountAllAssets => "account_all_assets",
+            Self::AccountTx => "account_tx",
             Self::UserStats => "user_stats",
             Self::Height => "height",
         }
@@ -331,6 +340,7 @@ impl LighterWsChannelKind {
             "account_all_trades" => Some(Self::AccountAllTrades),
             "account_all_positions" => Some(Self::AccountAllPositions),
             "account_all_assets" => Some(Self::AccountAllAssets),
+            "account_tx" => Some(Self::AccountTx),
             "user_stats" => Some(Self::UserStats),
             "height" => Some(Self::Height),
             _ => None,
@@ -358,6 +368,7 @@ pub enum LighterWsChannel {
     AccountAllTrades(i64),
     AccountAllPositions(i64),
     AccountAllAssets(i64),
+    AccountTx(i64),
     UserStats(i64),
     Height,
 }
@@ -379,6 +390,7 @@ impl LighterWsChannel {
             Self::AccountAllTrades(_) => LighterWsChannelKind::AccountAllTrades,
             Self::AccountAllPositions(_) => LighterWsChannelKind::AccountAllPositions,
             Self::AccountAllAssets(_) => LighterWsChannelKind::AccountAllAssets,
+            Self::AccountTx(_) => LighterWsChannelKind::AccountTx,
             Self::UserStats(_) => LighterWsChannelKind::UserStats,
             Self::Height => LighterWsChannelKind::Height,
         }
@@ -404,6 +416,7 @@ impl LighterWsChannel {
             | Self::AccountAllTrades(account_index)
             | Self::AccountAllPositions(account_index)
             | Self::AccountAllAssets(account_index)
+            | Self::AccountTx(account_index)
             | Self::UserStats(account_index) => format!("{kind}/{account_index}"),
             Self::AccountOrders {
                 market_index,
@@ -436,6 +449,7 @@ impl LighterWsChannel {
                 | Self::AccountAllTrades(_)
                 | Self::AccountAllPositions(_)
                 | Self::AccountAllAssets(_)
+                | Self::AccountTx(_)
                 | Self::UserStats(_)
         )
     }
@@ -456,9 +470,22 @@ impl LighterMarketSelection {
     }
 }
 
+/// Transaction status update published by the authenticated `account_tx` stream.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LighterWsTx {
+    pub hash: String,
+    pub status: LighterTxStatus,
+    pub event_info: String,
+}
+
+/// A venue WebSocket data or account frame.
+///
+/// Account `transaction_time` fields preserve raw microseconds, including zero.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum LighterWsFrame {
+    #[serde(rename = "shutdown")]
+    Shutdown { close_in_ms: u64 },
     #[serde(rename = "subscribed/order_book")]
     OrderBookSnapshot {
         channel: Ustr,
@@ -541,6 +568,13 @@ pub enum LighterWsFrame {
         channel: Ustr,
         orders: AHashMap<Ustr, Vec<LighterOrder>>,
     },
+    #[serde(rename = "subscribed/account_tx")]
+    AccountTxSubscribed { channel: Ustr },
+    #[serde(rename = "update/account_tx")]
+    AccountTx {
+        channel: Ustr,
+        txs: Vec<LighterWsTx>,
+    },
     #[serde(rename = "subscribed/account_all_trades")]
     AccountAllTradesSnapshot {
         channel: Ustr,
@@ -570,6 +604,8 @@ pub enum LighterWsFrame {
         last_funding_round: Option<AHashMap<Ustr, Decimal>>,
         #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_time: Option<i64>,
     },
     #[serde(rename = "update/account_all_positions")]
     AccountAllPositions {
@@ -581,6 +617,8 @@ pub enum LighterWsFrame {
         last_funding_round: Option<AHashMap<Ustr, Decimal>>,
         #[serde(default, deserialize_with = "deserialize_optional_decimal_map")]
         last_funding_discount: Option<AHashMap<Ustr, Decimal>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_time: Option<i64>,
     },
     #[serde(
         rename = "update/account_all_assets",
@@ -590,6 +628,8 @@ pub enum LighterWsFrame {
         assets: AHashMap<Ustr, LighterAsset>,
         channel: Ustr,
         timestamp: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        transaction_time: Option<i64>,
     },
     #[serde(rename = "update/user_stats", alias = "subscribed/user_stats")]
     UserStats {
@@ -897,6 +937,10 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::common::enums::{
+        LighterOrderKind, LighterOrderStatus, LighterOrderTimeInForce, LighterTradeType,
+        LighterTriggerStatus,
+    };
 
     const WS_ORDER_BOOK_UPDATE: &str = include_str!("../../test_data/ws_order_book_update.json");
     const WS_ORDER_BOOK_SUBSCRIBED: &str =
@@ -1549,6 +1593,7 @@ mod tests {
                 assets,
                 channel,
                 timestamp,
+                transaction_time,
             } => {
                 assert_eq!(channel, Ustr::from("account_all_assets:1234"));
                 let asset = assets.get(&Ustr::from("3")).unwrap();
@@ -1562,6 +1607,7 @@ mod tests {
                 );
                 assert_eq!(asset.margin_mode, Ustr::from("disabled"));
                 assert_eq!(timestamp, 1_781_161_199_648);
+                assert_eq!(transaction_time, None);
             }
             _ => panic!("expected account all assets frame"),
         }
@@ -1752,6 +1798,73 @@ mod tests {
     }
 
     #[rstest]
+    #[case::absent(None, false)]
+    #[case::null(None, true)]
+    #[case::zero(Some(0), false)]
+    #[case::negative(Some(-1), false)]
+    #[case::micros(Some(1_791_406_944_316_056), false)]
+    #[case::exact_integer(Some(9_007_199_254_740_993), false)]
+    #[case::maximum(Some(i64::MAX), false)]
+    fn test_account_transaction_time_round_trip(
+        #[values("subscribed", "update")] prefix: &str,
+        #[values("positions", "assets")] channel: &str,
+        #[case] transaction_time: Option<i64>,
+        #[case] explicit_null: bool,
+    ) {
+        let fixture = match channel {
+            "positions" => {
+                include_str!("../../test_data/ws_account_all_positions_transaction_time.json")
+            }
+            "assets" => include_str!("../../test_data/ws_account_all_assets_transaction_time.json"),
+            _ => unreachable!(),
+        };
+
+        let mut value: Value = serde_json::from_str(fixture).unwrap();
+        value["type"] = serde_json::json!(format!("{prefix}/account_all_{channel}"));
+        match transaction_time {
+            Some(timestamp) => value["transaction_time"] = serde_json::json!(timestamp),
+            None if explicit_null => value["transaction_time"] = Value::Null,
+            None => {
+                value.as_object_mut().unwrap().remove("transaction_time");
+            }
+        }
+
+        let text = value.to_string();
+
+        for frame in [
+            serde_json::from_str::<LighterWsFrame>(&text).unwrap(),
+            serde_json::from_value(value).unwrap(),
+        ] {
+            let preserved = match &frame {
+                LighterWsFrame::AccountAllPositionsSnapshot {
+                    transaction_time, ..
+                }
+                | LighterWsFrame::AccountAllPositions {
+                    transaction_time, ..
+                }
+                | LighterWsFrame::AccountAllAssets {
+                    transaction_time, ..
+                } => *transaction_time,
+                _ => panic!("expected account position or asset frame"),
+            };
+
+            let serialized = serde_json::to_value(&frame).unwrap();
+
+            assert_eq!(preserved, transaction_time);
+            assert_eq!(
+                serialized.get("transaction_time"),
+                transaction_time
+                    .map(|timestamp| serde_json::json!(timestamp))
+                    .as_ref(),
+            );
+            assert_eq!(
+                serde_json::from_value::<LighterWsFrame>(serialized).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[rstest]
     fn test_height_frame_deserializes() {
         let frame: LighterWsFrame = serde_json::from_str(WS_HEIGHT_UPDATE).unwrap();
 
@@ -1869,5 +1982,110 @@ mod tests {
             }
             _ => panic!("expected candle update frame"),
         }
+    }
+
+    #[rstest]
+    #[case(0)]
+    #[case(7350)]
+    #[case(u64::MAX)]
+    fn shutdown_notification_parses_deadline(#[case] close_in_ms: u64) {
+        let frame: LighterWsFrame = serde_json::from_value(
+            serde_json::json!({"type":"shutdown", "close_in_ms":close_in_ms}),
+        )
+        .unwrap();
+
+        match frame {
+            LighterWsFrame::Shutdown {
+                close_in_ms: actual,
+            } => assert_eq!(actual, close_in_ms),
+            other => panic!("expected shutdown, was {other:?}"),
+        }
+    }
+
+    #[rstest]
+    #[case(serde_json::json!({"type":"shutdown"}))]
+    #[case(serde_json::json!({"type":"shutdown", "close_in_ms":-1}))]
+    #[case(serde_json::json!({"type":"shutdown", "close_in_ms":"7350"}))]
+    fn shutdown_notification_rejects_invalid_deadline(#[case] frame: serde_json::Value) {
+        assert!(serde_json::from_value::<LighterWsFrame>(frame).is_err());
+    }
+
+    #[rstest]
+    fn test_account_orders_frame_keeps_siblings_of_unfamiliar_classifications() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
+        let mut unfamiliar = payload["orders"]["0"][0].clone();
+        unfamiliar["order_id"] = serde_json::json!("900");
+        unfamiliar["order_index"] = serde_json::json!(900);
+        unfamiliar["type"] = serde_json::json!("future-type");
+        unfamiliar["time_in_force"] = serde_json::json!("future-tif");
+        unfamiliar["status"] = serde_json::json!("future-status");
+        unfamiliar["trigger_status"] = serde_json::json!("future-trigger");
+        payload["orders"]["0"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, unfamiliar);
+        let healthy: LighterWsFrame = serde_json::from_str(WS_ACCOUNT_ORDERS_UPDATE).unwrap();
+
+        let LighterWsFrame::AccountOrders {
+            orders: healthy, ..
+        } = healthy
+        else {
+            panic!("expected account orders frame");
+        };
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        let LighterWsFrame::AccountOrders { orders, .. } = frame else {
+            panic!("expected account orders frame");
+        };
+
+        let orders = &orders[&Ustr::from("0")];
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0].order_id, "900");
+        assert_eq!(orders[0].order_type, LighterOrderKind::Other);
+        assert_eq!(orders[0].time_in_force, LighterOrderTimeInForce::Unknown);
+        assert_eq!(orders[0].status, LighterOrderStatus::Unknown);
+        assert_eq!(orders[0].trigger_status, LighterTriggerStatus::Unknown);
+        assert_eq!(orders[1], healthy[&Ustr::from("0")][0]);
+    }
+
+    #[rstest]
+    fn test_account_all_trades_frame_keeps_fill_data_of_unfamiliar_trade_type() {
+        let mut payload: serde_json::Value =
+            serde_json::from_str(WS_ACCOUNT_ALL_TRADES_UPDATE).unwrap();
+        let mut unfamiliar = payload["trades"]["0"][0].clone();
+        unfamiliar["trade_id"] = serde_json::json!(900);
+        unfamiliar["trade_id_str"] = serde_json::json!("900");
+        unfamiliar["type"] = serde_json::json!("future-trade");
+        payload["trades"]["0"]
+            .as_array_mut()
+            .unwrap()
+            .insert(0, unfamiliar);
+        let healthy: LighterWsFrame = serde_json::from_str(WS_ACCOUNT_ALL_TRADES_UPDATE).unwrap();
+
+        let LighterWsFrame::AccountAllTrades {
+            trades: healthy, ..
+        } = healthy
+        else {
+            panic!("expected account all trades frame");
+        };
+
+        let healthy = &healthy[&Ustr::from("0")][0];
+        let mut expected = healthy.clone();
+        expected.trade_id = 900;
+        expected.trade_id_str = Some("900".to_string());
+        expected.trade_type = LighterTradeType::Other;
+
+        let frame: LighterWsFrame = serde_json::from_value(payload).unwrap();
+
+        let LighterWsFrame::AccountAllTrades { trades, .. } = frame else {
+            panic!("expected account all trades frame");
+        };
+
+        let trades = &trades[&Ustr::from("0")];
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0], expected);
+        assert_eq!(&trades[1], healthy);
     }
 }

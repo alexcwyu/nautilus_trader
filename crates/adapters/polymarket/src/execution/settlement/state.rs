@@ -22,7 +22,7 @@ use nautilus_model::{
     types::{Money, Price, Quantity},
 };
 
-use super::admission::AdmittedLeg;
+use super::admission::{AdmittedLeg, TakerFeeBasis};
 
 /// Maximum number of settlement entries created after hydration before the registry faults the
 /// client closed.
@@ -83,6 +83,9 @@ pub(crate) enum LegApplication {
 ///
 /// Venue evidence remains comparable after core application; reconstructed core events may
 /// contain normalized quantities and cannot establish the original stream economics.
+///
+/// `taker_fee_basis` is copied from the first non-failed taker admission. Maker, failed, and
+/// reconstructed legs leave it unset, so a later schedule can still conflict with their commission.
 #[derive(Debug)]
 pub(crate) struct SettlementLeg {
     pub venue_order_id: VenueOrderId,
@@ -93,6 +96,7 @@ pub(crate) struct SettlementLeg {
     pub last_qty: Quantity,
     pub last_px: Price,
     pub commission: Money,
+    pub taker_fee_basis: Option<TakerFeeBasis>,
     pub ts_event: UnixNanos,
     pub application: LegApplication,
     /// The canonical applied fill as published by core, retained for void construction.
@@ -113,6 +117,7 @@ impl SettlementLeg {
             last_qty: leg.last_qty,
             last_px: leg.last_px,
             commission: leg.commission.clone(),
+            taker_fee_basis: leg.taker_fee_basis,
             ts_event: leg.ts_event,
             application: LegApplication::Absent,
             applied_fill: None,
@@ -130,6 +135,7 @@ impl SettlementLeg {
 
 /// Effects the caller must execute after a registry transition.
 #[derive(Debug)]
+#[cfg_attr(feature = "high-precision", expect(clippy::large_enum_variant))]
 pub(crate) enum SettlementAction {
     /// Apply the leg by emitting an `OrderFilled` through the established emission machinery.
     ApplyLeg {
@@ -218,19 +224,32 @@ impl SettlementRecord {
             && (self.settlement == SettlementState::Quarantined || self.refresh_requested)
     }
 
-    /// Returns `true` while the record holds evidence that reconciliation must not treat as
-    /// covered: a hard fault, a targeted REST read still owed, a pending application, or a leg
-    /// awaiting application before terminal settlement.
+    /// Returns `true` while the record holds evidence that fill, position, and mass-status reports
+    /// must not treat as covered: a hard fault, a targeted REST read still owed, a pending
+    /// application, or a leg awaiting application before terminal settlement.
+    ///
+    /// Order-status reports use [`Self::blocks_order_status`], so a leg that only awaits
+    /// application does not fail the check.
     pub(crate) fn is_unresolved(&self) -> bool {
         self.hard_fault.is_some()
             || self.awaits_resolution()
-            || self.legs.iter().any(|leg| {
-                matches!(
-                    leg.application,
-                    LegApplication::FillPending | LegApplication::VoidPending
-                ) || (!self.settlement.is_rest_terminal()
-                    && leg.application == LegApplication::Absent
-                    && !leg.report_routed)
-            })
+            || self.legs.iter().any(|leg| self.leg_awaits_application(leg))
+    }
+
+    pub(super) fn leg_awaits_application(&self, leg: &SettlementLeg) -> bool {
+        matches!(
+            leg.application,
+            LegApplication::FillPending | LegApplication::VoidPending
+        ) || (!self.settlement.is_rest_terminal()
+            && leg.application == LegApplication::Absent
+            && !leg.report_routed)
+    }
+
+    /// Returns `true` when an order-status report must not treat this record's fills as covered.
+    ///
+    /// A leg that only awaits application does not block. A hard fault, quarantine, or owed
+    /// targeted REST read does, because those can report fills incorrectly.
+    pub(crate) fn blocks_order_status(&self) -> bool {
+        self.hard_fault.is_some() || self.awaits_resolution()
     }
 }

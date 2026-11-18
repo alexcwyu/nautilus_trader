@@ -40,7 +40,7 @@ pub mod tokenized_asset;
 #[cfg(any(test, feature = "test-support"))]
 pub mod stubs;
 
-use std::{fmt::Display, str::FromStr};
+use std::{any::Any, fmt::Display, str::FromStr};
 
 use enum_dispatch::enum_dispatch;
 use nautilus_core::{
@@ -247,7 +247,7 @@ fn is_usd_equivalent_currency(currency: Currency) -> bool {
 }
 
 #[enum_dispatch]
-pub trait Instrument: 'static + Send {
+pub trait Instrument: Any + Send {
     fn tick_scheme(&self) -> Option<Ustr> {
         None
     }
@@ -405,10 +405,10 @@ pub trait Instrument: 'static + Send {
     ///
     /// # Errors
     ///
-    /// Returns an error when `price` is a sentinel value or would require rounding.
+    /// Returns an error if `price` is a sentinel value or would require rounding.
     #[inline(always)]
     fn try_normalize_price(&self, price: Price) -> CorrectnessResult<Price> {
-        if price == ERROR_PRICE {
+        if price.precision == ERROR_PRICE.precision {
             return Err(CorrectnessError::InvalidValue {
                 param: "price".to_string(),
                 value: "ERROR_PRICE".to_string(),
@@ -530,7 +530,7 @@ pub trait Instrument: 'static + Send {
     ///
     /// # Errors
     ///
-    /// Returns an error when `quantity` is undefined or would require rounding.
+    /// Returns an error if `quantity` is undefined or would require rounding.
     #[inline(always)]
     fn try_normalize_qty(&self, quantity: Quantity) -> CorrectnessResult<Quantity> {
         if quantity.is_undefined() {
@@ -988,6 +988,8 @@ mod tests {
     #[rstest]
     #[case(Price::from("10000"), "10000.00")]
     #[case(Price::from("10000.0000"), "10000.00")]
+    #[case(Price::from("0"), "0.00")]
+    #[case(Price::from("0.0000"), "0.00")]
     fn try_normalize_price_rewrites_grid_aligned_values(
         currency_pair_btcusdt: CurrencyPair,
         #[case] input: Price,

@@ -13,6 +13,9 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+pub(super) const REFINEMENT_VOL_MIN: f64 = 1e-6;
+pub(super) const REFINEMENT_VOL_MAX: f64 = 10.0;
+
 pub trait BlackScholesReal:
     Sized
     + Copy
@@ -360,8 +363,8 @@ pub fn compute_iv_and_greeks<T: BlackScholesReal>(
 
     // Clamp volatility between 0.0001% and 1000% annualized to keep outputs finite
     let vol = (vol - (num * den_safe.recip_precise()))
-        .max(T::splat(1e-6))
-        .min(T::splat(10.0));
+        .max(T::splat(REFINEMENT_VOL_MIN))
+        .min(T::splat(REFINEMENT_VOL_MAX));
 
     let inv_vol_f = vol.recip_precise();
     let inv_scaled_vol_f = inv_vol_f * inv_sqrt_t;
@@ -665,8 +668,8 @@ mod tests {
             vega_exact_raw,
             g_exact.vega
         );
-        // Theta units differ: exact uses multiplier * daily_factor (0.0027378507871321013), fast uses raw units
-        let theta_daily_factor = 0.002_737_850_787_132_101_3;
+        // The exact result scales theta by multiplier / 365, while the fast result is annualized
+        let theta_daily_factor = 1.0 / 365.0;
         let theta_exact_raw = g_exact.theta / (multiplier * theta_daily_factor);
         assert!(
             (f64::from(g_fast.theta) - theta_exact_raw).abs() < greeks_tol,
@@ -693,7 +696,7 @@ mod tests {
 
         let g_exact = black_scholes_greeks_exact(s, r, b, vol, false, k, t);
 
-        let theta_daily_factor = 0.002_737_850_787_132_101_3;
+        let theta_daily_factor = 1.0 / 365.0;
         let theta_exact_raw = g_exact.theta / (multiplier * theta_daily_factor);
         assert!(
             (f64::from(g_fast.theta) - theta_exact_raw).abs() < 1e-3,
@@ -774,8 +777,8 @@ mod tests {
             g_halley.vega,
             vega_exact_raw
         );
-        // Theta units differ: exact uses multiplier * daily_factor (0.0027378507871321013), fast uses raw units
-        let theta_daily_factor = 0.002_737_850_787_132_101_3;
+        // The exact result scales theta by multiplier / 365, while the fast result is annualized
+        let theta_daily_factor = 1.0 / 365.0;
         let theta_exact_raw = g_exact.theta / (multiplier * theta_daily_factor);
         assert!(
             (f64::from(g_halley.theta) - theta_exact_raw).abs() < greeks_tol,

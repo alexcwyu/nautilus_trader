@@ -18,6 +18,7 @@
 use std::{
     error::Error,
     future::Future,
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -27,8 +28,9 @@ use std::{
 use bytes::Bytes;
 use http::{
     HeaderValue, Request, Response,
-    header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, REFERER, WWW_AUTHENTICATE},
+    header::{ACCEPT, ACCEPT_ENCODING, HeaderName, PROXY_AUTHORIZATION, REFERER, USER_AGENT},
 };
+use http_body::Body;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
@@ -45,6 +47,7 @@ use tower_service::Service;
 use url::Url;
 
 use super::{HttpClientError, HttpRedirectPolicy, connector::Connector, error::transport_error};
+use crate::tls::create_tls_config_from_certs_dir;
 
 #[derive(Clone, Debug)]
 pub(super) struct Client {
@@ -56,24 +59,31 @@ impl Client {
     pub(super) fn new(
         proxy: Option<&str>,
         use_system_proxy: bool,
+        certs_dir: Option<&str>,
         user_agent: Option<HeaderValue>,
         settings: Settings,
     ) -> Result<Self, HttpClientError> {
-        let provider = rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .ok_or_else(|| {
-                HttpClientError::ClientBuildError("TLS provider is unavailable".into())
-            })?;
+        let mut tls = if let Some(dir) = certs_dir {
+            create_tls_config_from_certs_dir(Path::new(dir), true)
+                .map_err(|e| HttpClientError::ClientBuildError(format!("{e:#}")))?
+        } else {
+            let provider = rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .ok_or_else(|| {
+                    HttpClientError::ClientBuildError("TLS provider is unavailable".into())
+                })?;
 
-        let verifier = platform_verifier(&provider)?;
-        let mut tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
+            let verifier = platform_verifier(&provider)?;
+            rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth()
+        };
+
         let connector = Connector::new(tls.clone(), proxy, use_system_proxy, user_agent)?;
-        let proxies = connector.proxies.clone();
+        let proxies = Arc::clone(&connector.proxies);
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let connector = HttpsConnector::from((connector, tls));
 
@@ -101,7 +111,10 @@ impl Client {
             policy: redirects,
             count: 0,
             previous: None,
+            cross_origin: false,
+            has_body: false,
         };
+
         FollowRedirect::with_policy(self.clone(), policy)
             .preserve_extensions(false)
             .call(request)
@@ -159,6 +172,8 @@ struct Redirects {
     policy: HttpRedirectPolicy,
     count: usize,
     previous: Option<Url>,
+    cross_origin: bool,
+    has_body: bool,
 }
 
 impl Policy<Full<Bytes>, HttpClientError> for Redirects {
@@ -177,34 +192,60 @@ impl Policy<Full<Bytes>, HttpClientError> for Redirects {
             ));
         }
 
+        if attempt.previous().scheme_str() == Some("https")
+            && attempt.location().scheme_str() == Some("http")
+        {
+            return Err(HttpClientError::Error(
+                "redirect downgrades HTTPS to HTTP".into(),
+            ));
+        }
+
+        let (Ok(previous), Ok(next)) = (
+            Url::parse(&attempt.previous().to_string()),
+            Url::parse(&attempt.location().to_string()),
+        ) else {
+            return Err(HttpClientError::Error("invalid redirect URL".into()));
+        };
+
+        let cross_origin = previous.origin() != next.origin();
+
+        // Venue credentials travel in custom headers and signed bodies, so no body crosses origins
+        if cross_origin && self.has_body {
+            return Err(HttpClientError::Error(
+                "cross-origin redirect of a request with a body".into(),
+            ));
+        }
+
         self.count += 1;
-        self.previous = Url::parse(&attempt.previous().to_string()).ok();
+        self.previous = Some(previous);
+        self.cross_origin = cross_origin;
         Ok(Action::Follow)
     }
 
     fn on_request(&mut self, request: &mut Request<Full<Bytes>>) {
+        self.has_body = !request.body().is_end_stream();
+
         let Some(previous) = &self.previous else {
             return;
         };
-        let Ok(next) = Url::parse(&request.uri().to_string()) else {
-            return;
-        };
 
-        if previous.origin() != next.origin() {
-            for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
-                request.headers_mut().remove(name);
-            }
-            request.headers_mut().remove("cookie2");
+        if self.cross_origin {
+            let headers = request.headers_mut();
+            let retained: Vec<_> = CROSS_ORIGIN_HEADERS
+                .into_iter()
+                .filter_map(|name| headers.remove(&name).map(|value| (name, value)))
+                .collect();
+            headers.clear();
+            headers.extend(retained);
+            return;
         }
 
-        if !(previous.scheme() == "https" && next.scheme() == "http") {
-            let mut referer = previous.clone();
-            let _ = referer.set_username("");
-            let _ = referer.set_password(None);
-            referer.set_fragment(None);
-            if let Ok(value) = referer.as_str().parse() {
-                request.headers_mut().insert(REFERER, value);
-            }
+        let mut referer = previous.clone();
+        let _ = referer.set_username("");
+        let _ = referer.set_password(None);
+        referer.set_fragment(None);
+        if let Ok(value) = referer.as_str().parse() {
+            request.headers_mut().insert(REFERER, value);
         }
     }
 
@@ -212,6 +253,8 @@ impl Policy<Full<Bytes>, HttpClientError> for Redirects {
         Some(body.clone())
     }
 }
+
+const CROSS_ORIGIN_HEADERS: [HeaderName; 3] = [ACCEPT, ACCEPT_ENCODING, USER_AGENT];
 
 // Each `Verifier::new` reloads the platform roots, which on Linux reads the CA bundle from disk,
 // so concurrent first builds share one load under the lock, and a failed load is not cached.
@@ -223,12 +266,12 @@ fn platform_verifier(
     let mut cached = VERIFIER.lock();
 
     if let Some(verifier) = &*cached {
-        return Ok(verifier.clone());
+        return Ok(Arc::clone(verifier));
     }
 
-    let verifier = rustls_platform_verifier::Verifier::new(provider.clone())
+    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(provider))
         .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?;
-    Ok(cached.insert(Arc::new(verifier)).clone())
+    Ok(Arc::clone(cached.insert(Arc::new(verifier))))
 }
 
 fn retryable(e: &(dyn Error + 'static)) -> bool {
@@ -239,7 +282,56 @@ fn retryable(e: &(dyn Error + 'static)) -> bool {
                 && ((e.is_go_away() && e.reason() == Some(h2::Reason::NO_ERROR))
                     || (e.is_reset() && e.reason() == Some(h2::Reason::REFUSED_STREAM)));
         }
+
         cause = e.source();
     }
+
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn cross_origin_redirect_retains_only_allowed_headers() {
+        let mut policy = Redirects {
+            policy: HttpRedirectPolicy::Follow,
+            count: 1,
+            previous: Some(Url::parse("https://source.example/start?signature=SECRET").unwrap()),
+            cross_origin: true,
+            has_body: false,
+        };
+
+        let mut request = Request::builder()
+            .uri("https://destination.example/next")
+            .header(ACCEPT, "application/json")
+            .header(ACCEPT_ENCODING, "gzip")
+            .header(USER_AGENT, "client-41")
+            .header(REFERER, "https://private.example/signed?token=PRIOR_SECRET")
+            .header("authorization", "Bearer private-27")
+            .header("cookie", "session=private-91")
+            .header("x-venue-apikey", "private-53")
+            .header("x-venue-signature", "private-67")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        policy.on_request(&mut request);
+
+        let headers: Vec<_> = request
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                ("accept", "application/json"),
+                ("accept-encoding", "gzip"),
+                ("user-agent", "client-41"),
+            ]
+        );
+    }
 }

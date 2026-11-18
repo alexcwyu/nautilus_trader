@@ -7,6 +7,9 @@ for each benchmark process.
 
 Refresh on substantive perf change or before release; bump the date.
 Absolute numbers vary by machine; only same-machine deltas are meaningful.
+Rows marked `*` use 2026-10-26 AEST measurements: Linux 7.0.0-38-generic, rustc 1.99.1, CPU 48,
+three interleaved runs per state, and concurrent workloads. Unmarked rows retain the earlier measurements
+unless their section records a separate baseline.
 
 ## How to reproduce
 
@@ -31,6 +34,59 @@ channel emission, and network I/O.
 | Bench                               | Median | Throughput       |
 | ----------------------------------- | ------ | ---------------- |
 | `dispatch/price_change_interleaved` | 367 ns | 16.3 M changes/s |
+
+### Local book application (`src/data/dispatch.rs`)
+
+The ignored `price_change_book_application_benchmark` compares parse-only work with the production
+`apply_book_changes` path. `wire` sets `compute_effective_deltas=false`; `effective` sets it to `true`.
+Both modes time the same application function, so their row differences do not establish a setting-specific cost.
+Criterion IDs follow `dispatch/book_application/<mode>/<batch>/<stage>`.
+
+Values are nanoseconds, rounded to 0.1 ns: the median of three session median estimates. `Added` is the
+median of the three paired session differences, so it can differ from the column difference. Its range
+shows their minimum and maximum, not a confidence interval.
+
+| Mode      | Batch    | Parse (ns) | With book (ns) | Added (ns) | Added range (ns) |
+| --------- | -------- | ---------: | -------------: | ---------: | ---------------- |
+| Wire      | Ordinary |       97.7 |          244.1 |      145.9 | [145.1, 154.5]   |
+| Effective | Ordinary |       97.1 |          247.6 |      151.9 | [146.6, 155.9]   |
+| Wire      | Crossing |       97.1 |          674.8 |      577.8 | [541.3, 595.4]   |
+| Effective | Crossing |       97.0 |          674.9 |      577.9 | [567.0, 578.3]   |
+
+Keep the local L2 book in both modes. Relative to parse-only, the production application path adds about
+150 ns per ordinary batch; the crossing case adds about 580 ns while emitting two pruning deletes.
+A top-only cache cannot enumerate the stale
+levels needed for those deletes. A separate ordered price index would still process every update and
+introduce another book representation. These measurements do not establish an end-to-end bottleneck
+that justifies that change. `dispatch/price_change_interleaved` and `inbound_pipeline/book_deltas`
+measure different work and are not controls for this comparison.
+
+- **Workload**: One instrument's one-change batch from the captured crossing-burst fixture. Ordinary
+  uses the first update after the initial 24-bid, 22-ask snapshot; crossing replays the preceding updates
+  and measures the SELL remainder that prunes two bids. Each case checks the complete output batch and
+  final best prices before timing.
+- **Timed**: Both benches parse the timestamp and construct deltas. `with_book` also fills a separate
+  delta vector, takes the DashMap write guard, and applies the L2 batch through `apply_book_changes`,
+  including cross checking and pruning. Parse-only collection reuses its input buffer, so `Added`
+  includes the buffer-handling difference as well as book application.
+- **Excluded**: Fixture decode, replay, book reset, asset lookup, grouping, the integrity lock, sequence
+  and subscription validation, channel emission, and network I/O. Snapshot seeding is not measured.
+- **Criterion**: 100 samples, one-second warm-up, three-second measurement windows. `PerIteration`
+  resets the book outside each timed call. Per-call clock timing affects the absolute estimates;
+  paired differences reduce its shared overhead.
+- **Host**: 2026-11-17, source base `35e619c2b1`, AMD Ryzen Threadripper 9980X, Linux 7.0.0-43-generic,
+  rustc 1.100.0, and `bench-lto` with the settings above. All three sessions use CPU 48 with its governor
+  set to `performance` and process ASLR disabled. Desktop processes are active during measurement.
+
+Build without affinity pinning, then run the four cases serially. Repeat the timed command three times
+with [the publication controls](../../../../docs/developer_guide/benchmarking.md#measure-criterion-for-publication):
+
+```bash
+CARGO_BUILD_JOBS=4 cargo test -p nautilus-polymarket --lib --profile bench-lto --no-run
+CARGO_BUILD_JOBS=4 taskset -c 48 setarch "$(uname -m)" -R \
+    cargo test -p nautilus-polymarket --lib --profile bench-lto \
+    price_change_book_application_benchmark -- --ignored --nocapture --test-threads=1
+```
 
 ## Inbound pipeline (`data.rs`)
 
@@ -59,8 +115,9 @@ the dispatch loop; both paths share the string-decimal + status logic.
 ## Effective delta processing (`effective_deltas.rs`)
 
 Parsed `OrderBookDeltas` plus a populated L2 MBP book -> updated book and effective domain batch.
-Criterion clones the seeded book outside the timed region. Snapshot depth is per side, so depth 100
-contains 200 price levels.
+Synthetic cases exclude fixture-reset clones; depth is per side, so depth 100 contains 200 price levels.
+The captured case times an unchanged snapshot, including decode, decimal conversion, and a transactional clone.
+It excludes hash verification, subscription locks, channels, and network I/O.
 
 | Bench                                                | Estimate |
 | ---------------------------------------------------- | -------: |
@@ -70,6 +127,7 @@ contains 200 price levels.
 | `effective_deltas/snapshot/unchanged/100`            | 32.6 µs  |
 | `effective_deltas/snapshot/ten_percent_resized/100`  | 32.5 µs  |
 | `effective_deltas/snapshot/ten_percent_replaced/100` | 33.0 µs  |
+| `effective_deltas/inbound_snapshot_captured`         | 19.9 µs* |
 
 ## Execution pipeline (`exec.rs`)
 
@@ -91,6 +149,13 @@ independent ops), so there is no `modify` row.
 | `exec_pipeline/submit_limit_neg_risk` | 48.8 µs | 20.5 k/s   |
 | `exec_pipeline/cancel`                | 254 ns  | 3.93 M/s   |
 
+## Continuous reconciliation
+
+The [local reconciliation scenario](../tests/README.md#continuous-reconciliation-benchmark) measures
+market-data delivery while a real `LiveNode` runs periodic Polymarket report requests against a local
+paginated venue. It compares inline and worker collection, checks equal work, and reports report-cycle
+latency separately. It is an ignored integration benchmark because it measures concurrent wall-clock work.
+
 ## Crypto path (`signing.rs`)
 
 Decomposes the exec-pipeline signature cost into its components and
@@ -111,29 +176,30 @@ covers the L2 HMAC path used by every authenticated REST call.
 Diagnostic benches that decompose the pipeline numbers above. Use these
 to localize where time goes when a pipeline bench regresses.
 
-| Bench                             | Median  |
-| --------------------------------- | ------- |
-| `decode_only/trade`               | 274 ns  |
-| `decode_only/book`                | 902 ns  |
-| `decode_only/price_change`        | 415 ns  |
-| `decode_only/user_order`          | 978 ns  |
-| `decode_only/user_order_captured` | 952 ns  |
-| `decode_only/user_order_dispatch` | 1.05 µs |
-| `decode_only/user_trade`          | 639 ns  |
-| `decode_only/user_batch`          | 2.15 µs |
-| `parse_only/trade`                | 160 ns  |
-| `parse_only/book_snapshot`        | 385 ns  |
-| `parse_only/book_deltas`          | 40.4 ns |
-| `atom/decimal_from_str`           | 7.70 ns |
-| `atom/price_from_decimal_dp`      | 11.7 ns |
-| `atom/quantity_from_decimal_dp`   | 8.22 ns |
-| `atom/price_combined`             | 18.7 ns |
-| `atom/compute_commission`         | 119 ns  |
-| `atom/adjust_market_buy_amount`   | 209 ns  |
-| `atom/trade_id_determine`         | 108 ns  |
-| `atom/uuid4_new`                  | 14.5 ns |
-| `atom/event_filled_construct`     | 19.0 ns |
-| `atom/event_accepted_construct`   | 15.5 ns |
+| Bench                              | Median   |
+| ---------------------------------- | -------- |
+| `decode_only/trade`                | 274 ns   |
+| `decode_only/book`                 | 902 ns   |
+| `decode_only/price_change`         | 415 ns   |
+| `decode_only/user_order`           | 978 ns   |
+| `decode_only/user_order_captured`  | 952 ns   |
+| `decode_only/user_order_dispatch`  | 1.05 µs  |
+| `decode_only/user_trade`           | 639 ns   |
+| `decode_only/user_batch`           | 2.15 µs  |
+| `decode_only/user_batch_tag_first` | 3.36 µs* |
+| `parse_only/trade`                 | 160 ns   |
+| `parse_only/book_snapshot`         | 385 ns   |
+| `parse_only/book_deltas`           | 40.4 ns  |
+| `atom/decimal_from_str`            | 7.70 ns  |
+| `atom/price_from_decimal_dp`       | 11.7 ns  |
+| `atom/quantity_from_decimal_dp`    | 8.22 ns  |
+| `atom/price_combined`              | 18.7 ns  |
+| `atom/compute_commission`          | 119 ns   |
+| `atom/adjust_market_buy_amount`    | 209 ns   |
+| `atom/trade_id_determine`          | 108 ns   |
+| `atom/uuid4_new`                   | 14.5 ns  |
+| `atom/event_filled_construct`      | 19.0 ns  |
+| `atom/event_accepted_construct`    | 15.5 ns  |
 
 ## Notes
 

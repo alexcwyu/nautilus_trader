@@ -13,11 +13,15 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use ahash::AHashMap;
 use databento::dbn;
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    enums::AssetClass,
-    identifiers::{InstrumentId, Symbol},
+    enums::{AssetClass, ExerciseStyle, SettlementType},
+    identifiers::{
+        InstrumentId, Symbol,
+        futures::{FuturesYearDigits, parse_futures_symbol},
+    },
     instruments::{
         CurrencyPair, Equity, FuturesContract, FuturesSpread, InstrumentAny, OptionContract,
         OptionSpread,
@@ -31,9 +35,11 @@ use super::{
     primitives::{
         decode_lot_size, decode_multiplier, decode_optional_timestamp, decode_price,
         decode_price_increment, decode_timestamp, decode_underlying, parse_cfi_iso10926,
-        parse_currency_or_usd_default, parse_option_kind,
+        parse_cfi_option_terms, parse_currency_or_usd_default, parse_option_kind,
+        precision_from_raw,
     },
 };
+use crate::symbology::resolve_futures_instrument_id;
 
 /// # Errors
 ///
@@ -172,6 +178,7 @@ pub fn decode_equity(
     instrument_id: InstrumentId,
     ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<Equity> {
+    let raw_symbol = Symbol::new_checked(msg.raw_symbol()?)?;
     let currency = parse_currency_or_usd_default(msg.currency());
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
     let lot_size = decode_lot_size(msg.min_lot_size_round_lot);
@@ -180,7 +187,7 @@ pub fn decode_equity(
 
     Ok(Equity::builder()
         .instrument_id(instrument_id)
-        .raw_symbol(instrument_id.symbol)
+        .raw_symbol(raw_symbol)
         // No ISIN available yet
         .currency(currency)
         .price_precision(price_increment.precision)
@@ -202,6 +209,7 @@ pub fn decode_futures_contract(
     instrument_id: InstrumentId,
     ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<FuturesContract> {
+    let raw_symbol = Symbol::new_checked(msg.raw_symbol()?)?;
     let currency = parse_currency_or_usd_default(msg.currency());
     let exchange = Ustr::from(msg.exchange()?);
     let underlying = decode_underlying(msg.asset()?, &instrument_id.symbol);
@@ -214,7 +222,7 @@ pub fn decode_futures_contract(
 
     Ok(FuturesContract::builder()
         .instrument_id(instrument_id)
-        .raw_symbol(instrument_id.symbol)
+        .raw_symbol(raw_symbol)
         .asset_class(asset_class.unwrap_or(AssetClass::Commodity))
         .exchange(exchange)
         .underlying(underlying)
@@ -240,6 +248,7 @@ pub fn decode_futures_spread(
     instrument_id: InstrumentId,
     ts_init: Option<UnixNanos>,
 ) -> anyhow::Result<FuturesSpread> {
+    let raw_symbol = Symbol::new_checked(msg.raw_symbol()?)?;
     let exchange = Ustr::from(msg.exchange()?);
     let underlying = decode_underlying(msg.asset()?, &instrument_id.symbol);
     let (asset_class, _) = parse_cfi_iso10926(msg.cfi()?);
@@ -253,7 +262,7 @@ pub fn decode_futures_spread(
 
     Ok(FuturesSpread::builder()
         .instrument_id(instrument_id)
-        .raw_symbol(instrument_id.symbol)
+        .raw_symbol(raw_symbol)
         .asset_class(asset_class.unwrap_or(AssetClass::Commodity))
         .exchange(exchange)
         .underlying(underlying)
@@ -272,6 +281,10 @@ pub fn decode_futures_spread(
 
 /// Decodes a Databento instrument definition message into an `OptionContract` instrument.
 ///
+/// Strike precision preserves every wire digit, with a floor at the strike currency's precision.
+/// Exercise style and settlement type come from the CFI code. OPRA definitions carry no CFI code,
+/// so they use fixed rules by option root.
+///
 /// # Errors
 ///
 /// Returns an error if parsing or constructing `OptionContract` fails.
@@ -281,10 +294,30 @@ pub fn decode_option_contract(
     ts_init: Option<UnixNanos>,
     decode_config: Option<&DatabentoDecodeConfig>,
 ) -> anyhow::Result<OptionContract> {
+    let raw_symbol = Symbol::new_checked(msg.raw_symbol()?)?;
     let currency = parse_currency_or_usd_default(msg.currency());
     let strike_price_currency = parse_currency_or_usd_default(msg.strike_price_currency());
     let exchange = Ustr::from(msg.exchange()?);
-    let underlying = decode_underlying(msg.underlying()?, &instrument_id.symbol);
+    let mut underlying = decode_underlying(msg.underlying()?, &instrument_id.symbol);
+    if instrument_id
+        .symbol
+        .as_str()
+        .split_once(' ')
+        .and_then(|(code, _)| parse_futures_symbol(code))
+        .is_some_and(|parsed| parsed.year_digits.len() == 2)
+    {
+        let underlying_id =
+            InstrumentId::new(Symbol::from(underlying.as_str()), instrument_id.venue);
+        let underlying_id = resolve_futures_instrument_id(
+            &dbn::RecordRef::from(msg),
+            underlying_id,
+            FuturesYearDigits::Two,
+            &AHashMap::new(),
+            None,
+        )?;
+        underlying = Ustr::from(underlying_id.symbol.as_str());
+    }
+
     let asset_class_opt = if instrument_id.venue.as_str() == "OPRA" {
         Some(AssetClass::Equity)
     } else {
@@ -292,12 +325,18 @@ pub fn decode_option_contract(
         asset_class
     };
     let option_kind = parse_option_kind(msg.instrument_class)?;
-    let strike_price = decode_price(
-        msg.strike_price,
-        strike_price_currency.precision,
-        "strike_price",
-    )?;
+    let strike_precision =
+        precision_from_raw(msg.strike_price).max(strike_price_currency.precision);
+    let strike_price = decode_price(msg.strike_price, strike_precision, "strike_price")
+        .map_err(|e| anyhow::anyhow!("{instrument_id}: {e}"))?;
     let dataset = msg.hd.publisher().ok().map(|p| p.dataset());
+    let (exercise_style, settlement_type) = match parse_cfi_option_terms(msg.cfi()?) {
+        (None, None) if dataset == Some(dbn::Dataset::OpraPillar) => {
+            opra_option_terms(underlying.as_str()).unzip()
+        }
+        terms => terms,
+    };
+
     let price_increment = decode_price_increment(msg.min_price_increment, currency.precision);
     let multiplier =
         decode_option_multiplier(dataset, msg.contract_multiplier, msg.unit_of_measure_qty)?;
@@ -313,7 +352,7 @@ pub fn decode_option_contract(
 
     Ok(OptionContract::builder()
         .instrument_id(instrument_id)
-        .raw_symbol(instrument_id.symbol)
+        .raw_symbol(raw_symbol)
         .asset_class(asset_class_opt.unwrap_or(AssetClass::Commodity))
         .exchange(exchange)
         .underlying(underlying)
@@ -326,9 +365,50 @@ pub fn decode_option_contract(
         .price_increment(price_increment)
         .multiplier(multiplier)
         .lot_size(lot_size)
+        .maybe_exercise_style(exercise_style)
+        .maybe_settlement_type(settlement_type)
         .ts_event(ts_event)
         .ts_init(ts_init)
         .build()?)
+}
+
+// OPRA cash-settled option roots (index, currency, and index binary options), European-style
+const OPRA_ROOTS_CASH_EUROPEAN: &[&str] = &[
+    "BKX", "BKXPM", "CBTX", "CBTXW", "DJX", "DJXW", "HGX", "MBTX", "MBTXW", "MGTN", "MGTNW",
+    "MRTBW", "MRUT", "MXACW", "MXEA", "MXEF", "MXUSA", "MXWLD", "NANOS", "NDX", "NDXB", "NDXP",
+    "OSX", "OSXPM", "RLV", "RUI", "RUT", "RUTW", "SIXB", "SIXI", "SIXM", "SIXRE", "SIXU", "SIXV",
+    "SPEQW", "SPEQX", "SPESG", "SPX", "SPXO", "SPXW", "UTY", "VIX", "VIXW", "XDA", "XDB", "XDC",
+    "XDE", "XDN", "XDS", "XDZ", "XEO", "XND", "XSP", "XSPBW",
+];
+
+// OPRA cash-settled index option roots, American-style
+const OPRA_ROOTS_CASH_AMERICAN: &[&str] = &["OEX", "XAU"];
+
+// OPRA definitions carry no CFI code: roots outside the cash-settled lists take the US equity and
+// ETF option convention, except root shapes that the record cannot tell apart from other products
+fn opra_option_terms(root: &str) -> Option<(ExerciseStyle, SettlementType)> {
+    if OPRA_ROOTS_CASH_EUROPEAN.contains(&root) {
+        Some((ExerciseStyle::European, SettlementType::Cash))
+    } else if OPRA_ROOTS_CASH_AMERICAN.contains(&root) {
+        Some((ExerciseStyle::American, SettlementType::Cash))
+    } else if is_opra_root_ambiguous(root) {
+        None
+    } else {
+        Some((ExerciseStyle::American, SettlementType::Physical))
+    }
+}
+
+// Cboe metric binaries use five-letter `K` roots (`KAAPL`), a shape some equities share, and
+// roots with a digit before a letter (`B1SPY`) belong to no identified product
+fn is_opra_root_ambiguous(root: &str) -> bool {
+    let root = root.as_bytes();
+    let has_metric_binary_shape =
+        root.len() == 5 && root[0] == b'K' && root.iter().all(u8::is_ascii_uppercase);
+    let has_digit_before_letter = root
+        .windows(2)
+        .any(|pair| pair[0].is_ascii_digit() && pair[1].is_ascii_alphabetic());
+
+    has_metric_binary_shape || has_digit_before_letter
 }
 
 fn decode_option_multiplier(
@@ -336,12 +416,16 @@ fn decode_option_multiplier(
     contract_multiplier: i32,
     unit_of_measure_qty: i64,
 ) -> anyhow::Result<Quantity> {
-    match (dataset, contract_multiplier) {
-        (Some(dbn::Dataset::OpraPillar), 0 | i32::MAX) => decode_multiplier(unit_of_measure_qty),
-        (Some(dbn::Dataset::OpraPillar), value) if value < 0 => {
+    match (dataset, contract_multiplier, unit_of_measure_qty) {
+        // OPRA definitions can leave both fields unset: use the standard OCC contract size
+        (Some(dbn::Dataset::OpraPillar), 0 | i32::MAX, 0 | i64::MAX) => {
+            Ok(Quantity::from_mantissa_exponent(100, 0, 0))
+        }
+        (Some(dbn::Dataset::OpraPillar), 0 | i32::MAX, _) => decode_multiplier(unit_of_measure_qty),
+        (Some(dbn::Dataset::OpraPillar), value, _) if value < 0 => {
             anyhow::bail!("Invalid negative `contract_multiplier`: {value}")
         }
-        (Some(dbn::Dataset::OpraPillar), value) => {
+        (Some(dbn::Dataset::OpraPillar), value, _) => {
             Ok(Quantity::from_mantissa_exponent(value as u64, 0, 0))
         }
         _ => decode_multiplier(unit_of_measure_qty),

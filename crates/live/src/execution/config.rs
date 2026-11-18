@@ -50,13 +50,13 @@ pub struct ExecutionManagerConfig {
     pub inflight_threshold_ms: u64,
     /// Maximum number of retries for inflight checks.
     pub inflight_max_retries: u32,
-    /// Policy when a submitted order exhausts automatic recovery.
+    /// Policy when a submitted order, or a pending cancel or update, exhausts automatic recovery.
     pub submission_recovery_policy: SubmissionRecoveryPolicy,
     /// The lookback minutes for open order checks.
     pub open_check_lookback_mins: Option<u64>,
     /// Threshold before acting on venue discrepancies for open orders.
     pub open_check_threshold_ns: DurationNanos,
-    /// Maximum retries before resolving an open order missing at the venue.
+    /// Eligible missing-order checks before issuing a targeted order status query.
     pub open_check_missing_retries: u32,
     /// Whether open-order polling should only request open orders from the venue.
     pub open_check_open_only: bool,
@@ -76,7 +76,8 @@ pub struct ExecutionManagerConfig {
     pub purge_closed_positions_buffer_mins: Option<u32>,
     /// The time buffer (minutes) before account events can be purged.
     pub purge_account_events_lookback_mins: Option<u32>,
-    /// If purge operations should also delete from the backing database.
+    /// If purging also deletes orders and positions from the backing database.
+    /// Redis and PostgreSQL retain persisted account events for replay.
     pub purge_from_database: bool,
 }
 
@@ -115,11 +116,10 @@ impl ExecutionManagerConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::with_capacity(3);
-
         if let Some(mins) = self.lookback_mins {
             errors.check(
                 checked_mins_to_secs(mins).is_some(),

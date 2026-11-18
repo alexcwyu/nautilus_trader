@@ -23,6 +23,7 @@ pub mod custom;
 pub mod delta;
 pub mod depth;
 pub mod funding;
+pub mod greeks;
 pub mod index_price;
 pub mod instrument;
 pub mod instrument_status;
@@ -37,11 +38,11 @@ pub mod report;
 pub mod snapshot;
 pub mod trade;
 
-#[cfg(feature = "arrow-display")]
-pub mod display;
-
 mod depth_display;
 mod display_conversion;
+
+#[cfg(feature = "arrow-display")]
+pub mod display;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -148,7 +149,7 @@ pub fn timestamp_data_type() -> DataType {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] when a value exceeds Arrow's signed timestamp range.
+/// Returns an error if a value exceeds Arrow's signed timestamp range.
 pub fn timestamp_array(
     values: impl IntoIterator<Item = u64>,
 ) -> Result<TimestampNanosecondArray, ArrowError> {
@@ -159,7 +160,7 @@ pub fn timestamp_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] when a value exceeds Arrow's signed timestamp range.
+/// Returns an error if a value exceeds Arrow's signed timestamp range.
 pub fn optional_timestamp_array(
     values: impl IntoIterator<Item = Option<u64>>,
 ) -> Result<TimestampNanosecondArray, ArrowError> {
@@ -184,7 +185,7 @@ pub fn optional_timestamp_array(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] when the value is negative.
+/// Returns an error if the value is negative.
 pub fn decode_timestamp(
     values: &TimestampNanosecondArray,
     name: &'static str,
@@ -208,13 +209,21 @@ pub fn decode_timestamp(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] when a timestamp exceeds the signed Arrow range or the batch is
-/// otherwise invalid.
+/// Returns an error if a timestamp exceeds the signed Arrow range or the batch is otherwise
+/// invalid.
 pub fn record_batch_with_timestamps(
     schema: Arc<Schema>,
     columns: Vec<ArrayRef>,
 ) -> Result<RecordBatch, ArrowError> {
     validate_encode_precisions(schema.metadata())?;
+
+    if columns.len() != schema.fields().len() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "number of columns({}) must match number of fields({}) in schema",
+            columns.len(),
+            schema.fields().len()
+        )));
+    }
 
     let columns = schema
         .fields()
@@ -265,7 +274,7 @@ fn timestamp_column(field: &Field, column: &dyn Array) -> Result<ArrayRef, Arrow
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] for negative timestamps or invalid arrays.
+/// Returns an error if timestamps are negative or arrays are invalid.
 pub fn record_batch_with_u64_timestamps(batch: &RecordBatch) -> Result<RecordBatch, EncodingError> {
     let mut changed = false;
     let mut fields = Vec::with_capacity(batch.num_columns());
@@ -325,7 +334,7 @@ pub fn enum_dictionary_data_type() -> DataType {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the number of distinct values exceeds the `Int8` key range.
+/// Returns an error if the number of distinct values exceeds the `Int8` key range.
 pub fn enum_dictionary_array(
     values: impl IntoIterator<Item = impl Display>,
 ) -> Result<DictionaryArray<Int8Type>, ArrowError> {
@@ -356,7 +365,7 @@ pub fn money_data_type() -> DataType {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if an amount or dictionary value cannot be represented.
+/// Returns an error if an amount or dictionary value cannot be represented.
 pub fn money_array(
     values: impl IntoIterator<Item = Option<Money>>,
 ) -> Result<StructArray, ArrowError> {
@@ -398,8 +407,8 @@ pub fn money_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] naming `field` when the value has more than 16 decimal places or
-/// cannot be rescaled exactly.
+/// Returns an error if the value has more than 16 decimal places or cannot be rescaled exactly. The
+/// error names `field`.
 pub fn decimal_to_arrow(value: &Decimal, field: &'static str) -> Result<i128, ArrowError> {
     let value = value.normalize();
     let scale = value.scale();
@@ -429,7 +438,7 @@ pub fn decimal_to_arrow(value: &Decimal, field: &'static str) -> Result<i128, Ar
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is NULL or outside `rust_decimal`'s range.
+/// Returns an error if the value is NULL or outside `rust_decimal`'s range.
 pub fn decode_decimal(
     values: &Decimal128Array,
     field: &'static str,
@@ -449,7 +458,7 @@ pub fn decode_decimal(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the struct is NULL, malformed, or outside the model range.
+/// Returns an error if the struct is NULL, malformed, or outside the model range.
 pub fn decode_money(
     values: &StructArray,
     field: &'static str,
@@ -580,7 +589,7 @@ pub fn is_json_string_field(field: &Field) -> bool {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError::InvalidArgumentError`] if `raw` is [`PRICE_ERROR`].
+/// Returns an error if `raw` is [`PRICE_ERROR`].
 pub fn price_raw_to_decimal(
     raw: PriceRaw,
     field: &'static str,
@@ -611,8 +620,8 @@ pub fn price_raw_to_decimal(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError::InvalidArgumentError`] if a non-sentinel quantity does not fit in
-/// Arrow's signed decimal representation.
+/// Returns an error if a non-sentinel quantity does not fit in Arrow's signed decimal
+/// representation.
 pub fn quantity_raw_to_decimal(
     raw: QuantityRaw,
     field: &'static str,
@@ -648,7 +657,7 @@ pub fn quantity_raw_to_decimal(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the values do not fit the declared decimal type.
+/// Returns an error if the values do not fit the declared decimal type.
 pub fn price_decimal_array(
     values: impl IntoIterator<Item = PriceRaw>,
     field: &'static str,
@@ -665,7 +674,7 @@ pub fn price_decimal_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a value does not fit or the declared decimal type is invalid.
+/// Returns an error if a value does not fit or the declared decimal type is invalid.
 pub fn quantity_decimal_array(
     values: impl IntoIterator<Item = QuantityRaw>,
     field: &'static str,
@@ -682,8 +691,8 @@ pub fn quantity_decimal_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a value is `PRICE_UNDEF` or does not fit the declared decimal
-/// type, so the required decoders can read back every written value.
+/// Returns an error if a value is `PRICE_UNDEF` or does not fit the declared decimal type, so the
+/// required decoders can read back every written value.
 pub fn required_price_decimal_array(
     values: impl IntoIterator<Item = PriceRaw>,
     field: &'static str,
@@ -706,8 +715,8 @@ pub fn required_price_decimal_array(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if a value is `QUANTITY_UNDEF` or does not fit the declared decimal
-/// type, so the required decoders can read back every written value.
+/// Returns an error if a value is `QUANTITY_UNDEF` or does not fit the declared decimal type, so
+/// the required decoders can read back every written value.
 pub fn required_quantity_decimal_array(
     values: impl IntoIterator<Item = QuantityRaw>,
     field: &'static str,
@@ -774,7 +783,7 @@ fn decimal_to_raw<T: TryFrom<i128>>(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value cannot be represented by this build.
+/// Returns an error if the value cannot be represented by this build.
 pub fn decode_decimal_price(
     values: &Decimal128Array,
     precision: u8,
@@ -795,7 +804,7 @@ pub fn decode_decimal_price(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is null or cannot be represented by this build.
+/// Returns an error if the value is null or cannot be represented by this build.
 pub fn decode_required_decimal_price(
     values: &Decimal128Array,
     precision: u8,
@@ -815,7 +824,7 @@ pub fn decode_required_decimal_price(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value cannot be represented by this build.
+/// Returns an error if the value cannot be represented by this build.
 pub fn decode_decimal_quantity(
     values: &Decimal128Array,
     precision: u8,
@@ -836,7 +845,7 @@ pub fn decode_decimal_quantity(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is null or cannot be represented by this build.
+/// Returns an error if the value is null or cannot be represented by this build.
 pub fn decode_required_decimal_quantity(
     values: &Decimal128Array,
     precision: u8,
@@ -856,7 +865,7 @@ pub fn decode_required_decimal_quantity(
 ///
 /// # Errors
 ///
-/// Returns an [`EncodingError`] if the value is null.
+/// Returns an error if the value is null.
 pub fn decode_required_timestamp(
     values: &UInt64Array,
     field: &'static str,
@@ -899,6 +908,26 @@ pub(crate) fn decode_required_u8(
     Ok(values.value(row))
 }
 
+pub(crate) fn validate_required_column(
+    values: &dyn Array,
+    field: &'static str,
+) -> Result<(), EncodingError> {
+    if let Some(row) = first_logical_null(values) {
+        return Err(EncodingError::ParseError(
+            field,
+            format!("row {row}: required value is null"),
+        ));
+    }
+
+    Ok(())
+}
+
+pub(crate) fn first_logical_null(values: &dyn Array) -> Option<usize> {
+    values
+        .logical_nulls()
+        .and_then(|nulls| nulls.iter().position(|valid| !valid))
+}
+
 #[cfg(test)]
 fn get_raw_price(value: i128) -> PriceRaw {
     decimal_to_price_raw(value, "test", 0).expect("Decimal price must fit the current build")
@@ -938,7 +967,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `ArrowError` if the encoding fails.
+    /// Returns an error if the encoding fails.
     fn encode_batch<T>(
         metadata: &HashMap<String, String>,
         data: &[T],
@@ -1022,7 +1051,7 @@ pub fn schema_without_identifier_column(schema: &Schema) -> Schema {
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the record batch cannot be rebuilt.
+/// Returns an error if the record batch cannot be rebuilt.
 pub fn record_batch_with_identifier_column(
     batch: RecordBatch,
     identifier: Option<&str>,
@@ -1035,8 +1064,8 @@ pub fn record_batch_with_identifier_column(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the number of identifier values differs from
-/// the record batch row count or the record batch cannot be rebuilt.
+/// Returns an error if the number of identifier values differs from the record batch row count or
+/// the record batch cannot be rebuilt.
 pub fn record_batch_with_identifier_values(
     batch: RecordBatch,
     identifier_values: Vec<Option<String>>,
@@ -1081,7 +1110,7 @@ pub fn identifier_array_from_display<T: Display>(
 ///
 /// # Errors
 ///
-/// Returns an [`ArrowError`] if the record batch cannot be rebuilt.
+/// Returns an error if the record batch cannot be rebuilt.
 pub fn record_batch_without_identifier_column(
     mut batch: RecordBatch,
 ) -> Result<RecordBatch, ArrowError> {
@@ -1102,7 +1131,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the decoding fails.
+    /// Returns an error if the decoding fails.
     fn decode_batch(
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
@@ -1118,7 +1147,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the decoding fails.
+    /// Returns an error if the decoding fails.
     fn decode_typed_batch(
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
@@ -1146,7 +1175,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an `EncodingError` if the decoding fails.
+    /// Returns an error if the decoding fails.
     fn decode_data_batch(
         metadata: &HashMap<String, String>,
         record_batch: RecordBatch,
@@ -1159,7 +1188,7 @@ pub trait WriteStream {
     ///
     /// # Errors
     ///
-    /// Returns a `DataStreamingError` if writing or finishing the stream fails.
+    /// Returns an error if writing or finishing the stream fails.
     fn write(&mut self, record_batch: &RecordBatch) -> Result<(), DataStreamingError>;
 }
 
@@ -1178,8 +1207,8 @@ impl<T: Write> WriteStream for T {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `column_index` is out of range: `EncodingError::MissingColumn`.
-/// - The column type is neither Utf8 nor Utf8View: `EncodingError::InvalidColumnType`.
+/// - `column_index` is out of range.
+/// - The column type is neither Utf8 nor Utf8View.
 pub fn extract_column_string<'a>(
     cols: &'a [ArrayRef],
     column_key: &'static str,
@@ -1389,8 +1418,8 @@ impl U32ColumnRef<'_> {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `column_index` is out of range: `EncodingError::MissingColumn`.
-/// - The column type is neither Binary nor BinaryView: `EncodingError::InvalidColumnType`.
+/// - `column_index` is out of range.
+/// - The column type is neither Binary nor BinaryView.
 pub fn extract_column_binary<'a>(
     cols: &'a [ArrayRef],
     column_key: &'static str,
@@ -1448,8 +1477,8 @@ impl BinaryColumnRef<'_> {
 /// # Errors
 ///
 /// Returns an error if:
-/// - `column_index` is out of range: `EncodingError::MissingColumn`.
-/// - The column type does not match `expected_type`: `EncodingError::InvalidColumnType`.
+/// - `column_index` is out of range.
+/// - The column type does not match `expected_type`.
 pub fn extract_column<'a, T: Array + 'static>(
     cols: &'a [ArrayRef],
     column_key: &'static str,
@@ -1548,10 +1577,9 @@ pub fn optional_ustr_value(values: Option<&StringArray>, row: usize) -> Option<U
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Instrument IDs differ, or non-clear precision metadata differs:
-///   `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Instrument IDs differ, or non-clear precision metadata differs.
+/// - Encoding fails.
 pub fn book_deltas_to_arrow_record_batch_bytes(
     data: &[OrderBookDelta],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1581,9 +1609,9 @@ pub fn book_deltas_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn book_depths_to_arrow_record_batch_bytes(
     data: &[OrderBookDepth],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1607,9 +1635,9 @@ pub fn book_depths_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn quotes_to_arrow_record_batch_bytes(
     data: &[QuoteTick],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1621,9 +1649,9 @@ pub fn quotes_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn trades_to_arrow_record_batch_bytes(
     data: &[TradeTick],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1635,9 +1663,9 @@ pub fn trades_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn bars_to_arrow_record_batch_bytes(data: &[Bar]) -> Result<RecordBatch, EncodingError> {
     encode_batch_with_metadata(data)
 }
@@ -1647,9 +1675,9 @@ pub fn bars_to_arrow_record_batch_bytes(data: &[Bar]) -> Result<RecordBatch, Enc
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn mark_prices_to_arrow_record_batch_bytes(
     data: &[MarkPriceUpdate],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1661,9 +1689,9 @@ pub fn mark_prices_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn index_prices_to_arrow_record_batch_bytes(
     data: &[IndexPriceUpdate],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1675,9 +1703,9 @@ pub fn index_prices_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn instrument_status_to_arrow_record_batch_bytes(
     data: &[InstrumentStatus],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1689,9 +1717,9 @@ pub fn instrument_status_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn option_greeks_to_arrow_record_batch_bytes(
     data: &[OptionGreeks],
 ) -> Result<RecordBatch, EncodingError> {
@@ -1703,16 +1731,16 @@ pub fn option_greeks_to_arrow_record_batch_bytes(
 /// # Errors
 ///
 /// Returns an error if:
-/// - `data` is empty: `EncodingError::EmptyData`.
-/// - Metadata differs between rows: `EncodingError::MixedMetadata`.
-/// - Encoding fails: `EncodingError::ArrowError`.
+/// - `data` is empty.
+/// - Metadata differs between rows.
+/// - Encoding fails.
 pub fn instrument_closes_to_arrow_record_batch_bytes(
     data: &[InstrumentClose],
 ) -> Result<RecordBatch, EncodingError> {
     encode_batch_with_metadata(data)
 }
 
-fn encode_batch_with_metadata<T>(data: &[T]) -> Result<RecordBatch, EncodingError>
+pub(crate) fn encode_batch_with_metadata<T>(data: &[T]) -> Result<RecordBatch, EncodingError>
 where
     T: EncodeToRecordBatch,
 {
@@ -1779,6 +1807,26 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Invalid argument error: Metadata 'price_precision' is 17, maximum supported catalog scale is 16"
+        );
+    }
+
+    #[rstest]
+    fn test_record_batch_with_timestamps_rejects_surplus_columns() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts_event",
+            timestamp_data_type(),
+            false,
+        )]));
+        let columns = vec![
+            Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![2])) as ArrayRef,
+        ];
+
+        let error = record_batch_with_timestamps(schema, columns).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid argument error: number of columns(2) must match number of fields(1) in schema"
         );
     }
 
@@ -2222,11 +2270,12 @@ mod schema_invariant_tests {
         },
         enums::{AggressorSide, BookAction, InstrumentCloseType, OrderSide},
         events::{
-            AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-            OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-            OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected,
-            OrderReleased, OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated,
-            PositionAdjusted, PositionChanged, PositionClosed, PositionOpened, PositionSnapshot,
+            AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
+            OrderDenied, OrderEmulated, OrderExpired, OrderFillVoided, OrderFilled,
+            OrderInitialized, OrderModifyDenied, OrderModifyRejected, OrderPendingCancel,
+            OrderPendingUpdate, OrderRejected, OrderReleased, OrderSnapshot, OrderSubmitted,
+            OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed,
+            PositionOpened, PositionSnapshot,
         },
         identifiers::{InstrumentId, TradeId},
         instruments::{
@@ -2240,16 +2289,20 @@ mod schema_invariant_tests {
             perpetual_contract::PerpetualContract, tokenized_asset::TokenizedAsset,
         },
         reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-        types::{PRICE_ERROR, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity},
+        types::{
+            PRICE_ERROR, PRICE_UNDEF, Price, QUANTITY_UNDEF, Quantity,
+            fixed::{FIXED_PRECISION, FIXED_PRECISION_STANDARD},
+        },
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
 
     use super::{
         ArrowSchemaProvider, DecodeFromRecordBatch, EncodeToRecordBatch, FIXED_DECIMAL_PRECISION,
-        FIXED_DECIMAL_SCALE, KEY_IDENTIFIER, QUANTITY_RAW_MAX, decimal_to_arrow, decode_decimal,
-        decode_decimal_price, fixed_decimal_data_type, is_timestamp_field, price_decimal_array,
-        quantity_decimal_array, timestamp_data_type,
+        FIXED_DECIMAL_SCALE, KEY_IDENTIFIER, QUANTITY_RAW_MAX, STANDARD_TO_DECIMAL_SCALE,
+        decimal_to_arrow, decode_decimal, decode_decimal_price, decode_decimal_quantity,
+        fixed_decimal_data_type, is_timestamp_field, price_decimal_array, quantity_decimal_array,
+        timestamp_data_type,
     };
 
     #[derive(Clone, Copy, Debug)]
@@ -2400,6 +2453,42 @@ mod schema_invariant_tests {
         assert_eq!(
             decode_decimal_price(&array, price.precision, "price", 0).unwrap(),
             price,
+        );
+    }
+
+    #[rstest]
+    #[case("price", false)]
+    #[case("size", true)]
+    fn decimal_decode_rejects_spurious_digits_with_row_context(
+        #[case] field: &'static str,
+        #[case] quantity: bool,
+    ) {
+        let array = Decimal128Array::from(vec![0, STANDARD_TO_DECIMAL_SCALE])
+            .with_precision_and_scale(FIXED_DECIMAL_PRECISION, FIXED_DECIMAL_SCALE)
+            .unwrap();
+
+        let error = if quantity {
+            decode_decimal_quantity(&array, 0, field, 1).unwrap_err()
+        } else {
+            decode_decimal_price(&array, 0, field, 1).unwrap_err()
+        };
+
+        let raw = if FIXED_PRECISION == FIXED_PRECISION_STANDARD {
+            1
+        } else {
+            STANDARD_TO_DECIMAL_SCALE
+        };
+
+        let scale = 10_i128.pow(u32::from(FIXED_PRECISION));
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Error parsing `{field}`: row 1: Invalid fixed-point raw value {raw} for precision 0: \
+             remainder {raw} when divided by scale {scale}. \
+             Raw value should be a multiple of {scale}. \
+             This indicates data corruption or incorrect precision/scaling upstream"
+            )
         );
     }
 
@@ -2770,11 +2859,13 @@ mod schema_invariant_tests {
             schema::<OrderRejected>(),
             schema::<OrderPendingCancel>(),
             schema::<OrderCanceled>(),
+            schema::<OrderCancelDenied>(),
             schema::<OrderCancelRejected>(),
             schema::<OrderExpired>(),
             schema::<OrderTriggered>(),
             schema::<OrderPendingUpdate>(),
             schema::<OrderReleased>(),
+            schema::<OrderModifyDenied>(),
             schema::<OrderModifyRejected>(),
             schema::<OrderUpdated>(),
             schema::<OrderFilled>(),

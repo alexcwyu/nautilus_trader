@@ -18,20 +18,18 @@
 //! The `nautilus-lighter` crate provides integration with the Lighter protocol for trading
 //! perpetual futures and spot markets on the Lighter and Robinhood Chain deployments.
 //!
+//! The official Lighter API reference can be found at <https://docs.lighter.xyz/api>.
+//!
 //! # NautilusTrader
 //!
-//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
-//! engine for multi-asset, multi-venue trading systems.
+//! [NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native trading engine
+//! with a deterministic, event-driven architecture for multi-asset, multi-venue systems.
 //!
-//! The system spans research, deterministic simulation, and live execution within a single
-//! event-driven architecture, providing research-to-live semantic parity.
+//! The system spans research, simulation, and live execution, providing research-to-live semantic parity.
 //!
 //! # Feature Flags
 //!
-//! This crate provides feature flags to control source code inclusion during compilation,
-//! depending on the intended use case, i.e. whether to provide Python bindings
-//! for the [nautilus_trader](https://pypi.org/project/nautilus_trader) Python package,
-//! or as part of a Rust only build.
+//! Feature flags control code inclusion for Rust builds and Python bindings:
 //!
 //! - `examples`: Enables the crate's example binaries.
 //! - `extension-module`: Builds as a Python extension module.
@@ -45,24 +43,20 @@
 //! enums, factory wiring, and integrator revocation. Data and execution
 //! clients are consumed directly through the Rust trait surface.
 //!
-//! # Integrator attribution
+//! # Integrator Attribution
 //!
-//! On Lighter Mainnet, submitted create and modify order transactions from Plus and Premium
-//! accounts carry the NautilusTrader integrator account index in Lighter's `L2TxAttributes`. This
-//! helps us gauge real usage of the integration and prioritize ongoing maintenance. Maker and taker
-//! integrator fees are set to zero, so attribution adds no trading cost. All other account tiers,
-//! sessions without an account snapshot, Lighter Testnet, and both Robinhood environments leave
-//! `L2TxAttributes` empty.
+//! On Lighter and Robinhood mainnets, the execution client adds NautilusTrader's integrator account index
+//! to create and modify transactions with zero integrator fees. At startup it attempts to approve the
+//! integrator and apply the `NAUTILUS` referral code. Both testnets omit attribution.
 //!
-//! Lighter requires an `ApproveIntegrator` approval before these attributes can be attached to
-//! Lighter Mainnet orders. During startup, the execution client submits the required zero-fee
-//! approval for a configured Plus or Premium L2 account. Other Lighter account tiers, sessions
-//! without an account snapshot, Lighter Testnet, and Robinhood clients do not submit an approval.
+//! See [attribution details](https://nautilustrader.io/docs/nightly/integrations/lighter/#integrator-attribution)
+//! for approval, maker-only keys, and revocation.
 //!
-//! Robinhood Mainnet instead applies the `NAUTILUS` referral to the account's public L1 address
-//! during execution-client startup. Application failures log a warning and do not block trading.
-//! Robinhood Testnet does not apply a referral. See the [Lighter integration guide](https://nautilustrader.io/docs/nightly/integrations/lighter/#integrator-attribution)
-//! for attribution and revocation details.
+//! # Documentation
+//!
+//! - [Integration guide](https://nautilustrader.io/docs/nightly/integrations/lighter/)
+//! - [Rust examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/crates/adapters/lighter/examples)
+//! - [Python examples](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/lighter)
 
 #![warn(rustc::all)]
 #![deny(unsafe_code)]

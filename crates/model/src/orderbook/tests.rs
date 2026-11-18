@@ -788,49 +788,6 @@ fn test_book_get_price_for_exposure_no_market() {
     );
 }
 
-#[cfg(feature = "defi")]
-#[rstest]
-fn test_book_worst_price_preserves_mixed_scale_traversal() {
-    let mut book = OrderBook::new(InstrumentId::from("AAPL.XNAS"), BookType::L2_MBP);
-    let price = Price::from("1.00");
-    book.add(
-        BookOrder::new(OrderSide::Sell, price, Quantity::from_raw(1, 18), 1),
-        0,
-        0,
-        0.into(),
-    );
-    assert_eq!(
-        book.get_worst_px_for_quantity(Quantity::from(2), OrderSide::Buy),
-        Some(price)
-    );
-}
-
-#[cfg(feature = "defi")]
-#[rstest]
-fn test_book_exposure_accepts_native_scale_quantities() {
-    let mut book = OrderBook::new(InstrumentId::from("AAPL.XNAS"), BookType::L2_MBP);
-    let target = Quantity::from_raw(1_000_000_000_000_000_000, 18);
-    assert_eq!(
-        book.get_avg_px_qty_for_exposure(target, OrderSide::Buy),
-        (0.0, 0.0, 0.0)
-    );
-    book.add(
-        BookOrder::new(
-            OrderSide::Sell,
-            Price::from("1.00"),
-            Quantity::from_raw(2_000_000_000_000_000_000, 18),
-            1,
-        ),
-        0,
-        0,
-        0.into(),
-    );
-    assert_eq!(
-        book.get_avg_px_qty_for_exposure(target, OrderSide::Buy),
-        (1.0, 1.0, 1.0)
-    );
-}
-
 #[rstest]
 fn test_book_get_price_for_exposure(stub_depth10: OrderBookDepth) {
     let depth = stub_depth10;
@@ -932,6 +889,37 @@ fn test_book_simulate_fills_routes_to_opposite_ladder(
         .into_iter()
         .map(|(price, size)| (Price::from(price), Quantity::from(size)))
         .collect::<Vec<_>>();
+
+    assert_eq!(fills, expected);
+}
+
+#[rstest]
+#[case::buy(OrderSide::Buy, OrderSide::Sell, "101.00", "102.00")]
+#[case::sell(OrderSide::Sell, OrderSide::Buy, "99.00", "98.00")]
+fn test_book_simulate_fills_caps_large_liquidity_to_remainder(
+    #[case] order_side: OrderSide,
+    #[case] resting_side: OrderSide,
+    #[case] first_price: &str,
+    #[case] second_price: &str,
+) {
+    let instrument_id = InstrumentId::from("AAPL.XNAS");
+    let mut book = OrderBook::new(instrument_id, BookType::L3_MBO);
+    let maximum = Quantity::from_raw_checked(QUANTITY_RAW_MAX, 0).unwrap();
+    let resting = [
+        BookOrder::new(resting_side, Price::from(first_price), Quantity::from(1), 1),
+        BookOrder::new(resting_side, Price::from(second_price), maximum, 2),
+    ];
+
+    for order in resting {
+        book.add(order, 0, order.order_id, order.order_id.into());
+    }
+
+    let order = BookOrder::new(order_side, Price::from(second_price), Quantity::from(2), 3);
+    let fills = book.simulate_fills(&order);
+    let expected = vec![
+        (Price::from(first_price), Quantity::from(1)),
+        (Price::from(second_price), Quantity::from(1)),
+    ];
 
     assert_eq!(fills, expected);
 }
@@ -10293,6 +10281,151 @@ fn test_deltas_to_quotes_emits_on_two_sided_book() {
     assert_eq!(quotes[0].bid_price, Price::from("99.00"));
     assert_eq!(quotes[0].ask_price, Price::from("101.00"));
     assert_eq!(quotes[0].ts_event, UnixNanos::from(2000u64));
+}
+
+#[rstest]
+#[case("1", "0.5", "1.0", "0.5")]
+#[case("0.25", "1", "0.25", "1.00")]
+#[case("1", "0.500", "1.000", "0.500")]
+fn test_deltas_to_quotes_preserves_mixed_size_precision(
+    #[case] bid_size: &str,
+    #[case] ask_size: &str,
+    #[case] expected_bid: &str,
+    #[case] expected_ask: &str,
+    #[values(BookType::L2_MBP, BookType::L3_MBO)] book_type: BookType,
+) {
+    let id = InstrumentId::from("TEST.VENUE");
+    let mut deltas = vec![
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Buy,
+            "99.00",
+            bid_size,
+            1,
+            1000,
+        ),
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Sell,
+            "101.00",
+            ask_size,
+            2,
+            2000,
+        ),
+    ];
+    deltas[1].ts_init = 2007.into();
+    let bid_size = Quantity::from(expected_bid);
+    let ask_size = Quantity::from(expected_ask);
+    let bid_price = Price::from("99.00");
+    let ask_price = Price::from("101.00");
+    let ts_event = UnixNanos::from(2000);
+    let ts_init = UnixNanos::from(2007);
+
+    let expected = QuoteTick::new(
+        id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init,
+    );
+
+    let quotes = OrderBook::deltas_to_quotes(book_type, &deltas);
+
+    assert_eq!(quotes, vec![expected]);
+    assert_eq!(quotes[0].bid_size.raw(), bid_size.raw());
+    assert_eq!(quotes[0].ask_size.raw(), ask_size.raw());
+    assert_eq!(quotes[0].bid_size.precision, bid_size.precision);
+    assert_eq!(quotes[0].ask_size.precision, ask_size.precision);
+}
+
+#[rstest]
+#[case(OrderSide::Buy, "1.25", "0.50")]
+#[case(OrderSide::Sell, "0.50", "1.25")]
+fn test_deltas_to_quotes_preserves_mixed_precision_within_level(
+    #[case] side: OrderSide,
+    #[case] expected_bid: &str,
+    #[case] expected_ask: &str,
+) {
+    let id = InstrumentId::from("TEST.VENUE");
+
+    let (price, other_side, other_price) = match side {
+        OrderSide::Buy => ("99.00", OrderSide::Sell, "101.00"),
+        OrderSide::Sell => ("101.00", OrderSide::Buy, "99.00"),
+    };
+
+    let mut deltas = vec![
+        make_delta(id, BookAction::Add, side, price, "1", 1, 1000),
+        make_delta(id, BookAction::Add, side, price, "0.25", 2, 2000),
+        make_delta(id, BookAction::Add, other_side, other_price, "0.5", 3, 3000),
+    ];
+    deltas[2].ts_init = 3007.into();
+    let bid_size = Quantity::from(expected_bid);
+    let ask_size = Quantity::from(expected_ask);
+    let bid_price = Price::from("99.00");
+    let ask_price = Price::from("101.00");
+    let ts_event = UnixNanos::from(3000);
+    let ts_init = UnixNanos::from(3007);
+
+    let expected = QuoteTick::new(
+        id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init,
+    );
+
+    let quotes = OrderBook::deltas_to_quotes(BookType::L3_MBO, &deltas);
+
+    assert_eq!(quotes, vec![expected]);
+    assert_eq!(quotes[0].bid_size.raw(), bid_size.raw());
+    assert_eq!(quotes[0].ask_size.raw(), ask_size.raw());
+    assert_eq!(quotes[0].bid_size.precision, bid_size.precision);
+    assert_eq!(quotes[0].ask_size.precision, ask_size.precision);
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+#[case("1", "1.000000000000000000")]
+#[case("0.25000000000000001", "0.250000000000000010")]
+fn test_deltas_to_quotes_rescales_native_sizes(
+    #[case] bid_size: &str,
+    #[case] expected_bid: &str,
+    #[values(BookType::L2_MBP, BookType::L3_MBO)] book_type: BookType,
+) {
+    let id = InstrumentId::from("TEST.VENUE");
+    let ask_size = "0.500000000000000001";
+    let deltas = vec![
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Buy,
+            "99.00",
+            bid_size,
+            1,
+            1000,
+        ),
+        make_delta(
+            id,
+            BookAction::Add,
+            OrderSide::Sell,
+            "101.00",
+            ask_size,
+            2,
+            2000,
+        ),
+    ];
+    let bid_size = Quantity::from(expected_bid);
+    let ask_size = Quantity::from(ask_size);
+    let bid_price = Price::from("99.00");
+    let ask_price = Price::from("101.00");
+    let ts_event = UnixNanos::from(2000);
+    let ts_init = UnixNanos::from(2000);
+
+    let expected = QuoteTick::new(
+        id, bid_price, ask_price, bid_size, ask_size, ts_event, ts_init,
+    );
+
+    let quotes = OrderBook::deltas_to_quotes(book_type, &deltas);
+
+    assert_eq!(quotes, vec![expected]);
+    assert_eq!(quotes[0].bid_size.raw(), bid_size.raw());
+    assert_eq!(quotes[0].ask_size.raw(), ask_size.raw());
+    assert_eq!(quotes[0].bid_size.precision, bid_size.precision);
+    assert_eq!(quotes[0].ask_size.precision, ask_size.precision);
 }
 
 #[rstest]

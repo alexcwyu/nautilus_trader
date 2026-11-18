@@ -21,7 +21,7 @@ use nautilus_common::{
     actor::{DataActor, DataActorCore, data_actor::DataActorConfig},
     cache::Cache,
     clients::DataClient,
-    clock::VirtualClock,
+    clock::{Clock, VirtualClock},
     component::Component,
     messages::{
         data::DataCommand,
@@ -49,10 +49,17 @@ use crate::common::{defi::make_initialized_pool_and_swap, mocks::MockDataClient}
 #[rstest]
 #[case::first_subscriber_retires_first(0)]
 #[case::second_subscriber_retires_first(1)]
-fn test_shared_pool_demand_survives_until_final_owner_retires(#[case] first: usize) {
+fn test_shared_pool_demand_survives_until_final_owner_retires(
+    #[case] first: usize,
+    #[values(false, true)] stopped: bool,
+) {
     let mut fixture = DefiFixture::new(true);
     let client_id = fixture.client_ids[0];
     fixture.subscribe(0, PoolShape::Swaps, client_id);
+    if stopped {
+        fixture.engine.borrow_mut().stop();
+    }
+
     fixture.subscribe(1, PoolShape::Swaps, client_id);
 
     fixture.actors[first].dispose().unwrap();
@@ -350,11 +357,11 @@ impl DefiFixture {
         let cache = Rc::new(RefCell::new(Cache::default()));
 
         let engine = Rc::new(RefCell::new(DataEngine::new(
-            clock.clone(),
-            cache.clone(),
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            Rc::clone(&cache),
             None,
         )));
-        let target = engine.clone();
+        let target = Rc::clone(&engine);
         msgbus::register_data_command_endpoint(
             MessagingSwitchboard::data_engine_queue_execute(),
             TypedIntoHandler::from(move |command: DataCommand| {
@@ -369,11 +376,11 @@ impl DefiFixture {
             .map(|client_id| {
                 let recorder = Rc::new(RefCell::new(Vec::new()));
                 let client = MockDataClient::new_with_recorder(
-                    clock.clone(),
-                    cache.clone(),
+                    Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+                    Rc::clone(&cache),
                     *client_id,
                     None,
-                    Some(recorder.clone()),
+                    Some(Rc::clone(&recorder)),
                 );
                 engine.borrow_mut().register_client(
                     DataClientAdapter::new(*client_id, None, false, false, Box::new(client)),
@@ -393,7 +400,11 @@ impl DefiFixture {
                 };
 
                 actor
-                    .register(trader_id, clock.clone(), cache.clone())
+                    .register(
+                        trader_id,
+                        Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+                        Rc::clone(&cache),
+                    )
                     .unwrap();
                 actor
             })

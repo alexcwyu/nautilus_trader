@@ -87,6 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         market_id: None,
         account_index: Some(credential.account_index()),
         order_index: None,
+        order_index_str: None,
+        integrator_account_index: None,
         sort_by: LighterTradeSortBy::Timestamp,
         sort_dir: Some(LighterSortDirection::Desc),
         cursor: None,
@@ -298,6 +300,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         market_id: None,
         account_index: Some(credential.account_index()),
         order_index: None,
+        order_index_str: None,
+        integrator_account_index: None,
         sort_by: LighterTradeSortBy::Timestamp,
         sort_dir: Some(LighterSortDirection::Desc),
         cursor: None,
@@ -480,7 +484,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut url = url::Url::parse(base)?;
         url.set_query(Some(&serde_urlencoded::to_string(params)?));
         let resp = raw
-            .request_with_params_url_redacted(
+            .request_with_params(
                 Method::GET,
                 base.to_owned(),
                 Some(params),

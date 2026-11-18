@@ -92,7 +92,8 @@ pub struct ExecutionEngineConfig {
     /// The time buffer (minutes) before account events can be purged.
     #[serde(default)]
     pub purge_account_events_lookback_mins: Option<u32>,
-    /// If purge operations should also delete from the backing database.
+    /// If purging also deletes orders and positions from the backing database.
+    /// Redis and PostgreSQL retain persisted account events for replay.
     #[serde(default)]
     #[builder(default)]
     pub purge_from_database: bool,
@@ -107,8 +108,7 @@ impl<S: execution_engine_config_builder::IsComplete> ExecutionEngineConfigBuilde
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`ExecutionEngineConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`ExecutionEngineConfig::validate`]).
     pub fn build(self) -> ConfigResult<ExecutionEngineConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -121,8 +121,8 @@ impl ExecutionEngineConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -207,8 +207,26 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn test_default_config_is_valid() {
-        assert!(ExecutionEngineConfig::builder().build().is_ok());
+    fn test_default_config_values() {
+        let config = ExecutionEngineConfig::default();
+
+        assert!(config.load_cache);
+        assert!(!config.manage_own_order_books);
+        assert!(!config.snapshot_orders);
+        assert!(!config.snapshot_positions);
+        assert_eq!(config.snapshot_positions_interval_secs, None);
+        assert!(!config.carry_replay_events_on_reopen);
+        assert!(!config.allow_overfills);
+        assert!(!config.filter_unclaimed_external_orders);
+        assert_eq!(config.external_clients, None);
+        assert_eq!(config.purge_closed_orders_interval_mins, None);
+        assert_eq!(config.purge_closed_orders_buffer_mins, None);
+        assert_eq!(config.purge_closed_positions_interval_mins, None);
+        assert_eq!(config.purge_closed_positions_buffer_mins, None);
+        assert_eq!(config.purge_account_events_interval_mins, None);
+        assert_eq!(config.purge_account_events_lookback_mins, None);
+        assert!(!config.purge_from_database);
+        assert!(!config.debug);
     }
 
     #[rstest]
@@ -249,32 +267,28 @@ mod tests {
     }
 
     #[rstest]
-    fn test_zero_purge_closed_orders_interval_rejected() {
-        let result = ExecutionEngineConfig::builder()
-            .purge_closed_orders_interval_mins(0)
-            .build();
-        assert!(
-            matches!(result, Err(ConfigError::Range { field, .. }) if field == "purge_closed_orders_interval_mins")
-        );
-    }
+    #[case("purge_closed_orders_interval_mins")]
+    #[case("purge_closed_positions_interval_mins")]
+    #[case("purge_account_events_interval_mins")]
+    fn test_zero_purge_interval_rejected(#[case] field: &str) {
+        let mut config = ExecutionEngineConfig::default();
 
-    #[rstest]
-    fn test_zero_purge_closed_positions_interval_rejected() {
-        let result = ExecutionEngineConfig::builder()
-            .purge_closed_positions_interval_mins(0)
-            .build();
-        assert!(
-            matches!(result, Err(ConfigError::Range { field, .. }) if field == "purge_closed_positions_interval_mins")
-        );
-    }
+        match field {
+            "purge_closed_orders_interval_mins" => {
+                config.purge_closed_orders_interval_mins = Some(0);
+            }
+            "purge_closed_positions_interval_mins" => {
+                config.purge_closed_positions_interval_mins = Some(0);
+            }
+            "purge_account_events_interval_mins" => {
+                config.purge_account_events_interval_mins = Some(0);
+            }
+            _ => unreachable!(),
+        }
 
-    #[rstest]
-    fn test_zero_purge_account_events_interval_rejected() {
-        let result = ExecutionEngineConfig::builder()
-            .purge_account_events_interval_mins(0)
-            .build();
-        assert!(
-            matches!(result, Err(ConfigError::Range { field, .. }) if field == "purge_account_events_interval_mins")
+        assert_eq!(
+            config.validate().unwrap_err(),
+            ConfigError::range(field, "must be a positive number of minutes, was 0"),
         );
     }
 

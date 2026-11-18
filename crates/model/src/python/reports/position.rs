@@ -35,7 +35,7 @@ impl PositionStatusReport {
     /// When `avg_px_open_precision` is set, reconciliation accepts `avg_px_open` within one unit at
     /// that precision on top of its relative tolerance. A precision above 28 adds no allowance.
     #[new]
-    #[pyo3(signature = (account_id, instrument_id, position_side, quantity, ts_last, ts_init, report_id=None, venue_position_id=None, avg_px_open=None, avg_px_open_reconciliation=None, avg_px_open_precision=None))]
+    #[pyo3(signature = (account_id, instrument_id, position_side, quantity, ts_last, ts_init, report_id=None, venue_position_id=None, avg_px_open=None, avg_px_open_reconciliation=None, avg_px_open_precision=None, liquidation_price=None))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
         account_id: AccountId,
@@ -49,6 +49,7 @@ impl PositionStatusReport {
         avg_px_open: Option<Decimal>,
         avg_px_open_reconciliation: Option<AvgPxReconciliation>,
         avg_px_open_precision: Option<u8>,
+        liquidation_price: Option<Decimal>,
     ) -> Self {
         let report = Self::new(
             account_id,
@@ -65,6 +66,7 @@ impl PositionStatusReport {
         Self {
             avg_px_open_reconciliation: avg_px_open_reconciliation.unwrap_or_default(),
             avg_px_open_precision,
+            liquidation_price,
             ..report
         }
     }
@@ -140,6 +142,12 @@ impl PositionStatusReport {
     }
 
     #[getter]
+    #[pyo3(name = "liquidation_price")]
+    const fn py_liquidation_price(&self) -> Option<Decimal> {
+        self.liquidation_price
+    }
+
+    #[getter]
     #[pyo3(name = "report_id")]
     const fn py_report_id(&self) -> UUID4 {
         self.report_id
@@ -182,7 +190,7 @@ impl PositionStatusReport {
     ///
     /// # Errors
     ///
-    /// Returns a Python exception if conversion from dict fails.
+    /// Returns an error if conversion from dict fails.
     #[staticmethod]
     #[pyo3(name = "from_dict")]
     pub fn py_from_dict(py: Python<'_>, values: Py<PyDict>) -> PyResult<Self> {
@@ -193,7 +201,7 @@ impl PositionStatusReport {
     ///
     /// # Errors
     ///
-    /// Returns a Python exception if conversion to dict fails.
+    /// Returns an error if conversion to dict fails.
     #[pyo3(name = "to_dict")]
     pub fn py_to_dict(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
@@ -222,6 +230,10 @@ impl PositionStatusReport {
             self.avg_px_open_reconciliation.to_string(),
         )?;
         dict.set_item("avg_px_open_precision", self.avg_px_open_precision)?;
+        dict.set_item(
+            "liquidation_price",
+            self.liquidation_price.map(|price| price.to_string()),
+        )?;
         Ok(dict.into())
     }
 }
@@ -234,7 +246,12 @@ mod tests {
     use super::*;
 
     #[rstest]
-    fn test_position_status_report_python_dict_round_trip() {
+    #[case::reported(Some(dec!(0.87654321987654321)))]
+    #[case::zero(Some(Decimal::ZERO))]
+    #[case::unavailable(None)]
+    fn test_position_status_report_python_dict_round_trip(
+        #[case] liquidation_price: Option<Decimal>,
+    ) {
         Python::initialize();
         Python::attach(|py| {
             let report = PositionStatusReport::py_new(
@@ -249,6 +266,7 @@ mod tests {
                 Some(dec!(1.23456)),
                 Some(AvgPxReconciliation::OpeningOnly),
                 Some(4),
+                liquidation_price,
             );
 
             let values = report.py_to_dict(py).unwrap();
@@ -261,6 +279,7 @@ mod tests {
                 AvgPxReconciliation::OpeningOnly
             );
             assert_eq!(report.avg_px_open_precision, Some(4));
+            assert_eq!(report.py_liquidation_price(), liquidation_price);
             assert_eq!(restored, report);
         });
     }

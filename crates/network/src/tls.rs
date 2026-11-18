@@ -23,7 +23,7 @@
 //! directory is used as the client certificate instead. Write access to the directory is
 //! therefore equivalent to control over which servers those connections trust. Each anchor
 //! added this way is logged at INFO with its SHA-256 fingerprint so operators can audit exactly
-//! what became trusted.
+//! what became trusted. On Unix, loading a world-writable directory logs a warning.
 
 use std::{
     convert::TryFrom,
@@ -118,6 +118,9 @@ pub(crate) fn create_tls_config_from_certs_dir(
         );
     }
 
+    #[cfg(unix)]
+    warn_if_world_writable(certs_dir)?;
+
     let mut all_certs: Vec<(std::path::PathBuf, Vec<CertificateDer<'static>>)> = Vec::new();
     let mut client_key = None;
     let mut root_store = rustls::RootCertStore::empty();
@@ -146,7 +149,6 @@ pub(crate) fn create_tls_config_from_certs_dir(
             let test_config = rustls::ClientConfig::builder()
                 .with_root_certificates(rustls::RootCertStore::empty())
                 .with_client_auth_cert(all_certs[i].1.clone(), key.clone_key());
-
             if test_config.is_ok() {
                 let (path, cert) = all_certs.remove(i);
                 log::debug!("Matched client certificate from {}", path.display());
@@ -161,6 +163,7 @@ pub(crate) fn create_tls_config_from_certs_dir(
                 certs_dir.display()
             );
         }
+
         matched
     } else {
         None
@@ -180,7 +183,6 @@ pub(crate) fn create_tls_config_from_certs_dir(
     }
 
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
-
     if let (Some(cert), Some(key)) = (client_cert, client_key) {
         return Ok(builder.with_client_auth_cert(cert, key)?);
     }
@@ -198,6 +200,25 @@ pub(crate) fn create_tls_config_from_certs_dir(
     );
 
     Ok(builder.with_no_client_auth())
+}
+
+#[cfg(unix)]
+fn warn_if_world_writable(certs_dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = std::fs::metadata(certs_dir)
+        .with_context(|| format!("failed to read metadata for {}", certs_dir.display()))?
+        .permissions()
+        .mode();
+
+    if mode & 0o002 != 0 {
+        log::warn!(
+            "Certificate directory {} is world-writable: any local user can add a trusted root",
+            certs_dir.display()
+        );
+    }
+
+    Ok(())
 }
 
 // Sorted for deterministic selection; unreadable metadata errors rather than reading as absent
@@ -342,6 +363,7 @@ zhxL/14wqaVBwUW6/RNRr9hz6MkFFC8Uced5obScy8kOI0bMbeIC4ftNGG9pUdms
             .unwrap()
             .self_signed(&key_pair)
             .unwrap();
+
         TestIdentity {
             key_pem: key_pair.serialize_pem(),
             cert_pem: cert.pem(),
@@ -428,6 +450,7 @@ zhxL/14wqaVBwUW6/RNRr9hz6MkFFC8Uced5obScy8kOI0bMbeIC4ftNGG9pUdms
             )
             .unwrap();
         }
+
         std::fs::write(
             temp_dir.path().join("server.pem"),
             &server_identity.cert_pem,
@@ -515,6 +538,43 @@ zhxL/14wqaVBwUW6/RNRr9hz6MkFFC8Uced5obScy8kOI0bMbeIC4ftNGG9pUdms
             "Should succeed ignoring invalid cert file: {:?}",
             result.err()
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(not(all(feature = "simulation", madsim)))]
+    #[rstest]
+    #[case::world_writable(0o777, true)]
+    #[case::sticky_world_writable(0o1777, true)]
+    #[case::group_writable(0o770, false)]
+    #[case::owner_only(0o700, false)]
+    #[tokio::test]
+    async fn test_world_writable_certs_dir_is_warned(#[case] mode: u32, #[case] warned: bool) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp_dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+
+        let capture = capture_logs_for(&["nautilus_network::tls"]).await;
+        create_tls_config_from_certs_dir(temp_dir.path(), false).unwrap();
+        // The capture buffer is process-global, so select the records naming this directory
+        let directory = temp_dir.path().display().to_string();
+        let warnings: Vec<String> = capture
+            .messages()
+            .into_iter()
+            .filter(|(level, _)| *level == Level::Warn)
+            .filter(|(_, message)| message.contains(&directory))
+            .map(|(_, message)| message)
+            .collect();
+
+        let expected = if warned {
+            vec![format!(
+                "Certificate directory {directory} is world-writable: any local user can add a trusted root"
+            )]
+        } else {
+            vec![]
+        };
+
+        assert_eq!(warnings, expected);
     }
 
     #[cfg(target_os = "linux")]

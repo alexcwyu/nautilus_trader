@@ -95,10 +95,7 @@ where
     F: Fn(&T) -> Headers + Send + Sync,
 {
     fn extract(&self, message: &dyn Any) -> Headers {
-        message
-            .downcast_ref::<T>()
-            .map(&self.func)
-            .unwrap_or_default()
+        message.downcast_ref::<T>().map_or_default(&self.func)
     }
 }
 
@@ -347,8 +344,7 @@ impl EncoderRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the encoder's [`EncodeError`] when an encoder is registered but rejects
-    /// the message.
+    /// Returns an error if an encoder is registered but rejects the message.
     pub fn encode<T: 'static>(
         &self,
         message: &T,
@@ -370,8 +366,7 @@ impl EncoderRegistry {
     ///
     /// # Errors
     ///
-    /// Returns the encoder's [`EncodeError`] when an encoder is registered for the
-    /// concrete type but rejects the message.
+    /// Returns an error if an encoder is registered for the concrete type but rejects the message.
     pub fn encode_any(
         &self,
         message: &dyn Any,

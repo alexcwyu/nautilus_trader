@@ -78,7 +78,7 @@ pub struct SocketConfig {
     ///
     /// Bounds the initial connection attempt, each reconnect attempt, and how long a send waits for
     /// the client to become active again. Keep it above the reconnect backoff so a send does not
-    /// give up part-way through a normal reconnect.
+    /// give up part-way through a normal reconnect. The client has no separate send-wait timeout.
     pub connect_timeout_ms: Option<u64>,
     /// The initial reconnection delay (milliseconds) for reconnects.
     pub reconnect_delay_initial_ms: Option<u64>,
@@ -88,13 +88,17 @@ pub struct SocketConfig {
     pub reconnect_backoff_factor: Option<f64>,
     /// The maximum jitter (milliseconds) added to reconnection delays.
     pub reconnect_jitter_ms: Option<u64>,
-    /// The maximum number of initial connection attempts. Defaults to 5.
+    /// The maximum number of initial connection attempts, including the first. Defaults to 5.
+    ///
+    /// The field name is retained for compatibility: this bounds total attempts, not retries after
+    /// the first. `Some(0)` and `Some(1)` both make one attempt.
     pub connection_max_retries: Option<u32>,
     /// The maximum number of reconnection attempts before closing the client.
     ///
     /// - `None`: Unlimited reconnection attempts (default, recommended for production).
-    /// - `Some(n)`: Transitions to CLOSED once `n` consecutive reconnect attempts have either
-    ///   failed or established connections active for less than 10 seconds.
+    /// - `Some(0)`: Disables reconnection; any reconnect trigger closes the client.
+    /// - `Some(n)` for `n > 0`: Transitions to CLOSED once `n` consecutive reconnect attempts have
+    ///   either failed or established connections active for less than 10 seconds.
     pub reconnect_max_attempts: Option<u32>,
     /// The dead-peer timeout (seconds) for the read task.
     ///
@@ -133,8 +137,7 @@ impl<S: socket_config_builder::IsComplete> SocketConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`NetworkConfigError`] if any field fails validation
-    /// (see [`SocketConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`SocketConfig::validate`]).
     pub fn build(self) -> NetworkConfigResult<SocketConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -147,13 +150,12 @@ impl SocketConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`NetworkConfigError`] if `url` is empty, the heartbeat interval or a
-    /// reconnection timing field is not positive, `reconnect_backoff_factor` is outside
-    /// `[1.0, 100.0]`, `reconnect_delay_initial_ms` exceeds `reconnect_delay_max_ms`, or
-    /// `writer_capacity` is outside `[1, Semaphore::MAX_PERMITS]`.
+    /// Returns an error if `url` is empty, the heartbeat interval or a reconnection timing field is
+    /// not positive, `reconnect_backoff_factor` is outside `[1.0, 100.0]`,
+    /// `reconnect_delay_initial_ms` exceeds `reconnect_delay_max_ms`, or `writer_capacity` is
+    /// outside `[1, Semaphore::MAX_PERMITS]`.
     pub fn validate(&self) -> NetworkConfigResult<()> {
         let mut errors = Vec::new();
-
         if let Err(e) = crate::writer::validate_capacity(self.writer_capacity) {
             errors.push(e);
         }
@@ -326,6 +328,7 @@ mod tests {
             interval_secs: 5,
             payload: b"ping".to_vec(),
         });
+
         config.heartbeat_timeout_secs = timeout_secs;
 
         assert_eq!(config.resolved_heartbeat_timeout(), expected);

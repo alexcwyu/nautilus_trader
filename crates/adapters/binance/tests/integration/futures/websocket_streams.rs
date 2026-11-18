@@ -33,12 +33,16 @@ use axum::{
     response::Response,
     routing::get,
 };
+use futures_util::{StreamExt, pin_mut};
 use nautilus_binance::{
     common::{
         consts::{BINANCE_CLIENT_ID, BINANCE_VENUE},
         enums::{BinanceEnvironment, BinanceProductType},
     },
-    futures::websocket::streams::client::BinanceFuturesWebSocketClient,
+    futures::websocket::streams::{
+        client::BinanceFuturesWebSocketClient,
+        messages::{AccountUpdateReason, BinanceFuturesWsStreamsMessage},
+    },
 };
 use nautilus_common::{
     live::runner::replace_system_event_sender,
@@ -144,12 +148,11 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                         let params = value
                             .get("params")
                             .and_then(|v| v.as_array())
-                            .map(|arr| {
+                            .map_or_default(|arr| {
                                 arr.iter()
                                     .filter_map(|v| v.as_str().map(String::from))
                                     .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
+                            });
 
                         {
                             let mut fail_list = state.fail_next_subscriptions.lock().await;
@@ -196,12 +199,11 @@ async fn handle_socket(mut socket: WebSocket, state: TestServerState) {
                         let params = value
                             .get("params")
                             .and_then(|v| v.as_array())
-                            .map(|arr| {
+                            .map_or_default(|arr| {
                                 arr.iter()
                                     .filter_map(|v| v.as_str().map(String::from))
                                     .collect::<Vec<_>>()
-                            })
-                            .unwrap_or_default();
+                            });
 
                         let mut streams = state.subscribed_streams.lock().await;
                         streams.retain(|s| !params.contains(s));
@@ -341,6 +343,69 @@ fn test_client_debug_redacts_url() {
 
     assert!(output.contains("url: \"<redacted>\""));
     assert!(!output.contains("dstream.binancefuture.com"));
+}
+
+#[rstest]
+#[case(
+    BinanceProductType::UsdM,
+    include_str!("../../../test_data/futures/user_data_json/account_update_funding_fee_usdm.json"),
+    "BTCUSDT"
+)]
+#[case(
+    BinanceProductType::CoinM,
+    include_str!("../../../test_data/futures/user_data_json/account_update_funding_fee_coinm.json"),
+    "BTCUSD_PERP"
+)]
+#[tokio::test]
+async fn test_account_update_funding_fee_symbol_reaches_consumer(
+    #[case] product_type: BinanceProductType,
+    #[case] payload: &'static str,
+    #[case] symbol: &str,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let router = Router::new().route(
+        "/ws",
+        get(move |upgrade: WebSocketUpgrade| async move {
+            upgrade.on_upgrade(move |mut socket| async move {
+                socket.send(Message::Text(payload.into())).await.unwrap();
+                let _ = socket.recv().await;
+            })
+        }),
+    );
+
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut client = BinanceFuturesWebSocketClient::new(
+        product_type,
+        BinanceEnvironment::Testnet,
+        None,
+        None,
+        Some(format!("ws://{addr}/ws")),
+        None,
+        TransportBackend::default(),
+    )
+    .unwrap();
+    client.connect().await.unwrap();
+    let stream = client.stream();
+    pin_mut!(stream);
+
+    let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap();
+    client.close().await.unwrap();
+    server.abort();
+
+    let BinanceFuturesWsStreamsMessage::AccountUpdate(msg) = message else {
+        panic!("Expected account update, received {message:?}");
+    };
+
+    assert_eq!(msg.account.reason, AccountUpdateReason::FundingFee);
+    assert_eq!(
+        msg.account.symbol.as_ref().map(|value| value.as_str()),
+        Some(symbol)
+    );
 }
 
 #[rstest]

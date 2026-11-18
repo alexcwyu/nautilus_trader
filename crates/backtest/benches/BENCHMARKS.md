@@ -1,14 +1,17 @@
 # Backtest Engine Benchmarks
 
 This document records the native canonical benchmark, its dated optimization decisions, the
-v1.231.0 and v2 comparison, and the benchmark's CI role. Use the native sections to reproduce the
-workload or evaluate another optimization under equivalent controls. Use the version comparison to
-inspect the released Cython and Rust/PyO3 results and their raw evidence.
+v1.231.0 and v2 comparison, account-history retention measurements, HEDGING position-update
+measurements, and the benchmark's CI role.
+Use the native sections to reproduce a workload or evaluate an optimization under equivalent controls.
+Use the version comparison to inspect the released Cython and Rust/PyO3 results and their raw evidence.
 
-The latest native profile, collected on 2026-08-30 at commit `3dee76e70e4dc66cf705a90629924ec22e5cb3ab`,
-found no safe production candidate above the 10.872622191% shared-host detection floor. The dated
-records remain relevant because they define retained optimizations, rejected variants, and the
-conditions required to reconsider them.
+The latest native profile, collected on 2026-11-02 at commit
+`25217eea5d3b1ccad4c41c2765400c577541180f`, confirmed `BookLadder::replace_l1` as the largest
+single production lead. That day's rounds removed the measured L1 cache-hash candidate and left
+the empty command-queue fast path unimplemented after its realistic estimate fell below the fresh
+admission thresholds. The dated records remain relevant because they define retained
+optimizations, rejected variants, and the conditions required to reconsider them.
 
 ## Native canonical benchmark
 
@@ -35,12 +38,15 @@ stream. Typed cases append `_typed` to the scenario name, such as `replay_only_t
 keep the bare scenario name so earlier baselines stay comparable. The correctness test requires both
 modes to produce identical canonical results.
 
-Before timing, the benchmark checks these counts, all 20,000 processed data events, execution
-event counts, the canonical account digest, and the complete `CanonicalBacktestResult` digest.
+Before timing, the benchmark compares each result with its checked-in reference: an exact
+trading-state fingerprint and numerical values. The fingerprint contains these counts, all 20,000
+processed data events, execution event counts, the account digest, and a state digest.
+The [canonical comparison rules](../../../docs/developer_guide/benchmarking.md#canonical-backtest-workloads)
+define the numerical fields and tolerances.
 The correctness test also requires the preloaded and freshly loaded paths to produce identical
-canonical results. The complete result digest is exact within the active precision mode. Filled
-workloads lock separate standard and `high-precision` digests because portfolio statistics
-preserve exact `f64` bits; event counts, action counts, and account digests remain the same.
+canonical results. Both precision modes produce the same trading-state fingerprint, but some
+numerical values differ beyond the tolerances, so each mode has its own reference files.
+This check excludes the full `CanonicalBacktestResult` digest, which preserves exact `f64` bits.
 
 ### Absolute baseline environment
 
@@ -191,6 +197,8 @@ artifact identity. A profile share selects a target; it never establishes an ela
 | 2026-08-30 | Pending queue snapshot                  |                   3.790% | 10.302% median reduction               | Retained               |
 | 2026-08-30 | Current-HEAD target search              |            10.872622191% | No eligible target                     | No candidate           |
 | 2026-09-04 | Typed batch input                       |    Per-row baseline band | Typed within legacy round bands        | Retained               |
+| 2026-11-02 | L1 cache map ahash swap                 |             3.241947562% | 4.27% median regression                | Removed                |
+| 2026-11-02 | Empty command-queue fast path           |            13.510776671% | 0.932517798% estimated removable share | Not implemented        |
 
 ### 2026-08-29: L1 replacement
 
@@ -491,8 +499,9 @@ The 15.223379333 ms median and 6.326209262% full spread set the admission thresh
 4.712818562% realistic removal estimate did not clear that threshold, so no production candidate,
 candidate executable, paired comparison, or candidate fingerprint run was created. This campaign
 establishes change-detection limits under normal shared-host load, not quiet-host absolute timing.
-Reconsider an empty command-queue fast path after reducing the fresh spread below its conservative
-effect estimate, or select a larger eligible non-book cost.
+The 2026-11-02 revaluation below met the reduced-spread condition with a 0.719145376% fresh spread
+and still rejected the candidate, because the direct drain share at current HEAD had fallen to
+1.554196330%.
 
 ### 2026-08-30: Shared-host repeatability calibration
 
@@ -817,6 +826,143 @@ The quote reduction matches the 72-byte difference between `Data` and `QuoteTick
 reduction matches the 168-byte enum plus the allocator header that `Data::BookDepth` spends on
 each boxed snapshot.
 
+### 2026-11-02: Rejected L1 cache map ahash swap
+
+The baseline was the signed `Add DataTester historical request controls` commit
+`64bb2b8526fd66964125b40b5bbf0af060ed120a`, measured from a clean tree. The candidate changed the
+`BookLadder` order cache field from `HashMap<u64, BookPrice>` to `ahash::AHashMap<u64, BookPrice>`
+and nothing else; `ahash` was already a `nautilus-model` dependency. The host was the Threadripper
+9980X system described above with kernel `7.0.0-38-generic`, the `powersave` governor on all 128
+logical CPUs, SMT and boost enabled, per-process ASLR disablement, and an unpinned benchmark
+thread. Rust and Cargo 1.99.1 built both `bench-lto` executables once for reuse with standard
+precision and the default empty `nautilus-backtest` feature set. No `valgrind` installation was
+present, so iai instruction counts were unavailable and sizing used a temporary Criterion
+microbenchmark instead.
+
+A fresh one-millisecond `gprofng` profile of canonical replay-only `run_preloaded` from the
+immutable baseline executable captured 17.112 seconds of CPU samples. `BacktestEngine::run`
+accounted for 10.406 seconds inclusive, and `BookLadder::replace_l1` for 3.258 seconds inclusive:
+19.04% of captured samples and 31.31% of the `run` stack, keeping it the largest single production
+lead. In this build the L1 cache insert appeared as its own unfolded symbol,
+`hashbrown::map::HashMap<u64, BookPrice, RandomState>::insert`, with 0.487 seconds inclusive:
+2.85% of captured samples and 4.68% of `run`. That share is the upper bound for the entire insert
+cost, covering hashing, probing, and storage, so the hashing alone is materially smaller.
+
+| Item                | Baseline                                                           | Candidate                                                          |
+| ------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Repository revision | `64bb2b8526fd66964125b40b5bbf0af060ed120a`                         | Baseline revision plus the measured patch                          |
+| Executable SHA-256  | `1b7b32e4ced97f4a23488c700f49284be075395d2e5ebd5a08d0a2ed39cbda7f` | `c965e4da58d8793e0b3c2f8ced4866ea7f4f2838fc84cc2debc479ff2ebac754` |
+| ELF build ID        | `f2b70927db12bba7c9f588e57e8d24e835c92945`                         | `3caa3557280a46e9f10974e3e6a400a8a5f74663`                         |
+
+Three fresh baseline sessions on the immutable baseline executable measured 10.565264,
+10.773944, and 10.914549 ms. Their 10.773944 ms median and 3.241947562% full spread set the fresh
+noise band. Sessions averaged 87% to 89% CPU idle under the normal desktop workload with no
+concurrent build process, which is quieter than the shared-load regime behind the 10.872622191%
+floor but noisier than the quietest recorded sessions.
+
+Sizing used a temporary Criterion benchmark, since removed from the tree. Its quote batch case
+drove 1,000 L1 quote replacements, or 2,000 `replace_l1` calls, through `OrderBook::
+update_quote_tick` with a deterministic price walk. Three alternated rounds measured:
+
+| Round | Baseline median | Candidate median |
+| ----- | --------------: | ---------------: |
+|     1 |    69.056 us    |    74.137 us     |
+|     2 |    70.773 us    |    75.744 us     |
+|     3 |    71.303 us    |    76.048 us     |
+
+The candidate was 4.7 to 5.1 us slower in every round, about 7% of the path, with baseline and
+candidate executables alternating within each round. An isolated map
+case timing 1,000 clear-plus-insert cycles of the same side-constant key measured 9.229 us with
+the standard hasher and 9.484 us with ahash, a 2.7% ahash deficit. The expected integer-key
+hashing advantage does not materialize on the steady-state clear-and-insert pattern; the map and
+table work around it offsets the cheaper hash function.
+
+Three paired sessions then alternated the immutable executables for canonical replay-only
+`run_preloaded`. Each run used an isolated Criterion home, a 3-second warm-up, a 5-second
+measurement target, and 50 samples.
+
+| Pair order         | Baseline median | Candidate median | Change |
+| ------------------ | --------------: | ---------------: | -----: |
+| Baseline/candidate |       10.979 ms |        11.110 ms | +1.19% |
+| Candidate/baseline |       10.653 ms |        11.107 ms | +4.27% |
+| Baseline/candidate |       10.331 ms |        11.229 ms | +8.71% |
+
+The candidate was slower in all three pairs, with a median 4.27% regression that matches the
+microbench direction. Every session executed the canonical fingerprint verification before
+timing and passed, so the candidate preserved every exact semantic fingerprint. All 402 focused
+order-book unit tests passed on the candidate source. The candidate was removed and the
+temporary benchmark deleted.
+
+Do not select the ahash swap for the `BookLadder` order cache again under the same hasher
+implementation, toolchain, and workload. The profile bounds the whole cache-insert cost near 5%
+of `run`, the swap measured no faster on the isolated operation, and both the L1 replacement path
+and the canonical workload regressed. Reconsider only after a material hasher or hashbrown
+dependency change, a toolchain change that alters standard-hash code generation, or a
+representative-workload change that grows the cache-insert share.
+
+### 2026-11-02: Empty command-queue fast path revaluation
+
+The 2026-08-30 command-queue profile left the empty fast path unimplemented because its
+4.712818562% realistic estimate did not clear that day's 6.326209262% shared-host spread. This
+round re-established the baseline, profile, and admission decision at current HEAD. No production
+code, test, or harness change resulted.
+
+| Item                 | Baseline                                                           |
+| -------------------- | ------------------------------------------------------------------ |
+| Repository revision  | `25217eea5d3b1ccad4c41c2765400c577541180f`                         |
+| Measured source tree | `c022d6583b19ff56aeebf5d4fabf643f977368dd`                         |
+| Executable SHA-256   | `c0e456a7e55b8526acbf32371e7507f763670c1cdd25fc264a6b5bbf66a8945d` |
+| ELF build ID         | `162e729ddb316aef1cf5da8266b8eda780bfaca1`                         |
+
+Rust and Cargo 1.99.1 built the executable once from the clean tree with standard precision, the
+default empty `nautilus-backtest` feature set, and `bench-lto`. The executable was copied to a
+read-only path, and every session verified its SHA-256 before and after execution and completed
+the canonical fingerprint checks. The host remained the Threadripper 9980X system with kernel
+`7.0.0-38-generic`, the `powersave` governor on all 128 logical CPUs, SMT and boost enabled,
+per-process ASLR disablement, and an unpinned benchmark thread. Each session ran canonical
+replay-only `run_preloaded` with a 3-second warm-up, a 5-second measurement target, 50 samples,
+and an isolated Criterion home. Compiler observations count cargo, rustc, clippy-driver, and
+linker process names in one-second host samples.
+
+A fresh one-millisecond `gprofng` profile of the immutable executable captured 17.110 seconds of
+CPU samples. `BacktestEngine::run` accounted for 9.973 seconds inclusive, or 58.29%.
+`BacktestEngine::drain_command_queues` accounted for 0.641 seconds inclusive: 3.7463% of captured
+samples and 6.4274% of the `run` stack. The direct trading and data command drains accounted for
+0.155 seconds inclusive (`drain_trading_cmd_queue` 0.054 seconds, `drain_data_cmd_queue` 0.101
+seconds), or 1.554196330% of `run`. This replaces the 2026-08-30 actionable upper bound of
+7.854697604%: the direct drain share at current HEAD is roughly one fifth of its August value, so
+the August lead no longer holds at this revision. A fast path keeps the thread-local emptiness
+tests, settling checks, and exec client event drain, so the predeclared 60% removal factor gives
+a realistic estimate of 0.932517798% end to end. `BookLadder::replace_l1` remained the largest
+single production lead at 18.4278% of captured samples.
+
+Three initial baseline sessions measured 10.672696937, 10.596332500, and 10.618776063 ms at
+95.77% to 96.60% average CPU idle with at most seven compiler observations. Their 10.618776063 ms
+median and 0.719145376% full spread give a 1.438290751% threshold at twice the spread. One
+further session overlapped concurrent compiler work from a sibling checkout, averaged 94.96% CPU
+idle, and was discarded. The admission rule was then fixed before further timing: twice the full
+spread of five further consecutive quiet sessions.
+
+| Session | Baseline median | Average CPU idle | Compiler observations |
+| ------: | --------------: | ---------------: | --------------------: |
+|       1 | 10.131573625 ms |           97.96% |                     0 |
+|       2 |  9.890054500 ms |           97.95% |                     0 |
+|       3 | 10.243396125 ms |           97.65% |                     0 |
+|       4 | 10.513002063 ms |           97.40% |                     0 |
+|       5 | 10.582035687 ms |           96.87% |                     0 |
+
+The five sessions produced a 10.243396125 ms median and a 6.755388336% full spread, with medians
+drifting upward through the set. Session-to-session drift dominates the band even near 98% average
+CPU idle, so the predeclared admission threshold is 13.510776671%.
+
+The 0.932517798% realistic estimate does not clear that threshold and does not clear the tighter
+1.438290751% threshold from the initial trio. The full 1.554196330% bound barely reaches that
+tighter threshold, and no fast path can remove it because the emptiness tests, settling checks,
+and exec client event drain remain. No candidate patch, executable, or paired comparison was
+produced. Reconsider an empty command-queue fast path after a material replay-loop or
+queue-implementation change regrows the direct drain share, or after a calibration establishes a
+protocol that resolves end-to-end effects below 1% on this host.
+
 ## v1.231.0 and v2 comparison
 
 The 2026-08-27 comparison used the Python
@@ -967,6 +1113,245 @@ boundary remains dominated by `run()`.
 The wall-clock tables above remain the performance evidence. Together, the profiles identify
 position ownership and cloning as the first target for a separate optimization pass. No production
 behavior changed during this profiling pass.
+
+## Account history retention
+
+The 2026-11-14 comparison uses existing hourly account-event purging with a 60-minute lookback,
+without production changes. Orders, positions, and market data remain retained, so reducing
+account-event history does not produce the same reduction in total process memory.
+
+Production source is commit `b9e6f468f8dc35088a06742aadb1866e9c274328`, with the added
+`tests/account_retention.rs` workload, SHA-256
+`0298e4f3b2b7e5b73a5240db00b17a8b9bc3669f706884c0db367dd27d90d30a`. The measured executable has
+SHA-256 `34f46c756af0b430426ae8587153ca41230cc60e661cfcb550d84c76ec5a2b52`.
+
+### Workload and collection
+
+`tests/account_retention.rs` runs a margin account with 1,000,000 USDT, market buys at 100 USDT,
+market sells at 102 USDT, quantity 1, and a 0.1% fee on each fill. Day indices congruent to 1 modulo
+3 stay flat. Other days submit 100 or 1,000 round trips, beginning at 00:01 UTC at one fill per
+second. Each day also has opening and closing quotes. Every round trip earns exactly 1.798 USDT
+after 0.202 USDT commission.
+
+No latency model is configured, so simulated command latency is zero.
+
+Each row uses three fresh processes per configuration and collection mode. Configuration order
+alternates between full/purged, purged/full, and full/purged. All 72 processes produce the same
+financial fingerprint for their workload, covering balances, commissions, PnL, order and position
+counts, daily snapshots, return series, and backtest statistics. Full history remains the default;
+the comparison changes only the purge interval and lookback.
+
+- **Peak RSS**: Linux `VmHWM` after `BacktestEngine::run()`, including fixture construction, engine
+  setup, replay, and end-of-run analysis. Collection precedes test verification and teardown.
+- **Elapsed time**: `BacktestEngine::run()` only, including end-of-run analysis, in separate
+  processes that do not read RSS. Setup, test verification, and teardown stay outside this interval.
+- **Environment**: AMD Ryzen 9 7950X, Linux 6.8.0-149-generic, rustc 1.100.0
+  (`0ef1bc386`, 2026-11-09), standard precision, and `bench-lto` with fat LTO and one code generation
+  unit. Recorded controls: `powersave` governor and enabled ASLR. Collection runs without concurrent
+  builds. These are local configuration comparisons, not fixed-host throughput baselines.
+
+### Memory and retained events
+
+Values show median peak RSS with the observed [minimum, maximum] in MiB. Event counts are retained
+account events at the end of the run, not the largest count between purges.
+
+| Days | Round trips per active day | Fills  | Events: full/purged | Full RSS, MiB           | Purged RSS, MiB         |
+| ---- | -------------------------- | ------ | ------------------- | ----------------------- | ----------------------- |
+| 2    | 100                        | 200    | 201 / 1             | 14.72 [14.54, 14.92]    | 14.59 [14.57, 14.66]    |
+| 2    | 1,000                      | 2,000  | 2,001 / 1           | 32.91 [32.67, 33.04]    | 32.18 [32.05, 32.40]    |
+| 7    | 100                        | 1,000  | 1,001 / 1           | 24.02 [23.92, 24.09]    | 23.57 [23.45, 23.64]    |
+| 7    | 1,000                      | 10,000 | 10,001 / 1          | 92.34 [92.18, 92.48]    | 88.26 [88.23, 88.36]    |
+| 30   | 100                        | 4,000  | 4,001 / 1           | 48.26 [48.09, 48.31]    | 46.38 [46.36, 46.50]    |
+| 30   | 1,000                      | 40,000 | 40,001 / 1          | 325.35 [325.21, 325.46] | 307.75 [294.30, 308.53] |
+
+The largest case reduces median peak RSS by 17.59 MiB (5.4%). Its purged samples span 14.23 MiB,
+but every purged sample is below every full-history sample. The full and purged ranges overlap in
+the smallest case. These results do not establish a general memory reduction for other fill rates,
+lookbacks, data layouts, or allocators.
+
+### Separately collected elapsed time
+
+Values show median seconds with the observed [minimum, maximum]. These short local samples do
+not establish a throughput improvement.
+
+| Days | Round trips per active day | Full run, seconds          | Purged run, seconds        |
+| ---- | -------------------------- | -------------------------- | -------------------------- |
+| 2    | 100                        | 0.00589 [0.00585, 0.00597] | 0.00596 [0.00541, 0.00602] |
+| 2    | 1,000                      | 0.04859 [0.04781, 0.04951] | 0.04898 [0.04813, 0.04900] |
+| 7    | 100                        | 0.02625 [0.02570, 0.02655] | 0.02555 [0.02528, 0.02555] |
+| 7    | 1,000                      | 0.22728 [0.22529, 0.22829] | 0.22562 [0.22270, 0.22684] |
+| 30   | 100                        | 0.09392 [0.09223, 0.09466] | 0.09332 [0.09268, 0.09523] |
+| 30   | 1,000                      | 0.92866 [0.92790, 0.94389] | 0.90494 [0.89870, 0.90969] |
+
+### Retention and report contract
+
+The [account history retention guide](../../../docs/concepts/backtesting/accounts-and-margin.md#account-history-retention)
+defines the contract, including the limits of report-backed Python tearsheets.
+
+- **Rust tests**: Default retention and zero-, 60-, 1,440-, and 10,000-minute lookbacks at hourly
+  cadence preserve exact single- and multi-currency balances, account and position commissions,
+  per-position realized PnL, daily equity through flat periods, and return-source selection. Separate
+  full/purged cases verify overnight unrealized equity and daily returns. Standard and high-precision
+  tests pass. Rust statistics retain position-return fallback when snapshots cannot supply returns.
+- **Python report tests**: Every column of the retained rows matches the full-history report for
+  single- and multi-currency cash and margin accounts. Cutoff cases verify removal at or before the
+  cutoff, latest-event preservation, and full reports when the lookback covers the run.
+
+### Reproduce on Linux
+
+Run from the repository root. The ignored measurement test prints one JSON object per process.
+`peak_rss_kib` is populated only in memory mode, and `run_elapsed_secs` only in time mode. Compare
+the `fingerprint` field across configurations and modes for each duration and fill density.
+
+```bash
+(
+    set -e
+    retention_dir=$(mktemp -d)
+    CARGO_BUILD_JOBS=8 cargo test --locked --profile bench-lto -p nautilus-backtest \
+        --test account_retention --no-run --message-format=json > "$retention_dir/build.jsonl"
+    retention_binary=$(python3 - "$retention_dir/build.jsonl" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    for line in source:
+        item = json.loads(line)
+        if item.get("target", {}).get("name") == "account_retention" and item.get("executable"):
+            print(item["executable"])
+            break
+PY
+    )
+    for mode in time memory; do
+        for days in 2 7 30; do
+            for pairs in 100 1000; do
+                for round in 1 2 3; do
+                    order="full purged"
+                    if [ "$round" = 2 ]; then order="purged full"; fi
+                    for policy in $order; do
+                        (
+                            unset RETENTION_MEMORY RETENTION_LOOKBACK_MINS
+                            if [ "$mode" = memory ]; then export RETENTION_MEMORY=1; fi
+                            if [ "$policy" = purged ]; then export RETENTION_LOOKBACK_MINS=60; fi
+                            RETENTION_DAYS=$days RETENTION_PAIRS=$pairs "$retention_binary" \
+                                --ignored --exact measure_account_retention --nocapture
+                        ) > "$retention_dir/$mode-$days-$pairs-$round-$policy.log"
+                    done
+                done
+            done
+        done
+    done
+    printf 'Samples: %s\n' "$retention_dir"
+)
+```
+
+## HEDGING position updates
+
+The 2026-11-16 round measures `Portfolio::update_position` as HEDGING positions accumulate on one
+instrument. It retains cached sort keys in `Cache` position queries that return more than 32
+positions.
+
+### Workload and collection
+
+The `portfolio/update_position` matrix in
+[`crates/portfolio/benches/portfolio.rs`](../../portfolio/benches/portfolio.rs) holds 10, 100, or
+1,000 positions on one instrument in one margin account, either all open or all closed. In each
+cycle, one probe position opens, reduces, and closes. Each case times only the `update_position`
+call for one event kind. Cache updates, the probe purge, and the account-event purge stay outside
+the timed interval. Before timing, each position set checks exact net position, unrealized and
+realized PnL, maintenance margin, balance, and last account state over two probe cycles.
+
+- **Environment**: AMD Ryzen 9 7950X, Linux 6.8.0-149-generic, rustc 1.100.0
+  (`0ef1bc386`, 2026-11-09), standard precision, the default empty `nautilus-portfolio` feature
+  set, and `bench-lto`. Recorded controls: `powersave` governor, per-process ASLR disablement, and
+  an unpinned benchmark thread, without concurrent builds. These are local comparisons, not
+  fixed-host baselines.
+- **Sampling**: Three sessions per executable in the order baseline, candidate, candidate,
+  baseline, baseline, candidate. Each session uses an isolated Criterion home, a 1-second warm-up,
+  a 3-second measurement target, and 30 samples. Tables report the median of the three session
+  medians. Spread is `(maximum - minimum) / median`.
+- **Noise band**: Queries that return 32 or fewer positions run unchanged code. Rows with that
+  shape differed between the two executables by -4.4% to +3.0%, so a change inside that range is
+  no measurable change.
+
+| Item                | Baseline                                                           | Candidate                                                          |
+| ------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| Repository revision | `12982032fb970cabc085f00169c720792c3edecf` plus the benchmark      | Baseline plus the retained patch                                   |
+| Executable SHA-256  | `725c94b1fb433ebd235a471ab47be8558b226679a54c59cb8969d918a64ef9ac` | `b9d281ad4d66e32fc4e6c39e32d797e196c1093a10d3d4e62905ae2371b7bccc` |
+| ELF build ID        | `2229d135806e92deba9f37e158cd7c60010c8784`                         | `7cc8a9d71b02b08b5eee6888a2ae770dd58444ec`                         |
+
+### Profile
+
+A one-millisecond `gprofng` profile of the baseline `change/open_positions/1000` case captured
+2.033 seconds of CPU samples. The profile also samples fixture construction, the open and close
+probe events, and the purges, so the shares locate work and do not isolate the timed event.
+
+- **Open positions**: Of all samples, `update_position` accounted for 87.1% inclusive,
+  `Cache::get_positions_for_ids` for 54.0%, its sort by `PositionId` for 49.6%, and
+  `query_positions_in_bucket` for 13.4%.
+- **Closed positions**: In the `change/closed_positions/1000` case, `calculate_realized_pnl`
+  accounted for 87.5% of all samples inclusive and `get_positions_for_ids` for 63.2%.
+
+In this benchmark, each probe event runs four sorted position queries for the instrument: three
+over open positions for net position, unrealized PnL, and margin, and one over all positions for
+realized PnL. The sort read each position's ID again on every comparison.
+
+### Retained change
+
+`Cache::get_positions_for_ids` sorts with cached keys when a query returns more than 32 positions,
+as `get_orders_for_ids` does. The returned order does not change.
+
+Lower is better. Rows show the `change` event; `open` and `close` rows moved within 0.6
+percentage points of them. Session spread was at most 1.0% in every row.
+
+| Positions | Count | Baseline median | Candidate median | Change  |
+| --------- | ----: | --------------: | ---------------: | ------: |
+| Open      |    10 |        4.795 us |         4.757 us |  -0.80% |
+| Open      |   100 |       37.586 us |        35.047 us |  -6.76% |
+| Open      | 1,000 |      474.889 us |       377.791 us | -20.45% |
+| Closed    |    10 |        2.237 us |         2.228 us |  -0.42% |
+| Closed    |   100 |        8.533 us |         7.818 us |  -8.37% |
+| Closed    | 1,000 |       98.050 us |        73.378 us | -25.16% |
+
+The 10-position rows are inside the noise band. The 100-position and 1,000-position rows clear it.
+
+Supporting checks used the same production patch and alternating session orders:
+
+- **Cutoff**: A scratch matrix at 33, 48, and 64 positions measured the candidate 1.7% to 4.7%
+  faster in all 18 rows. No regression appeared just above 32 positions.
+- **Other callers**: The existing portfolio query benchmarks at 100 positions measured the
+  candidate 1.0% to 7.1% faster.
+- **Canonical timing**: Preloaded `run()` measured -1.33% for bar EMA cross and +0.28% for replay
+  only, neither separated from its baseline range. Scheduled market orders first read +3.19% over
+  three sessions per executable. Six further sessions per executable measured +0.78% with
+  overlapping ranges, so the first read did not reproduce. The canonical workloads use NETTING, so
+  their position queries stay at or below 32 entries.
+- **Canonical correctness**: The canonical correctness test passed with every fingerprint
+  unchanged.
+- **HEDGING end to end**: A scratch patch, not retained, set the engine `position_history` venue
+  to HEDGING so that each of 250 or 1,000 market orders opens a position. Preloaded `run()`
+  improved from 25.074 ms to 22.689 ms (-9.51%) and from 413.235 ms to 339.749 ms (-17.78%), with
+  spreads at or below 0.37%. Both executables exported byte-identical canonical results.
+
+### Next lead
+
+A profile of the candidate on the same cases attributes 43.8% (open) and 54.5% (closed) of samples
+to `get_positions_for_ids`, and 17.5% and 21.3% to `query_positions_in_bucket`. The four sorted
+queries per event remain, and three of them return the same open positions. Profile the committed
+baseline again before selecting a candidate for them.
+
+### Reproduce
+
+Check the exact outcomes, then run one session of the matrix:
+
+```bash
+CARGO_BUILD_JOBS=16 cargo bench --locked -p nautilus-portfolio \
+    --bench portfolio -- update_position --test
+
+CARGO_BUILD_JOBS=16 setarch "$(uname -m)" -R \
+    cargo bench --locked -p nautilus-portfolio --profile bench-lto \
+    --bench portfolio -- update_position \
+    --warm-up-time 1 --measurement-time 3 --sample-size 30 --noplot
+```
 
 ## CI policy
 

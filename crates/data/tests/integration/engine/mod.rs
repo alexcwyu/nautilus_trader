@@ -20,6 +20,7 @@ mod clients;
 mod common;
 mod continuous_futures;
 mod engine_misc;
+mod external;
 mod historical;
 mod instruments;
 mod market_data;
@@ -54,25 +55,29 @@ use nautilus_common::{
     clock::{Clock, VirtualClock},
     messages::data::{
         BarsResponse, BookDeltasResponse, BookDepthResponse, BookResponse, CustomDataResponse,
-        DataCommand, DataResponse, FundingRatesResponse, InstrumentResponse, InstrumentsResponse,
-        OptionChainReferencePriceResponse, PARAMS_IS_PARENT, QuotesResponse, RequestBars,
-        RequestBookDeltas, RequestBookDepth, RequestBookSnapshot, RequestCommand,
-        RequestCustomData, RequestFundingRates, RequestInstrument, RequestInstruments, RequestJoin,
-        RequestOptionChainReferencePrice, RequestQuotes, RequestTrades, SubscribeBars,
-        SubscribeBookDeltas, SubscribeBookDepth, SubscribeBookSnapshots, SubscribeCommand,
-        SubscribeCustomData, SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
-        SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
-        SubscribeMarkPrices, SubscribeOptionChain, SubscribeOptionGreeks, SubscribeQuotes,
-        SubscribeTrades, TradesResponse, UnsubscribeBars, UnsubscribeBookDeltas,
-        UnsubscribeBookDepth, UnsubscribeBookSnapshots, UnsubscribeCommand, UnsubscribeCustomData,
-        UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-        UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeMarkPrices,
-        UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+        DataCommand, DataRequestFailed, DataResponse, DataResponseEnvelope, FundingRatesResponse,
+        InstrumentResponse, InstrumentsResponse, OptionChainReferencePriceResponse,
+        PARAMS_IS_PARENT, QuotesResponse, RequestBars, RequestBookDeltas, RequestBookDepth,
+        RequestBookSnapshot, RequestCommand, RequestCustomData, RequestFundingRates,
+        RequestInstrument, RequestInstruments, RequestJoin, RequestOptionChainReferencePrice,
+        RequestQuotes, RequestTrades, SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth,
+        SubscribeBookSnapshots, SubscribeCommand, SubscribeCustomData, SubscribeFundingRates,
+        SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
+        SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices, SubscribeOptionChain,
+        SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, TradesResponse, UnsubscribeBars,
+        UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeBookSnapshots, UnsubscribeCommand,
+        UnsubscribeCustomData, UnsubscribeFundingRates, UnsubscribeIndexPrices,
+        UnsubscribeInstrument, UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus,
+        UnsubscribeMarkPrices, UnsubscribeOptionChain, UnsubscribeOptionGreeks, UnsubscribeQuotes,
+        UnsubscribeTrades,
     },
     msgbus::{
         self, BusPayloadType, BusTap, Endpoint, MStr, MessageBus, Topic, TypedHandler,
         TypedIntoHandler,
-        stubs::{get_any_saving_handler, get_typed_message_saving_handler},
+        stubs::{
+            TypedMessageSavingHandler, get_any_saving_handler, get_response_saving_handler,
+            get_typed_message_saving_handler,
+        },
         switchboard::{self, MessagingSwitchboard},
     },
     testing::wait_until,

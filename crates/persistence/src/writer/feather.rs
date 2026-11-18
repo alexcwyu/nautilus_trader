@@ -53,24 +53,30 @@ use nautilus_common::{clock::Clock, live::LiveClock};
 use nautilus_core::{DurationNanos, UnixNanos, time::nanos_since_unix_epoch};
 use nautilus_model::{
     data::{
-        Bar, CustomData, CustomDataTrait, Data, DataBatch, FundingRateUpdate, IndexPriceUpdate,
-        InstrumentStatus, MarkPriceUpdate, NautilusDataType, OptionGreeks, OrderBookDelta,
-        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick, close::InstrumentClose,
+        Bar, CustomData, CustomDataTrait, Data, DataBatch, DataType as CustomDataType,
+        FundingRateUpdate, IndexPriceUpdate, InstrumentStatus, MarkPriceUpdate, NautilusDataType,
+        OptionGreeks, OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
+        close::InstrumentClose,
         encode_custom_to_arrow, get_arrow_schema,
+        greeks::{GreeksData, PortfolioGreeks},
     },
     events::{
-        AccountState, OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied,
-        OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
-        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
-        OrderSnapshot, OrderSubmitted, OrderTriggered, OrderUpdated, PositionAdjusted,
-        PositionChanged, PositionClosed, PositionEvent, PositionOpened, PositionSnapshot,
+        AccountState, OrderAccepted, OrderCancelDenied, OrderCancelRejected, OrderCanceled,
+        OrderDenied, OrderEmulated, OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled,
+        OrderInitialized, OrderModifyDenied, OrderModifyRejected, OrderPendingCancel,
+        OrderPendingUpdate, OrderRejected, OrderReleased, OrderSnapshot, OrderSubmitted,
+        OrderTriggered, OrderUpdated, PositionAdjusted, PositionChanged, PositionClosed,
+        PositionEvent, PositionOpened, PositionSnapshot,
     },
     instruments::{InstrumentAny, NautilusInstrumentType},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
 };
-use nautilus_serialization::arrow::{
-    EncodeToRecordBatch, KEY_TYPE_NAME, catalog_identifier_from_metadata,
-    record_batch_with_identifier_column, schema_with_identifier_column,
+use nautilus_serialization::{
+    arrow::{
+        EncodeToRecordBatch, KEY_TYPE_NAME, catalog_identifier_from_metadata,
+        record_batch_with_identifier_column, schema_with_identifier_column,
+    },
+    ensure_custom_data_registered,
 };
 
 use crate::{
@@ -81,9 +87,12 @@ use crate::{
             record_path_prefix,
         },
     },
-    common::custom::{
-        augment_batch_with_data_type_column, schema_with_data_type_column,
-        validate_custom_catalog_schema,
+    common::{
+        custom::{
+            augment_batch_with_data_type_column, schema_with_data_type_column,
+            validate_custom_catalog_schema,
+        },
+        metadata::record_batch_ts_init_range,
     },
     writer::{
         filter::{WriterRecordFilter, catalog_family},
@@ -255,10 +264,7 @@ fn arrow_metadata_row(
     metadata: &HashMap<String, String>,
     fields: &arrow::datatypes::Fields,
 ) -> anyhow::Result<StagedArrowMetadataRow> {
-    let schema_metadata = metadata
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let schema_metadata = metadata.iter().collect::<BTreeMap<_, _>>();
 
     let field_metadata = fields
         .iter()
@@ -280,7 +286,7 @@ fn arrow_metadata_row(
         "schema_metadata": schema_metadata,
         "field_metadata": field_metadata,
     }))?;
-    let metadata_id = staged_metadata_id(&canonical_metadata_json(metadata)?);
+    let metadata_id = staged_metadata_id(&serde_json::to_string(&schema_metadata)?);
 
     Ok(StagedArrowMetadataRow {
         metadata_id,
@@ -331,6 +337,10 @@ struct FeatherFile {
     buffer: Vec<RecordBatch>,
     buffer_rows: usize,
     buffer_bytes: u64,
+    /// The largest `ts_init` written, which the next file's rows must exceed.
+    last_ts_init: Option<u64>,
+    /// The file reached `max_size`; the next row with a later `ts_init` opens a new file.
+    size_rotation_due: bool,
 }
 
 impl FeatherFile {
@@ -373,11 +383,13 @@ impl FeatherFile {
             buffer: Vec::new(),
             buffer_rows: 0,
             buffer_bytes: 0,
+            last_ts_init: None,
+            size_rotation_due: false,
         })
     }
 
-    // Returns true when size rotation is due
-    fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<bool, ArrowError> {
+    // Appends the batch and notes when size rotation is due
+    fn write_record_batch(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
         let batch = if batch.schema() == self.schema {
             batch.clone()
         } else {
@@ -393,7 +405,7 @@ impl FeatherFile {
         }
 
         let Some(max_size) = self.max_size else {
-            return Ok(false);
+            return Ok(());
         };
 
         // The in-memory size only estimates the encoded size, so write before the exact check
@@ -401,7 +413,8 @@ impl FeatherFile {
             self.write_buffer()?;
         }
 
-        Ok(self.size() >= max_size)
+        self.size_rotation_due = self.size() >= max_size;
+        Ok(())
     }
 
     fn write_buffer(&mut self) -> Result<(), ArrowError> {
@@ -466,27 +479,29 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
-/// Rotations and flushes collected by the synchronous encode path and run once it completes.
-#[derive(Debug, Default)]
-struct PendingIo {
-    rotate_paths: Vec<FileWriterPath>,
-    flush_due: bool,
-}
-
 /// Configuration for file rotation.
+///
+/// Time rotations are decided by the rows' `ts_init`, not the wall clock, and no rotation splits
+/// rows of one `ts_init` over two files (`FeatherWriter::rotated_for`): the catalog requires the
+/// promoted files' `ts_init` ranges to be disjoint.
+///
+/// That guarantee holds only while a staged type's `ts_init` does not decrease across its
+/// identifiers. A rotation compares a row with the open file alone, so a late row at or before a
+/// sealed file's last `ts_init` lands in a later file, which can then overlap the sealed file's
+/// range and fail promotion.
 #[derive(Debug, Clone)]
 pub enum RotationConfig {
-    /// Rotate based on file size.
+    /// Rotate based on file size, before the next row with a later `ts_init`.
     Size {
         /// Maximum buffer size in bytes before rotation.
         max_size: u64,
     },
-    /// Rotate based on a time interval.
+    /// Rotate before the first row whose `ts_init` is an interval past the file's first row.
     Interval {
         /// Interval in nanoseconds.
         interval_ns: u64,
     },
-    /// Rotate based on scheduled dates.
+    /// Rotate before the first row whose `ts_init` is at or after a scheduled time of day.
     ScheduledDates {
         /// Interval in nanoseconds.
         interval_ns: u64,
@@ -607,12 +622,8 @@ impl FeatherWriter {
             record_batch_with_delta_staged_metadata(&batch, std::slice::from_ref(&metadata_row))?;
 
         // Write the RecordBatch to the appropriate FileWriter.
-        let mut pending = PendingIo::default();
-
-        self.stage_batch_write(path, &batch, &mut pending)?;
-        pending.flush_due = self.flush_is_due();
-
-        self.complete_pending_io(&pending)
+        self.stage_batch_writes(path, std::slice::from_ref(&batch))?;
+        self.flush_if_due()
     }
 
     /// Writes a batch of data values as one or more `RecordBatch`es.
@@ -623,7 +634,10 @@ impl FeatherWriter {
     /// `price_precision=0, size_precision=0`).
     ///
     /// Rows are grouped by identifier so each group encodes with its own metadata before it is
-    /// appended to the type's file.
+    /// appended to the type's file. The groups of one file are staged together
+    /// (`stage_batch_writes`): the groups come out of their map in hash order, and a rotation
+    /// decided group by group could seal the file on a later group's row and put an earlier
+    /// group's row, equal to the sealed file's last `ts_init`, in the next file.
     pub fn write_batch<T>(&mut self, data: Vec<T>) -> Result<(), Box<dyn std::error::Error>>
     where
         T: EncodeToRecordBatch + CatalogFamily + 'static,
@@ -654,7 +668,7 @@ impl FeatherWriter {
             return Ok(());
         }
 
-        let mut pending = PendingIo::default();
+        let mut staged: Vec<(FileWriterPath, Vec<RecordBatch>)> = Vec::new();
 
         for (data_type, group) in groups.into_values() {
             let path = self.get_writer_path(data_type);
@@ -674,12 +688,17 @@ impl FeatherWriter {
             let batch = record_batch_with_identifier_column(batch, identifier.as_deref())?;
             let batch = record_batch_with_delta_staged_metadata(&batch, &metadata_rows)?;
 
-            self.stage_batch_write(path, &batch, &mut pending)?;
+            match staged.iter_mut().find(|(staged, _)| *staged == path) {
+                Some((_, batches)) => batches.push(batch),
+                None => staged.push((path, vec![batch])),
+            }
         }
 
-        pending.flush_due = self.flush_is_due();
+        for (path, batches) in staged {
+            self.stage_batch_writes(path, &batches)?;
+        }
 
-        self.complete_pending_io(&pending)
+        self.flush_if_due()
     }
 
     // Instrument classes have different fields, so each class stages its own file
@@ -698,29 +717,70 @@ impl FeatherWriter {
         Ok(CatalogDataType::Instrument(class))
     }
 
-    fn stage_batch_write(
+    /// Appends `batches` to the open file of `path`, or to the file opened after rotating it when
+    /// their earliest `ts_init` is due one (`rotated_for`). The batches share that one decision,
+    /// so rows written together land in one file whatever their order.
+    fn stage_batch_writes(
         &mut self,
         path: FileWriterPath,
-        batch: &RecordBatch,
-        pending: &mut PendingIo,
+        batches: &[RecordBatch],
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.writers.contains_key(&path) {
+            return Ok(());
+        }
+
+        let (first_ts, last_ts) = record_batch_ts_init_range(batches)?;
+        let path = self.rotated_for(path, first_ts)?;
         let Some(file) = self.writers.get_mut(&path) else {
             return Ok(());
         };
 
-        let should_rotate = match file.write_record_batch(batch) {
-            Ok(should_rotate) => should_rotate,
-            Err(e) => {
+        for batch in batches {
+            if let Err(e) = file.write_record_batch(batch) {
                 self.abandon_file(&path);
                 return Err(e.into());
             }
-        };
-
-        if should_rotate || self.check_scheduled_rotation(&path) {
-            pending.rotate_paths.push(path);
         }
 
+        file.last_ts_init = Some(file.last_ts_init.map_or(last_ts, |last| last.max(last_ts)));
         Ok(())
+    }
+
+    /// The file a row of `path` at `ts_init` writes to: the open one, or the one opened after
+    /// sealing it when a rotation is due.
+    ///
+    /// The catalog promotes each sealed file to one Parquet file and requires the files' `ts_init`
+    /// ranges to be disjoint, so a rotation is decided by the row's own `ts_init` before the row is
+    /// written: the first row at or after a scheduled boundary opens the next file, and a row
+    /// sharing the `ts_init` of the file's last row stays in it whatever rotation is due. The
+    /// wall clock would put the first row after a boundary in the old file, and a second row with
+    /// the same `ts_init` (the prints of one fill) in the new one.
+    fn rotated_for(
+        &mut self,
+        path: FileWriterPath,
+        ts_init: u64,
+    ) -> Result<FileWriterPath, Box<dyn std::error::Error>> {
+        let scheduled = self.scheduled_rotation_due(&path, ts_init);
+        let Some(file) = self.writers.get(&path) else {
+            return Ok(path);
+        };
+
+        if !(scheduled || file.size_rotation_due)
+            || file.last_ts_init.is_some_and(|last| ts_init <= last)
+        {
+            return Ok(path);
+        }
+
+        let schema = file.schema.clone();
+        let data_type = path.data_type.clone();
+        self.seal_file(&path)?;
+
+        let path = self.reserve_writer_path(data_type);
+        let file = FeatherFile::create(&path.path, &schema, &self.rotation_config)?;
+        self.writers.insert(path.clone(), file);
+        // This row is the new file's first: it sets the file's next rotation
+        self.scheduled_rotation_due(&path, ts_init);
+        Ok(path)
     }
 
     /// Returns whether the auto-flush interval has elapsed since the last flush.
@@ -734,82 +794,52 @@ impl FeatherWriter {
         elapsed_ms >= self.flush_interval_ms
     }
 
-    fn complete_pending_io(
-        &mut self,
-        pending: &PendingIo,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        for path in &pending.rotate_paths {
-            self.seal_file(path)?;
-        }
-
-        if pending.flush_due {
+    /// Flushes once the synchronous encode path completes, when the auto-flush interval elapsed.
+    fn flush_if_due(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.flush_is_due() {
             self.flush()?;
         }
 
         Ok(())
     }
 
-    fn check_scheduled_rotation(&mut self, path: &FileWriterPath) -> bool {
-        match &self.rotation_config {
-            RotationConfig::Interval { interval_ns } => {
-                let now = self.clock.timestamp_ns();
-                let next_rotation = self.next_rotation_times.get(path).copied();
+    /// Whether a row at `ts_init` falls at or after the next interval or scheduled rotation of
+    /// `path`'s file. The file's first row sets that rotation from its own `ts_init`; sealing the
+    /// file forgets it, so a due rotation stays due until the file is sealed.
+    fn scheduled_rotation_due(&mut self, path: &FileWriterPath, ts_init: u64) -> bool {
+        if let Some(next) = self.next_rotation_times.get(path) {
+            return ts_init >= next.as_u64();
+        }
 
-                match next_rotation {
-                    None => {
-                        self.next_rotation_times
-                            .insert(path.clone(), now + DurationNanos::new(*interval_ns));
-                        false
-                    }
-                    Some(next) if now >= next => {
-                        self.next_rotation_times
-                            .insert(path.clone(), now + DurationNanos::new(*interval_ns));
-                        true
-                    }
-                    _ => false,
-                }
+        let next = match &self.rotation_config {
+            RotationConfig::Interval { interval_ns } => {
+                UnixNanos::from(ts_init) + DurationNanos::new(*interval_ns)
             }
             RotationConfig::ScheduledDates {
                 interval_ns,
                 rotation_time,
                 rotation_timezone,
-            } => {
-                let now = self.clock.timestamp_ns();
-                let next_rotation = self.next_rotation_times.get(path).copied();
-
-                match next_rotation {
-                    None => {
-                        let next = self.calculate_next_scheduled_rotation(
-                            *rotation_time,
-                            rotation_timezone,
-                            *interval_ns,
-                        );
-                        self.next_rotation_times.insert(path.clone(), next);
-                        false
-                    }
-                    Some(next) if now >= next => {
-                        let next = self.calculate_next_scheduled_rotation(
-                            *rotation_time,
-                            rotation_timezone,
-                            *interval_ns,
-                        );
-                        self.next_rotation_times.insert(path.clone(), next);
-                        true
-                    }
-                    _ => false,
-                }
-            }
-            _ => false,
-        }
+            } => Self::next_scheduled_rotation(
+                UnixNanos::from(ts_init),
+                *rotation_time,
+                rotation_timezone,
+                *interval_ns,
+            ),
+            _ => return false,
+        };
+        self.next_rotation_times.insert(path.clone(), next);
+        false
     }
 
-    fn calculate_next_scheduled_rotation(
-        &self,
+    /// The first scheduled rotation after `after`: today's `rotation_time` in `rotation_timezone`,
+    /// advanced by `interval_ns` until it passes `after`.
+    fn next_scheduled_rotation(
+        after: UnixNanos,
         rotation_time: UnixNanos,
         rotation_timezone: &TimeZone,
         interval_ns: u64,
     ) -> UnixNanos {
-        let now_utc = self.clock.timestamp_ns().to_datetime_utc();
+        let now_utc = after.to_datetime_utc();
         let now_local = rotation_timezone.to_datetime(now_utc);
 
         let rotation_time_secs = u32::try_from(*rotation_time / 1_000_000_000).unwrap_or(0);
@@ -1331,11 +1361,13 @@ impl FeatherWriter {
         try_write!(message, OrderRejected);
         try_write!(message, OrderPendingCancel);
         try_write!(message, OrderCanceled);
+        try_write!(message, OrderCancelDenied);
         try_write!(message, OrderCancelRejected);
         try_write!(message, OrderExpired);
         try_write!(message, OrderTriggered);
         try_write!(message, OrderPendingUpdate);
         try_write!(message, OrderReleased);
+        try_write!(message, OrderModifyDenied);
         try_write!(message, OrderModifyRejected);
         try_write!(message, OrderUpdated);
         try_write!(message, OrderFilled);
@@ -1350,6 +1382,25 @@ impl FeatherWriter {
         try_write!(message, FillReport);
         try_write!(message, PositionStatusReport);
         try_write!(message, ExecutionMassStatus);
+
+        if let Some(greeks) = message.downcast_ref::<GreeksData>() {
+            ensure_custom_data_registered::<GreeksData>();
+
+            let data_type = CustomDataType::new(
+                GreeksData::type_name_static(),
+                None,
+                Some(greeks.instrument_id.to_string()),
+            );
+
+            let custom = CustomData::new(Arc::new(greeks.clone()), data_type);
+            return Some(Box::new(move |writer| writer.write_custom_data(&custom)));
+        }
+
+        if let Some(portfolio) = message.downcast_ref::<PortfolioGreeks>() {
+            ensure_custom_data_registered::<PortfolioGreeks>();
+            let custom = CustomData::from_arc(Arc::new(portfolio.clone()));
+            return Some(Box::new(move |writer| writer.write_custom_data(&custom)));
+        }
 
         if let Some(deltas) = message.downcast_ref::<OrderBookDeltas>() {
             let deltas = deltas.deltas.clone();
@@ -1398,7 +1449,9 @@ impl FeatherWriter {
             OrderEventAny::Triggered(event) => self.write(*event),
             OrderEventAny::PendingUpdate(event) => self.write(*event),
             OrderEventAny::PendingCancel(event) => self.write(*event),
+            OrderEventAny::ModifyDenied(event) => self.write(*event),
             OrderEventAny::ModifyRejected(event) => self.write(*event),
+            OrderEventAny::CancelDenied(event) => self.write(*event),
             OrderEventAny::CancelRejected(event) => self.write(*event),
             OrderEventAny::Updated(event) => self.write(*event),
             OrderEventAny::Filled(event) => self.write(event.clone()),
@@ -1446,12 +1499,8 @@ impl FeatherWriter {
         batch =
             record_batch_with_delta_staged_metadata(&batch, std::slice::from_ref(&metadata_row))?;
 
-        let mut pending = PendingIo::default();
-
-        self.stage_batch_write(path, &batch, &mut pending)?;
-        pending.flush_due = self.flush_is_due();
-
-        self.complete_pending_io(&pending)
+        self.stage_batch_writes(path, std::slice::from_ref(&batch))?;
+        self.flush_if_due()
     }
 
     pub(crate) fn should_write_custom(&self, type_name: &str, identifier: Option<&str>) -> bool {
@@ -1609,6 +1658,18 @@ fn recover_released_feather_file(partial_path: &Path) {
 }
 
 fn recover_partial_feather_file(partial_path: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(partial_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    anyhow::ensure!(
+        metadata.is_file(),
+        "Partial Feather path must be a regular file: {}",
+        partial_path.display(),
+    );
+
     let file = match OpenOptions::new().read(true).write(true).open(partial_path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1760,8 +1821,12 @@ mod tests {
     }
 
     fn quote_at(ts: u64) -> QuoteTick {
+        quote_for("AUD/USD.SIM", ts)
+    }
+
+    fn quote_for(instrument_id: &str, ts: u64) -> QuoteTick {
         QuoteTick::new(
-            InstrumentId::from("AUD/USD.SIM"),
+            InstrumentId::from(instrument_id),
             Price::from("1.0"),
             Price::from("1.1"),
             Quantity::from("1000"),
@@ -1878,6 +1943,84 @@ mod tests {
             .map(|batch| batch.num_rows())
             .sum::<usize>();
         assert_eq!(rows, 1);
+    }
+
+    #[rstest]
+    fn test_subscription_records_greeks_once_and_unsubscribes() {
+        use nautilus_common::msgbus::{MStr, publish_any, publish_greeks};
+        use nautilus_serialization::arrow::{DecodeDataFromRecordBatch, custom::CustomDataDecoder};
+        let temp_dir = TempDir::new().unwrap();
+
+        let writer = Rc::new(RefCell::new(FeatherWriter::new(
+            temp_dir.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::NoRotation,
+            None,
+            Some(0),
+        )));
+        let greeks = GreeksData::from_delta("AUD/USD.SIM".parse().unwrap(), 1.25, 8.0, 11.into());
+        let portfolio = greeks.to_portfolio_greeks();
+        let greeks_topic = MStr::topic("data.GreeksData.instrument_id=AUD/USD.SIM").unwrap();
+        let portfolio_topic = MStr::topic("data.PortfolioGreeks").unwrap();
+        let handler = FeatherWriter::subscribe_to_message_bus(writer.clone()).unwrap();
+        publish_greeks(greeks_topic, &greeks);
+        publish_any(portfolio_topic, &portfolio);
+        FeatherWriter::unsubscribe_from_message_bus(&handler);
+        publish_greeks(greeks_topic, &greeks);
+        publish_any(portfolio_topic, &portfolio);
+        writer.borrow_mut().close().unwrap();
+        let mut counts = HashMap::new();
+
+        for batch in feather_files(&temp_dir.path().join("data/custom"), FEATHER_EXTENSION)
+            .iter()
+            .flat_map(|path| read_feather_batches(path))
+        {
+            let schema = batch.schema();
+            let name = schema.metadata()["type_name"].clone();
+            *counts.entry(name.clone()).or_insert(0) += batch.num_rows();
+            let decoded = CustomDataDecoder::decode_data_batch(schema.metadata(), batch).unwrap();
+            assert_eq!(decoded.len(), 1);
+
+            let Data::Custom(custom) = &decoded[0] else {
+                panic!("expected custom data")
+            };
+
+            match name.as_str() {
+                "GreeksData" => {
+                    assert_eq!(
+                        custom.data_type,
+                        CustomDataType::new(
+                            "GreeksData",
+                            None,
+                            Some(greeks.instrument_id.to_string())
+                        )
+                    );
+                    assert_eq!(
+                        custom.data.as_any().downcast_ref::<GreeksData>(),
+                        Some(&greeks)
+                    );
+                }
+                "PortfolioGreeks" => {
+                    assert_eq!(
+                        custom.data_type,
+                        CustomDataType::new("PortfolioGreeks", None, None)
+                    );
+                    assert_eq!(
+                        custom.data.as_any().downcast_ref::<PortfolioGreeks>(),
+                        Some(&portfolio)
+                    );
+                }
+                _ => panic!("unexpected custom data type {name}"),
+            }
+        }
+
+        assert_eq!(
+            counts,
+            HashMap::from([
+                ("GreeksData".to_string(), 1),
+                ("PortfolioGreeks".to_string(), 1),
+            ])
+        );
     }
 
     #[rstest]
@@ -2043,22 +2186,35 @@ mod tests {
         assert_eq!(identifiers, vec!["AUD/USD.SIM".to_string()]);
     }
 
+    // The `ts_init` of every quote in a sealed file, in file order
+    fn timestamps(path: &Path) -> Vec<u64> {
+        read_quotes(path)
+            .into_iter()
+            .map(|data| match data {
+                Data::Quote(quote) => quote.ts_init.as_u64(),
+                other => panic!("not a quote: {other:?}"),
+            })
+            .collect()
+    }
+
+    // Every sealed file's timestamps, ordered by content
+    fn sealed_timestamps(directory: &Path) -> Vec<Vec<u64>> {
+        let mut files: Vec<_> = feather_files(directory, FEATHER_EXTENSION)
+            .iter()
+            .map(|path| timestamps(path))
+            .collect();
+        files.sort();
+        files
+    }
+
     #[rstest]
     fn scheduled_rotation_keeps_time_of_day_anchor_after_late_rotation() {
         let temp_dir = TempDir::new().unwrap();
-
-        let now = Arc::new(AtomicU64::new(
-            1_767_258_000_000_000_000, // 2026-01-01 09:00:00 UTC
-        ));
-
-        let path = FileWriterPath {
-            path: PathBuf::from("quotes.feather"),
-            data_type: NautilusDataType::QuoteTick.into(),
-        };
+        let quotes = NautilusDataType::QuoteTick.into();
 
         let mut writer = FeatherWriter::new(
             temp_dir.path().to_path_buf(),
-            WriterClock::Test(Arc::clone(&now)),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
             RotationConfig::ScheduledDates {
                 interval_ns: 86_400_000_000_000,
                 rotation_time: UnixNanos::from(36_000_000_000_000u64),
@@ -2068,18 +2224,225 @@ mod tests {
             None,
         );
 
-        assert!(!writer.check_scheduled_rotation(&path));
+        // 2026-01-01 09:00:00 UTC: the file rotates at 10:00
+        writer.write(quote_at(1_767_258_000_000_000_000)).unwrap();
         assert_eq!(
-            writer.next_rotation_times[&path],
-            UnixNanos::from(1_767_261_600_000_000_000u64),
+            writer.get_next_rotation_time(&quotes),
+            Some(UnixNanos::from(1_767_261_600_000_000_000u64)),
         );
 
-        now.store(1_767_263_400_000_000_000, Ordering::Relaxed); // 10:30 UTC
-        assert!(writer.check_scheduled_rotation(&path));
+        // The first row after it, at 10:30, opens the next file, which rotates at 10:00 tomorrow
+        writer.write(quote_at(1_767_263_400_000_000_000)).unwrap();
         assert_eq!(
-            writer.next_rotation_times[&path],
-            UnixNanos::from(1_767_348_000_000_000_000u64),
+            writer.get_next_rotation_time(&quotes),
+            Some(UnixNanos::from(1_767_348_000_000_000_000u64)),
         );
+        assert_eq!(
+            sealed_timestamps(temp_dir.path()),
+            vec![vec![1_767_258_000_000_000_000]]
+        );
+    }
+
+    // The prints of one fill share a `ts_init`; a scheduled rotation between them left the catalog
+    // two files with touching ranges, which its promotion refuses
+    #[rstest]
+    fn scheduled_rotation_opens_the_next_file_before_the_first_row_past_the_boundary() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut writer = FeatherWriter::new(
+            temp_dir.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::ScheduledDates {
+                interval_ns: 3_600_000_000_000,
+                rotation_time: UnixNanos::default(),
+                rotation_timezone: jiff::tz::TimeZone::UTC,
+            },
+            None,
+            None,
+        );
+
+        // 2026-11-07 17:47:15 UTC, then two rows at 18:14:41.380125727 UTC
+        let (before, after) = (1_794_073_635_000_000_000u64, 1_794_075_281_380_125_727u64);
+        writer.write(quote_at(before)).unwrap();
+        writer.write(quote_at(after)).unwrap();
+        writer.write(quote_at(after)).unwrap();
+        assert_eq!(sealed_timestamps(temp_dir.path()), vec![vec![before]]);
+
+        writer.close().unwrap();
+        assert_eq!(
+            sealed_timestamps(temp_dir.path()),
+            vec![vec![before], vec![after, after]]
+        );
+    }
+
+    // `write_batch` stages its identifier groups in hash order. Rotating group by group could
+    // seal the file on the later row of one group and then put the other group's row, sharing the
+    // sealed file's last `ts_init`, in the next file: the rows of one call share one file
+    #[rstest]
+    fn a_batch_shares_one_rotation_decision_whatever_its_group_order() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut writer = FeatherWriter::new(
+            temp_dir.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::Interval { interval_ns: 10 },
+            None,
+            None,
+        );
+
+        writer.write(quote_at(1)).unwrap();
+        writer
+            .write_data_batch(vec![
+                Data::from(quote_at(1)),
+                Data::from(quote_for("EUR/USD.SIM", 11)),
+            ])
+            .unwrap();
+        assert_eq!(sealed_timestamps(temp_dir.path()), Vec::<Vec<u64>>::new());
+
+        // The rotation the batch's row at 11 made due opens the next file at the next later row
+        writer.write(quote_at(12)).unwrap();
+        writer.close().unwrap();
+
+        // The groups' order within the file follows their map
+        let mut files = sealed_timestamps(temp_dir.path());
+        for file in &mut files {
+            file.sort_unstable();
+        }
+        assert_eq!(files, vec![vec![1, 1, 11], vec![12]]);
+    }
+
+    #[rstest]
+    fn size_rotation_waits_for_the_next_ts_init() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut writer = FeatherWriter::new(
+            temp_dir.path().to_path_buf(),
+            WriterClock::Test(Arc::new(AtomicU64::new(0))),
+            RotationConfig::Size { max_size: 1 },
+            None,
+            None,
+        );
+
+        for ts in [1, 1, 2, 2, 3] {
+            writer.write(quote_at(ts)).unwrap();
+        }
+        writer.close().unwrap();
+
+        assert_eq!(
+            sealed_timestamps(temp_dir.path()),
+            vec![vec![1, 1], vec![2, 2], vec![3]]
+        );
+    }
+
+    #[rstest]
+    #[case::modify(true)]
+    #[case::cancel(false)]
+    fn test_command_denied_dynamic_round_trip(
+        #[case] modify: bool,
+        #[values(false, true)] envelope: bool,
+    ) {
+        use nautilus_core::UUID4;
+        use nautilus_model::{
+            events::order::spec::{OrderCancelDeniedSpec, OrderModifyDeniedSpec},
+            identifiers::{AccountId, ClientOrderId, StrategyId, TraderId, VenueOrderId},
+        };
+        use nautilus_serialization::arrow::DecodeTypedFromRecordBatch;
+        let cause = UUID4::new();
+        let trader = TraderId::from("WRITER-017");
+        let strategy = StrategyId::from("S-DENIAL-019");
+        let instrument = InstrumentId::from("ETHUSDT-PERP.BINANCE");
+        let client = ClientOrderId::from("O-DENIAL-023");
+        let venue = VenueOrderId::from("V-DENIAL-029");
+        let account = AccountId::from("BINANCE-031");
+
+        let event = if modify {
+            OrderEventAny::ModifyDenied(
+                OrderModifyDeniedSpec::builder()
+                    .trader_id(trader)
+                    .strategy_id(strategy)
+                    .instrument_id(instrument)
+                    .client_order_id(client)
+                    .venue_order_id(venue)
+                    .account_id(account)
+                    .reason("not sent to modify".into())
+                    .ts_event(37.into())
+                    .ts_init(41.into())
+                    .causation_id(cause)
+                    .build(),
+            )
+        } else {
+            OrderEventAny::CancelDenied(
+                OrderCancelDeniedSpec::builder()
+                    .trader_id(trader)
+                    .strategy_id(strategy)
+                    .instrument_id(instrument)
+                    .client_order_id(client)
+                    .venue_order_id(venue)
+                    .account_id(account)
+                    .reason("not sent to cancel".into())
+                    .ts_event(43.into())
+                    .ts_init(47.into())
+                    .causation_id(cause)
+                    .build(),
+            )
+        };
+
+        let temp = TempDir::new().unwrap();
+        let clock = WriterClock::Test(Arc::new(AtomicU64::new(0)));
+
+        let mut writer = FeatherWriter::new(
+            temp.path().to_path_buf(),
+            clock,
+            RotationConfig::NoRotation,
+            None,
+            None,
+        );
+
+        let written = if envelope {
+            writer.write_any_message(&event).unwrap()
+        } else {
+            match &event {
+                OrderEventAny::ModifyDenied(event) => writer.write_any_message(event).unwrap(),
+                OrderEventAny::CancelDenied(event) => writer.write_any_message(event).unwrap(),
+                _ => unreachable!(),
+            }
+        };
+
+        assert!(written);
+        writer.close().unwrap();
+        let files = feather_files(temp.path(), "feather");
+        assert_eq!(files.len(), 1);
+        let mut recovered = Vec::new();
+
+        for batch in read_feather_batches(&files[0]) {
+            let metadata = batch.schema().metadata().clone();
+            assert_eq!(
+                metadata.get("type_name").unwrap(),
+                if modify {
+                    "OrderModifyDenied"
+                } else {
+                    "OrderCancelDenied"
+                }
+            );
+
+            if modify {
+                recovered.extend(
+                    OrderModifyDenied::decode_typed_batch(&metadata, batch)
+                        .unwrap()
+                        .into_iter()
+                        .map(OrderEventAny::ModifyDenied),
+                );
+            } else {
+                recovered.extend(
+                    OrderCancelDenied::decode_typed_batch(&metadata, batch)
+                        .unwrap()
+                        .into_iter()
+                        .map(OrderEventAny::CancelDenied),
+                );
+            }
+        }
+
+        assert_eq!(recovered, vec![event]);
     }
 
     #[rstest]
@@ -2886,13 +3249,29 @@ mod tests {
 
     #[rstest]
     #[cfg(unix)]
+    fn recovery_leaves_partial_file_symlinks_untouched() {
+        let temp_dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let partial = write_partial_file(outside.path(), &[1, 2]);
+        let original = fs::read(&partial).unwrap();
+        let link = temp_dir.path().join("quotes_0.feather.partial");
+        std::os::unix::fs::symlink(&partial, &link).unwrap();
+
+        recover_partial_feather_files(temp_dir.path());
+
+        assert_eq!(fs::read(&partial).unwrap(), original);
+        assert_eq!(fs::read_link(&link).unwrap(), partial);
+        assert!(!link.with_extension("").exists());
+        assert!(!partial.with_extension("").exists());
+    }
+
+    #[rstest]
+    #[cfg(unix)]
     fn recovery_continues_after_a_file_it_cannot_recover() {
         let temp_dir = TempDir::new().unwrap();
         let run = temp_dir.path().join("run");
         let partial = write_partial_file(&run, &[1]);
 
-        // A partial path that resolves to a directory fails to open for writing on every Unix
-        // platform, even as root
         let unrecoverable = temp_dir.path().join("bad.feather.partial");
         std::os::unix::fs::symlink(&run, &unrecoverable).unwrap();
 
@@ -2904,8 +3283,9 @@ mod tests {
             warnings,
             vec![
                 format!(
-                    "Failed to recover Feather file {}: Is a directory (os error 21)",
-                    unrecoverable.display()
+                    "Failed to recover Feather file {}: Partial Feather path must be a regular file: {}",
+                    unrecoverable.display(),
+                    unrecoverable.display(),
                 ),
                 format!(
                     "Recovered 1 record batch(es) into Feather file {}, dropped 8 trailing byte(s)",
@@ -2972,23 +3352,28 @@ mod tests {
             })
             .to_vec();
 
-        // Both identifier groups fill the shared quotes file, so the batch queues its seal twice
+        // The first identifier group fills the shared quotes file; the second shares its
+        // `ts_init`, so it joins the full file instead of opening the next
         writer.write_batch(quotes).unwrap();
 
-        let sealed = feather_files(temp_dir.path(), FEATHER_EXTENSION);
-        let batches = read_feather_batches(&sealed[0]);
+        assert_eq!(writer.writers.len(), 1);
+        assert!(feather_files(temp_dir.path(), FEATHER_EXTENSION).is_empty());
 
-        assert!(writer.writers.is_empty());
+        writer.close().unwrap();
+
+        let sealed = feather_files(temp_dir.path(), FEATHER_EXTENSION);
         assert_eq!(sealed.len(), 1);
         assert!(feather_files(temp_dir.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
         assert_eq!(
-            identifiers_from_record_batches(&batches).unwrap(),
+            identifiers_from_record_batches(&read_feather_batches(&sealed[0])).unwrap(),
             vec!["AUD/USD.SIM".to_string(), "EUR/USD.SIM".to_string()],
         );
     }
 
+    // A full file is sealed when the next row with a later `ts_init` arrives, which opens the
+    // next file; the last full file waits for close
     #[rstest]
-    fn size_rotation_seals_each_full_file_and_opens_the_next_lazily() {
+    fn size_rotation_seals_each_full_file_before_the_next_later_row() {
         let temp_dir = TempDir::new().unwrap();
         let shared_clock = Arc::new(AtomicU64::new(0));
 
@@ -3015,18 +3400,16 @@ mod tests {
                 .unwrap();
         }
 
-        let rows = feather_files(temp_dir.path(), FEATHER_EXTENSION)
-            .iter()
-            .map(|path| {
-                read_feather_batches(path)
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .sum::<usize>()
-            })
-            .collect::<Vec<_>>();
+        assert_eq!(sealed_timestamps(temp_dir.path()), vec![vec![1_000]]);
+        assert_eq!(writer.writers.len(), 1);
+
+        writer.close().unwrap();
 
         assert!(writer.writers.is_empty());
-        assert_eq!(rows, vec![1, 1]);
+        assert_eq!(
+            sealed_timestamps(temp_dir.path()),
+            vec![vec![1_000], vec![2_000]]
+        );
         assert!(feather_files(temp_dir.path(), FEATHER_PARTIAL_EXTENSION).is_empty());
     }
 

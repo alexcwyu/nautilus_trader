@@ -22,9 +22,10 @@ use nautilus_common::{
     msgbus::{self, Handler, MStr, Topic, switchboard},
     timer::TimeEvent,
 };
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{OrderBookDeltas, OrderBookDepth, QuoteTick},
-    enums::{BookType, InstrumentClass},
+    enums::{BookAction, BookType, InstrumentClass},
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::Instrument,
     orderbook::OrderBook,
@@ -32,12 +33,15 @@ use nautilus_model::{
 use ustr::Ustr;
 
 use super::{
-    BookDeltasResponse, BookDepthResponse, DataEngine, DurationNanos, FAILED, OrderBookDelta,
-    PARAMS_IS_PARENT, Params, RecordFlag, SubscribeBookDeltas, SubscribeBookDepth, SubscriptionKey,
-    TimeEventCallback, TypedHandler, UUID4, UnsubscribeBookDeltas, UnsubscribeBookDepth,
-    UnsubscribeBookSnapshots, UnsubscribeCommand, is_parent_subscription,
-    log_error_on_cache_insert,
+    BookDeltasResponse, BookDepthResponse, DataEngine, DataResponse, DataResponseEnvelope,
+    DurationNanos, FAILED, OrderBookDelta, PARAMS_IS_PARENT, Params, RecordFlag,
+    SubscribeBookDeltas, SubscribeBookDepth, SubscriptionKey, TimeEventCallback, TypedHandler,
+    UUID4, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeBookSnapshots,
+    UnsubscribeCommand, is_parent_subscription, log_error_on_cache_insert, log_if_empty_response,
 };
+
+// Bounds the deltas held per request and instrument for a source that sets no `F_LAST`
+const REQUEST_BOOK_EVENT_OPEN_LIMIT: usize = 10_000;
 
 impl DataEngine {
     /// Returns all instrument IDs for which book delta subscriptions exist.
@@ -61,20 +65,42 @@ impl DataEngine {
             .collect()
     }
 
+    /// Returns whether a retained book subscription names or covers `instrument_id`.
+    ///
+    /// Includes resolved parent targets and ownership retained after a client subscription failure.
+    /// Does not indicate that an upstream feed is active or a book is complete.
+    #[must_use]
+    pub fn has_book_subscription(&self, instrument_id: &InstrumentId) -> bool {
+        self.book_subscription_owners.contains_key(instrument_id)
+            || self.book_subscriptions.contains_key(instrument_id)
+            || self.subscriptions_external.iter().any(|((_, key), _)| {
+                matches!(
+                    key,
+                    SubscriptionKey::BookDeltas(id)
+                        | SubscriptionKey::BookDepth(id)
+                        | SubscriptionKey::BookSnapshots(id, _)
+                        if id == instrument_id
+                )
+            })
+    }
+
     pub(super) fn subscribe_book_deltas(
         &mut self,
         cmd: &SubscribeBookDeltas,
     ) -> anyhow::Result<bool> {
-        if cmd.instrument_id.is_synthetic() {
+        let instrument_id = cmd.single_instrument_id()?;
+        if instrument_id.is_synthetic()
+            && !cmd.client_id.is_some_and(|id| self.is_external_client(id))
+        {
             anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDelta` data");
         }
 
         let had_deltas =
-            self.has_book_delta_subscription_key(cmd.instrument_id, cmd.client_id, cmd.venue);
+            self.has_book_delta_subscription_key(instrument_id, cmd.client_id, cmd.venue);
 
         self.retain_book_subscription(SubscribeCommand::BookDeltas(cmd.clone()))?;
 
-        self.increment_book_delta_subscription(cmd.instrument_id, cmd.client_id, cmd.venue);
+        self.increment_book_delta_subscription(instrument_id, cmd.client_id, cmd.venue);
 
         Ok(!had_deltas)
     }
@@ -83,16 +109,19 @@ impl DataEngine {
         &mut self,
         cmd: &SubscribeBookDepth,
     ) -> anyhow::Result<bool> {
-        if cmd.instrument_id.is_synthetic() {
+        let instrument_id = cmd.single_instrument_id()?;
+        if instrument_id.is_synthetic()
+            && !cmd.client_id.is_some_and(|id| self.is_external_client(id))
+        {
             anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDepth` data");
         }
 
         let had_depth =
-            self.has_book_depth_subscription_key(cmd.instrument_id, cmd.client_id, cmd.venue);
+            self.has_book_depth_subscription_key(instrument_id, cmd.client_id, cmd.venue);
 
         self.retain_book_subscription(SubscribeCommand::BookDepth(cmd.clone()))?;
 
-        self.increment_book_depth_subscription(cmd.instrument_id, cmd.client_id, cmd.venue);
+        self.increment_book_depth_subscription(instrument_id, cmd.client_id, cmd.venue);
 
         Ok(!had_depth)
     }
@@ -101,13 +130,14 @@ impl DataEngine {
         &mut self,
         cmd: &SubscribeBookSnapshots,
     ) -> anyhow::Result<()> {
-        if cmd.instrument_id.is_synthetic() {
+        let instrument_id = cmd.single_instrument_id()?;
+        if instrument_id.is_synthetic() {
             anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDelta` data");
         }
 
-        let parent = resolve_parent_components(&cmd.instrument_id, cmd.params.as_ref())?;
+        let parent = resolve_parent_components(&instrument_id, cmd.params.as_ref())?;
 
-        let had_snapshots = self.has_book_snapshot_subscriptions(&cmd.instrument_id);
+        let had_snapshots = self.has_book_snapshot_subscriptions(&instrument_id);
 
         self.retain_book_subscription(SubscribeCommand::BookSnapshots(cmd.clone()))?;
 
@@ -115,11 +145,11 @@ impl DataEngine {
 
         if !had_snapshots {
             self.book_snapshot_sources.insert(
-                cmd.instrument_id,
+                instrument_id,
                 BookSnapshotSource {
                     command: cmd.clone(),
                     client_command: SubscribeCommand::BookDeltas(SubscribeBookDeltas::new(
-                        cmd.instrument_id,
+                        instrument_id,
                         cmd.book_type,
                         cmd.client_id,
                         cmd.venue,
@@ -136,7 +166,7 @@ impl DataEngine {
 
         let source = self
             .book_snapshot_sources
-            .get(&cmd.instrument_id)
+            .get(&instrument_id)
             .cloned()
             .expect("snapshot source command must exist after increment");
         self.subscribe_book_snapshot_source(&source.command, source.client_command);
@@ -149,8 +179,12 @@ impl DataEngine {
         cmd: &SubscribeBookSnapshots,
         client_command: SubscribeCommand,
     ) {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
         if let Some(client_id) = cmd.client_id.as_ref()
-            && self.external_clients.contains(client_id)
+            && self.is_external_client(*client_id)
         {
             if self.config.debug {
                 log::debug!("Skipping subscribe command for external client {client_id}: {cmd:?}");
@@ -161,16 +195,13 @@ impl DataEngine {
 
         log::debug!(
             "Forwarding BookSnapshots as BookDeltas for {}, client_id={:?}, venue={:?}",
-            cmd.instrument_id,
+            instrument_id,
             cmd.client_id,
             cmd.venue,
         );
 
         if let Some(client) = self.get_command_client(cmd.client_id.as_ref(), cmd.venue.as_ref()) {
-            log::debug!(
-                "Calling client.execute_subscribe for BookDeltas: {}",
-                cmd.instrument_id
-            );
+            log::debug!("Calling client.execute_subscribe for BookDeltas: {instrument_id}");
             client.execute_subscribe(client_command);
         } else {
             log::error!(
@@ -182,7 +213,11 @@ impl DataEngine {
     }
 
     pub(super) fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> bool {
-        match self.decrement_book_delta_subscription(cmd.instrument_id, cmd.client_id, cmd.venue) {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        match self.decrement_book_delta_subscription(instrument_id, cmd.client_id, cmd.venue) {
             BookDeltasUnsubscribeResult::NotSubscribed => {
                 log::warn!("Cannot unsubscribe from `OrderBookDeltas` data: not subscribed");
                 return false;
@@ -195,7 +230,11 @@ impl DataEngine {
     }
 
     pub(super) fn unsubscribe_book_depth(&mut self, cmd: &UnsubscribeBookDepth) -> bool {
-        match self.decrement_book_depth_subscription(cmd.instrument_id, cmd.client_id, cmd.venue) {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        match self.decrement_book_depth_subscription(instrument_id, cmd.client_id, cmd.venue) {
             BookDeltasUnsubscribeResult::NotSubscribed => {
                 log::warn!("Cannot unsubscribe from `OrderBookDepth` data: not subscribed");
                 return false;
@@ -208,7 +247,11 @@ impl DataEngine {
     }
 
     pub(super) fn unsubscribe_book_snapshots(&mut self, cmd: &UnsubscribeBookSnapshots) {
-        match self.decrement_book_snapshot_subscription(cmd.instrument_id, cmd.interval_ms) {
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+
+        match self.decrement_book_snapshot_subscription(instrument_id, cmd.interval_ms) {
             BookSnapshotUnsubscribeResult::NotSubscribed => {
                 log::warn!("Cannot unsubscribe from `OrderBook` snapshots: not subscribed");
                 return;
@@ -217,20 +260,19 @@ impl DataEngine {
             BookSnapshotUnsubscribeResult::Removed => {}
         }
 
-        if self.has_book_snapshot_subscriptions(&cmd.instrument_id) {
+        if self.has_book_snapshot_subscriptions(&instrument_id) {
             return;
         }
 
-        let Some(source) = self.book_snapshot_sources.remove(&cmd.instrument_id) else {
+        let Some(source) = self.book_snapshot_sources.remove(&instrument_id) else {
             log::error!(
-                "Cannot release order book snapshot source for {}: command not retained",
-                cmd.instrument_id,
+                "Cannot release order book snapshot source for {instrument_id}: command not retained",
             );
             return;
         };
 
         if let Some(client_id) = source.command.client_id.as_ref()
-            && self.external_clients.contains(client_id)
+            && self.is_external_client(*client_id)
         {
             return;
         }
@@ -240,7 +282,10 @@ impl DataEngine {
             source.command.venue.as_ref(),
         ) {
             let deltas_cmd = UnsubscribeBookDeltas::new(
-                source.command.instrument_id,
+                source
+                    .command
+                    .single_instrument_id()
+                    .expect("book commands are projected onto one instrument"),
                 source.command.client_id,
                 source.command.venue,
                 UUID4::new(),
@@ -254,9 +299,15 @@ impl DataEngine {
 
     fn retain_book_subscription(&mut self, command: SubscribeCommand) -> anyhow::Result<()> {
         let instrument_id = match &command {
-            SubscribeCommand::BookDeltas(cmd) => cmd.instrument_id,
-            SubscribeCommand::BookDepth(cmd) => cmd.instrument_id,
-            SubscribeCommand::BookSnapshots(cmd) => cmd.instrument_id,
+            SubscribeCommand::BookDeltas(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            SubscribeCommand::BookDepth(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            SubscribeCommand::BookSnapshots(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
             _ => unreachable!("only book subscriptions are retained"),
         };
 
@@ -273,9 +324,14 @@ impl DataEngine {
             vec![instrument_id]
         };
 
-        let client_id = self
-            .get_command_client(command.client_id(), command.venue())
-            .map(|client| client.client_id);
+        let client_id = if let Some(client_id) = command.client_id()
+            && self.is_external_client(*client_id)
+        {
+            Some(*client_id)
+        } else {
+            self.get_command_client(command.client_id(), command.venue())
+                .map(|client| client.client_id)
+        };
 
         let subscription = Rc::new(BookSubscriptionOwner {
             command,
@@ -283,7 +339,10 @@ impl DataEngine {
             targets,
         });
 
-        let mut params = subscription.command.params().cloned().unwrap_or_default();
+        let mut params = subscription
+            .command
+            .params()
+            .map_or_default(|params| IndexMap::clone(params));
         params.shift_remove(PARAMS_IS_PARENT);
 
         for active in subscription
@@ -307,7 +366,10 @@ impl DataEngine {
                 continue;
             }
 
-            let mut active_params = active.command.params().cloned().unwrap_or_default();
+            let mut active_params = active
+                .command
+                .params()
+                .map_or_default(|params| IndexMap::clone(params));
             active_params.shift_remove(PARAMS_IS_PARENT);
             anyhow::ensure!(
                 subscription.client_id == active.client_id
@@ -330,7 +392,7 @@ impl DataEngine {
                 .entry(*target_id)
                 .or_default()
                 .owners
-                .push(subscription.clone());
+                .push(Rc::clone(&subscription));
         }
 
         self.book_subscription_owners
@@ -340,13 +402,38 @@ impl DataEngine {
         Ok(())
     }
 
+    pub(super) fn clear_book_state(&mut self) {
+        let book_updaters: Vec<_> = self.book_updaters.drain().collect();
+        for (instrument_id, updater) in book_updaters {
+            Self::unsubscribe_book_updater(instrument_id, updater);
+        }
+
+        self.book_subscriptions.clear();
+        self.book_subscription_owners.clear();
+
+        self.book_deltas_counts.clear();
+        self.book_depth_counts.clear();
+        self.book_intervals.clear();
+        self.book_snapshot_counts.clear();
+        self.book_snapshot_sources.clear();
+        self.book_snapshotters.clear();
+        self.buffered_deltas_map.clear();
+        self.deltas_frame.clear();
+    }
+
     pub(super) fn release_book_subscription(&mut self, command: &UnsubscribeCommand) -> bool {
         let key = SubscriptionKey::from_unsubscribe(command);
 
         let instrument_id = match command {
-            UnsubscribeCommand::BookDeltas(cmd) => cmd.instrument_id,
-            UnsubscribeCommand::BookDepth(cmd) => cmd.instrument_id,
-            UnsubscribeCommand::BookSnapshots(cmd) => cmd.instrument_id,
+            UnsubscribeCommand::BookDeltas(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            UnsubscribeCommand::BookDepth(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
+            UnsubscribeCommand::BookSnapshots(cmd) => cmd
+                .single_instrument_id()
+                .expect("book commands are projected onto one instrument"),
             _ => unreachable!("only book subscriptions are released"),
         };
 
@@ -392,19 +479,24 @@ impl DataEngine {
                 continue;
             };
 
-            let deltas_handler: TypedHandler<OrderBookDeltas> = TypedHandler::new(updater.clone());
-            let depth_handler: TypedHandler<OrderBookDepth> = TypedHandler::new(updater);
-            msgbus::unsubscribe_book_deltas(
-                switchboard::get_book_deltas_topic(target_id).into(),
-                &deltas_handler,
-            );
-            msgbus::unsubscribe_book_depth(
-                switchboard::get_book_depth_topic(target_id).into(),
-                &depth_handler,
-            );
+            Self::unsubscribe_book_updater(target_id, updater);
         }
 
         true
+    }
+
+    fn unsubscribe_book_updater(instrument_id: InstrumentId, updater: Rc<BookUpdater>) {
+        // Updaters use per-underlying topics; release router ownership before dropping them
+        let deltas_handler: TypedHandler<OrderBookDeltas> = TypedHandler::new(Rc::clone(&updater));
+        let depth_handler: TypedHandler<OrderBookDepth> = TypedHandler::new(updater);
+        msgbus::unsubscribe_book_deltas(
+            switchboard::get_book_deltas_topic(instrument_id).into(),
+            &deltas_handler,
+        );
+        msgbus::unsubscribe_book_depth(
+            switchboard::get_book_depth_topic(instrument_id).into(),
+            &depth_handler,
+        );
     }
 
     fn has_book_snapshot_subscriptions(&self, instrument_id: &InstrumentId) -> bool {
@@ -505,7 +597,10 @@ impl DataEngine {
         cmd: &SubscribeBookSnapshots,
         parent: Option<(Ustr, InstrumentClass)>,
     ) -> bool {
-        let key = (cmd.instrument_id, cmd.interval_ms);
+        let instrument_id = cmd
+            .single_instrument_id()
+            .expect("instrument command has one member at this boundary");
+        let key = (instrument_id, cmd.interval_ms);
 
         if let Some(count) = self.book_snapshot_counts.get_mut(&key) {
             *count += 1;
@@ -516,28 +611,26 @@ impl DataEngine {
 
         let snapshot_infos = if let Some(snapshot_infos) = self.book_intervals.get(&cmd.interval_ms)
         {
-            snapshot_infos.clone()
+            Rc::clone(snapshot_infos)
         } else {
             let snapshot_infos = Rc::new(RefCell::new(IndexMap::new()));
             self.book_intervals
-                .insert(cmd.interval_ms, snapshot_infos.clone());
-            self.schedule_book_snapshotter(cmd.interval_ms, snapshot_infos.clone());
+                .insert(cmd.interval_ms, Rc::clone(&snapshot_infos));
+            self.schedule_book_snapshotter(cmd.interval_ms, Rc::clone(&snapshot_infos));
             snapshot_infos
         };
 
-        let topic = switchboard::get_book_snapshots_topic(cmd.instrument_id, cmd.interval_ms);
+        let topic = switchboard::get_book_snapshots_topic(instrument_id, cmd.interval_ms);
 
         let snap_info = BookSnapshotInfo {
-            instrument_id: cmd.instrument_id,
-            venue: cmd.instrument_id.venue,
+            instrument_id,
+            venue: instrument_id.venue,
             parent,
             topic,
             interval_ms: cmd.interval_ms,
         };
 
-        snapshot_infos
-            .borrow_mut()
-            .insert(cmd.instrument_id, snap_info);
+        snapshot_infos.borrow_mut().insert(instrument_id, snap_info);
 
         true
     }
@@ -600,10 +693,10 @@ impl DataEngine {
         let snapshotter = Rc::new(BookSnapshotter::new(
             interval_ms,
             snapshot_infos,
-            self.cache.clone(),
+            Rc::clone(&self.cache),
         ));
         let timer_name = snapshotter.timer_name;
-        let snapshotter_callback = snapshotter.clone();
+        let snapshotter_callback = Rc::clone(&snapshotter);
         let callback_fn: Rc<dyn Fn(TimeEvent)> =
             Rc::new(move |event| snapshotter_callback.snapshot(event));
         let callback = TimeEventCallback::from(callback_fn);
@@ -651,53 +744,159 @@ impl DataEngine {
         }
     }
 
-    pub(super) fn handle_book_deltas_response(&self, resp: &BookDeltasResponse) {
-        if !self.cache_is_owned_by_live_subscription(&resp.instrument_id) {
-            let mut cache = self.cache.as_ref().borrow_mut();
-            if let Some(book) = cache.order_book_mut(&resp.instrument_id) {
-                for delta in &resp.data {
-                    if let Err(e) = book.apply_delta(delta) {
-                        log::error!("Failed to apply historical delta to cache: {e}");
-                    }
-                }
-            } else {
-                log::debug!(
-                    "Skipping cache write for {} historical deltas on {}: no cache book yet",
-                    resp.data.len(),
-                    resp.instrument_id,
-                );
-            }
+    // Cuts the envelope's book deltas to the events they complete, then applies and publishes
+    // those events. Returns whether the envelope still needs delivery.
+    pub(super) fn handle_book_deltas_envelope(
+        &mut self,
+        envelope: &mut DataResponseEnvelope,
+    ) -> bool {
+        let request_id = *envelope.correlation_id();
+        let completed = envelope.completed();
+        let sub_correlation_id = envelope.sub_correlation_id();
+
+        let Some(DataResponse::BookDeltas(resp)) = envelope.response_mut() else {
+            return true;
+        };
+
+        if log_if_empty_response(&resp.data, &resp.instrument_id, &request_id) {
+            return true;
         }
 
-        // Group deltas by `F_LAST` so each published batch preserves the original event
-        // boundary and metadata (timestamps and sequence from the closing delta), matching
-        // the live `handle_delta` buffering semantic. Collapsing the whole response into
-        // one batch would surface a synthetic event with the trailing delta's flags only.
-        if resp.data.is_empty() {
+        let key = (request_id, resp.instrument_id);
+        let mut events = self.request_book_events.remove(&key).unwrap_or_default();
+        let held = events.open_len();
+        let withheld = events.withheld.len();
+        let batches = events.take_ready(resp, request_id, sub_correlation_id, completed);
+        resp.data = if held == 0 && events.withheld.len() == withheld {
+            resp.data.slice(0, resp.data.len() - events.open_len())
+        } else {
+            let deltas: Vec<OrderBookDelta> = batches
+                .iter()
+                .flat_map(|batch| batch.deltas.iter().copied())
+                .collect();
+            deltas.into()
+        };
+
+        // The request's next envelope may close the open event, and its completion reads the flag
+        if events.seen_f_last || events.open.is_some() {
+            self.request_book_events.insert(key, events);
+        }
+
+        if batches.is_empty() {
+            return completed;
+        }
+
+        self.apply_book_deltas_to_cache(resp);
+
+        let topic = switchboard::get_pipeline_book_deltas_topic(resp.instrument_id);
+        for batch in &batches {
+            msgbus::publish_deltas(topic, batch);
+        }
+
+        true
+    }
+
+    fn apply_book_deltas_to_cache(&self, resp: &BookDeltasResponse) {
+        if self.cache_is_owned_by_live_subscription(&resp.instrument_id) {
             return;
         }
 
-        let topic = switchboard::get_pipeline_book_deltas_topic(resp.instrument_id);
-        let mut frame: Vec<OrderBookDelta> = Vec::new();
+        let mut cache = self.cache.as_ref().borrow_mut();
 
-        for delta in &resp.data {
-            frame.push(*delta);
-            if RecordFlag::F_LAST.matches(delta.flags) {
-                let batch = OrderBookDeltas::new(resp.instrument_id, std::mem::take(&mut frame));
-                msgbus::publish_deltas(topic, &batch);
+        let Some(book) = cache.order_book_mut(&resp.instrument_id) else {
+            log::debug!(
+                "Skipping cache write for {} historical deltas on {}: no cache book yet",
+                resp.data.len(),
+                resp.instrument_id,
+            );
+            return;
+        };
+
+        for delta in resp.data.iter() {
+            if let Err(e) = book.apply_delta(delta) {
+                log::error!("Failed to apply historical delta to cache: {e}");
             }
         }
+    }
 
-        if !frame.is_empty() {
-            let batch = OrderBookDeltas::new(resp.instrument_id, frame);
+    // Returns a failure reason when a source that sets `F_LAST` left an event open at a snapshot
+    // or at the end, which stays undelivered. A source that sets no `F_LAST` has its open event
+    // delivered in its own envelope.
+    pub(super) fn complete_request_book_events(&mut self, request_id: &UUID4) -> Option<String> {
+        let mut completed: Vec<(InstrumentId, RequestBookEvents)> = self
+            .request_book_events
+            .extract_if(|(id, _), _| id == request_id)
+            .map(|((_, instrument_id), events)| (instrument_id, events))
+            .collect();
+        completed.sort_by_key(|(instrument_id, _)| *instrument_id);
+
+        let mut interrupted = Vec::new();
+        let mut unterminated = Vec::new();
+
+        for (instrument_id, events) in completed {
+            for pending in &events.withheld {
+                interrupted.push(format!("{instrument_id} ({pending})"));
+            }
+
+            let Some(open) = events.open else {
+                continue;
+            };
+
+            if events.seen_f_last {
+                let pending = pending_details(&open.deltas);
+                unterminated.push(format!("{instrument_id} ({pending})"));
+                continue;
+            }
+
+            log::warn!(
+                "Publishing open book event for {instrument_id} with {} deltas without F_LAST, completed request={request_id}",
+                open.deltas.len(),
+            );
+
+            let batch = OrderBookDeltas::new(instrument_id, open.deltas);
+
+            let response = BookDeltasResponse {
+                data: batch.deltas.clone().into(),
+                ..open.response
+            };
+
+            self.apply_book_deltas_to_cache(&response);
+
+            let topic = switchboard::get_pipeline_book_deltas_topic(instrument_id);
             msgbus::publish_deltas(topic, &batch);
+
+            let response = DataResponse::BookDeltas(response);
+            let envelope = DataResponseEnvelope::new(response, false, open.sub_correlation_id)
+                .with_correlation_id(*request_id);
+            msgbus::send_response_envelope(&envelope);
         }
+
+        let mut reasons = Vec::new();
+
+        if !interrupted.is_empty() {
+            let details = interrupted.join(", ");
+            reasons.push(format!(
+                "Order book deltas reach a snapshot without an `F_LAST` delta for {details}"
+            ));
+        }
+
+        if !unterminated.is_empty() {
+            let details = unterminated.join(", ");
+            reasons.push(format!(
+                "Order book deltas end without an `F_LAST` delta for {details}"
+            ));
+        }
+
+        if reasons.is_empty() {
+            return None;
+        }
+
+        Some(reasons.join("; "))
     }
 
     pub(super) fn handle_book_depth_response(&self, resp: &BookDepthResponse) {
         let topic = switchboard::get_pipeline_book_depth_topic(resp.instrument_id);
-
-        for depth in &resp.data {
+        for depth in resp.data.iter() {
             msgbus::publish_depth(topic, depth);
         }
     }
@@ -710,26 +909,24 @@ impl DataEngine {
     ) -> anyhow::Result<()> {
         {
             let mut cache = self.cache.borrow_mut();
-
             for target_id in target_ids {
-                if !cache.has_order_book(target_id) {
+                if cache
+                    .order_book(target_id)
+                    .is_none_or(|book| book.book_type != book_type)
+                {
                     cache.add_order_book(OrderBook::new(*target_id, book_type))?;
                 }
             }
         }
 
         for target_id in target_ids {
-            let updater = self
-                .book_updaters
-                .entry(*target_id)
-                .or_insert_with(|| {
-                    Rc::new(BookUpdater::new(
-                        target_id,
-                        self.cache.clone(),
-                        self.config.emit_quotes_from_book,
-                    ))
-                })
-                .clone();
+            let updater = Rc::clone(self.book_updaters.entry(*target_id).or_insert_with(|| {
+                Rc::new(BookUpdater::new(
+                    target_id,
+                    Rc::clone(&self.cache),
+                    self.config.emit_quotes_from_book,
+                ))
+            }));
 
             if depth {
                 msgbus::subscribe_book_depth(
@@ -748,6 +945,128 @@ impl DataEngine {
 
         Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RequestBookEvents {
+    open: Option<OpenBookEvent>,
+    seen_f_last: bool,
+    withheld: Vec<String>,
+}
+
+// `response` and `sub_correlation_id` rebuild the envelope the held deltas arrived in
+#[derive(Debug)]
+struct OpenBookEvent {
+    deltas: Vec<OrderBookDelta>,
+    response: BookDeltasResponse,
+    sub_correlation_id: Option<UUID4>,
+}
+
+impl RequestBookEvents {
+    fn open_len(&self) -> usize {
+        self.open.as_ref().map_or(0, |event| event.deltas.len())
+    }
+
+    // Returns the events `resp` completes, led by the deltas held from the request's earlier
+    // envelopes, and holds the open remainder for its next envelope
+    fn take_ready(
+        &mut self,
+        resp: &BookDeltasResponse,
+        request_id: UUID4,
+        sub_correlation_id: Option<UUID4>,
+        completed: bool,
+    ) -> Vec<OrderBookDeltas> {
+        let instrument_id = resp.instrument_id;
+        let mut open = self.open.take().map_or_default(|event| event.deltas);
+        let mut batches = Vec::new();
+
+        // Group deltas by `F_LAST` so each published batch preserves the original event
+        // boundary and metadata (timestamps and sequence from the closing delta), matching
+        // the live `handle_delta` buffering semantic.
+        for delta in resp.data.iter() {
+            let starts_snapshot =
+                delta.action == BookAction::Clear && RecordFlag::F_SNAPSHOT.matches(delta.flags);
+
+            if starts_snapshot && !open.is_empty() {
+                let deltas = std::mem::take(&mut open);
+                batches.extend(self.end_before_snapshot(instrument_id, deltas, request_id));
+            }
+
+            open.push(*delta);
+            if RecordFlag::F_LAST.matches(delta.flags) {
+                // A snapshot or book clear sets `F_LAST` even when the source marks no other event
+                self.seen_f_last |= !RecordFlag::F_SNAPSHOT.matches(delta.flags)
+                    && delta.action != BookAction::Clear;
+
+                let batch = OrderBookDeltas::new(instrument_id, std::mem::take(&mut open));
+                batches.push(batch);
+            }
+        }
+
+        // A source that sets no `F_LAST` closes no event, so its deltas go out at the limit and
+        // with the request's final payload
+        let releases = completed || open.len() >= REQUEST_BOOK_EVENT_OPEN_LIMIT;
+        if !self.seen_f_last && !open.is_empty() && releases {
+            log::warn!(
+                "Publishing open book event for {instrument_id} with {} deltas without F_LAST, request={request_id}",
+                open.len(),
+            );
+
+            let batch = OrderBookDeltas::new(instrument_id, std::mem::take(&mut open));
+            batches.push(batch);
+        }
+
+        if !open.is_empty() {
+            let response = BookDeltasResponse {
+                data: Vec::new().into(),
+                ..resp.clone()
+            };
+
+            self.open = Some(OpenBookEvent {
+                deltas: open,
+                response,
+                sub_correlation_id,
+            });
+        }
+
+        batches
+    }
+
+    // A snapshot starts a new event, so the event open before it can no longer close. A source
+    // that sets `F_LAST` has it withheld, and any other source has it released as its own event.
+    fn end_before_snapshot(
+        &mut self,
+        instrument_id: InstrumentId,
+        deltas: Vec<OrderBookDelta>,
+        request_id: UUID4,
+    ) -> Option<OrderBookDeltas> {
+        if self.seen_f_last {
+            log::warn!(
+                "Withholding open book event for {instrument_id} with {} deltas before a snapshot, request={request_id}",
+                deltas.len(),
+            );
+
+            let pending = pending_details(&deltas);
+            self.withheld.push(pending);
+            return None;
+        }
+
+        log::warn!(
+            "Publishing open book event for {instrument_id} with {} deltas before a snapshot, request={request_id}",
+            deltas.len(),
+        );
+
+        Some(OrderBookDeltas::new(instrument_id, deltas))
+    }
+}
+
+fn pending_details(deltas: &[OrderBookDelta]) -> String {
+    format!(
+        "{} pending, ts_init {} to {}",
+        deltas.len(),
+        deltas[0].ts_init,
+        deltas[deltas.len() - 1].ts_init,
+    )
 }
 
 #[derive(Debug, Default)]
@@ -841,6 +1160,8 @@ pub(crate) enum BookDeltasUnsubscribeResult {
 /// The `BookUpdater` processes incoming order book deltas and maintains
 /// the current state of an order book. It can handle both incremental
 /// updates and full snapshots for the instrument it's assigned to.
+/// When `emit_quotes_from_book` is enabled, derived quotes use the book's last
+/// event time for `ts_event` and the incoming update's `ts_init`.
 #[derive(Debug)]
 pub struct BookUpdater {
     pub id: Ustr,
@@ -881,7 +1202,7 @@ impl Handler<OrderBookDeltas> for BookUpdater {
                 }
 
                 if self.emit_quotes_from_book {
-                    emit = derive_quote_from_book(book);
+                    emit = derive_quote_from_book(book, deltas.ts_init);
                 }
             }
         }
@@ -908,7 +1229,7 @@ impl Handler<OrderBookDepth> for BookUpdater {
                 }
 
                 if self.emit_quotes_from_book {
-                    emit = derive_quote_from_book(book);
+                    emit = derive_quote_from_book(book, depth.ts_init);
                 }
             }
         }
@@ -919,7 +1240,7 @@ impl Handler<OrderBookDepth> for BookUpdater {
     }
 }
 
-fn derive_quote_from_book(book: &OrderBook) -> Option<QuoteTick> {
+fn derive_quote_from_book(book: &OrderBook, ts_init: UnixNanos) -> Option<QuoteTick> {
     let bid_price = book.best_bid_price()?;
     let ask_price = book.best_ask_price()?;
     let bid_size = book.best_bid_size()?;
@@ -936,7 +1257,7 @@ fn derive_quote_from_book(book: &OrderBook) -> Option<QuoteTick> {
         bid_size,
         ask_size,
         book.ts_last,
-        book.ts_last,
+        ts_init,
     ))
 }
 
@@ -1177,8 +1498,8 @@ mod tests {
         let received = Rc::new(RefCell::new(Vec::new()));
         let handler = CacheWritingBookHandler {
             id: Ustr::from("CacheWritingBookHandler"),
-            cache: cache.clone(),
-            received: received.clone(),
+            cache: Rc::clone(&cache),
+            received: Rc::clone(&received),
         };
         msgbus::subscribe_book_snapshots(topic.into(), TypedHandler::new(handler), None);
 
@@ -1225,8 +1546,8 @@ mod tests {
         let received = Rc::new(RefCell::new(Vec::new()));
         let handler = CacheWritingBookHandler {
             id: Ustr::from("CacheWritingBookHandler-NoUpdates"),
-            cache: cache.clone(),
-            received: received.clone(),
+            cache: Rc::clone(&cache),
+            received: Rc::clone(&received),
         };
         msgbus::subscribe_book_snapshots(topic.into(), TypedHandler::new(handler), None);
 

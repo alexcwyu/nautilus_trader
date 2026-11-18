@@ -15,6 +15,8 @@
 
 //! Tests for Interactive Brokers instrument provider.
 
+use std::collections::HashMap;
+
 use ibapi::contracts::{
     ComboLeg, ComboLegOpenClose, Contract, Currency, Exchange, LegAction, SecurityType, Symbol,
 };
@@ -41,7 +43,7 @@ use crate::{
 
 fn create_test_provider() -> InteractiveBrokersInstrumentProvider {
     let config = InteractiveBrokersInstrumentProviderConfig::default();
-    InteractiveBrokersInstrumentProvider::new(config)
+    InteractiveBrokersInstrumentProvider::new(config).unwrap()
 }
 
 fn create_test_option_spread(instrument_id: InstrumentId) -> OptionSpread {
@@ -279,7 +281,7 @@ fn test_determine_stock_venue_reuses_compatible_cached_mic_venue() {
         ..Default::default()
     };
 
-    let provider = InteractiveBrokersInstrumentProvider::new(config);
+    let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
     provider.insert_test_instrument(InstrumentAny::from(equity_aapl()), 265598, 1);
 
     let contract = Contract {
@@ -315,6 +317,57 @@ fn test_determine_stock_smart_venue_reuses_cached_symbol_venue() {
     let venue = provider.determine_venue(&contract, None);
 
     assert_eq!(venue.as_str(), "XNAS");
+}
+
+#[rstest]
+fn test_determine_stock_venue_uses_symbol_to_mic_venue() {
+    let config = InteractiveBrokersInstrumentProviderConfig {
+        symbol_to_mic_venue: HashMap::from([("AAPL".to_string(), "EQUS".to_string())]),
+        convert_exchange_to_mic_venue: true,
+        ..Default::default()
+    };
+
+    let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
+
+    let mapped = Contract {
+        contract_id: 0,
+        symbol: Symbol::from("AAPL"),
+        security_type: SecurityType::Stock,
+        exchange: Exchange::from("SMART"),
+        primary_exchange: Exchange::from("NASDAQ"),
+        currency: Currency::from("USD"),
+        ..Default::default()
+    };
+    let unmapped = Contract {
+        symbol: Symbol::from("MSFT"),
+        ..mapped.clone()
+    };
+
+    assert_eq!(provider.determine_venue(&mapped, None).as_str(), "EQUS");
+    assert_eq!(provider.determine_venue(&unmapped, None).as_str(), "XNAS");
+}
+
+#[rstest]
+fn test_determine_stock_venue_symbol_mapping_wins_over_cached_venue() {
+    let config = InteractiveBrokersInstrumentProviderConfig {
+        symbol_to_mic_venue: HashMap::from([("AAPL".to_string(), "EQUS".to_string())]),
+        ..Default::default()
+    };
+
+    let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
+    provider.insert_test_instrument(InstrumentAny::from(equity_aapl()), 265598, 1);
+
+    let contract = Contract {
+        contract_id: 0,
+        symbol: Symbol::from("AAPL"),
+        security_type: SecurityType::Stock,
+        exchange: Exchange::from("SMART"),
+        primary_exchange: Exchange::default(),
+        currency: Currency::from("USD"),
+        ..Default::default()
+    };
+
+    assert_eq!(provider.determine_venue(&contract, None).as_str(), "EQUS");
 }
 
 #[rstest]
@@ -391,4 +444,34 @@ fn test_parse_spread_instrument_id_to_legs() {
     // Check second leg (negative ratio)
     assert_eq!(legs[1].0.symbol.as_str(), "MSFT");
     assert_eq!(legs[1].1, -2);
+}
+
+#[rstest]
+fn test_share_class_space_names_stock_with_space_both_ways() {
+    let config = InteractiveBrokersInstrumentProviderConfig {
+        symbol_to_mic_venue: HashMap::from([("BRK".to_string(), "EQUS".to_string())]),
+        ..Default::default()
+    };
+    let provider = InteractiveBrokersInstrumentProvider::new(config).unwrap();
+    let contract = Contract {
+        contract_id: 0,
+        symbol: Symbol::from("BRK B"),
+        security_type: SecurityType::Stock,
+        exchange: Exchange::from("SMART"),
+        primary_exchange: Exchange::from("NYSE"),
+        currency: Currency::from("USD"),
+        local_symbol: "BRK B".to_string(),
+        ..Default::default()
+    };
+
+    let instrument_id = provider
+        .resolve_instrument_id_for_contract(&contract)
+        .unwrap();
+    let outbound = provider
+        .resolve_contract_for_instrument(instrument_id)
+        .unwrap();
+
+    assert_eq!(instrument_id, InstrumentId::from("BRK B.EQUS"));
+    assert_eq!(outbound.symbol.as_str(), "BRK B");
+    assert_eq!(outbound.security_type, SecurityType::Stock);
 }

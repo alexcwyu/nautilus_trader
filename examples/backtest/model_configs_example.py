@@ -24,6 +24,7 @@ from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.config import DataCatalogConfig
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.execution import FixedFeeModel
 from nautilus_trader.execution import MakerTakerFeeModel
@@ -52,27 +53,30 @@ if __name__ == "__main__":
         random_seed=42,
     )
 
+    maker_taker_fee_model = MakerTakerFeeModel(
+        maker_rate=Decimal("0.0001"),
+        taker_rate=Decimal("0.0002"),
+    )
+
+    fixed_fee_model = FixedFeeModel(
+        commission=Money.from_str("1.50 USD"),
+        charge_commission_once=True,
+    )
+
+    per_contract_fee_model = PerContractFeeModel(
+        commission=Money.from_str("0.01 USD"),
+    )
+
+    recurring_fixed_fee_model = FixedFeeModel(
+        commission=Money.from_str("2.00 USD"),
+        charge_commission_once=False,
+    )
+
     latency_model = StaticLatencyModel(
         base_latency_nanos=5_000_000,
         insert_latency_nanos=2_000_000,
         update_latency_nanos=3_000_000,
         cancel_latency_nanos=1_000_000,
-    )
-
-    maker_taker_fee_model = MakerTakerFeeModel(
-        maker_rate=Decimal("0.0001"),
-        taker_rate=Decimal("0.0002"),
-    )
-    fixed_fee_model = FixedFeeModel(
-        commission=Money.from_str("1.50 USD"),
-        charge_commission_once=True,
-    )
-    per_contract_fee_model = PerContractFeeModel(
-        commission=Money.from_str("0.01 USD"),
-    )
-    recurring_fixed_fee_model = FixedFeeModel(
-        commission=Money.from_str("2.00 USD"),
-        charge_commission_once=False,
     )
 
     # Create venue configs with different models
@@ -83,8 +87,8 @@ if __name__ == "__main__":
         starting_balances=["1000000 USD"],
         book_type=BookType.L1_MBP,
         fill_model=fill_model,
-        latency_model=latency_model,
         fee_model=maker_taker_fee_model,
+        latency_model=latency_model,
     )
 
     venue_config2 = BacktestVenueConfig(
@@ -94,8 +98,8 @@ if __name__ == "__main__":
         starting_balances=["1000000 USD"],
         book_type=BookType.L1_MBP,
         fill_model=fill_model,
-        latency_model=latency_model,
         fee_model=fixed_fee_model,
+        latency_model=latency_model,
     )
 
     venue_config3 = BacktestVenueConfig(
@@ -105,8 +109,8 @@ if __name__ == "__main__":
         starting_balances=["1000000 USD"],
         book_type=BookType.L1_MBP,
         fill_model=fill_model,
-        latency_model=latency_model,
         fee_model=per_contract_fee_model,
+        latency_model=latency_model,
     )
 
     # Create venue config with custom fixed fee model
@@ -117,14 +121,14 @@ if __name__ == "__main__":
         starting_balances=["1000000 USD"],
         book_type=BookType.L1_MBP,
         fill_model=fill_model,
-        latency_model=latency_model,
         fee_model=recurring_fixed_fee_model,
+        latency_model=latency_model,
     )
 
     # Create data config (this is just a placeholder - you would need actual data)
     data_config = BacktestDataConfig(
         data_type=NautilusDataType.QuoteTick,
-        catalog_path="./data",
+        catalog=DataCatalogConfig(path="./data"),
         instrument_id=InstrumentId.from_str("AAPL.NASDAQ"),
     )
 

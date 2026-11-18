@@ -19,16 +19,17 @@ use std::{collections::HashMap, str::FromStr, sync::LazyLock};
 
 use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use jiff::{Timestamp, tz::Offset};
-use nautilus_model::identifiers::{InstrumentId, Symbol as NautilusSymbol, Venue};
+use nautilus_model::identifiers::{
+    InstrumentId, Symbol as NautilusSymbol, Venue,
+    futures::{
+        FuturesYearDigits, format_futures_symbol, futures_month, futures_month_code,
+        parse_futures_symbol as parse_futures_code, resolve_futures_year,
+        resolve_futures_year_from_expiry,
+    },
+};
 
 use crate::{
-    common::{
-        enums::{IbOptionRight, IbSecurityType},
-        futures::{
-            format_futures_symbol, futures_month, futures_month_code,
-            parse_futures_symbol as parse_futures_code, resolve_futures_year,
-        },
-    },
+    common::enums::{IbOptionRight, IbSecurityType},
     config::SymbologyMethod,
 };
 
@@ -36,7 +37,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Symbology {
     method: SymbologyMethod,
-    futures_year_digits: u8,
+    futures_year_digits: FuturesYearDigits,
+    share_class_space: bool,
 }
 
 impl Symbology {
@@ -44,9 +46,24 @@ impl Symbology {
     pub const fn new(method: SymbologyMethod) -> Self {
         Self {
             method,
-            // Pinned to the venue local symbol; two-digit contract years are not enabled.
-            futures_year_digits: 1,
+            futures_year_digits: FuturesYearDigits::DEFAULT,
+            share_class_space: true,
         }
+    }
+
+    /// Selects one- or two-digit years for futures instrument IDs.
+    #[must_use]
+    pub fn with_futures_year_digits(mut self, futures_year_digits: FuturesYearDigits) -> Self {
+        self.futures_year_digits = futures_year_digits;
+        self
+    }
+
+    /// Selects whether simplified stock IDs keep IB's share-class space (`BRK B`) or use a
+    /// hyphen (`BRK-B`).
+    #[must_use]
+    pub fn with_share_class_space(mut self, share_class_space: bool) -> Self {
+        self.share_class_space = share_class_space;
+        self
     }
 
     #[must_use]
@@ -64,15 +81,13 @@ impl Symbology {
         contract: &Contract,
         venue: Option<Venue>,
     ) -> anyhow::Result<InstrumentId> {
-        anyhow::ensure!(
-            matches!(self.futures_year_digits, 1 | 2),
-            "`futures_year_digits` must be either 1 or 2"
-        );
-
         let instrument_id = match self.method {
-            SymbologyMethod::Simplified => {
-                contract_to_instrument_id_simplified(contract, venue, self.futures_year_digits)
-            }
+            SymbologyMethod::Simplified => contract_to_instrument_id_simplified(
+                contract,
+                venue,
+                self.futures_year_digits,
+                self.share_class_space,
+            ),
             SymbologyMethod::Raw => {
                 contract_to_instrument_id_raw(contract, venue, self.futures_year_digits)
             }
@@ -100,11 +115,6 @@ impl Symbology {
         exchange: Option<&str>,
         currency: Option<&str>,
     ) -> anyhow::Result<Contract> {
-        anyhow::ensure!(
-            matches!(self.futures_year_digits, 1 | 2),
-            "`futures_year_digits` must be either 1 or 2"
-        );
-
         if instrument_id.venue.as_str() == "OPRA" {
             let symbol = instrument_id
                 .symbol
@@ -153,7 +163,8 @@ fn ib_option_right_to_option_right(right: IbOptionRight) -> OptionRight {
 fn contract_to_instrument_id_simplified(
     contract: &Contract,
     venue: Option<Venue>,
-    futures_year_digits: u8,
+    futures_year_digits: FuturesYearDigits,
+    share_class_space: bool,
 ) -> InstrumentId {
     let venue = venue.unwrap_or_else(|| {
         // For Index and Future, use contract exchange when set (e.g. ESTX50 -> EUREX, FESX -> EUREX).
@@ -191,9 +202,12 @@ fn contract_to_instrument_id_simplified(
 
     let symbol = match contract.security_type {
         SecurityType::Stock => {
-            // STK: Use localSymbol with spaces replaced by hyphens, fallback to symbol
+            // STK: Use localSymbol, keeping a share-class space (BRK B) unless configured to
+            // use a hyphen (BRK-B); fallback to symbol
             let symbol_str = if contract.local_symbol.is_empty() {
                 contract.symbol.as_str().to_string()
+            } else if share_class_space {
+                contract.local_symbol.as_str().to_string()
             } else {
                 contract.local_symbol.as_str().replace(' ', "-")
             };
@@ -241,7 +255,7 @@ fn contract_to_instrument_id_simplified(
             NautilusSymbol::from(symbol_str.as_str())
         }
         SecurityType::Future => {
-            if futures_year_digits == 2 {
+            if futures_year_digits == FuturesYearDigits::Two {
                 match futures_symbol_from_contract(contract, futures_year_digits) {
                     Ok(symbol) => {
                         return InstrumentId::new(NautilusSymbol::from(symbol), venue);
@@ -277,7 +291,7 @@ fn contract_to_instrument_id_simplified(
             }
         }
         SecurityType::FuturesOption => {
-            if futures_year_digits == 2 {
+            if futures_year_digits == FuturesYearDigits::Two {
                 match futures_symbol_from_contract(contract, futures_year_digits) {
                     Ok(symbol) => {
                         return InstrumentId::new(NautilusSymbol::from(symbol), venue);
@@ -357,7 +371,7 @@ fn contract_to_instrument_id_simplified(
 fn contract_to_instrument_id_raw(
     contract: &Contract,
     venue: Option<Venue>,
-    futures_year_digits: u8,
+    futures_year_digits: FuturesYearDigits,
 ) -> InstrumentId {
     let venue = venue.unwrap_or_else(|| match contract.security_type {
         SecurityType::ForexPair => Venue::from("IDEALPRO"),
@@ -373,7 +387,7 @@ fn contract_to_instrument_id_raw(
         _ => Venue::from("SMART"),
     });
 
-    let local_symbol = if futures_year_digits == 2
+    let local_symbol = if futures_year_digits == FuturesYearDigits::Two
         && matches!(
             contract.security_type,
             SecurityType::Future | SecurityType::FuturesOption
@@ -634,6 +648,20 @@ const FUTURES_MONTH_CODES: &[(char, &str)] = &[
     ('X', "11"),
     ('Z', "12"),
 ];
+
+/// Returns the venue `symbol_to_mic_venue` maps the contract's symbol to, by prefix match.
+#[must_use]
+pub fn symbol_mic_venue(
+    contract: &Contract,
+    symbol_to_mic_venue: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let symbol = contract.symbol.as_str();
+    symbol_to_mic_venue
+        .iter()
+        .find(|(symbol_prefix, _)| symbol.starts_with(symbol_prefix.as_str()))
+        .map(|(_, symbol_venue)| symbol_venue.clone())
+}
+
 /// Determine venue from contract using provider configuration.
 ///
 /// This implements the same logic as Python's `determine_venue_from_contract`:
@@ -654,13 +682,8 @@ pub fn determine_venue_from_contract(
         return "IBCMDTY".to_string();
     }
 
-    if !symbol_to_mic_venue.is_empty() {
-        let symbol = contract.symbol.as_str();
-        for (symbol_prefix, symbol_venue) in symbol_to_mic_venue {
-            if symbol.starts_with(symbol_prefix) {
-                return symbol_venue.clone();
-            }
-        }
+    if let Some(venue) = symbol_mic_venue(contract, symbol_to_mic_venue) {
+        return venue;
     }
 
     // Use the exchange from the contract (primaryExchange if exchange is SMART)
@@ -722,7 +745,7 @@ pub fn exchange_to_mic_venue(exchange: &str) -> Option<String> {
 fn instrument_id_to_contract(
     instrument_id: InstrumentId,
     exchange: Option<&str>,
-    futures_year_digits: u8,
+    futures_year_digits: FuturesYearDigits,
     reference_year: i32,
     currency: Option<&str>,
 ) -> Contract {
@@ -862,7 +885,7 @@ fn instrument_id_to_contract(
             };
         }
 
-        if futures_year_digits == 2
+        if futures_year_digits == FuturesYearDigits::Two
             && let Some(contract) = futures_contract_from_symbol(
                 symbol_str,
                 SecurityType::FuturesOption,
@@ -885,7 +908,7 @@ fn instrument_id_to_contract(
             };
         }
 
-        if futures_year_digits == 2
+        if futures_year_digits == FuturesYearDigits::Two
             && let Some(contract) = futures_contract_from_symbol(
                 symbol_str,
                 SecurityType::Future,
@@ -977,7 +1000,7 @@ fn instrument_id_to_contract(
 fn instrument_id_to_ib_contract_raw(
     instrument_id: &InstrumentId,
     exchange: Option<&str>,
-    futures_year_digits: u8,
+    futures_year_digits: FuturesYearDigits,
     reference_year: i32,
     currency: Option<&str>,
 ) -> Option<Contract> {
@@ -997,7 +1020,7 @@ fn instrument_id_to_ib_contract_raw(
 
     let exchange_str = exchange.unwrap_or(default_exchange);
 
-    if futures_year_digits == 2
+    if futures_year_digits == FuturesYearDigits::Two
         && matches!(
             security_type,
             SecurityType::Future | SecurityType::FuturesOption
@@ -1229,8 +1252,9 @@ fn format_option_strike(strike: f64) -> String {
 
 fn futures_symbol_from_contract(
     contract: &Contract,
-    futures_year_digits: u8,
+    futures_year_digits: FuturesYearDigits,
 ) -> anyhow::Result<String> {
+    let futures_year_digits = u8::from(futures_year_digits);
     let expiry = contract.last_trade_date_or_contract_month.as_str();
     let year = expiry
         .get(..4)
@@ -1269,11 +1293,7 @@ fn futures_symbol_from_contract(
 
     let parsed = parse_futures_code(futures_symbol)
         .ok_or_else(|| anyhow::anyhow!("Invalid futures local symbol '{futures_symbol}'"))?;
-    // The expiry field carries the last-trade date on details responses, which can fall in
-    // the year before the contract month (January contracts such as CLF6 trading last in
-    // December). Resolving the symbol's own year digits against that year is exact because
-    // the contract-month year is never earlier than the last-trade year.
-    let year = resolve_futures_year(parsed.year_digits, year)
+    let year = resolve_futures_year_from_expiry(parsed.year_digits, year)
         .ok_or_else(|| anyhow::anyhow!("Invalid futures year digits '{}'", parsed.year_digits))?;
 
     let formatted =
@@ -1292,13 +1312,10 @@ fn futures_contract_from_symbol(
     reference_year: i32,
     currency: Option<&str>,
 ) -> Option<Contract> {
-    let (futures_symbol, option) = if security_type == SecurityType::FuturesOption {
-        let (futures_symbol, rest) = symbol.split_once(' ')?;
-        let mut chars = rest.chars();
-        let right_char = chars.next()?;
-        let right = IbOptionRight::from_str(&right_char.to_string()).ok()?;
-        let strike = chars.as_str().parse::<f64>().ok()?;
-        (futures_symbol, Some((right, strike)))
+    let (futures_symbol, suffix) = if security_type == SecurityType::FuturesOption {
+        validate_futures_option_symbol(symbol)?;
+        let (futures_symbol, suffix) = symbol.split_once(' ')?;
+        (futures_symbol, Some(suffix))
     } else {
         (symbol, None)
     };
@@ -1312,17 +1329,23 @@ fn futures_contract_from_symbol(
         "USD"
     });
 
-    Some(Contract {
-        symbol: Symbol::from(parsed.root),
-        trading_class: parsed.root.to_string(),
+    let native = format_futures_symbol(parsed.root, parsed.month_code, year, 1)?;
+    let local_symbol = suffix.map_or_else(|| native.clone(), |suffix| format!("{native} {suffix}"));
+
+    let mut contract = Contract {
+        local_symbol,
         security_type,
         exchange: Exchange::from(exchange),
         currency: Currency::from(currency),
-        last_trade_date_or_contract_month: format!("{year:04}{month:02}"),
-        right: option.map(|(right, _)| ib_option_right_to_option_right(right)),
-        strike: option.map_or(0.0, |(_, strike)| strike),
         ..Default::default()
-    })
+    };
+
+    if contract.security_type == SecurityType::Future {
+        contract.trading_class = parsed.root.to_string();
+        contract.last_trade_date_or_contract_month = format!("{year:04}{month:02}");
+    }
+
+    Some(contract)
 }
 
 fn is_futures_underlying(symbol: &str) -> bool {
@@ -1354,10 +1377,14 @@ fn validate_futures_option_symbol(symbol: &str) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
-    use nautilus_model::identifiers::{InstrumentId, Symbol as NautilusSymbol, Venue};
+    use nautilus_model::identifiers::{
+        InstrumentId, Symbol as NautilusSymbol, Venue, futures::FuturesYearDigits,
+    };
     use rstest::rstest;
 
-    use super::{Symbology, exchange_to_mic_venue, possible_exchanges_for_venue};
+    use super::{
+        Symbology, exchange_to_mic_venue, instrument_id_to_contract, possible_exchanges_for_venue,
+    };
     use crate::config::SymbologyMethod;
 
     #[rstest]
@@ -1446,6 +1473,7 @@ mod tests {
         };
 
         let instrument_id = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .instrument_id(&contract, Some(Venue::from("XCME")))
             .unwrap();
 
@@ -1478,6 +1506,7 @@ mod tests {
         };
 
         let instrument_id = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .instrument_id(&contract, Some(Venue::from("XNYM")))
             .unwrap();
 
@@ -1540,6 +1569,7 @@ mod tests {
         let instrument_id = InstrumentId::new(NautilusSymbol::from(symbol), Venue::from("XCME"));
 
         let contract = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .contract(instrument_id, None)
             .unwrap();
 
@@ -1714,6 +1744,7 @@ mod tests {
         let instrument_id = InstrumentId::from("YMM6.XCBT");
 
         let contract = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .contract(instrument_id, None)
             .unwrap();
 
@@ -1729,6 +1760,7 @@ mod tests {
         let instrument_id = InstrumentId::from("OESXH6.XEUR");
 
         let contract = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .contract(instrument_id, None)
             .unwrap();
 
@@ -1744,6 +1776,7 @@ mod tests {
         let instrument_id = InstrumentId::from("YMM6 C45000.XCBT");
 
         let contract = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .contract(instrument_id, None)
             .unwrap();
 
@@ -1981,6 +2014,7 @@ mod tests {
         let instrument_id = InstrumentId::from("YMM6=FUT.XCBT");
 
         let contract = Symbology::new(SymbologyMethod::Simplified)
+            .with_futures_year_digits(FuturesYearDigits::One)
             .contract(instrument_id, Some("CBOT"))
             .unwrap();
 
@@ -1989,6 +2023,48 @@ mod tests {
         assert_eq!(contract.local_symbol.as_str(), "YMM6");
         assert!(contract.symbol.as_str().is_empty());
         assert!(contract.last_trade_date_or_contract_month.is_empty());
+    }
+
+    fn share_class_stock() -> Contract {
+        Contract {
+            symbol: Symbol::from("BRK B"),
+            security_type: SecurityType::Stock,
+            exchange: Exchange::from("SMART"),
+            primary_exchange: Exchange::from("NYSE"),
+            currency: Currency::from("USD"),
+            local_symbol: "BRK B".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[rstest]
+    #[case(true, "BRK B.NYSE")]
+    #[case(false, "BRK-B.NYSE")]
+    fn test_ib_contract_to_instrument_id_simplified_names_share_class(
+        #[case] share_class_space: bool,
+        #[case] expected: &str,
+    ) {
+        let instrument_id = Symbology::new(SymbologyMethod::Simplified)
+            .with_share_class_space(share_class_space)
+            .instrument_id(&share_class_stock(), Some(Venue::from("NYSE")))
+            .unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from(expected));
+    }
+
+    #[rstest]
+    #[case("BRK B.NYSE")]
+    #[case("BRK-B.NYSE")]
+    fn test_instrument_id_to_ib_contract_simplified_spells_share_class_with_space(
+        #[case] instrument_id: &str,
+    ) {
+        let contract = Symbology::new(SymbologyMethod::Simplified)
+            .contract(InstrumentId::from(instrument_id), Some("NYSE"))
+            .unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Stock);
+        assert_eq!(contract.symbol.as_str(), "BRK B");
+        assert_eq!(contract.primary_exchange.as_str(), "NYSE");
     }
 
     #[rstest]
@@ -2005,5 +2081,113 @@ mod tests {
         assert_eq!(contract.primary_exchange.as_str(), "IBIS");
         assert!(contract.currency.as_str().is_empty());
         assert!(contract.local_symbol.is_empty());
+    }
+
+    #[rstest]
+    #[case("ESZ6", "20261218", "ESZ26.XCME")]
+    #[case("ESZ9", "20291221", "ESZ29.XCME")]
+    #[case("ESH0", "20200320", "ESH20.XCME")]
+    #[case("ESH0", "20300315", "ESH30.XCME")]
+    #[case("CLF6", "20251219", "CLF26.XCME")]
+    #[case("CLF0", "20291219", "CLF30.XCME")]
+    #[case("SR3Z6", "20270316", "SR3Z26.XCME")]
+    #[case("SR3Z9", "20300319", "SR3Z29.XCME")]
+    fn test_default_futures_year_matches_definition(
+        #[case] symbol: &str,
+        #[case] expiry: &str,
+        #[case] expected: InstrumentId,
+    ) {
+        let contract = Contract {
+            symbol: Symbol::from("ROOT"),
+            security_type: SecurityType::Future,
+            local_symbol: symbol.to_string(),
+            last_trade_date_or_contract_month: expiry.to_string(),
+            ..Default::default()
+        };
+
+        let id = Symbology::new(SymbologyMethod::Simplified)
+            .instrument_id(&contract, Some(Venue::from("XCME")))
+            .unwrap();
+        assert_eq!(id, expected);
+    }
+
+    #[rstest]
+    #[case(SymbologyMethod::Simplified, "CLF30.XNYM")]
+    #[case(SymbologyMethod::Raw, "CLF30=FUT.XNYM")]
+    fn test_two_digit_futures_request_uses_root_and_contract_month(
+        #[case] method: SymbologyMethod,
+        #[case] instrument_id: InstrumentId,
+    ) {
+        let contract = instrument_id_to_contract(
+            instrument_id,
+            Some("NYMEX"),
+            FuturesYearDigits::Two,
+            2029,
+            Some("USD"),
+        );
+        assert_eq!(contract.symbol.as_str(), "");
+        assert_eq!(contract.trading_class, "CL");
+        assert_eq!(contract.security_type, SecurityType::Future);
+        assert_eq!(contract.exchange.as_str(), "NYMEX");
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.last_trade_date_or_contract_month, "203001");
+        assert_eq!(contract.local_symbol, "CLF0");
+        assert_eq!(contract.right, None);
+        assert_eq!(contract.strike, 0.0);
+
+        let inbound = Symbology::new(method)
+            .instrument_id(
+                &Contract {
+                    local_symbol: "CLF0".to_string(),
+                    last_trade_date_or_contract_month: "20291219".to_string(),
+                    ..contract
+                },
+                Some(Venue::from("XNYM")),
+            )
+            .unwrap();
+
+        assert_eq!(inbound, instrument_id);
+    }
+
+    #[rstest]
+    #[case("6EH26.XCME", "6EH6", "6E", SecurityType::Future, "202603", None, 0.0)]
+    #[case(
+        "VXH26=FUT.CFE",
+        "VXH6",
+        "VX",
+        SecurityType::Future,
+        "202603",
+        None,
+        0.0
+    )]
+    #[case(
+        "EW1F26 P5000.XCME",
+        "EW1F6 P5000",
+        "",
+        SecurityType::FuturesOption,
+        "",
+        None,
+        0.0
+    )]
+    fn test_two_digit_lookup_preserves_native_symbols(
+        #[case] id: InstrumentId,
+        #[case] native: &str,
+        #[case] trading_class: &str,
+        #[case] kind: SecurityType,
+        #[case] month: &str,
+        #[case] right: Option<OptionRight>,
+        #[case] strike: f64,
+    ) {
+        let contract =
+            instrument_id_to_contract(id, Some("CME"), FuturesYearDigits::Two, 2026, Some("USD"));
+        assert_eq!(contract.symbol.as_str(), "");
+        assert_eq!(contract.local_symbol, native);
+        assert_eq!(contract.trading_class, trading_class);
+        assert_eq!(contract.security_type, kind);
+        assert_eq!(contract.exchange.as_str(), "CME");
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.last_trade_date_or_contract_month, month);
+        assert_eq!(contract.right, right);
+        assert_eq!(contract.strike, strike);
     }
 }

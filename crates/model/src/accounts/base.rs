@@ -18,22 +18,24 @@
 //! Concrete account types (`CashAccount`, `MarginAccount`, etc.) build on the abstractions defined
 //! in this file.
 
-use ahash::AHashMap;
+use std::sync::Arc;
+
+use ahash::{AHashMap, AHashSet};
 use indexmap::IndexMap;
 use nautilus_core::{
     DurationNanos, UnixNanos,
     correctness::{CorrectnessError, CorrectnessResult, FAILED, check_equal},
 };
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    accounts::fill_position_pnl,
     enums::{AccountType, LiquiditySide, OrderSide},
-    events::{AccountState, OrderFilled},
+    events::{AccountState, OrderFilled, account::state::BALANCES_SNAPSHOT_COMPLETE_INFO_KEY},
     fees::{MakerTakerFeeRates, calculate_maker_taker_commission},
     identifiers::{AccountId, InstrumentId},
     instruments::{Instrument, InstrumentAny},
-    position::Position,
+    position::{Position, amount, money_from_qty, notional},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 
@@ -54,7 +56,9 @@ pub struct BaseAccount {
     /// (as opposed to taken from venue reports).
     pub calculate_account_state: bool,
     /// The account state events, oldest first.
-    pub events: Vec<AccountState>,
+    ///
+    /// Clones share this history until one of them is modified.
+    pub events: Arc<Vec<AccountState>>,
     /// The commissions charged so far, keyed by currency.
     pub commissions: AHashMap<Currency, Money>,
     /// The current balances in the account, keyed by currency.
@@ -78,7 +82,7 @@ impl BaseAccount {
             account_type: event.account_type,
             base_currency: event.base_currency,
             calculate_account_state,
-            events: vec![event],
+            events: Arc::new(vec![event]),
             commissions: AHashMap::new(),
             balances,
             balances_starting,
@@ -92,7 +96,7 @@ impl BaseAccount {
             account_type: self.account_type,
             base_currency: self.base_currency,
             calculate_account_state: self.calculate_account_state,
-            events: Vec::new(),
+            events: Arc::default(),
             commissions: self.commissions.clone(),
             balances: self.balances.clone(),
             balances_starting: self.balances_starting.clone(),
@@ -200,8 +204,6 @@ impl BaseAccount {
     ///
     /// Returns an error if the accumulated commission exceeds [`Money`] bounds.
     pub fn try_update_commissions(&mut self, commission: Money) -> anyhow::Result<()> {
-        // TODO: Remove once from_raw enforces canonical precision alignment (v2)
-        let commission = commission.normalized();
         if commission.is_zero() {
             return Ok(());
         }
@@ -248,14 +250,45 @@ impl BaseAccount {
 
     /// Applies an [`AccountState`] event, updating balances.
     ///
+    /// Current complete balance snapshots zero cached currencies omitted from the event.
+    ///
     /// # Panics
     ///
     /// Panics if `event.account_id` does not match this account's ID. Every account rejects a
     /// foreign event before reaching here, so this remains an internal invariant.
-    pub fn base_apply(&mut self, event: AccountState) {
+    pub fn base_apply(&mut self, mut event: AccountState) {
         check_equal(&event.account_id, &self.id, "event.account_id", "self.id").expect(FAILED);
+        let snapshot_is_current = self
+            .events
+            .last()
+            .is_none_or(|last| event.ts_event >= last.ts_event);
+        if snapshot_is_current
+            && event
+                .info
+                .as_ref()
+                .and_then(|info| info.get_bool(BALANCES_SNAPSHOT_COMPLETE_INFO_KEY))
+                == Some(true)
+        {
+            let reported: AHashSet<Currency> = event
+                .balances
+                .iter()
+                .map(|balance| balance.currency)
+                .collect();
+
+            let omitted = self
+                .balances
+                .keys()
+                .filter(|currency| !reported.contains(*currency))
+                .map(|currency| {
+                    let zero = Money::zero(*currency);
+                    AccountBalance::new(zero, zero, zero)
+                });
+
+            event.balances.extend(omitted);
+        }
+
         self.update_balances(&event.balances);
-        self.events.push(event);
+        Arc::make_mut(&mut self.events).push(event);
     }
 
     /// Purges all account state events which are outside the lookback window.
@@ -276,7 +309,7 @@ impl BaseAccount {
 
         let mut retained_events = Vec::new();
 
-        for event in &self.events {
+        for event in self.events.iter() {
             if purge_cutoff.is_none_or(|cutoff| event.ts_event > cutoff) {
                 retained_events.push(event.clone());
             }
@@ -287,14 +320,16 @@ impl BaseAccount {
             retained_events.push(self.events.last().expect("events not empty").clone());
         }
 
-        self.events = retained_events;
+        self.events = Arc::new(retained_events);
     }
 
     /// Calculates the amount of balance to lock for a new order based on the given side, quantity, and price.
     ///
+    /// Projects the reservation at native [`Money`] precision with midpoint-to-even rounding.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the locked amount cannot be represented in the target currency.
+    /// Returns an error if an input or the locked amount exceeds the accounting bounds.
     pub fn base_calculate_balance_locked(
         &self,
         instrument: &InstrumentAny,
@@ -303,26 +338,21 @@ impl BaseAccount {
         price: Price,
         use_quote_for_inverse: Option<bool>,
     ) -> anyhow::Result<Money> {
-        let (amount, currency) = match side {
+        match side {
             // A buy at a negative price settles as a credit rather than a debit, so it
             // reserves nothing. Clamping per order rather than after aggregation keeps a
             // negative-price buy from financing a positive-price one before either fills.
             OrderSide::Buy => {
-                let notional = instrument.try_calculate_notional_value(
-                    quantity,
-                    price,
-                    use_quote_for_inverse,
-                )?;
-                (notional.as_decimal().max(Decimal::ZERO), notional.currency)
+                let notional =
+                    calculate_notional(instrument, quantity, price, use_quote_for_inverse)?;
+                Ok(notional.max(Money::zero(notional.currency)))
             }
             // No modeled base asset means nothing to reserve; inventory is venue-enforced.
             OrderSide::Sell => match instrument.base_currency() {
-                Some(base_currency) => (quantity.as_decimal(), base_currency),
-                None => (Decimal::ZERO, instrument.quote_currency()),
+                Some(currency) => Ok(money_from_qty(quantity, currency)?),
+                None => Ok(Money::from_raw_checked(0, instrument.quote_currency())?),
             },
-        };
-
-        Ok(Money::from_decimal(amount, currency)?)
+        }
     }
 
     /// Calculates profit and loss amounts for a filled order.
@@ -334,27 +364,39 @@ impl BaseAccount {
     /// Note: Unlike betting accounts, cash accounts do NOT cap to position quantity.
     /// The full fill quantity is used for PnL calculation.
     ///
+    /// Projects each cash flow at native [`Money`] precision with midpoint-to-even rounding.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a PnL amount cannot be represented in the target currency.
+    /// Returns an error if an input, cash flow, or resulting position exceeds the accounting bounds.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "matches the owned Position input of Account::calculate_pnls"
+    )]
     pub fn base_calculate_pnls(
         &self,
         instrument: &InstrumentAny,
         fill: &OrderFilled,
-        _position: Option<Position>,
+        position: Option<Position>,
     ) -> anyhow::Result<Vec<Money>> {
+        if let Some(commission) = fill.commission {
+            amount(commission)?;
+        }
+
+        fill_position_pnl(instrument, fill, position.as_ref())?;
+
         let mut pnls: IndexMap<Currency, Money> = IndexMap::new();
         let base_currency = instrument.base_currency();
 
         // No quantity capping (betting accounts cap to position qty, cash accounts don't)
         let fill_qty = fill.last_qty;
-        let notional = instrument.try_calculate_notional_value(fill_qty, fill.last_px, None)?;
+        let notional = calculate_notional(instrument, fill_qty, fill.last_px, None)?;
 
         if fill.order_side == OrderSide::Buy {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
-                    Money::from_decimal(fill_qty.as_decimal(), base_currency_value)?,
+                    money_from_qty(fill_qty, base_currency_value)?,
                 );
             }
             pnls.insert(notional.currency, -notional);
@@ -362,7 +404,7 @@ impl BaseAccount {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
-                    -Money::from_decimal(fill_qty.as_decimal(), base_currency_value)?,
+                    -money_from_qty(fill_qty, base_currency_value)?,
                 );
             }
             pnls.insert(notional.currency, notional);
@@ -391,6 +433,35 @@ impl BaseAccount {
         let rate = fee_rates.rate_for(liquidity_side)?;
         calculate_maker_taker_commission(instrument, last_qty, last_px, rate, use_quote_for_inverse)
     }
+}
+
+fn calculate_notional(
+    instrument: &InstrumentAny,
+    quantity: Quantity,
+    price: Price,
+    use_quote_for_inverse: Option<bool>,
+) -> anyhow::Result<Money> {
+    if instrument.is_inverse() && use_quote_for_inverse.unwrap_or(false) {
+        return Ok(money_from_qty(quantity, instrument.quote_currency())?);
+    }
+
+    let currency = if instrument.is_inverse() {
+        instrument
+            .base_currency()
+            .ok_or_else(|| anyhow::anyhow!("inverse instrument has no base currency"))?
+    } else {
+        instrument.cost_currency()
+    };
+
+    Ok(notional(
+        quantity,
+        price,
+        instrument.multiplier(),
+        instrument
+            .instrument_class()
+            .divides_notional_by_price(instrument.is_inverse()),
+        currency,
+    )?)
 }
 
 /// Updates the locked balance for the given instrument and currency, then recalculates the
@@ -575,10 +646,16 @@ fn non_spendable_balance(current_balance: AccountBalance) -> AccountBalance {
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use nautilus_core::{Params, UUID4};
     use rstest::rstest;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::{events::account::stubs::cash_account_state, types::money::MONEY_RAW_MAX};
+    use crate::{
+        events::account::{state::BALANCES_SNAPSHOT_COMPLETE_INFO_KEY, stubs::cash_account_state},
+        types::money::MONEY_RAW_MAX,
+    };
 
     #[rstest]
     fn test_base_purge_account_events_retains_latest_when_all_purged() {
@@ -676,6 +753,111 @@ mod tests {
         account.base_purge_account_events(UnixNanos::from(u64::MAX), 60);
 
         assert_eq!(account.events.len(), 1);
+    }
+
+    #[rstest]
+    fn test_base_clone_shares_events() {
+        let account = BaseAccount::new(cash_account_state(), true);
+
+        let cloned = account.clone();
+
+        assert!(Arc::ptr_eq(&account.events, &cloned.events));
+    }
+
+    #[rstest]
+    fn test_base_apply_after_clone() {
+        let initial = cash_account_state();
+        let mut later = cash_account_state();
+        later.ts_event = UnixNanos::from(200_000_000_000);
+        let mut account = BaseAccount::new(initial.clone(), true);
+        let cloned = account.clone();
+
+        account.base_apply(later.clone());
+
+        assert_eq!(*account.events, vec![initial.clone(), later]);
+        assert_eq!(*cloned.events, vec![initial]);
+    }
+
+    #[rstest]
+    #[case::complete_snapshot(true, 2, "0 BTC", 2)]
+    #[case::partial_snapshot(false, 2, "1 BTC", 1)]
+    #[case::stale_complete_snapshot(true, 0, "1 BTC", 1)]
+    fn test_base_apply_zeroes_omitted_balances_only_for_complete_snapshots(
+        #[case] complete: bool,
+        #[case] event_ts: u64,
+        #[case] expected_btc: &str,
+        #[case] expected_event_balances: usize,
+    ) {
+        let balance = |total: Money| AccountBalance::new(total, Money::zero(total.currency), total);
+        let account_id = AccountId::from("SIM-001");
+
+        let initial = AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![
+                balance(Money::from("1 BTC")),
+                balance(Money::from("100 USD")),
+            ],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+            Some(Currency::USD()),
+        );
+
+        let mut account = BaseAccount::new(initial, true);
+
+        let info = complete.then(|| {
+            Params::new(IndexMap::from([(
+                BALANCES_SNAPSHOT_COMPLETE_INFO_KEY.to_string(),
+                serde_json::Value::Bool(true),
+            )]))
+        });
+
+        let later = AccountState::new(
+            account_id,
+            AccountType::Cash,
+            vec![balance(Money::from("90 USD"))],
+            vec![],
+            true,
+            UUID4::new(),
+            UnixNanos::from(event_ts),
+            UnixNanos::from(event_ts),
+            Some(Currency::USD()),
+        )
+        .with_info(info);
+
+        account.base_apply(later);
+
+        let expected_btc = Money::from(expected_btc);
+        let btc = account.base_balance(Some(Currency::BTC())).unwrap();
+        let usd = account.base_balance(Some(Currency::USD())).unwrap();
+        assert_eq!(btc.total, expected_btc);
+        assert_eq!(btc.locked, Money::zero(Currency::BTC()));
+        assert_eq!(btc.free, expected_btc);
+        assert_eq!(usd.total, Money::from("90 USD"));
+        assert_eq!(usd.locked, Money::zero(Currency::USD()));
+        assert_eq!(usd.free, Money::from("90 USD"));
+        assert_eq!(
+            account.events.last().unwrap().balances.len(),
+            expected_event_balances,
+        );
+    }
+
+    #[rstest]
+    fn test_base_purge_account_events_after_clone() {
+        let initial = cash_account_state();
+        let mut later = cash_account_state();
+        later.ts_event = UnixNanos::from(200_000_000_000);
+        let mut account = BaseAccount::new(initial.clone(), true);
+        account.base_apply(later.clone());
+        let cloned = account.clone();
+
+        account.base_purge_account_events(UnixNanos::from(300_000_000_000), 150);
+
+        assert_eq!(*account.events, vec![later.clone()]);
+        assert_eq!(*cloned.events, vec![initial, later]);
     }
 
     #[rstest]
@@ -821,7 +1003,7 @@ mod tests {
     }
 
     #[rstest]
-    fn test_update_commissions_sub_canonical_raw_skipped() {
+    fn test_update_commissions_native_precision_preserved() {
         use crate::{
             events::account::stubs::cash_account_state,
             types::{Currency, Money},
@@ -830,10 +1012,24 @@ mod tests {
         let mut account = BaseAccount::new(cash_account_state(), true);
         let usd = Currency::USD();
 
-        // Sub-canonical raw (1 < tick size for USD precision 2) normalizes to zero
         account.update_commissions(Money::from_raw(1, usd));
+        account.update_commissions(Money::from_raw(2, usd));
 
-        assert!(account.commission(&usd).is_none());
+        assert_eq!(account.commission(&usd), Some(Money::from_raw(3, usd)));
+    }
+
+    #[rstest]
+    fn test_update_commissions_exact_usd_accumulates_with_legacy_money() {
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        let usd = Currency::USD();
+        let exact = Money::from_decimal_exact(dec!(0.000001), usd).unwrap();
+        account.update_commissions(exact);
+        account.update_commissions(Money::from("0.01 USD"));
+
+        assert_eq!(
+            account.commission(&usd).unwrap().as_decimal(),
+            dec!(0.010001)
+        );
     }
 
     #[rstest]

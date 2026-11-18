@@ -129,7 +129,7 @@ pub struct WebSocketConfig {
     /// Bounds three things: the initial connection attempt, each reconnect attempt, and how long a
     /// send waits for the client to become active again. A short value therefore makes sends give
     /// up early during a reconnect as well as failing a connection attempt faster; keep it above
-    /// the reconnect backoff.
+    /// the reconnect backoff. The client has no separate send-wait timeout.
     ///
     /// Only applies to handler mode and must be non-zero when set. Stream mode ignores this field
     /// and bounds its connection attempt at 10 seconds.
@@ -160,8 +160,9 @@ pub struct WebSocketConfig {
     /// Only applies to handler mode. Stream mode ignores this field.
     ///
     /// - `None`: Unlimited reconnection attempts (default, recommended for production).
-    /// - `Some(n)`: Transitions to CLOSED once `n` consecutive reconnect attempts have either
-    ///   failed or established connections active for less than 10 seconds.
+    /// - `Some(0)`: Disables reconnection; any reconnect trigger closes the client.
+    /// - `Some(n)` for `n > 0`: Transitions to CLOSED once `n` consecutive reconnect attempts have
+    ///   either failed or established connections active for less than 10 seconds.
     #[serde(default)]
     pub reconnect_max_attempts: Option<u32>,
     /// The dead-peer timeout (seconds) for the read task.
@@ -171,7 +172,8 @@ pub struct WebSocketConfig {
     ///
     /// When set, the read task stops and triggers reconnection if no inbound frame of any kind
     /// arrives within this duration. Ping and Pong both refresh it, so this detects a peer that has
-    /// gone silent rather than one whose feed is merely quiet. Set it above
+    /// gone silent rather than one whose feed is merely quiet. Continuation frames refresh it
+    /// before their message is complete. Set it above
     /// [`Self::heartbeat_interval_secs`] so a healthy connection cannot trip it; three intervals is
     /// the usual choice, tolerating two lost replies.
     ///
@@ -229,9 +231,8 @@ pub struct WebSocketConfig {
     pub proxy_url: Option<String>,
     /// Maximum size in bytes of one inbound WebSocket message.
     ///
-    /// `None` passes the selected backend's default message cap of 64 MiB. Sockudo applies that
-    /// default only while reassembling fragments; a finished single-frame message is bounded by the
-    /// frame cap unless this field is set. `Some(0)` is rejected. A message that exceeds this cap
+    /// `None` passes the selected backend's default message cap of 64 MiB. The cap applies to
+    /// single-frame and fragmented messages. `Some(0)` is rejected. A message that exceeds this cap
     /// and fits in the frame cap fails the read with `MessageTooLarge`. This cap does not bound
     /// per-frame memory: both backends apply it after the frame payload is read. Set
     /// `max_frame_size_bytes` for that bound.
@@ -240,9 +241,8 @@ pub struct WebSocketConfig {
     /// Maximum size in bytes of one inbound WebSocket frame payload, excluding the frame header.
     ///
     /// `None` keeps the selected backend's default of 16 MiB. `Some(0)` is rejected. Sockudo reports
-    /// a frame larger than 125 bytes that exceeds the cap as `FrameTooLarge`. Its small-frame parser
-    /// skips the cap when the whole frame is already buffered, so a shorter frame is not reliably
-    /// rejected. Tungstenite uses one capacity error for both limits, so every frame breach is
+    /// a frame that exceeds the cap as `FrameTooLarge`, including a fully buffered small frame.
+    /// Tungstenite uses one capacity error for both limits, so every frame breach is
     /// `MessageTooLarge`. On Sockudo, a frame that exceeds this cap fails before the message cap.
     #[serde(default)]
     pub max_frame_size_bytes: Option<usize>,
@@ -283,8 +283,7 @@ impl<S: web_socket_config_builder::IsComplete> WebSocketConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`NetworkConfigError`] if any field fails validation
-    /// (see [`WebSocketConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`WebSocketConfig::validate`]).
     pub fn build(self) -> NetworkConfigResult<WebSocketConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -297,14 +296,12 @@ impl WebSocketConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`NetworkConfigError`] if `url` is empty, the heartbeat interval, a
-    /// reconnection timing field, or an inbound size limit is not positive,
-    /// `reconnect_backoff_factor` is outside `[1.0, 100.0]`, `reconnect_delay_initial_ms`
-    /// exceeds `reconnect_delay_max_ms`, or `writer_capacity` is outside
-    /// `[1, Semaphore::MAX_PERMITS]`.
+    /// Returns an error if `url` is empty, the heartbeat interval, a reconnection timing field, or
+    /// an inbound size limit is not positive, `reconnect_backoff_factor` is outside `[1.0, 100.0]`,
+    /// `reconnect_delay_initial_ms` exceeds `reconnect_delay_max_ms`, or `writer_capacity` is
+    /// outside `[1, Semaphore::MAX_PERMITS]`.
     pub fn validate(&self) -> NetworkConfigResult<()> {
         let mut errors = Vec::new();
-
         if let Err(e) = crate::writer::validate_capacity(self.writer_capacity) {
             errors.push(e);
         }
@@ -425,8 +422,8 @@ impl WebSocketConfig {
 pub struct InitialConnectRetryPolicy {
     /// Maximum number of connection attempts, including the first attempt.
     ///
-    /// This is an upper bound rather than a promise: a failure classified as permanent returns
-    /// before the bound is reached.
+    /// A value of 1 disables retries. This is an upper bound rather than a promise: a failure
+    /// classified as permanent returns before the bound is reached.
     pub max_attempts: NonZeroU32,
     /// Delay before the second connection attempt.
     pub delay_initial: Duration,

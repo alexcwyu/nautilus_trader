@@ -13,11 +13,12 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-//! Benchmarks for applying fills to an order.
+//! Benchmarks for applying fills and reading the last order event.
 //!
 //! Measures complete fill batches applied through `Order::apply`.
-//! Average-price arithmetic extends a cached `Decimal` fold, while duplicate detection scans
-//! prior events. The fill counts expose both small-order overhead and history-dependent cost.
+//! Average-price arithmetic extends a cached `Decimal` fold. Duplicate detection scans short
+//! histories and switches to a trade ID index once the order holds enough events.
+//! The fill counts expose both small-order overhead and history-dependent cost.
 //!
 //! Run with `cargo bench -p nautilus-model --bench order_fills_criterion`.
 
@@ -31,7 +32,7 @@ use nautilus_model::{
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
     },
-    orders::MarketOrder,
+    orders::{MarketOrder, Order, OrderAny},
     types::{Currency, Price, Quantity},
 };
 
@@ -138,5 +139,40 @@ fn bench_order_fills(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_order_fills);
+fn generic_last_event<T: Order + ?Sized>(order: &T) -> &OrderEventAny {
+    order.last_event()
+}
+
+fn bench_last_order_event(c: &mut Criterion) {
+    let mut group = c.benchmark_group("last_order_event");
+
+    for count in [0_u64, 128, 10_000] {
+        let mut order = accepted_market_order(Quantity::from(count.max(1)));
+
+        for event in fill_events(count) {
+            order.apply(event).unwrap();
+        }
+
+        let event_count = order.event_count();
+        let any = OrderAny::Market(order.clone());
+        let erased: &dyn Order = &order;
+
+        group.bench_function(BenchmarkId::new("concrete", event_count), |b| {
+            b.iter(|| black_box(black_box(&order).last_event()));
+        });
+        group.bench_function(BenchmarkId::new("generic", event_count), |b| {
+            b.iter(|| black_box(generic_last_event(black_box(&order))));
+        });
+        group.bench_function(BenchmarkId::new("dyn", event_count), |b| {
+            b.iter(|| black_box(black_box(erased).last_event()));
+        });
+        group.bench_function(BenchmarkId::new("enum", event_count), |b| {
+            b.iter(|| black_box(black_box(&any).last_event()));
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_order_fills, bench_last_order_event);
 criterion_main!(benches);

@@ -45,6 +45,7 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use nautilus_network::{
+    ConnectionUrl,
     http::create_standard_nautilus_headers,
     mode::ConnectionMode,
     ratelimiter::{RateLimiter, clock::MonotonicClock},
@@ -78,6 +79,7 @@ use crate::{
         symbol::BybitSymbol,
         urls::{bybit_ws_private_url, bybit_ws_public_url, bybit_ws_trade_url},
     },
+    http::client::BybitHttpClient,
     websocket::{
         enums::{BybitWsOperation, BybitWsPrivateChannel, BybitWsPublicChannel},
         error::{BybitWsError, BybitWsResult},
@@ -97,10 +99,11 @@ const AUTH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const BATCH_PROCESSING_LIMIT: usize = 20;
 /// Public/market data WebSocket client for Bybit.
 pub struct BybitWebSocketClient {
-    url: String,
+    url: ConnectionUrl,
     environment: BybitEnvironment,
     product_type: Option<BybitProductType>,
     credential: Option<Credential>,
+    http_client: Option<BybitHttpClient>,
     requires_auth: bool,
     auth_tracker: AuthTracker,
     heartbeat: Option<u64>,
@@ -116,7 +119,6 @@ pub struct BybitWebSocketClient {
     rate_limiter: BybitRateLimiter,
     recv_window_ms: Arc<AtomicU64>,
     account_id: Option<AccountId>,
-    mm_level: Arc<AtomicU8>,
     bar_types_cache: Arc<AtomicMap<String, BarType>>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     trade_subs: Arc<AtomicSet<InstrumentId>>,
@@ -179,6 +181,7 @@ impl Clone for BybitWebSocketClient {
             environment: self.environment,
             product_type: self.product_type,
             credential: self.credential.clone(),
+            http_client: self.http_client.clone(),
             requires_auth: self.requires_auth,
             auth_tracker: self.auth_tracker.clone(),
             heartbeat: self.heartbeat,
@@ -194,7 +197,6 @@ impl Clone for BybitWebSocketClient {
             rate_limiter: self.rate_limiter.clone(),
             recv_window_ms: Arc::clone(&self.recv_window_ms),
             account_id: self.account_id,
-            mm_level: Arc::clone(&self.mm_level),
             bar_types_cache: Arc::clone(&self.bar_types_cache),
             instruments_cache: Arc::clone(&self.instruments_cache),
             trade_subs: Arc::clone(&self.trade_subs),
@@ -233,6 +235,9 @@ impl BybitWebSocketClient {
 
     /// Sets the timeout for waiting on (re)authentication before failing an
     /// authenticated operation. Defaults to `AUTH_WAIT_TIMEOUT` (5s).
+    ///
+    /// An authentication request that gets no venue reply within this timeout fails, and the
+    /// client discards the messages it holds for replay after a reconnect.
     pub fn set_auth_wait_timeout(&mut self, timeout: Duration) {
         self.auth_wait_timeout = timeout;
     }
@@ -261,10 +266,11 @@ impl BybitWebSocketClient {
             BybitRateLimiter::for_websocket(&resolved_url, None, proxy_url.as_deref());
 
         Self {
-            url: resolved_url,
+            url: resolved_url.into(),
             environment,
             product_type: Some(product_type),
             credential: None,
+            http_client: None,
             requires_auth: false,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
@@ -284,7 +290,6 @@ impl BybitWebSocketClient {
             trade_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
             account_id: None,
-            mm_level: Arc::new(AtomicU8::new(0)),
             transport_backend,
             cancellation_token: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
             proxy_url: proxy_url.map(SecretString::from),
@@ -330,10 +335,11 @@ impl BybitWebSocketClient {
         );
 
         Self {
-            url: resolved_url,
+            url: resolved_url.into(),
             environment,
             product_type: None,
             credential,
+            http_client: None,
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
@@ -353,7 +359,6 @@ impl BybitWebSocketClient {
             trade_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
             account_id: None,
-            mm_level: Arc::new(AtomicU8::new(0)),
             transport_backend,
             cancellation_token: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
             proxy_url: proxy_url.map(SecretString::from),
@@ -363,22 +368,18 @@ impl BybitWebSocketClient {
 
     /// Creates a new Bybit trade WebSocket client for order operations.
     ///
-    /// If `api_key` or `api_secret` are not provided, they will be loaded from
-    /// environment variables based on the environment:
-    /// - Demo: `BYBIT_DEMO_API_KEY`, `BYBIT_DEMO_API_SECRET`
-    /// - Testnet: `BYBIT_TESTNET_API_KEY`, `BYBIT_TESTNET_API_SECRET`
-    /// - Mainnet: `BYBIT_API_KEY`, `BYBIT_API_SECRET`
+    /// Uses the HTTP client's credentials and detects the market-maker level
+    /// in the background through its API-key information endpoint on first use.
     #[must_use]
     pub fn new_trade(
         environment: BybitEnvironment,
-        api_key: Option<String>,
-        api_secret: Option<String>,
+        http_client: BybitHttpClient,
         url: Option<String>,
         heartbeat: u64,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> Self {
-        let credential = Credential::resolve(api_key, api_secret, environment);
+        let credential = http_client.credential().cloned();
 
         let (cmd_tx, _) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
 
@@ -392,10 +393,11 @@ impl BybitWebSocketClient {
         );
 
         Self {
-            url: resolved_url,
+            url: resolved_url.into(),
             environment,
             product_type: None,
             credential,
+            http_client: Some(http_client),
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
@@ -415,7 +417,6 @@ impl BybitWebSocketClient {
             trade_subs: Arc::new(AtomicSet::new()),
             option_greeks_subs: Arc::new(AtomicSet::new()),
             account_id: None,
-            mm_level: Arc::new(AtomicU8::new(0)),
             transport_backend,
             cancellation_token: Arc::new(ArcSwap::from_pointee(CancellationToken::new())),
             proxy_url: proxy_url.map(SecretString::from),
@@ -446,10 +447,15 @@ impl BybitWebSocketClient {
         if !self.task_handle.is_empty() {
             self.close_locked().await?;
         }
+
         self.signal.store(false, Ordering::Relaxed);
         let cancellation_token = CancellationToken::new();
         self.cancellation_token
             .store(Arc::new(cancellation_token.clone()));
+
+        if let Some(http_client) = &self.http_client {
+            http_client.start_mm_detection();
+        }
 
         let (raw_handler, raw_rx) = channel_message_handler();
 
@@ -463,7 +469,7 @@ impl BybitWebSocketClient {
         })?;
 
         let config = WebSocketConfig {
-            url: self.url.clone(),
+            url: self.url.expose().to_owned(),
             headers: Self::default_headers(),
             heartbeat_interval_secs: self.heartbeat,
             heartbeat_payload: Some(ping_msg),
@@ -490,7 +496,7 @@ impl BybitWebSocketClient {
             vec![],
         ));
         let connection_rate_limiter = websocket_connection_limiter(
-            &self.url,
+            self.url.expose(),
             self.proxy_url.as_ref().map(SecretString::expose_secret),
         );
         let connection_rate_keys: Arc<[Ustr]> = Arc::from([websocket_connection_key()]);
@@ -507,13 +513,13 @@ impl BybitWebSocketClient {
             .await
             .map_err(|e| {
                 BybitWsError::Transport(format!(
-                    "Failed to connect to {}: {e}. \
-                    If this is a DNS error, check your network configuration and DNS settings.",
-                    self.url,
+                    "WebSocket connection failed: {}: {}",
+                    self.url.origin(),
+                    e.redacted_message()
                 ))
             })?;
 
-        self.connection_mode.store(client.connection_mode_atomic());
+        let connection_mode = client.connection_mode_atomic();
         let reconnect_handle = client.reconnect_handle();
         client.set_auth_tracker(self.auth_tracker.clone(), self.requires_auth);
 
@@ -531,8 +537,10 @@ impl BybitWebSocketClient {
             // Commands sent before this swap went to a closed channel and close skips
             // unsubscribes, so the new session starts from clean subscription state.
             let _guard = self.subscription_guard.lock().await;
-            *self.cmd_tx.write().await = cmd_tx.clone();
+            let mut command_sender = self.cmd_tx.write().await;
             self.subscriptions.clear();
+            *command_sender = cmd_tx.clone();
+            self.connection_mode.store(connection_mode);
         }
 
         let signal = Arc::clone(&self.signal);
@@ -542,6 +550,7 @@ impl BybitWebSocketClient {
         let cmd_tx_for_reconnect = cmd_tx.clone();
         let auth_tracker = self.auth_tracker.clone();
         let auth_tracker_for_handler = auth_tracker.clone();
+        let auth_timeout = self.auth_wait_timeout;
         let rate_limiter = self.rate_limiter.clone();
         let recv_window_ms = Arc::clone(&self.recv_window_ms);
         let mut rollback = ConnectRollback::new(self);
@@ -552,6 +561,7 @@ impl BybitWebSocketClient {
                 cmd_rx,
                 raw_rx,
                 auth_tracker_for_handler,
+                auth_timeout,
                 subscriptions.clone(),
                 rate_limiter,
                 recv_window_ms,
@@ -877,7 +887,7 @@ impl BybitWebSocketClient {
             // Returns true if this is the first subscription (ref count 0 -> 1)
             if self.subscriptions.add_reference(&topic) {
                 self.subscriptions.mark_subscribe(&topic);
-                topics_to_send.push(topic.clone());
+                topics_to_send.push(topic);
             } else {
                 log::debug!("Already subscribed to {topic}, skipping duplicate subscription");
             }
@@ -921,7 +931,7 @@ impl BybitWebSocketClient {
             // Returns true if this was the last subscription (ref count 1 -> 0)
             if self.subscriptions.remove_reference(&topic) {
                 self.subscriptions.mark_unsubscribe(&topic);
-                topics_to_send.push(topic.clone());
+                topics_to_send.push(topic);
             } else {
                 log::debug!("Topic {topic} still has active subscriptions, not unsubscribing");
             }
@@ -986,11 +996,6 @@ impl BybitWebSocketClient {
     /// Sets the account ID for account message parsing.
     pub fn set_account_id(&mut self, account_id: AccountId) {
         self.account_id = Some(account_id);
-    }
-
-    /// Sets the account market maker level.
-    pub fn set_mm_level(&self, mm_level: u8) {
-        self.mm_level.store(mm_level, Ordering::Relaxed);
     }
 
     /// Returns the account ID if set.
@@ -1657,7 +1662,10 @@ impl BybitWebSocketClient {
         let category = orders[0].category;
         let order_count = orders.len();
 
-        let mm_level = self.mm_level.load(Ordering::Relaxed);
+        let mm_level = self
+            .http_client
+            .as_ref()
+            .map_or(0, BybitHttpClient::mm_level);
         let has_non_post_only = orders
             .iter()
             .any(|o| !matches!(o.time_in_force, Some(BybitTimeInForce::PostOnly)));
@@ -2192,7 +2200,10 @@ impl BybitWebSocketClient {
 
     fn include_referer_header(&self, time_in_force: Option<BybitTimeInForce>) -> bool {
         let is_post_only = matches!(time_in_force, Some(BybitTimeInForce::PostOnly));
-        let mm_level = self.mm_level.load(Ordering::Relaxed);
+        let mm_level = self
+            .http_client
+            .as_ref()
+            .map_or(0, BybitHttpClient::mm_level);
         !(is_post_only && mm_level > 0)
     }
 
@@ -2267,6 +2278,10 @@ fn orderbook_topic(instrument_id: InstrumentId, depth: u32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use futures_util::{SinkExt, StreamExt};
+    use nautilus_common::testing::wait_until_async;
+    use nautilus_network::websocket::auth::AuthState;
+    use nautilus_testkit::connection::race_command_with_publication;
     use rstest::rstest;
 
     use super::*;
@@ -2274,6 +2289,69 @@ mod tests {
         common::{enums::BybitMarketUnit, testing::load_test_json},
         websocket::{messages::BybitWsFrame, parse_bybit_ws_frame},
     };
+
+    #[tokio::test]
+    async fn command_during_sender_publication_reaches_initialized_handler() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (received_tx, mut received_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    let payload: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                    let _ = received_tx.send(payload);
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let mut ws_client = BybitWebSocketClient::new_public(Some(url), 30);
+        let observer = ws_client.clone();
+        let expected = serde_json::json!({
+            "op": "subscribe",
+            "args": [
+                "publicTrade.BTCUSDT"
+            ]
+        });
+
+        let command = HandlerCommand::Subscribe {
+            topics: vec![expected.to_string()],
+        };
+
+        race_command_with_publication(
+            Arc::clone(&ws_client.cmd_tx),
+            ws_client.connect(),
+            move || command,
+            || observer.is_active(),
+        )
+        .await
+        .expect("connect failed");
+        let received = tokio::time::timeout(Duration::from_secs(2), received_rx.recv()).await;
+        ws_client.close().await.expect("disconnect failed");
+        server.abort();
+
+        let payload = received
+            .expect("startup command must reach server")
+            .unwrap();
+        assert_eq!(payload, expected);
+    }
+
+    #[rstest]
+    #[case("wss://stream.example.com/feed", "wss://stream.example.com")]
+    #[case(
+        "wss://SYN-user:SYN-password@stream.example.com:9443/SYN-path?token=SYN-query#SYN-fragment",
+        "wss://stream.example.com:9443"
+    )]
+    fn test_debug_preserves_url_origin(#[case] url: &str, #[case] origin: &str) {
+        let client = BybitWebSocketClient::new_public(Some(url.to_string()), 30);
+        let debug = format!("{client:?}");
+        assert!(debug.contains(&format!("url: {origin:?}")));
+        assert!(!debug.contains("SYN-"));
+        assert_eq!(client.url.expose(), url);
+    }
 
     #[tokio::test]
     async fn test_drop_clone_does_not_cancel_handler() {
@@ -2291,6 +2369,59 @@ mod tests {
 
         assert!(!cancellation_token.is_cancelled());
         assert!(!client.task_handle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reauthentication_without_reply_fails_authentication() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (reauth_tx, reauth_rx) = tokio::sync::oneshot::channel();
+
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let mut first = tokio_tungstenite::accept_async(first).await.unwrap();
+            first.next().await.unwrap().unwrap();
+            first
+                .send(tokio_tungstenite::tungstenite::Message::text(
+                    load_test_json("ws_auth_success.json"),
+                ))
+                .await
+                .unwrap();
+            drop(first);
+            let (replacement, _) = listener.accept().await.unwrap();
+            let mut replacement = tokio_tungstenite::accept_async(replacement).await.unwrap();
+            // The venue never replies to re-authentication
+            reauth_tx
+                .send(replacement.next().await.unwrap().unwrap())
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut client = BybitWebSocketClient::new_private(
+            BybitEnvironment::Testnet,
+            Some("test_api_key".to_string()),
+            Some("test_api_secret".to_string()),
+            Some(format!("ws://{addr}")),
+            20,
+            TransportBackend::default(),
+            None,
+        );
+        client.set_auth_wait_timeout(Duration::from_millis(200));
+        client.connect().await.unwrap();
+        let reauth = tokio::time::timeout(Duration::from_secs(10), reauth_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(reauth.to_text().unwrap()).unwrap();
+        wait_until_async(
+            || async { client.auth_tracker.auth_state() == AuthState::Failed },
+            Duration::from_secs(2),
+        )
+        .await;
+
+        assert_eq!(payload["op"], "auth");
+        client.close().await.unwrap();
+        server.abort();
     }
 
     // An unconnected client rejects every command, so success proves nothing was sent
@@ -2509,8 +2640,7 @@ mod tests {
     async fn batch_chunks_enter_handler_atomically() {
         let client = BybitWebSocketClient::new_trade(
             BybitEnvironment::Testnet,
-            Some("test-key".to_string()),
-            Some("test-secret".to_string()),
+            trade_http_client(),
             None,
             20,
             TransportBackend::default(),
@@ -2565,8 +2695,7 @@ mod tests {
     async fn option_batch_chunks_preserve_request_correlation() {
         let client = BybitWebSocketClient::new_trade(
             BybitEnvironment::Testnet,
-            Some("test-key".to_string()),
-            Some("test-secret".to_string()),
+            trade_http_client(),
             None,
             20,
             TransportBackend::default(),
@@ -2795,8 +2924,7 @@ mod tests {
     fn batch_place_command_carries_smp_type_per_order() {
         let client = BybitWebSocketClient::new_trade(
             BybitEnvironment::Testnet,
-            Some("test-key".to_string()),
-            Some("test-secret".to_string()),
+            trade_http_client(),
             None,
             20,
             TransportBackend::default(),
@@ -2899,8 +3027,7 @@ mod tests {
 
         let client = BybitWebSocketClient::new_trade(
             BybitEnvironment::Testnet,
-            Some("test-key".to_string()),
-            Some("test-secret".to_string()),
+            trade_http_client(),
             None,
             20,
             TransportBackend::default(),
@@ -2971,8 +3098,7 @@ mod tests {
 
         let client = BybitWebSocketClient::new_trade(
             BybitEnvironment::Testnet,
-            Some("test-key".to_string()),
-            Some("test-secret".to_string()),
+            trade_http_client(),
             None,
             20,
             TransportBackend::default(),
@@ -3015,8 +3141,7 @@ mod tests {
     fn test_build_place_order_params_with_bbo_omits_price() {
         let client = BybitWebSocketClient::new_trade(
             BybitEnvironment::Testnet,
-            Some("test-key".to_string()),
-            Some("test-secret".to_string()),
+            trade_http_client(),
             None,
             20,
             TransportBackend::default(),
@@ -3051,5 +3176,20 @@ mod tests {
         assert_eq!(params.price, None);
         assert_eq!(params.bbo_side_type, Some(BybitBboSideType::Queue));
         assert_eq!(params.bbo_level.as_deref(), Some("2"));
+    }
+
+    fn trade_http_client() -> BybitHttpClient {
+        BybitHttpClient::with_credentials(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            Some("http://127.0.0.1:1".to_string()),
+            2,
+            0,
+            1,
+            1,
+            5_000,
+            None,
+        )
+        .unwrap()
     }
 }

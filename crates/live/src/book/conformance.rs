@@ -149,7 +149,8 @@ impl BookStreamChecker {
     ///
     /// # Errors
     ///
-    /// Returns the first contract violation the batch causes.
+    /// Returns an error if the batch violates the book contract. The error reports the first
+    /// violation.
     pub fn apply(&mut self, deltas: &OrderBookDeltas) -> Result<(), BookContractViolation> {
         let checked = self
             .books
@@ -188,8 +189,7 @@ impl BookStreamChecker {
     ///
     /// # Errors
     ///
-    /// Returns [`BookContractViolation::TruthMismatch`] when either side differs, or
-    /// [`BookContractViolation::Unsynced`] before a snapshot since the book opened.
+    /// Returns an error if either side differs or no snapshot has arrived since the book opened.
     pub fn verify(
         &mut self,
         instrument_id: InstrumentId,
@@ -205,7 +205,6 @@ impl BookStreamChecker {
 
         let book_bids: BTreeMap<_, _> = checked.book.bids_as_map(Some(depth)).into_iter().collect();
         let book_asks: BTreeMap<_, _> = checked.book.asks_as_map(Some(depth)).into_iter().collect();
-
         if book_bids != *bids || book_asks != *asks {
             return Err(BookContractViolation::TruthMismatch { sequence });
         }
@@ -251,7 +250,6 @@ impl CheckedBook {
     ) -> Result<(), BookContractViolation> {
         let snapshot = group[0].action == BookAction::Clear;
         let sequence = group[group.len() - 1].sequence;
-
         if group
             .iter()
             .any(|delta| RecordFlag::F_SNAPSHOT.matches(delta.flags) != snapshot)
@@ -465,7 +463,6 @@ mod tests {
         checker.apply(&snapshot(10)).unwrap();
 
         let result = checker.apply(&batch(deltas));
-
         match (result, expected) {
             (Err(BookContractViolation::Integrity(_)), BookContractViolation::Integrity(_)) => {}
             (result, expected) => assert_eq!(result, Err(expected)),
@@ -600,7 +597,6 @@ mod tests {
     #[case::reopened(true)]
     fn verify_requires_snapshot_since_open(#[case] reopened: bool) {
         let mut checker = checker();
-
         if reopened {
             checker.apply(&snapshot(10)).unwrap();
             checker.open(instrument_id());

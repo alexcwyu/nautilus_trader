@@ -15,11 +15,13 @@
 
 use std::fmt::Debug;
 
+use anyhow::Context;
+use jiff::tz::TimeZone;
 use nautilus_common::{
     messages::data::{SubscribeBars, SubscribeCommand},
     msgbus::{self, MStr, Topic, TypedHandler},
 };
-use nautilus_core::UUID4;
+use nautilus_core::{UUID4, datetime::get_timezone};
 use nautilus_model::data::{Bar, BarType, QuoteTick, TradeTick};
 
 use super::{
@@ -30,8 +32,9 @@ use super::{
     TickImbalanceBarAggregator, TickRunsBarAggregator, TimeBarAggregator, UnsubscribeBars,
     UnsubscribeCommand, UnsubscribeQuotes, UnsubscribeTrades, ValueBarAggregator,
     ValueImbalanceBarAggregator, ValueRunsBarAggregator, VolumeBarAggregator,
-    VolumeImbalanceBarAggregator, VolumeRunsBarAggregator, log_error_on_cache_insert,
-    process_engine_bar, request_bar_aggregation_from_params, request_params, switchboard,
+    VolumeImbalanceBarAggregator, VolumeRunsBarAggregator, handlers::WarmupBuffer,
+    log_error_on_cache_insert, process_engine_bar, request_bar_aggregation_from_params,
+    request_params, requests::time_zone_from_params, switchboard,
 };
 
 impl DataEngine {
@@ -96,6 +99,7 @@ impl DataEngine {
                 *bar_type,
                 aggregator_request_id,
                 state.skip_first_non_full_bar,
+                state.time_zone.clone(),
             )?;
             self.setup_bar_aggregator(*bar_type, true, aggregator_request_id)?;
 
@@ -141,7 +145,7 @@ impl DataEngine {
                 })
                 .collect();
 
-            let cache = self.cache.clone();
+            let cache = Rc::clone(&self.cache);
 
             let handler: Box<dyn FnMut(Bar)> = Box::new(move |bar: Bar| {
                 // Request-generated bars are delivered only through the cache.
@@ -165,10 +169,16 @@ impl DataEngine {
 
         let aggregator_request_id = state.aggregator_request_id(*request_id);
 
-        for bar_type in state.bar_types {
+        // Finish each source before the aggregators that depend on it, so the bars from its
+        // replayed live data reach dependents still in historical mode
+        let bar_types = sources_before_dependents(&state.bar_types);
+
+        for bar_type in bar_types {
             let key = bar_aggregator_key(bar_type, aggregator_request_id);
             let has_live_handlers =
                 state.update_subscriptions && self.bar_aggregator_handlers.contains_key(&key);
+
+            self.finish_historical_bar_aggregator(&key, has_live_handlers);
 
             let keep_running = if has_live_handlers {
                 match self.setup_bar_aggregator(bar_type, false, aggregator_request_id) {
@@ -188,7 +198,10 @@ impl DataEngine {
                 aggregator.borrow_mut().set_is_running(keep_running);
             }
 
-            if !state.update_subscriptions
+            let stop_after_request = self.bar_aggregators_pending_stop.contains(&key)
+                && !self.has_pending_shared_bar_aggregation(bar_type);
+
+            if (!state.update_subscriptions || stop_after_request)
                 && let Err(e) = self.stop_bar_aggregator(bar_type, aggregator_request_id)
             {
                 log::error!("Error stopping request bar aggregator for {bar_type}: {e}");
@@ -198,7 +211,33 @@ impl DataEngine {
         true
     }
 
-    pub(super) fn process_request_bar_aggregation_response(&mut self, resp: &DataResponse) {
+    fn finish_historical_bar_aggregator(
+        &mut self,
+        key: &BarAggregatorKey,
+        has_live_handlers: bool,
+    ) {
+        // Replay buffered updates before closing their last historical interval
+        if has_live_handlers
+            && let Some(warmup) = self.bar_aggregator_warmups.remove(key)
+            && let Some(aggregator) = self.bar_aggregators.get(key)
+        {
+            warmup.release(aggregator.borrow_mut().as_mut());
+        }
+
+        if let Some(aggregator) = self.bar_aggregators.get(key) {
+            let mut aggregator = aggregator.borrow_mut();
+
+            if let Some(aggregator) = aggregator.as_any_mut().downcast_mut::<TimeBarAggregator>() {
+                aggregator.flush_pending_historical_bar();
+            }
+        }
+    }
+
+    pub(super) fn process_request_bar_aggregation_response(
+        &mut self,
+        resp: &DataResponse,
+        completed: bool,
+    ) {
         let correlation_id = *resp.correlation_id();
 
         let Some(state) = self.request_bar_aggregations.get(&correlation_id).cloned() else {
@@ -207,24 +246,26 @@ impl DataEngine {
 
         match resp {
             DataResponse::Quotes(r) => {
-                for quote in &r.data {
+                for quote in r.data.iter() {
                     self.update_request_bar_aggregators_from_quote(&state, correlation_id, *quote);
                 }
             }
             DataResponse::Trades(r) => {
-                for trade in &r.data {
+                for trade in r.data.iter() {
                     self.update_request_bar_aggregators_from_trade(&state, correlation_id, *trade);
                 }
             }
             DataResponse::Bars(r) => {
-                for bar in &r.data {
+                for bar in r.data.iter() {
                     self.update_request_bar_aggregators_from_bar(&state, correlation_id, *bar);
                 }
             }
             _ => {}
         }
 
-        self.cleanup_request_bar_aggregators(&correlation_id);
+        if completed {
+            self.cleanup_request_bar_aggregators(&correlation_id);
+        }
     }
 
     pub(super) fn update_request_bar_aggregators_from_quote(
@@ -311,10 +352,14 @@ impl DataEngine {
     }
 
     pub(super) fn subscribe_bars(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
-        match cmd.bar_type.aggregation_source() {
+        let bar_type = cmd
+            .single_bar_type()
+            .expect("native engine receives one bar type");
+
+        match bar_type.aggregation_source() {
             AggregationSource::Internal => self.start_bar_aggregation(cmd)?,
             AggregationSource::External => {
-                if cmd.bar_type.instrument_id().is_synthetic() {
+                if bar_type.instrument_id().is_synthetic() {
                     anyhow::bail!(
                         "Cannot subscribe for externally aggregated synthetic instrument bar data"
                     );
@@ -326,7 +371,9 @@ impl DataEngine {
     }
 
     pub(super) fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) {
-        let bar_type = cmd.bar_type;
+        let bar_type = cmd
+            .single_bar_type()
+            .expect("native engine receives one bar type");
 
         // Don't remove aggregator if other exact-topic subscribers still exist
         let topic = switchboard::get_bars_topic(bar_type.standard());
@@ -343,7 +390,7 @@ impl DataEngine {
             || cmd.clone(),
             |subscribe| {
                 UnsubscribeBars::new(
-                    subscribe.bar_type,
+                    subscribe.bar_types,
                     subscribe.client_id,
                     subscribe.venue,
                     cmd.command_id,
@@ -354,11 +401,24 @@ impl DataEngine {
             },
         );
 
-        if self
-            .bar_aggregators
-            .contains_key(&bar_aggregator_key(bar_type, None))
-        {
-            match self.stop_bar_aggregator(bar_type, None) {
+        let key = bar_aggregator_key(bar_type, None);
+
+        // History retains this instance after its live-source ownership was released
+        if self.bar_aggregators_pending_stop.contains(&key) {
+            return;
+        }
+
+        if self.bar_aggregators.contains_key(&key) {
+            let result = if self.has_pending_shared_bar_aggregation(bar_type) {
+                // Release live data without canceling an accepted historical aggregation
+                self.unsubscribe_bar_aggregator_handlers(&key);
+                self.bar_aggregators_pending_stop.insert(key);
+                Ok(())
+            } else {
+                self.stop_bar_aggregator(bar_type, None)
+            };
+
+            match result {
                 Ok(()) => {
                     self.subscriptions_bar_aggregation
                         .remove(&bar_type.standard());
@@ -368,10 +428,21 @@ impl DataEngine {
             }
         }
 
+        self.release_composite_bar_source(&command);
+    }
+
+    fn release_composite_bar_source(&mut self, command: &UnsubscribeBars) {
         // After stopping a composite, release its source through `unsubscribe_bars`, which frees
         // the client feed recorded in the source's retained command.
-        if command.bar_type.is_composite() {
-            let source_type = command.bar_type.composite();
+        if command
+            .single_bar_type()
+            .expect("retained aggregation has one bar type")
+            .is_composite()
+        {
+            let source_type = command
+                .single_bar_type()
+                .expect("retained aggregation has one bar type")
+                .composite();
 
             if self
                 .bar_aggregators
@@ -390,20 +461,31 @@ impl DataEngine {
         }
     }
 
+    fn has_pending_shared_bar_aggregation(&self, bar_type: BarType) -> bool {
+        self.request_bar_aggregations.values().any(|state| {
+            state.update_subscriptions
+                && state
+                    .bar_types
+                    .iter()
+                    .any(|requested| requested.standard() == bar_type.standard())
+        })
+    }
+
     fn create_bar_aggregator(
         &self,
         instrument: &InstrumentAny,
         bar_type: BarType,
         skip_first_non_full_bar: Option<bool>,
+        time_zone: TimeZone,
     ) -> Box<dyn BarAggregator> {
-        let cache = self.cache.clone();
+        let cache = Rc::clone(&self.cache);
         let validate_sequence = self.config.validate_data_sequence;
 
         let handler = move |bar: Bar| {
             process_engine_bar(&cache, validate_sequence, true, bar);
         };
 
-        let clock = self.clock.clone();
+        let clock = Rc::clone(&self.clock);
         let config = self.config.clone();
 
         let price_precision = instrument.price_precision();
@@ -425,6 +507,7 @@ impl DataEngine {
                 config.time_bars_timestamp_on_close,
                 config.time_bars_interval_type,
                 time_bars_origin_offset,
+                time_zone,
                 config.time_bars_build_delay,
                 skip_first_non_full_bar.unwrap_or(config.time_bars_skip_first_non_full_bar),
             ))
@@ -503,9 +586,25 @@ impl DataEngine {
         bar_type: BarType,
         request_id: Option<UUID4>,
         skip_first_non_full_bar: Option<bool>,
+        time_zone: Option<TimeZone>,
     ) -> anyhow::Result<()> {
         let key = bar_aggregator_key(bar_type, request_id);
-        if self.bar_aggregators.contains_key(&key) {
+
+        let time_zone = match time_zone {
+            Some(zone) => zone,
+            None => get_timezone(self.config.time_bars_time_zone.as_deref().unwrap_or("UTC"))
+                .context("invalid `time_bars_time_zone` configuration")?,
+        };
+
+        if let Some(aggregator) = self.bar_aggregators.get(&key) {
+            let aggregator = aggregator.borrow();
+            if let Some(aggregator) = aggregator.as_any().downcast_ref::<TimeBarAggregator>() {
+                anyhow::ensure!(
+                    aggregator.time_zone() == &time_zone,
+                    "Cannot reuse bar aggregator {bar_type} with a different time zone"
+                );
+            }
+
             return Ok(());
         }
 
@@ -522,7 +621,8 @@ impl DataEngine {
                 .clone()
         };
 
-        let aggregator = self.create_bar_aggregator(&instrument, bar_type, skip_first_non_full_bar);
+        let aggregator =
+            self.create_bar_aggregator(&instrument, bar_type, skip_first_non_full_bar, time_zone);
         debug_assert_eq!(
             aggregator.bar_type(),
             key.0,
@@ -535,7 +635,21 @@ impl DataEngine {
     }
 
     fn start_bar_aggregation(&mut self, cmd: &SubscribeBars) -> anyhow::Result<()> {
-        let key = bar_aggregator_key(cmd.bar_type, None);
+        let bar_type = cmd
+            .single_bar_type()
+            .expect("native engine receives one bar type");
+        let time_zone = time_zone_from_params(cmd.params.as_ref())?;
+        let skip_first_non_full_bar = cmd
+            .params
+            .as_ref()
+            .and_then(|params| params.get_bool("skip_first_non_full_bar"));
+        self.create_bar_aggregator_for_key(
+            bar_type,
+            None,
+            skip_first_non_full_bar,
+            time_zone.clone(),
+        )?;
+        let key = bar_aggregator_key(bar_type, None);
 
         if self
             .bar_aggregators
@@ -545,27 +659,21 @@ impl DataEngine {
         {
             if let Some(source_command) = self
                 .subscriptions_bar_aggregation
-                .get(&cmd.bar_type.standard())
+                .get(&bar_type.standard())
                 .and_then(|subscription| subscription.source.clone())
             {
                 self.execute(DataCommand::Subscribe(source_command));
             }
 
-            log::warn!(
-                "Aggregator for {} is currently in use, subscription can't be started",
-                cmd.bar_type,
-            );
+            log::debug!("Reusing running bar aggregator for {bar_type}");
             return Ok(());
         }
 
-        let skip_first_non_full_bar = cmd
-            .params
-            .as_ref()
-            .and_then(|params| params.get_bool("skip_first_non_full_bar"));
-        self.start_bar_aggregator(cmd.bar_type, None, skip_first_non_full_bar)?;
+        self.start_bar_aggregator(bar_type, None, skip_first_non_full_bar, time_zone)?;
+        self.bar_aggregators_pending_stop.remove(&key);
         let source = self.subscribe_bar_aggregator(cmd);
         self.subscriptions_bar_aggregation.insert(
-            cmd.bar_type.standard(),
+            bar_type.standard(),
             BarAggregationSubscription {
                 command: cmd.clone(),
                 source,
@@ -580,67 +688,33 @@ impl DataEngine {
         bar_type: BarType,
         request_id: Option<UUID4>,
         skip_first_non_full_bar: Option<bool>,
+        time_zone: Option<TimeZone>,
     ) -> anyhow::Result<()> {
         let key = bar_aggregator_key(bar_type, request_id);
-        let bar_type_std = bar_type.standard();
-
-        self.create_bar_aggregator_for_key(bar_type, request_id, skip_first_non_full_bar)?;
+        self.create_bar_aggregator_for_key(
+            bar_type,
+            request_id,
+            skip_first_non_full_bar,
+            time_zone,
+        )?;
         let aggregator = self
             .bar_aggregators
             .get(&key)
-            .ok_or_else(|| anyhow::anyhow!("Cannot start bar aggregation for {bar_type}"))?
-            .clone();
+            .map(Rc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Cannot start bar aggregation for {bar_type}"))?;
+        // A deferred aggregator is still replaying its request in historical mode, so live data
+        // is held back and replayed once the request completes
         let defer_subscription_activation = request_id.is_none()
             && aggregator.borrow().is_running()
             && !self.bar_aggregator_handlers.contains_key(&key);
 
         if !self.bar_aggregator_handlers.contains_key(&key) {
-            // Subscribe to underlying data topics
-            let mut subscriptions = Vec::new();
-
-            if bar_type.is_composite() {
-                let topic = switchboard::get_bars_topic(bar_type.composite());
-                let handler = TypedHandler::new(BarBarHandler::new(&aggregator, bar_type_std));
-                msgbus::subscribe_bars(topic.into(), handler.clone(), None);
-                subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
-            } else if bar_type.spec().price_type == PriceType::Last {
-                let topic = switchboard::get_trades_topic(bar_type.instrument_id());
-                let handler = TypedHandler::new(BarTradeHandler::new(&aggregator, bar_type_std));
-                msgbus::subscribe_trades(
-                    topic.into(),
-                    handler.clone(),
-                    Some(BAR_AGGREGATOR_PRIORITY),
-                );
-                subscriptions.push(BarAggregatorSubscription::Trade { topic, handler });
-            } else {
-                // Warn if imbalance/runs aggregation is wired to quotes (needs aggressor_side from trades)
-                if matches!(
-                    bar_type.spec().aggregation,
-                    BarAggregation::TickImbalance
-                        | BarAggregation::VolumeImbalance
-                        | BarAggregation::ValueImbalance
-                        | BarAggregation::TickRuns
-                        | BarAggregation::VolumeRuns
-                        | BarAggregation::ValueRuns
-                ) {
-                    log::warn!(
-                        "Bar type {bar_type} uses imbalance/runs aggregation which requires trade \
-                         data with `aggressor_side`, but `price_type` is not LAST so it will receive \
-                         quote data: bars will not emit correctly",
-                    );
-                }
-
-                let topic = switchboard::get_quotes_topic(bar_type.instrument_id());
-                let handler = TypedHandler::new(BarQuoteHandler::new(&aggregator, bar_type_std));
-                msgbus::subscribe_quotes(
-                    topic.into(),
-                    handler.clone(),
-                    Some(BAR_AGGREGATOR_PRIORITY),
-                );
-                subscriptions.push(BarAggregatorSubscription::Quote { topic, handler });
-            }
-
-            self.bar_aggregator_handlers.insert(key, subscriptions);
+            self.subscribe_bar_aggregator_handlers(
+                key,
+                bar_type,
+                &aggregator,
+                defer_subscription_activation,
+            );
         }
 
         if defer_subscription_activation {
@@ -654,6 +728,77 @@ impl DataEngine {
         Ok(())
     }
 
+    fn subscribe_bar_aggregator_handlers(
+        &mut self,
+        key: BarAggregatorKey,
+        bar_type: BarType,
+        aggregator: &Rc<RefCell<Box<dyn BarAggregator>>>,
+        defer: bool,
+    ) {
+        // Subscribe to underlying data topics
+        let mut subscriptions = Vec::new();
+
+        let bar_type_std = bar_type.standard();
+        let warmup;
+
+        if bar_type.is_composite() {
+            let topic = switchboard::get_bars_topic(bar_type.composite());
+            let buffer = defer.then(WarmupBuffer::new);
+
+            let handler = TypedHandler::new(
+                BarBarHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+            );
+
+            warmup = buffer.map(BarAggregatorWarmup::Bar);
+            msgbus::subscribe_bars(topic.into(), handler.clone(), None);
+            subscriptions.push(BarAggregatorSubscription::Bar { topic, handler });
+        } else if bar_type.spec().price_type == PriceType::Last {
+            let topic = switchboard::get_trades_topic(bar_type.instrument_id());
+            let buffer = defer.then(WarmupBuffer::new);
+
+            let handler = TypedHandler::new(
+                BarTradeHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+            );
+
+            warmup = buffer.map(BarAggregatorWarmup::Trade);
+            msgbus::subscribe_trades(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
+            subscriptions.push(BarAggregatorSubscription::Trade { topic, handler });
+        } else {
+            // Warn if imbalance/runs aggregation is wired to quotes (needs aggressor_side from trades)
+            if matches!(
+                bar_type.spec().aggregation,
+                BarAggregation::TickImbalance
+                    | BarAggregation::VolumeImbalance
+                    | BarAggregation::ValueImbalance
+                    | BarAggregation::TickRuns
+                    | BarAggregation::VolumeRuns
+                    | BarAggregation::ValueRuns
+            ) {
+                log::warn!(
+                    "Bar type {bar_type} uses imbalance/runs aggregation which requires trade \
+                     data with `aggressor_side`, but `price_type` is not LAST so it will receive \
+                     quote data: bars will not emit correctly",
+                );
+            }
+
+            let topic = switchboard::get_quotes_topic(bar_type.instrument_id());
+            let buffer = defer.then(WarmupBuffer::new);
+
+            let handler = TypedHandler::new(
+                BarQuoteHandler::new(aggregator, bar_type_std).with_warmup(buffer.clone()),
+            );
+
+            warmup = buffer.map(BarAggregatorWarmup::Quote);
+            msgbus::subscribe_quotes(topic.into(), handler.clone(), Some(BAR_AGGREGATOR_PRIORITY));
+            subscriptions.push(BarAggregatorSubscription::Quote { topic, handler });
+        }
+
+        self.bar_aggregator_handlers.insert(key, subscriptions);
+        if let Some(warmup) = warmup {
+            self.bar_aggregator_warmups.insert(key, warmup);
+        }
+    }
+
     fn subscribe_bar_aggregator(&mut self, cmd: &SubscribeBars) -> Option<SubscribeCommand> {
         let subscribe = self.bar_aggregator_source_command(cmd)?;
         self.execute(DataCommand::Subscribe(subscribe.clone()));
@@ -661,17 +806,17 @@ impl DataEngine {
     }
 
     fn bar_aggregator_source_command(&self, cmd: &SubscribeBars) -> Option<SubscribeCommand> {
-        let key = bar_aggregator_key(cmd.bar_type, None);
+        let bar_type = cmd
+            .single_bar_type()
+            .expect("native engine receives one bar type");
+        let key = bar_aggregator_key(bar_type, None);
         if !self.bar_aggregators.contains_key(&key) {
-            log::error!(
-                "Cannot subscribe bar aggregator: no aggregator found for {}",
-                cmd.bar_type,
-            );
+            log::error!("Cannot subscribe bar aggregator: no aggregator found for {bar_type}");
             return None;
         }
 
-        if cmd.bar_type.is_composite() {
-            let composite_bar_type = cmd.bar_type.composite();
+        if bar_type.is_composite() {
+            let composite_bar_type = bar_type.composite();
             if composite_bar_type.is_externally_aggregated() {
                 let subscribe = SubscribeBars::new(
                     composite_bar_type,
@@ -684,9 +829,9 @@ impl DataEngine {
                 );
                 return Some(SubscribeCommand::Bars(subscribe));
             }
-        } else if cmd.bar_type.spec().price_type == PriceType::Last {
+        } else if bar_type.spec().price_type == PriceType::Last {
             let subscribe = SubscribeTrades::new(
-                cmd.bar_type.instrument_id(),
+                bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
                 UUID4::new(),
@@ -697,7 +842,7 @@ impl DataEngine {
             return Some(SubscribeCommand::Trades(subscribe));
         } else {
             let subscribe = SubscribeQuotes::new(
-                cmd.bar_type.instrument_id(),
+                bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
                 UUID4::new(),
@@ -727,7 +872,7 @@ impl DataEngine {
         })?;
 
         // Set historical mode and handler
-        let cache = self.cache.clone();
+        let cache = Rc::clone(&self.cache);
         let validate_sequence = self.config.validate_data_sequence;
         let publish = !historical;
 
@@ -752,19 +897,72 @@ impl DataEngine {
                 let aggregator_weak = Rc::downgrade(aggregator);
                 aggregator.borrow_mut().set_aggregator_weak(aggregator_weak);
             } else {
-                aggregator.borrow_mut().set_clock(self.clock.clone());
+                aggregator.borrow_mut().set_clock(Rc::clone(&self.clock));
                 aggregator
                     .borrow_mut()
-                    .start_timer(Some(aggregator.clone()));
+                    .start_timer(Some(Rc::clone(aggregator)));
             }
+        }
+
+        if !historical && request_id.is_none() {
+            self.connect_time_bar_sources(bar_type);
         }
 
         Ok(())
     }
 
+    fn connect_time_bar_sources(&self, bar_type: BarType) {
+        let bar_types = self
+            .subscriptions_bar_aggregation
+            .values()
+            .map(|subscription| {
+                subscription
+                    .command
+                    .single_bar_type()
+                    .expect("retained aggregation has one bar type")
+            })
+            .chain(std::iter::once(bar_type));
+
+        for bar_type in bar_types {
+            if !bar_type.is_composite()
+                || !bar_type.spec().is_time_aggregated()
+                || !bar_type.composite().is_internally_aggregated()
+                || !bar_type.composite().spec().is_time_aggregated()
+            {
+                continue;
+            }
+
+            let Some(source) = self
+                .bar_aggregators
+                .get(&bar_aggregator_key(bar_type.composite(), None))
+            else {
+                continue;
+            };
+
+            let Some(aggregator) = self
+                .bar_aggregators
+                .get(&bar_aggregator_key(bar_type, None))
+            else {
+                continue;
+            };
+
+            if let Some(aggregator) = aggregator
+                .borrow_mut()
+                .as_any_mut()
+                .downcast_mut::<TimeBarAggregator>()
+            {
+                aggregator.set_timer_source(Rc::downgrade(source));
+            }
+        }
+    }
+
     fn unsubscribe_bar_aggregator(&mut self, cmd: &UnsubscribeBars) {
-        if cmd.bar_type.is_composite() {
-            let composite_bar_type = cmd.bar_type.composite();
+        let bar_type = cmd
+            .single_bar_type()
+            .expect("native engine receives one bar type");
+
+        if bar_type.is_composite() {
+            let composite_bar_type = bar_type.composite();
             if composite_bar_type.is_externally_aggregated() {
                 let unsubscribe = UnsubscribeBars::new(
                     composite_bar_type,
@@ -779,9 +977,9 @@ impl DataEngine {
                     unsubscribe,
                 )));
             }
-        } else if cmd.bar_type.spec().price_type == PriceType::Last {
+        } else if bar_type.spec().price_type == PriceType::Last {
             let unsubscribe = UnsubscribeTrades::new(
-                cmd.bar_type.instrument_id(),
+                bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
                 UUID4::new(),
@@ -794,7 +992,7 @@ impl DataEngine {
             )));
         } else {
             let unsubscribe = UnsubscribeQuotes::new(
-                cmd.bar_type.instrument_id(),
+                bar_type.instrument_id(),
                 cmd.client_id,
                 cmd.venue,
                 UUID4::new(),
@@ -806,6 +1004,17 @@ impl DataEngine {
                 unsubscribe,
             )));
         }
+    }
+
+    pub(super) fn clear_bar_aggregators(&mut self) {
+        let keys: Vec<BarAggregatorKey> = self.bar_aggregators.keys().copied().collect();
+        for (bar_type, request_id) in keys {
+            if let Err(e) = self.stop_bar_aggregator(bar_type, request_id) {
+                log::error!("Error stopping bar aggregator during reset for {bar_type}: {e}");
+            }
+        }
+
+        self.subscriptions_bar_aggregation.clear();
     }
 
     pub(super) fn stop_bar_aggregator(
@@ -820,9 +1029,17 @@ impl DataEngine {
         })?;
 
         aggregator.borrow_mut().stop();
+        self.bar_aggregators_pending_stop.remove(&key);
+        self.unsubscribe_bar_aggregator_handlers(&key);
+
+        Ok(())
+    }
+
+    fn unsubscribe_bar_aggregator_handlers(&mut self, key: &BarAggregatorKey) {
+        self.bar_aggregator_warmups.remove(key);
 
         // Unsubscribe any registered message handlers
-        if let Some(subs) = self.bar_aggregator_handlers.remove(&key) {
+        if let Some(subs) = self.bar_aggregator_handlers.remove(key) {
             for sub in subs {
                 match sub {
                     BarAggregatorSubscription::Bar { topic, handler } => {
@@ -837,8 +1054,6 @@ impl DataEngine {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -858,6 +1073,62 @@ pub(crate) type BarAggregatorKey = (BarType, Option<UUID4>);
 #[inline]
 pub(crate) fn bar_aggregator_key(bar_type: BarType, request_id: Option<UUID4>) -> BarAggregatorKey {
     (bar_type.standard(), request_id)
+}
+
+/// Returns `bar_types` ordered so that every composite follows the bar type it aggregates from.
+///
+/// Bar types at the same depth of the chain keep their original order.
+fn sources_before_dependents(bar_types: &[BarType]) -> Vec<BarType> {
+    // Depth is bounded by the number of bar types so a cyclic chain cannot loop
+    let depth = |bar_type: &BarType| {
+        let mut depth = 0;
+        let mut current = *bar_type;
+
+        while current.is_composite() && depth < bar_types.len() {
+            let Some(source) = bar_types
+                .iter()
+                .find(|candidate| candidate.standard() == current.composite().standard())
+            else {
+                break;
+            };
+            current = *source;
+            depth += 1;
+        }
+
+        depth
+    };
+
+    let mut ordered = bar_types.to_vec();
+    ordered.sort_by_cached_key(depth);
+    ordered
+}
+
+/// Live data held back for a bar aggregator that is still replaying a historical request.
+#[derive(Debug)]
+pub(super) enum BarAggregatorWarmup {
+    Bar(WarmupBuffer<Bar>),
+    Trade(WarmupBuffer<TradeTick>),
+    Quote(WarmupBuffer<QuoteTick>),
+}
+
+impl BarAggregatorWarmup {
+    /// Ends the warm-up and feeds the held data to `aggregator` in arrival order.
+    pub(super) fn release(&self, aggregator: &mut dyn BarAggregator) {
+        match self {
+            Self::Bar(buffer) => buffer
+                .release()
+                .into_iter()
+                .for_each(|bar| aggregator.handle_bar(bar)),
+            Self::Trade(buffer) => buffer
+                .release()
+                .into_iter()
+                .for_each(|trade| aggregator.handle_trade(trade)),
+            Self::Quote(buffer) => buffer
+                .release()
+                .into_iter()
+                .for_each(|quote| aggregator.handle_quote(quote)),
+        }
+    }
 }
 
 /// Typed subscription for bar aggregator handlers.
@@ -899,5 +1170,267 @@ impl Debug for BarAggregatorSubscription {
                 .field("handler_id", &handler.id())
                 .finish(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use indexmap::IndexMap;
+    use jiff::Timestamp;
+    use nautilus_common::{
+        cache::Cache,
+        clock::{Clock, VirtualClock},
+        messages::data::SubscribeBars,
+        msgbus::MessageBus,
+    };
+    use nautilus_core::{UUID4, UnixNanos, datetime::get_timezone};
+    use nautilus_model::{
+        data::{Bar, BarType},
+        identifiers::TraderId,
+        instruments::{InstrumentAny, stubs::audusd_sim},
+        types::{Price, Quantity},
+    };
+    use rstest::rstest;
+
+    use super::{
+        bar_aggregator_key, request_bar_aggregation_from_params, sources_before_dependents,
+        time_zone_from_params,
+    };
+    use crate::engine::{DataEngine, config::DataEngineConfig};
+
+    #[rstest]
+    #[case::utc_default(None, None, "2026-11-02T00:00:00Z")]
+    #[case::config(Some("America/New_York"), None, "2026-11-02T05:00:00Z")]
+    #[case::utc_override(Some("America/New_York"), Some("UTC"), "2026-11-02T00:00:00Z")]
+    fn test_calendar_zone_precedence_and_reuse(
+        #[case] config_zone: Option<&str>,
+        #[case] override_zone: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let _msgbus = MessageBus::new(TraderId::new("TESTER-001"), UUID4::new(), None, None)
+            .register_message_bus();
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        clock.borrow_mut().set_time(UnixNanos::from(
+            "2026-11-01T12:00:00Z".parse::<Timestamp>().unwrap(),
+        ));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
+            .unwrap();
+        let config = DataEngineConfig::builder()
+            .maybe_time_bars_time_zone(config_zone.map(str::to_owned))
+            .time_bars_skip_first_non_full_bar(true)
+            .build();
+        let mut engine = DataEngine::new(
+            Rc::clone(&clock) as Rc<RefCell<dyn Clock>>,
+            Rc::clone(&cache),
+            Some(config),
+        );
+        let bar_type = BarType::from("AUD/USD.SIM-1-DAY-LAST-INTERNAL");
+        let mut params = IndexMap::from([(
+            "skip_first_non_full_bar".to_owned(),
+            serde_json::json!(false),
+        )]);
+
+        if let Some(zone) = override_zone {
+            params.insert("time_zone".to_owned(), serde_json::json!(zone));
+        }
+
+        let cmd = SubscribeBars::new(
+            bar_type,
+            None,
+            Some(bar_type.instrument_id().venue),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            Some(nautilus_core::Params::new(params)),
+        );
+        engine.subscribe_bars(&cmd).unwrap();
+        engine.subscribe_bars(&cmd).unwrap();
+        let mut params = IndexMap::clone(cmd.params.as_ref().unwrap());
+        params.insert("time_zone".to_owned(), serde_json::json!("Asia/Tokyo"));
+
+        let cmd = SubscribeBars {
+            params: Some(nautilus_core::Params::new(params)),
+            ..cmd
+        };
+
+        let e = engine.subscribe_bars(&cmd).unwrap_err();
+
+        // Request-local instances can use another zone without replacing the live instance
+        engine
+            .create_bar_aggregator_for_key(
+                bar_type,
+                Some(UUID4::new()),
+                None,
+                Some(get_timezone("Asia/Tokyo").unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            e.to_string(),
+            format!("Cannot reuse bar aggregator {bar_type} with a different time zone")
+        );
+        assert_eq!(
+            clock.borrow().next_time_ns(&format!("TIME_BAR_{bar_type}")),
+            Some(UnixNanos::from(expected.parse::<Timestamp>().unwrap()))
+        );
+        let now = clock.borrow().timestamp_ns();
+        engine
+            .bar_aggregators
+            .get(&bar_aggregator_key(bar_type, None))
+            .unwrap()
+            .borrow_mut()
+            .update(Price::from("0.65000"), Quantity::from(2), now);
+        let close = UnixNanos::from(expected.parse::<Timestamp>().unwrap());
+        let events = clock.borrow_mut().advance_time(close, true);
+        let handlers = clock.borrow().match_handlers(events);
+        for handler in handlers {
+            handler.callback.call(handler.event);
+        }
+
+        assert_eq!(
+            cache.borrow().bar(&bar_type).copied(),
+            Some(Bar::new(
+                bar_type,
+                Price::from("0.65000"),
+                Price::from("0.65000"),
+                Price::from("0.65000"),
+                Price::from("0.65000"),
+                Quantity::from(2),
+                close,
+                close
+            ))
+        );
+    }
+
+    #[rstest]
+    #[case::wrong_type(serde_json::json!(17), "`time_zone` parameter must be a string")]
+    #[case::unknown_zone(serde_json::json!("Not/A_Zone"), "invalid `time_zone` parameter \"Not/A_Zone\"")]
+    fn test_calendar_zone_parameter_rejects_invalid_value(
+        #[case] value: serde_json::Value,
+        #[case] expected: &str,
+    ) {
+        let params = nautilus_core::Params::new([("time_zone".to_owned(), value)].into());
+        assert_eq!(
+            time_zone_from_params(Some(&params))
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+    }
+
+    #[rstest]
+    fn test_calendar_request_zone_checks_shared_instance() {
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim()))
+            .unwrap();
+        let mut engine = DataEngine::new(clock, cache, None);
+        let bar_type = BarType::from("AUD/USD.SIM-1-MONTH-LAST-INTERNAL");
+        engine
+            .create_bar_aggregator_for_key(bar_type, None, None, None)
+            .unwrap();
+        let params: nautilus_core::Params = serde_json::from_value(serde_json::json!({
+            "bar_types": [bar_type.to_string()], "update_subscriptions": true,
+            "time_zone": "America/New_York"
+        }))
+        .unwrap();
+        let state = request_bar_aggregation_from_params(Some(&params))
+            .unwrap()
+            .unwrap();
+        let id = UUID4::new();
+        let error = engine
+            .prepare_request_bar_aggregators_from_state(id, &state)
+            .unwrap_err();
+        let mut params = IndexMap::clone(&params);
+        params.insert("update_subscriptions".to_owned(), serde_json::json!(false));
+        let params = nautilus_core::Params::new(params);
+        let state = request_bar_aggregation_from_params(Some(&params))
+            .unwrap()
+            .unwrap();
+        engine
+            .prepare_request_bar_aggregators_from_state(id, &state)
+            .unwrap();
+        let instance = engine
+            .bar_aggregators
+            .get(&bar_aggregator_key(bar_type, Some(id)))
+            .unwrap()
+            .borrow();
+        let request_zone = instance
+            .as_any()
+            .downcast_ref::<crate::aggregation::TimeBarAggregator>()
+            .unwrap()
+            .time_zone()
+            .clone();
+        let live = engine
+            .bar_aggregators
+            .get(&bar_aggregator_key(bar_type, None))
+            .unwrap()
+            .borrow();
+        let live_zone = live
+            .as_any()
+            .downcast_ref::<crate::aggregation::TimeBarAggregator>()
+            .unwrap()
+            .time_zone()
+            .clone();
+        assert_eq!(
+            error.to_string(),
+            format!("Cannot reuse bar aggregator {bar_type} with a different time zone")
+        );
+        assert_eq!(request_zone, get_timezone("America/New_York").unwrap());
+        assert_eq!(live_zone, jiff::tz::TimeZone::UTC);
+        assert_eq!(engine.bar_aggregators.len(), 2);
+    }
+
+    #[rstest]
+    #[case::source_first(&["1-MINUTE-MID-INTERNAL", "5-MINUTE-MID-INTERNAL@1-MINUTE-INTERNAL"])]
+    #[case::composite_first(&["5-MINUTE-MID-INTERNAL@1-MINUTE-INTERNAL", "1-MINUTE-MID-INTERNAL"])]
+    fn test_sources_before_dependents_orders_two_level_chain(#[case] raw: &[&str]) {
+        let bar_types = to_bar_types(raw);
+
+        let ordered = sources_before_dependents(&bar_types);
+
+        assert_eq!(
+            ordered,
+            to_bar_types(&[
+                "1-MINUTE-MID-INTERNAL",
+                "5-MINUTE-MID-INTERNAL@1-MINUTE-INTERNAL",
+            ])
+        );
+    }
+
+    #[rstest]
+    fn test_sources_before_dependents_orders_three_level_chain_and_keeps_unrelated_order() {
+        let bar_types = to_bar_types(&[
+            "15-MINUTE-MID-INTERNAL@5-MINUTE-INTERNAL",
+            "100-TICK-LAST-INTERNAL",
+            "5-MINUTE-MID-INTERNAL@1-MINUTE-INTERNAL",
+            "1-MINUTE-MID-INTERNAL",
+            "50-TICK-LAST-INTERNAL",
+        ]);
+
+        let ordered = sources_before_dependents(&bar_types);
+
+        assert_eq!(
+            ordered,
+            to_bar_types(&[
+                "100-TICK-LAST-INTERNAL",
+                "1-MINUTE-MID-INTERNAL",
+                "50-TICK-LAST-INTERNAL",
+                "5-MINUTE-MID-INTERNAL@1-MINUTE-INTERNAL",
+                "15-MINUTE-MID-INTERNAL@5-MINUTE-INTERNAL",
+            ])
+        );
+    }
+
+    fn to_bar_types(raw: &[&str]) -> Vec<BarType> {
+        raw.iter()
+            .map(|bar_type| BarType::from(format!("AUD/USD.SIM-{bar_type}").as_str()))
+            .collect()
     }
 }

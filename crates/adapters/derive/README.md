@@ -13,21 +13,31 @@ The `nautilus-derive` crate implements the Derive adapter for NautilusTrader, in
 and WebSocket clients, REST and stream models, venue parsing, data and execution client wiring, and
 EIP-712 signing for the official **Derive API**.
 
-Derive offers European-style options, perpetual swaps, and spot markets on the Derive Chain, an
-optimistic rollup that settles to Ethereum. Orders match off-chain and settle on-chain while users
-retain custody through per-user smart-contract wallets.
+Derive offers European-style options, perpetual swaps, and spot markets. The v3 API authenticates
+the owner's EOA or multisig through a session-key signer. Orders match off-chain, and operations
+are batched for settlement on Ethereum while users retain custody.
+
+Order quantities must use base units. The adapter denies quote-denominated quantities before
+submission, including conditional orders and every leg of an affected order list. Public payload
+converters also reject quote-denominated quantities.
+
+The official Derive API reference can be found at <https://docs.derive.xyz/>.
 
 ## NautilusTrader
 
-[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native
-engine for multi-asset, multi-venue trading systems.
+[NautilusTrader](https://nautilustrader.io) is an open-source, production-grade, Rust-native trading engine
+with a deterministic, event-driven architecture for multi-asset, multi-venue systems.
 
-The system spans research, deterministic simulation, and live execution within a single
-event-driven architecture, providing research-to-live semantic parity.
+The system spans research, simulation, and live execution, providing research-to-live semantic parity.
+
+## Configuration
+
+See the [integration guide](../../../docs/integrations/derive.md) for client settings,
+credentials, and connection setup.
 
 ## Feature flags
 
-This crate provides feature flags to control source code inclusion during compilation:
+Feature flags control code inclusion for Rust builds and Python bindings:
 
 - `examples`: Enables the crate's example binaries.
 - `extension-module`: Builds as a Python extension module.
@@ -36,6 +46,14 @@ This crate provides feature flags to control source code inclusion during compil
   [high-precision mode](https://nautilustrader.io/docs/nightly/getting_started/installation/#precision-mode)
   to use 128-bit value types.
 - `python`: Enables Python bindings from [PyO3](https://pyo3.rs).
+- `simulation`: Enables deterministic simulation with `cfg(madsim)`.
+
+## Integrator attribution
+
+Signed order, replace, and trigger-order payloads set `referral_code` to `nautilus`,
+with no additional trading cost.
+
+See [attribution details](../../../docs/integrations/derive.md#referral-code-attribution).
 
 ## Fuzzing
 
@@ -45,8 +63,10 @@ nightly toolchain.
 
 ## Documentation
 
-See the [Derive integration guide](https://nautilustrader.io/docs/nightly/integrations/derive/)
-and [crate docs](https://docs.rs/nautilus-derive) for more detailed usage.
+- [Rust API reference](https://docs.rs/nautilus-derive)
+- [Integration guide](../../../docs/integrations/derive.md)
+- [Rust examples](examples/)
+- [Python examples](../../../examples/live/derive/)
 
 ## License
 

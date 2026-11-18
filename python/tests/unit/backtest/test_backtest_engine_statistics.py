@@ -35,10 +35,12 @@ def _float_maps_equal(a: dict[str, float], b: dict[str, float]) -> bool:
     """
     if a.keys() != b.keys():
         return False
+
     for key in a:
         va, vb = a[key], b[key]
         if math.isnan(va) and math.isnan(vb):
             continue
+
         if va != vb:
             return False
     return True
@@ -96,4 +98,19 @@ def test_engine_portfolio_statistics_equals_result() -> None:
     assert _nested_float_maps_equal(stats.pnls, result.stats_pnls)
     assert _float_maps_equal(stats.returns, result.stats_returns)
     assert _float_maps_equal(stats.general, result.stats_general)
+    engine.dispose()
+
+
+def test_engine_statistics_are_ordered_by_name() -> None:
+    """
+    Test engine statistics are ordered by name.
+    """
+    engine = _engine_with_account()
+    engine.run()
+    stats = engine.portfolio.statistics()
+    result = engine.get_result()
+    assert list(stats.pnls["USD"]) == sorted(stats.pnls["USD"])
+    assert list(stats.returns) == sorted(stats.returns)
+    assert list(result.stats_pnls["USD"]) == sorted(result.stats_pnls["USD"])
+    assert list(result.stats_returns) == sorted(result.stats_returns)
     engine.dispose()

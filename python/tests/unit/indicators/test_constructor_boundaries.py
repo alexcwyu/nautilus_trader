@@ -31,6 +31,7 @@ from nautilus_trader.model import InstrumentId
 MAX_PERIOD = 1 << 24
 MAX_USIZE = 2 * sys.maxsize + 1
 INSTRUMENT_ID = InstrumentId.from_str("ETHUSDT-PERP.BINANCE")
+
 MOVING_AVERAGE_TYPES = (
     indicators.MovingAverageType.Simple,
     indicators.MovingAverageType.Exponential,
@@ -135,7 +136,7 @@ def test_bounded_constructor_rejects_invalid_sizes(
     Reject invalid sizes through ordinary Python exceptions.
     """
     expected = OverflowError if name == "ZScore" and invalid > sys.maxsize else ValueError
-    pattern = "too large" if expected is OverflowError else r"period|displacement|slowing"
+    pattern = r"too (?:large|big)" if expected is OverflowError else r"period|displacement|slowing"
     with pytest.raises(expected, match=pattern):
         getattr(indicators, name)(**(kwargs | {field: invalid}))
 
@@ -344,6 +345,7 @@ def test_fuzzy_candle_constructor_preserves_distinct_fields() -> None:
         indicators.CandleWickSize.Small,
         indicators.CandleWickSize.Large,
     )
+
     assert candle.direction == indicators.CandleDirection.Bull
     assert candle.size == indicators.CandleSize.Large
     assert candle.body_size == indicators.CandleBodySize.Medium

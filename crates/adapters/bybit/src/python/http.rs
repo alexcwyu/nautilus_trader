@@ -538,8 +538,8 @@ impl BybitHttpClient {
     /// Request instruments for a given product type.
     ///
     /// When `base_coin` is provided, the request is narrowed to that base coin.
-    /// This is required for `Option`: Bybit's API returns only `BTC` options when
-    /// `baseCoin` is omitted.
+    /// `Option` requests with neither `symbol` nor `base_coin` load all listed
+    /// base coins.
     ///
     /// # Errors
     ///
@@ -775,7 +775,8 @@ impl BybitHttpClient {
         client_order_id=None,
         venue_order_id=None,
         quantity=None,
-        price=None
+        price=None,
+        trigger_price=None
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_modify_order<'py>(
@@ -788,6 +789,7 @@ impl BybitHttpClient {
         venue_order_id: Option<VenueOrderId>,
         quantity: Option<Quantity>,
         price: Option<Price>,
+        trigger_price: Option<Price>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.clone();
 
@@ -801,6 +803,7 @@ impl BybitHttpClient {
                     venue_order_id,
                     quantity,
                     price,
+                    trigger_price,
                 )
                 .await
                 .map_err(to_pyvalue_err)?;
@@ -809,7 +812,9 @@ impl BybitHttpClient {
         })
     }
 
-    /// Cancel an order.
+    /// Cancels an order and returns its confirmed terminal status.
+    ///
+    /// Polls until the order closes, bounded by the configured HTTP timeout.
     ///
     /// # Errors
     ///
@@ -818,6 +823,7 @@ impl BybitHttpClient {
     /// - The request fails.
     /// - The order doesn't exist.
     /// - The API returns an error.
+    /// - Terminal status confirmation times out.
     #[pyo3(name = "cancel_order")]
     #[pyo3(signature = (account_id, product_type, instrument_id, client_order_id=None, venue_order_id=None))]
     fn py_cancel_order<'py>(
@@ -1166,14 +1172,14 @@ impl BybitHttpClient {
         })
     }
 
-    /// Request multiple order status reports.
-    ///
-    /// Orders for instruments not currently loaded in cache will be skipped.
+    /// Requests multiple order status reports.
     ///
     /// When `open_only` is true the realtime endpoint is queried for currently
     /// open orders and again for recently closed orders, so terminal reports
-    /// are included. The closed pass fetches the most recent page only and is
-    /// not constrained by `start` or `end`.
+    /// are included. The closed pass fetches the most recent page only.
+    ///
+    /// Terminal orders are filtered by `updatedTime` against `start` and `end`.
+    /// Open orders are returned regardless of age.
     ///
     /// # Errors
     ///
@@ -1181,6 +1187,7 @@ impl BybitHttpClient {
     /// - Credentials are missing.
     /// - The request fails.
     /// - The API returns an error.
+    /// - A returned order has no symbol, has no cached instrument, or cannot be parsed.
     #[pyo3(name = "request_order_status_reports")]
     #[pyo3(signature = (account_id, product_type, instrument_id=None, open_only=false, start=None, end=None, limit=None))]
     #[expect(clippy::too_many_arguments)]
@@ -1224,11 +1231,15 @@ impl BybitHttpClient {
 
     /// Fetches execution history (fills) for the account and returns a list of `FillReport`s.
     ///
-    /// Executions for instruments not currently loaded in cache will be skipped.
+    /// Funding executions are skipped.
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A returned fill has no symbol, has no cached instrument, or cannot be parsed.
     ///
     /// # References
     ///
@@ -1267,12 +1278,20 @@ impl BybitHttpClient {
 
     /// Fetches position information for the account and returns a list of `PositionStatusReport`s.
     ///
-    /// Positions for instruments not currently loaded in cache will be skipped.
+    /// Derivative position reports fail as a set if any row cannot be resolved or parsed.
+    /// When SPOT position reports are enabled, the requested instrument must be cached.
     ///
     /// # Errors
     ///
-    /// This function returns an error if the request fails, or if SPOT position reports are enabled
-    /// and no instrument is specified, because wallet balances carry no pair identity.
+    /// Returns an error if:
+    /// - The request fails.
+    /// - The instrument ID is invalid.
+    /// - Pagination cannot advance.
+    /// - A derivative position row has no symbol.
+    /// - A derivative position's instrument, or the requested SPOT instrument, is not cached.
+    /// - A derivative position row cannot be parsed.
+    /// - SPOT position reports are enabled and no instrument is specified, because wallet balances
+    ///   carry no pair identity.
     ///
     /// # References
     ///

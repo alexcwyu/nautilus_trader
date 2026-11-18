@@ -217,28 +217,24 @@ impl ParquetDataCatalog {
                 continue;
             }
 
-            let path_parts: Vec<&str> = path_str.split('/').collect();
+            let directory = path_str
+                .rsplit_once('/')
+                .map_or(path_str.as_str(), |(directory, _)| directory);
 
-            let Some(data_index) = path_parts.iter().position(|part| *part == "data") else {
+            let (Some(type_dir), Some(identifier)) =
+                self.extract_data_cls_and_identifier_from_path(directory)?
+            else {
                 continue;
             };
 
-            let Some(type_dir) = path_parts.get(data_index + 1) else {
-                continue;
-            };
-
-            let type_dir = decode_object_store_segment(type_dir);
+            let type_dir = decode_object_store_segment(&type_dir);
             if !is_parquet_instrument_type_prefix(&type_dir)
                 || instrument_type.is_some_and(|value| instrument_path_prefix(value) != type_dir)
             {
                 continue;
             }
 
-            if path_parts.len() < data_index + 4 {
-                continue;
-            }
-
-            let instrument_id_dir = decode_object_store_segment(path_parts[path_parts.len() - 2]);
+            let instrument_id_dir = decode_object_store_segment(&identifier);
 
             if let Some(ids) = instrument_ids
                 && !ids
@@ -668,9 +664,10 @@ impl ParquetDataCatalog {
             let name = table_name(tables.len());
             let path = self.resolve_directory_for_datafusion(&directory);
 
-            if self
-                .session
-                .try_register_parquet_files_table(&name, vec![path.clone()])?
+            if !self.has_pending_consolidation(&directory)?
+                && self
+                    .session
+                    .try_register_parquet_files_table(&name, vec![path.clone()])?
             {
                 tables.push(DataFusionTable {
                     name,
@@ -777,7 +774,7 @@ impl ParquetDataCatalog {
 
         let mut all_data = Vec::new();
 
-        for file in files {
+        for (index, file) in files.into_iter().enumerate() {
             let object_path = self.to_object_path_parsed(&file)?;
 
             let mut decode_metadata = self.execute_async(|| async {
@@ -795,7 +792,7 @@ impl ParquetDataCatalog {
             let safe_sql_identifier = make_sql_safe_identifier(identifier);
             let safe_filename = extract_sql_safe_filename(&file);
             let table_name =
-                format!("custom_{safe_type_name}_{safe_sql_identifier}_{safe_filename}");
+                format!("custom_{safe_type_name}_{safe_sql_identifier}_{safe_filename}_{index}");
             let resolved_path = self.resolve_path_for_datafusion(&file);
             let sql_query = build_query(&table_name, start, end, where_clause);
 

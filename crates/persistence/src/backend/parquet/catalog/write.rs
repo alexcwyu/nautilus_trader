@@ -26,10 +26,11 @@ use super::{
     BTreeMap, CustomData, Data, DataBatch, EncodeToRecordBatch, HasCatalogDataType, HasTsInit,
     Instrument, InstrumentAny, NautilusDataType, NautilusRecordType, ObjectPath, ObjectStoreExt,
     Params, ParquetDataCatalog, PathBuf, RecordBatch, Serialize, UnixNanos,
-    WRITE_SKIP_DISJOINT_CHECK, are_intervals_disjoint, instrument_any_type, instrument_path_prefix,
-    local_to_object_store_path, parquet_data_path_prefix, prepare_custom_data_batch,
-    record_batch_without_identifier_column, record_path_prefix, timestamps_to_filename,
-    to_snake_case, write_batches_to_object_store, write_catalog_batch,
+    WRITE_SKIP_DISJOINT_CHECK, are_intervals_disjoint, group_custom_data_by_type,
+    instrument_any_type, instrument_path_prefix, local_to_object_store_path,
+    parquet_data_path_prefix, prepare_custom_data_batch, record_batch_without_identifier_column,
+    record_path_prefix, timestamps_to_filename, to_snake_case, write_batches_to_object_store,
+    write_catalog_batch,
 };
 use crate::{
     backend::parquet::{io::write_batches_to_object_store_create, paths::catalog_filename},
@@ -80,8 +81,26 @@ impl ParquetDataCatalog {
         end: Option<UnixNanos>,
         skip_disjoint_check: Option<bool>,
     ) -> anyhow::Result<()> {
+        let mut batches = Vec::new();
+        let mut custom = Vec::new();
+
         for batch in DataBatch::from_data_vec_grouped(data)? {
-            write_catalog_batch(self, &batch, start, end, skip_disjoint_check)?;
+            match batch {
+                DataBatch::Custom(data) => custom.extend(data.iter().cloned()),
+                batch => batches.push(batch),
+            }
+        }
+
+        // Check every custom group of every type name before any file is written
+        let custom_writes =
+            self.prepare_custom_data_groups(&custom, start, end, skip_disjoint_check)?;
+
+        for batch in &batches {
+            write_catalog_batch(self, batch, start, end, skip_disjoint_check)?;
+        }
+
+        for write in &custom_writes {
+            self.write_custom_data_prepared(write, skip_disjoint_check)?;
         }
 
         Ok(())
@@ -115,7 +134,7 @@ impl ParquetDataCatalog {
     ///
     /// # Errors
     ///
-    /// Returns error if batches do not contain `ts_init` or cannot be persisted.
+    /// Returns an error if batches do not contain `ts_init` or cannot be persisted.
     pub fn write_record_batches(
         &mut self,
         record_type: &NautilusRecordType,
@@ -130,6 +149,7 @@ impl ParquetDataCatalog {
         let (start_ts, end_ts) = record_batch_ts_init_range(batches)?;
         let record_prefix = record_path_prefix(record_type);
         let directory = self.make_path(record_prefix.as_ref(), identifier)?;
+        self.recover_consolidation(&self.to_object_path(&directory)?)?;
         let filename = timestamps_to_filename(UnixNanos::from(start_ts), UnixNanos::from(end_ts));
         let path = PathBuf::from(directory.clone()).join(&filename);
         let object_path = self.to_object_path(&path.to_string_lossy())?;
@@ -229,19 +249,7 @@ impl ParquetDataCatalog {
 
         let type_name = to_snake_case(std::any::type_name::<T>());
         Self::check_ascending_timestamps(data, &type_name)?;
-
-        let chunk_metadata = T::chunk_metadata(data);
-        if let Some(position) = data
-            .iter()
-            .position(|item| !item.matches_chunk_metadata(&chunk_metadata))
-        {
-            anyhow::bail!(
-                "Cannot write {type_name} data with mixed identities: element {position} has \
-                 metadata {:?} but the chunk has {chunk_metadata:?}; write each \
-                 instrument or bar type separately",
-                data[position].metadata(),
-            );
-        }
+        Self::check_chunk_identity(data, &type_name)?;
 
         let start_ts = start.unwrap_or(first.ts_init());
         let end_ts = end.unwrap_or(last.ts_init());
@@ -309,7 +317,7 @@ impl ParquetDataCatalog {
         self.write_custom_data_refs_batch(&data, start, end, skip_disjoint_check)
     }
 
-    pub(crate) fn write_custom_data_refs_batch(
+    fn write_custom_data_refs_batch(
         &self,
         data: &[&CustomData],
         start: Option<UnixNanos>,
@@ -320,17 +328,103 @@ impl ParquetDataCatalog {
             return Ok(PathBuf::new());
         }
 
-        let (batch, type_name, identifier, start_ts, end_ts) = prepare_custom_data_batch(data)?;
-        let start_ts = start.unwrap_or(start_ts);
-        let end_ts = end.unwrap_or(end_ts);
-        let batches = vec![record_batch_without_identifier_column(batch)?];
+        let write = self.prepare_custom_data_write(data, start, end)?;
+        self.write_custom_data_prepared(&write, skip_disjoint_check)
+    }
 
+    /// Writes custom data as one file per [`DataType`](nautilus_model::data::DataType) group.
+    ///
+    /// Every group is prepared and checked before any file is written, so a call whose groups
+    /// would share a file, or overlap within a directory while the disjoint check is active,
+    /// fails without writing anything.
+    pub(crate) fn write_custom_data_groups(
+        &self,
+        data: &[CustomData],
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        skip_disjoint_check: Option<bool>,
+    ) -> anyhow::Result<()> {
+        for write in &self.prepare_custom_data_groups(data, start, end, skip_disjoint_check)? {
+            self.write_custom_data_prepared(write, skip_disjoint_check)?;
+        }
+
+        Ok(())
+    }
+
+    // Prepares one write per custom data group and rejects groups that would share a file or,
+    // while the disjoint check is active, overlap within a directory. A file holds one data type,
+    // so two such groups cannot be stored together, and writing them in turn would skip the
+    // second as an existing file.
+    pub(crate) fn prepare_custom_data_groups(
+        &self,
+        data: &[CustomData],
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+        skip_disjoint_check: Option<bool>,
+    ) -> anyhow::Result<Vec<CustomDataWrite>> {
+        let check_disjoint = !skip_disjoint_check.unwrap_or(false);
+        let mut writes = Vec::new();
+        let mut directory_intervals: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
+
+        for group in group_custom_data_by_type(data) {
+            let write = self.prepare_custom_data_write(&group, start, end)?;
+            let interval = (write.start_ts.as_u64(), write.end_ts.as_u64());
+            let intervals = directory_intervals
+                .entry(write.directory.clone())
+                .or_default();
+
+            anyhow::ensure!(
+                !intervals.contains(&interval),
+                "Cannot write custom data for {} with different metadata to the same file {}: \
+                 a file holds one data type",
+                write.type_name,
+                PathBuf::from(&write.directory)
+                    .join(catalog_filename(write.start_ts, write.end_ts, None))
+                    .display(),
+            );
+            intervals.push(interval);
+            anyhow::ensure!(
+                !check_disjoint || are_intervals_disjoint(intervals),
+                "Cannot write custom data for {} with different metadata over overlapping \
+                 intervals {intervals:?} in {}",
+                write.type_name,
+                write.directory,
+            );
+
+            writes.push(write);
+        }
+
+        Ok(writes)
+    }
+
+    pub(crate) fn prepare_custom_data_write(
+        &self,
+        data: &[&CustomData],
+        start: Option<UnixNanos>,
+        end: Option<UnixNanos>,
+    ) -> anyhow::Result<CustomDataWrite> {
+        let (batch, type_name, identifier, start_ts, end_ts) = prepare_custom_data_batch(data)?;
         let directory = self.make_path_custom_data(&type_name, identifier.as_deref())?;
+
+        Ok(CustomDataWrite {
+            type_name,
+            directory,
+            start_ts: start.unwrap_or(start_ts),
+            end_ts: end.unwrap_or(end_ts),
+            batches: vec![record_batch_without_identifier_column(batch)?],
+        })
+    }
+
+    pub(crate) fn write_custom_data_prepared(
+        &self,
+        write: &CustomDataWrite,
+        skip_disjoint_check: Option<bool>,
+    ) -> anyhow::Result<PathBuf> {
         self.write_parquet_file_checked(
-            &directory,
-            start_ts,
-            end_ts,
-            &batches,
+            &write.directory,
+            write.start_ts,
+            write.end_ts,
+            &write.batches,
             skip_disjoint_check.unwrap_or(false),
             "File",
             None,
@@ -452,6 +546,7 @@ impl ParquetDataCatalog {
         data_description: Option<&str>,
         replay_identity: Option<&str>,
     ) -> anyhow::Result<PathBuf> {
+        self.recover_consolidation(&self.to_object_path(directory)?)?;
         let filename = catalog_filename(start_ts, end_ts, replay_identity);
 
         let path = PathBuf::from(directory).join(&filename);
@@ -659,6 +754,32 @@ impl ParquetDataCatalog {
         Ok(())
     }
 
+    // Rejects data whose elements carry different chunk metadata, such as two instruments or
+    // precisions, since one file stores one identity.
+    pub(crate) fn check_chunk_identity<T: EncodeToRecordBatch>(
+        data: &[T],
+        type_name: &str,
+    ) -> anyhow::Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let chunk_metadata = T::chunk_metadata(data);
+
+        if let Some(position) = data
+            .iter()
+            .position(|item| !item.matches_chunk_metadata(&chunk_metadata))
+        {
+            anyhow::bail!(
+                "Cannot write {type_name} data with mixed identities: element {position} has \
+                 metadata {:?} but the chunk has {chunk_metadata:?}; write each \
+                 instrument or bar type separately",
+                data[position].metadata(),
+            );
+        }
+
+        Ok(())
+    }
+
     /// Converts data into Arrow record batches for Parquet serialization.
     ///
     /// This method chunks the data according to the configured batch size and converts
@@ -697,6 +818,22 @@ impl ParquetDataCatalog {
         }
 
         Ok(batches)
+    }
+}
+
+// A custom data group prepared for writing, with its target directory and file range.
+pub(crate) struct CustomDataWrite {
+    type_name: String,
+    directory: String,
+    start_ts: UnixNanos,
+    end_ts: UnixNanos,
+    pub(crate) batches: Vec<RecordBatch>,
+}
+
+impl CustomDataWrite {
+    pub(crate) fn path(&self) -> PathBuf {
+        let filename = catalog_filename(self.start_ts, self.end_ts, None);
+        PathBuf::from(&self.directory).join(filename)
     }
 }
 
@@ -1166,7 +1303,7 @@ mod tests {
 
         let mut catalog = ParquetDataCatalog {
             base_path: String::new(),
-            original_uri: "memory://".to_string(),
+            original_uri: "s3://test-bucket".to_string(),
             object_store: object_store.clone(),
             session: DataBackendSession::new(5_000),
             batch_size: 5_000,

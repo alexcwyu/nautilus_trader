@@ -449,8 +449,22 @@ impl Order for StopMarketOrder {
         self.ts_last
     }
 
+    fn has_pending_update_command(&self) -> bool {
+        self.core.has_pending_update_command()
+    }
+
+    fn has_pending_cancel_command(&self) -> bool {
+        self.core.has_pending_cancel_command()
+    }
+
     fn events(&self) -> Vec<&OrderEventAny> {
         self.events.iter().collect()
+    }
+
+    fn last_event(&self) -> &OrderEventAny {
+        self.events
+            .last()
+            .expect("Order invariant violated: no events")
     }
 
     fn venue_order_ids(&self) -> Vec<&VenueOrderId> {
@@ -601,7 +615,7 @@ impl TryFrom<OrderInitialized> for StopMarketOrder {
                     message: "`trigger_type` is required for `StopMarketOrder` initialization"
                         .to_string(),
                 })?;
-        Self::new_checked(
+        let mut order = Self::new_checked(
             event.trader_id,
             event.strategy_id,
             event.instrument_id,
@@ -627,7 +641,9 @@ impl TryFrom<OrderInitialized> for StopMarketOrder {
             event.tags,
             event.event_id,
             event.ts_event,
-        )
+        )?;
+        order.set_init_metadata(event.reconciliation, event.causation_id, event.ts_init);
+        Ok(order)
     }
 }
 

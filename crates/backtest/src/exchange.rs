@@ -17,6 +17,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque},
     fmt::Debug,
     rc::Rc,
@@ -28,7 +29,7 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
-    messages::execution::{ModifyOrder, TradingCommand},
+    messages::execution::{ModifyOrder, SubmitOrderList, TradingCommand},
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
 };
 use nautilus_core::{
@@ -36,9 +37,12 @@ use nautilus_core::{
     correctness::{CorrectnessResultExt, FAILED, check_equal},
 };
 use nautilus_execution::{
-    matching_core::RestingOrder,
+    matching::RestingOrder,
     matching_engine::{
-        OrderMatchingEngine, config::OrderMatchingEngineConfig, inflight::InflightOrders,
+        OrderMatchingEngine,
+        config::{OrderMatchingEngineConfig, OrderPriorityResetPolicy},
+        inflight::InflightOrders,
+        orders::{MatchingOrders, OtoCommand},
     },
     models::{
         fee::FeeModelHandle,
@@ -49,10 +53,13 @@ use nautilus_execution::{
 use nautilus_model::{
     accounts::{Account, AccountAny, margin_model::MarginModelHandle},
     data::{
-        Bar, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, OrderBookDelta,
-        OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
+        Bar, BarType, Data, FundingRateUpdate, InstrumentClose, InstrumentStatus, MarkPriceUpdate,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth, QuoteTick, TradeTick,
     },
-    enums::{AccountType, AggressorSide, BookType, OmsType, OrderStatus, PositionAdjustmentType},
+    enums::{
+        AccountType, AggregationSource, AggressorSide, BookType, OmsType, OrderStatus,
+        PositionAdjustmentType, PositionSide, PriceType,
+    },
     events::{FundingSettlement, OrderEventAny, OrderUpdated, PositionAdjusted, PositionEvent},
     identifiers::{AccountId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
@@ -156,23 +163,25 @@ pub struct SimulatedExchange {
     /// panic. Outside it (market data, iteration, expiration, liquidation, open-order
     /// loading) events dispatch directly, so immediate mode keeps its synchronous timing.
     deferring_events: Rc<Cell<bool>>,
-    fee_model: FeeModelHandle,
     fill_model: FillModelHandle,
+    fee_model: FeeModelHandle,
+    margin_model: Option<MarginModelHandle>,
     latency_model: Option<LatencyModelHandle>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
+    initial_instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
     last_raw_id: u32,
     pending_funding_rates: BTreeMap<(UnixNanos, InstrumentId), FundingRateUpdate>,
     funding_settlements: BTreeSet<(UnixNanos, InstrumentId)>,
     leverages: AHashMap<InstrumentId, Decimal>,
-    margin_model: Option<MarginModelHandle>,
     modules: Vec<SimulationModuleHandle>,
-    module_error: Option<String>,
+    callback_error: Option<String>,
     clock: Rc<RefCell<dyn Clock>>,
     cache: Rc<RefCell<Cache>>,
     message_queue: VecDeque<TradingCommand>,
     inflight_queue: BinaryHeap<InflightCommand>,
     inflight_orders: InflightOrders,
+    matching_orders: MatchingOrders,
     inflight_counter: AHashMap<UnixNanos, u32>,
     bar_execution: bool,
     bar_adaptive_high_low_ordering: bool,
@@ -189,6 +198,7 @@ pub struct SimulatedExchange {
     allow_cash_borrowing: bool,
     frozen_account: bool,
     queue_position: bool,
+    order_priority_reset_policy: OrderPriorityResetPolicy,
     oto_full_trigger: bool,
     defer_option_settlement: bool,
     price_protection_points: u32,
@@ -246,23 +256,25 @@ impl SimulatedExchange {
             exec_client: None,
             event_handler: None,
             deferring_events: Rc::new(Cell::new(false)),
-            fee_model: config.fee_model,
             fill_model: config.fill_model,
+            fee_model: config.fee_model,
+            margin_model: config.margin_model,
             latency_model: config.latency_model,
             instruments: AHashMap::new(),
+            initial_instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
             last_raw_id: 0,
             pending_funding_rates: BTreeMap::new(),
             funding_settlements: BTreeSet::new(),
             leverages: config.leverages,
-            margin_model: config.margin_model,
             modules: config.modules,
-            module_error: None,
+            callback_error: None,
             clock,
             cache,
             message_queue: VecDeque::new(),
             inflight_queue: BinaryHeap::new(),
             inflight_orders: InflightOrders::default(),
+            matching_orders: MatchingOrders::default(),
             inflight_counter: AHashMap::new(),
             bar_execution: config.bar_execution,
             bar_adaptive_high_low_ordering: config.bar_adaptive_high_low_ordering,
@@ -279,6 +291,7 @@ impl SimulatedExchange {
             allow_cash_borrowing: config.allow_cash_borrowing,
             frozen_account: config.frozen_account,
             queue_position: config.queue_position,
+            order_priority_reset_policy: config.order_priority_reset_policy,
             oto_full_trigger: config.oto_full_trigger,
             defer_option_settlement: config.defer_option_settlement,
             price_protection_points: config.price_protection_points,
@@ -332,16 +345,16 @@ impl SimulatedExchange {
         self.liquidation_enabled
     }
 
-    pub(crate) fn check_module_error(&self) -> anyhow::Result<()> {
-        if let Some(error) = &self.module_error {
-            anyhow::bail!("Simulation module failure requires exchange reset: {error}");
+    pub(crate) fn check_callback_error(&self) -> anyhow::Result<()> {
+        if let Some(error) = &self.callback_error {
+            anyhow::bail!("Simulation callback failure requires exchange reset: {error}");
         }
         Ok(())
     }
 
     #[must_use]
-    pub(crate) const fn has_module_error(&self) -> bool {
-        self.module_error.is_some()
+    pub(crate) const fn has_callback_error(&self) -> bool {
+        self.callback_error.is_some()
     }
 
     fn store_module_error(
@@ -351,12 +364,12 @@ impl SimulatedExchange {
         error: &anyhow::Error,
     ) -> anyhow::Error {
         let error = format!("Simulation module {module_index} {method} failed: {error:#}");
-        self.module_error = Some(error.clone());
+        self.callback_error = Some(error.clone());
         anyhow::anyhow!(error)
     }
 
     fn pre_process_modules(&mut self, data: &Data) -> anyhow::Result<()> {
-        self.check_module_error()?;
+        self.check_callback_error()?;
 
         for module_index in 0..self.modules.len() {
             if let Err(e) = self.modules[module_index].pre_process(data) {
@@ -377,21 +390,27 @@ impl SimulatedExchange {
         self.instruments.keys()
     }
 
-    /// Returns the expiration timestamp for the given instrument, if present.
-    #[must_use]
-    pub fn instrument_expiration(&self, instrument_id: InstrumentId) -> Option<UnixNanos> {
-        self.matching_engines
-            .get(&instrument_id)
-            .and_then(|matching_engine| matching_engine.instrument.expiration_ns())
-    }
-
-    /// Returns whether an unprocessed instrument remains for the given expiration.
-    #[must_use]
-    pub fn has_unprocessed_instrument_expiration(&self, expiration_ns: UnixNanos) -> bool {
-        self.matching_engines.values().any(|matching_engine| {
-            !matching_engine.is_expiration_processed()
-                && matching_engine.instrument.expiration_ns() == Some(expiration_ns)
-        })
+    /// Returns whether `instrument` is already registered with this exchange, failing when its
+    /// ID is registered with a different definition.
+    ///
+    /// Definitions are compared without their event timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an instrument with the same ID is registered with a
+    /// different definition.
+    pub(crate) fn is_instrument_registered(
+        &self,
+        instrument: &InstrumentAny,
+    ) -> anyhow::Result<bool> {
+        match self.instruments.get(&instrument.id()) {
+            None => Ok(false),
+            Some(existing) if instrument_definitions_match(existing, instrument) => Ok(true),
+            Some(_) => anyhow::bail!(
+                "Instrument {} is already registered with a different definition",
+                instrument.id()
+            ),
+        }
     }
 
     pub fn initialize_account(&mut self) {
@@ -431,15 +450,21 @@ impl SimulatedExchange {
                     order.client_order_id()
                 );
             }
+
+            self.drain_oto_commands();
         }
     }
 
     // panics-doc-ok (transitive via expect_display on venue mismatch)
     /// Adds an instrument to the simulated exchange and initializes its matching engine.
     ///
+    /// Adding an instrument that is already registered with the same definition is a
+    /// no-op, so its matching engine and generated ID sequences are preserved.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
+    /// - An instrument with the same ID is already registered with a different definition.
     /// - The exchange account type is `Cash` and the instrument is a `CryptoPerpetual`,
     ///   `CryptoFuture`, `FuturesContract`, or `PerpetualContract`.
     /// - The matching engine raw ID is exhausted.
@@ -455,6 +480,10 @@ impl SimulatedExchange {
             "Venue of simulated exchange",
         )
         .expect_display(FAILED);
+
+        if self.is_instrument_registered(&instrument)? {
+            return Ok(());
+        }
 
         if self.account_type == AccountType::Cash
             && (matches!(instrument, InstrumentAny::CryptoPerpetual(_))
@@ -484,6 +513,7 @@ impl SimulatedExchange {
             .use_reduce_only(self.use_reduce_only)
             .use_market_order_acks(self.use_market_order_acks)
             .queue_position(self.queue_position)
+            .order_priority_reset_policy(self.order_priority_reset_policy)
             .oto_full_trigger(self.oto_full_trigger)
             .defer_option_settlement(self.defer_option_settlement)
             .maybe_price_protection_points(price_protection)
@@ -512,9 +542,42 @@ impl SimulatedExchange {
         }
         self.instruments.insert(instrument_id, instrument);
         matching_engine.set_inflight_orders(self.inflight_orders.clone());
+        matching_engine.set_matching_orders(self.matching_orders.clone());
         self.matching_engines.insert(instrument_id, matching_engine);
 
         log::info!("Added instrument {instrument_id} and created matching engine");
+        Ok(())
+    }
+
+    /// Applies replay definitions using the existing matching engine lifecycle.
+    pub(crate) fn update_instrument(&mut self, instrument: &InstrumentAny) -> anyhow::Result<()> {
+        let instrument_id = instrument.id();
+        if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+            anyhow::ensure!(
+                instrument.expiration_ns() == engine.instrument.expiration_ns()
+                    || matches!(
+                        (&engine.instrument, instrument),
+                        (
+                            InstrumentAny::BinaryOption(_),
+                            InstrumentAny::BinaryOption(_)
+                        )
+                    ),
+                "Cannot change expiration for instrument {instrument_id} during replay"
+            );
+            self.cache.borrow_mut().add_instrument(instrument.clone())?;
+            self.initial_instruments
+                .entry(instrument_id)
+                .or_insert_with(|| engine.instrument.clone());
+            engine.update_instrument(instrument.clone())?;
+            self.instruments.insert(instrument_id, instrument.clone());
+            let ts_now = self.clock.borrow().timestamp_ns();
+
+            if instrument.expiration_ns().is_some_and(|ns| ns < ts_now) {
+                engine.process_instrument_expiration(ts_now);
+            }
+        }
+
+        self.drain_oto_commands();
         Ok(())
     }
 
@@ -703,65 +766,63 @@ impl SimulatedExchange {
             return Ok(());
         }
 
-        if let Some(exec_client) = &self.exec_client {
-            let venue = exec_client.venue();
-            let account_state = {
-                let cache = self.cache.borrow();
-                if let Some(account) = cache.account_for_venue(&venue) {
-                    if let Some(balance) = account.balance(Some(adjustment.currency)) {
-                        let mut current_balance = *balance;
-                        let Some(total) = current_balance.total.checked_add(adjustment) else {
-                            return Err(AccountAdjustmentError::TotalOverflow(adjustment.currency));
-                        };
+        let Some(exec_client) = &self.exec_client else {
+            return Ok(());
+        };
 
-                        match &*account {
-                            AccountAny::Margin(margin_account)
-                                if lock_margins && margin_account.calculate_account_state =>
-                            {
-                                current_balance = margin_account.balance_locking_margins(total);
-                            }
-                            _ => {
-                                let Some(free) = current_balance.free.checked_add(adjustment)
-                                else {
-                                    return Err(AccountAdjustmentError::FreeBalanceOverflow(
-                                        adjustment.currency,
-                                    ));
-                                };
-                                current_balance.total = total;
-                                current_balance.free = free;
-                            }
-                        }
+        let venue = exec_client.venue();
 
-                        // Carry account-wide margins too, applying the state replaces both sets
-                        let margins = match &*account {
-                            AccountAny::Margin(margin_account) => margin_account
-                                .margins
-                                .values()
-                                .chain(margin_account.account_margins.values())
-                                .copied()
-                                .collect(),
-                            _ => Vec::new(),
-                        };
+        let (balances, margins, ts_event) = {
+            let cache = self.cache.borrow();
+            let account = cache
+                .account_for_venue(&venue)
+                .ok_or(AccountAdjustmentError::MissingAccount(venue))?;
+            let balance = account
+                .balance(Some(adjustment.currency))
+                .ok_or(AccountAdjustmentError::MissingBalance(adjustment.currency))?;
+            let total = balance
+                .total
+                .checked_add(adjustment)
+                .ok_or(AccountAdjustmentError::TotalOverflow(adjustment.currency))?;
 
-                        Some((
-                            vec![current_balance],
-                            margins,
-                            self.clock.borrow().timestamp_ns(),
-                        ))
-                    } else {
-                        return Err(AccountAdjustmentError::MissingBalance(adjustment.currency));
-                    }
-                } else {
-                    return Err(AccountAdjustmentError::MissingAccount(venue));
+            let current_balance = match &*account {
+                AccountAny::Margin(margin_account)
+                    if lock_margins && margin_account.calculate_account_state =>
+                {
+                    margin_account.balance_locking_margins(total)
+                }
+                _ => {
+                    let free = balance.free.checked_add(adjustment).ok_or(
+                        AccountAdjustmentError::FreeBalanceOverflow(adjustment.currency),
+                    )?;
+                    let mut current_balance = *balance;
+                    current_balance.total = total;
+                    current_balance.free = free;
+                    current_balance
                 }
             };
 
-            if let Some((balances, margins, ts_event)) = account_state {
-                exec_client
-                    .generate_account_state(balances, margins, true, ts_event, None)
-                    .map_err(|e| AccountAdjustmentError::AccountStateGeneration(e.to_string()))?;
-            }
-        }
+            // Carry account-wide margins too, applying the state replaces both sets
+            let margins = match &*account {
+                AccountAny::Margin(margin_account) => margin_account
+                    .margins
+                    .values()
+                    .chain(margin_account.account_margins.values())
+                    .copied()
+                    .collect(),
+                _ => Vec::new(),
+            };
+
+            (
+                vec![current_balance],
+                margins,
+                self.clock.borrow().timestamp_ns(),
+            )
+        };
+
+        exec_client
+            .generate_account_state(balances, margins, true, ts_event, None)
+            .map_err(|e| AccountAdjustmentError::AccountStateGeneration(e.to_string()))?;
         Ok(())
     }
 
@@ -808,8 +869,12 @@ impl SimulatedExchange {
     /// Iterates all matching engines so newly submitted orders can match
     /// against the current market state.
     pub fn iterate_matching_engines(&mut self, ts_now: UnixNanos) {
-        for matching_engine in self.matching_engines.values_mut() {
-            matching_engine.iterate(ts_now, AggressorSide::NoAggressor);
+        for index in 0..self.matching_engines.len() {
+            if let Some((_, engine)) = self.matching_engines.get_index_mut(index) {
+                engine.iterate(ts_now, AggressorSide::NoAggressor);
+            }
+
+            self.drain_oto_commands();
         }
     }
 
@@ -824,6 +889,8 @@ impl SimulatedExchange {
                 matching_engine.process_instrument_expiration(ts_now);
             }
         }
+
+        self.drain_oto_commands();
     }
 
     /// Returns unprocessed instrument expirations for timer scheduling.
@@ -859,6 +926,9 @@ impl SimulatedExchange {
     }
 
     /// Sends a trading command to the exchange for processing.
+    ///
+    /// Ignores commands while a callback failure is latched, until [`Self::reset`] clears it.
+    /// [`Self::process_modules`] returns the latched error.
     pub fn send(&mut self, command: TradingCommand) {
         if matches!(
             &command,
@@ -868,38 +938,56 @@ impl SimulatedExchange {
             return;
         }
 
-        if self.use_message_queue {
-            self.inflight_orders.insert(&command);
+        if self.callback_error.is_some() {
+            return;
         }
 
         if !self.use_message_queue {
             let _guard = DeferEventsGuard::new(Rc::clone(&self.deferring_events));
             self.process_trading_command(command);
         } else if self.latency_model.is_none() {
+            self.inflight_orders.insert(&command);
             self.message_queue.push_back(command);
         } else {
-            let (timestamp, counter) = self.generate_inflight_command(&command);
+            let (timestamp, counter) = match self.generate_inflight_command(&command) {
+                Ok(arrival) => arrival,
+                Err(e) => {
+                    self.callback_error = Some(format!("Latency model failed: {e:#}"));
+                    return;
+                }
+            };
+
+            self.inflight_orders.insert(&command);
             self.inflight_queue
                 .push(InflightCommand::new(timestamp, counter, command));
         }
     }
 
-    fn generate_inflight_command(&mut self, command: &TradingCommand) -> (UnixNanos, u32) {
+    fn generate_inflight_command(
+        &mut self,
+        command: &TradingCommand,
+    ) -> anyhow::Result<(UnixNanos, u32)> {
         if let Some(latency_model) = &self.latency_model {
-            let ts = match command {
+            let ts_now = self.clock.borrow().timestamp_ns();
+
+            let latency = match command {
                 TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
-                    command.ts_init() + latency_model.get_insert_latency()
+                    latency_model.get_insert_latency(command, ts_now)?
                 }
                 TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
-                    command.ts_init() + latency_model.get_update_latency()
+                    latency_model.get_update_latency(command, ts_now)?
                 }
                 TradingCommand::CancelOrder(_)
                 | TradingCommand::CancelOrders(_)
                 | TradingCommand::CancelAllOrders(_) => {
-                    command.ts_init() + latency_model.get_delete_latency()
+                    latency_model.get_delete_latency(command, ts_now)?
                 }
-                _ => panic!("Cannot handle command: {command:?}"),
+                _ => anyhow::bail!("Cannot handle command: {command:?}"),
             };
+
+            let ts = command.ts_init().checked_add(latency).ok_or_else(|| {
+                anyhow::anyhow!("Latency arrival timestamp exceeds u64 nanoseconds")
+            })?;
 
             let counter = self
                 .inflight_counter
@@ -907,9 +995,9 @@ impl SimulatedExchange {
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
 
-            (ts, *counter)
+            Ok((ts, *counter))
         } else {
-            panic!("Latency model should be initialized");
+            anyhow::bail!("Latency model should be initialized");
         }
     }
 
@@ -920,29 +1008,10 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_delta(&mut self, delta: OrderBookDelta) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDelta(delta))?;
-
-        if !self.matching_engines.contains_key(&delta.instrument_id) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&delta.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    delta.instrument_id
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&delta.instrument_id) {
+        self.dispatch_market_data(delta.instrument_id, |matching_engine| {
             matching_engine.process_order_book_delta(&delta)?;
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Processes a batch of order book deltas.
@@ -952,29 +1021,10 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_deltas(&mut self, deltas: &OrderBookDeltas) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDeltas(Box::new(deltas.clone())))?;
-
-        if !self.matching_engines.contains_key(&deltas.instrument_id) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&deltas.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    deltas.instrument_id
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&deltas.instrument_id) {
+        self.dispatch_market_data(deltas.instrument_id, |matching_engine| {
             matching_engine.process_order_book_deltas(deltas)?;
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Processes an L2 order book depth snapshot.
@@ -984,29 +1034,23 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_order_book_depth(&mut self, depth: &OrderBookDepth) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::BookDepth(Box::new(depth.clone())))?;
-
-        if !self.matching_engines.contains_key(&depth.instrument_id) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&depth.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    depth.instrument_id
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&depth.instrument_id) {
+        self.dispatch_market_data(depth.instrument_id, |matching_engine| {
             matching_engine.process_order_book_depth(depth)?;
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
+    }
+
+    /// Processes a mark price update and updates the matching engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if module pre-processing or matching engine initialization fails.
+    pub fn process_mark_price(&mut self, mark: &MarkPriceUpdate) -> anyhow::Result<()> {
+        self.pre_process_modules(&Data::MarkPrice(*mark))?;
+        self.dispatch_market_data(mark.instrument_id, |matching_engine| {
+            matching_engine.process_mark_price(mark);
+            Ok(())
+        })
     }
 
     /// Processes a quote tick and updates the matching engine.
@@ -1016,29 +1060,10 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_quote_tick(&mut self, quote: &QuoteTick) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::Quote(*quote))?;
-
-        if !self.matching_engines.contains_key(&quote.instrument_id) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&quote.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    quote.instrument_id
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&quote.instrument_id) {
+        self.dispatch_market_data(quote.instrument_id, |matching_engine| {
             matching_engine.process_quote_tick(quote);
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Processes a trade tick and updates the matching engine.
@@ -1048,61 +1073,36 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_trade_tick(&mut self, trade: &TradeTick) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::Trade(*trade))?;
-
-        if !self.matching_engines.contains_key(&trade.instrument_id) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&trade.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    trade.instrument_id
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&trade.instrument_id) {
+        self.dispatch_market_data(trade.instrument_id, |matching_engine| {
             matching_engine.process_trade_tick(trade);
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Processes a bar and updates the matching engine.
     ///
     /// # Errors
     ///
-    /// Returns an error if module pre-processing or matching engine processing fails.
+    /// Returns an error if L1 bar execution receives a non-time external bar other
+    /// than a mark-price bar, or if module pre-processing or matching engine processing fails.
     pub fn process_bar(&mut self, bar: Bar) -> anyhow::Result<()> {
+        if self.bar_execution
+            && self.book_type == BookType::L1_MBP
+            && bar.bar_type.is_externally_aggregated()
+            && bar.bar_type.spec().price_type != PriceType::Mark
+        {
+            anyhow::ensure!(
+                bar.bar_type.spec().is_time_aggregated(),
+                "Bar execution requires time-aggregated bars, received {}",
+                bar.bar_type,
+            );
+        }
+
         self.pre_process_modules(&Data::Bar(bar))?;
-
-        if !self.matching_engines.contains_key(&bar.instrument_id()) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&bar.instrument_id()).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    bar.instrument_id()
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&bar.instrument_id()) {
+        self.dispatch_market_data(bar.instrument_id(), |matching_engine| {
             matching_engine.process_bar(&bar);
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Processes an instrument status update.
@@ -1112,29 +1112,10 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_instrument_status(&mut self, status: InstrumentStatus) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::InstrumentStatus(status))?;
-
-        if !self.matching_engines.contains_key(&status.instrument_id) {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&status.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                self.add_instrument(instrument)?;
-            } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    status.instrument_id
-                );
-            }
-        }
-
-        if let Some(matching_engine) = self.matching_engines.get_mut(&status.instrument_id) {
+        self.dispatch_market_data(status.instrument_id, |matching_engine| {
             matching_engine.process_status(status.action);
-        } else {
-            anyhow::bail!("Matching engine should be initialized");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Processes an instrument close event.
@@ -1144,28 +1125,37 @@ impl SimulatedExchange {
     /// Returns an error if module pre-processing or matching engine processing fails.
     pub fn process_instrument_close(&mut self, close: InstrumentClose) -> anyhow::Result<()> {
         self.pre_process_modules(&Data::InstrumentClose(close))?;
+        self.dispatch_market_data(close.instrument_id, |matching_engine| {
+            matching_engine.process_instrument_close(close);
+            Ok(())
+        })
+    }
 
-        if !self.matching_engines.contains_key(&close.instrument_id) {
+    fn dispatch_market_data(
+        &mut self,
+        instrument_id: InstrumentId,
+        process: impl FnOnce(&mut OrderMatchingEngine) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        if !self.matching_engines.contains_key(&instrument_id) {
             let instrument = {
                 let cache = self.cache.as_ref().borrow();
-                cache.instrument(&close.instrument_id).cloned()
+                cache.instrument(&instrument_id).cloned()
             };
 
             if let Some(instrument) = instrument {
                 self.add_instrument(instrument)?;
             } else {
-                anyhow::bail!(
-                    "No matching engine found for instrument {}",
-                    close.instrument_id
-                );
+                anyhow::bail!("No matching engine found for instrument {instrument_id}");
             }
         }
 
-        if let Some(matching_engine) = self.matching_engines.get_mut(&close.instrument_id) {
-            matching_engine.process_instrument_close(close);
+        if let Some(matching_engine) = self.matching_engines.get_mut(&instrument_id) {
+            process(matching_engine)?;
         } else {
             anyhow::bail!("Matching engine should be initialized");
         }
+
+        self.drain_oto_commands();
         Ok(())
     }
 
@@ -1237,7 +1227,7 @@ impl SimulatedExchange {
         instrument_id: InstrumentId,
         ts_event: UnixNanos,
     ) -> anyhow::Result<()> {
-        self.check_module_error()?;
+        self.check_callback_error()?;
         let key = (ts_event, instrument_id);
         let Some(funding_rate) = self.pending_funding_rates.remove(&key) else {
             return Ok(());
@@ -1306,30 +1296,8 @@ impl SimulatedExchange {
         let account_id = exec_client.account_id();
         let account_venue = exec_client.venue();
 
-        if !self
-            .matching_engines
-            .contains_key(&funding_rate.instrument_id)
-        {
-            let instrument = {
-                let cache = self.cache.as_ref().borrow();
-                cache.instrument(&funding_rate.instrument_id).cloned()
-            };
-
-            if let Some(instrument) = instrument {
-                if let Err(e) = self.add_instrument(instrument) {
-                    log::error!(
-                        "Cannot settle funding for {}: failed to add instrument: {e}",
-                        funding_rate.instrument_id
-                    );
-                    return false;
-                }
-            } else {
-                log::warn!(
-                    "Cannot settle funding for {}: no matching engine or instrument",
-                    funding_rate.instrument_id
-                );
-                return false;
-            }
+        if !self.prepare_funding_instrument(funding_rate.instrument_id) {
+            return false;
         }
 
         // Snapshots without history: valuation reads only position state, and the snapshot is the
@@ -1364,130 +1332,26 @@ impl SimulatedExchange {
         };
 
         let settlement_currency = open_positions[0].settlement_currency;
-        let mut valued_positions = Vec::with_capacity(open_positions.len());
-        let mut account_adjustments: AHashMap<Currency, Money> = AHashMap::new();
 
-        for position in open_positions {
-            if position.settlement_currency != settlement_currency {
-                log::error!(
-                    "Cannot settle funding for {}: position settlement currencies differ",
-                    funding_rate.instrument_id
-                );
-                return false;
-            }
+        let Some(FundingValuation {
+            positions: valued_positions,
+            mut account_adjustments,
+        }) = value_funding_positions(
+            funding_rate,
+            settlement_price,
+            open_positions,
+            settlement_currency,
+        )
+        else {
+            return false;
+        };
 
-            let notional = match position.try_notional_value(settlement_price) {
-                Ok(notional) => notional,
-                Err(e) => {
-                    log::error!(
-                        "Cannot settle funding for position {}: invalid notional value: {e}",
-                        position.id
-                    );
-                    return false;
-                }
-            };
-            let side = if position.signed_qty > 0.0 {
-                -Decimal::ONE
-            } else {
-                Decimal::ONE
-            };
-            let Some(amount) = notional
-                .as_decimal()
-                .checked_mul(funding_rate.rate)
-                .and_then(|value| value.checked_mul(side))
-            else {
-                log::error!(
-                    "Cannot settle funding for position {}: funding amount overflow",
-                    position.id
-                );
-                return false;
-            };
-            let pnl_change = match Money::from_decimal(amount, notional.currency) {
-                Ok(money) => money,
-                Err(e) => {
-                    log::error!(
-                        "Cannot settle funding for position {}: invalid funding amount: {e}",
-                        position.id
-                    );
-                    return false;
-                }
-            };
-
-            if pnl_change.currency != settlement_currency {
-                log::error!(
-                    "Cannot settle funding for position {}: settlement currency {} differs from funding currency {}",
-                    position.id,
-                    settlement_currency,
-                    pnl_change.currency
-                );
-                return false;
-            }
-
-            if let Some(realized) = position.realized_pnl {
-                if realized.currency != pnl_change.currency {
-                    log::error!(
-                        "Cannot settle funding for position {}: realized PnL currency {} differs from funding currency {}",
-                        position.id,
-                        realized.currency,
-                        pnl_change.currency
-                    );
-                    return false;
-                }
-
-                if realized.checked_add(pnl_change).is_none() {
-                    log::error!(
-                        "Cannot settle funding for position {}: realized PnL overflow",
-                        position.id
-                    );
-                    return false;
-                }
-            }
-            let total_adjustment =
-                if let Some(current) = account_adjustments.get(&pnl_change.currency).copied() {
-                    let Some(total) = current.checked_add(pnl_change) else {
-                        log::error!(
-                            "Cannot settle funding for {}: aggregate account adjustment overflow",
-                            funding_rate.instrument_id
-                        );
-                        return false;
-                    };
-                    total
-                } else {
-                    pnl_change
-                };
-            account_adjustments.insert(pnl_change.currency, total_adjustment);
-            valued_positions.push((position, pnl_change));
-        }
-
-        let mut account_adjustments = account_adjustments.into_values().collect::<Vec<_>>();
-        account_adjustments.sort_unstable_by_key(|adjustment| adjustment.currency.code);
-
-        if !self.frozen_account {
-            let cache = self.cache.borrow();
-            let Some(account) = cache.account_for_venue(&account_venue) else {
-                log::error!("Cannot settle funding: no account for venue {account_venue}");
-                return false;
-            };
-
-            for adjustment in &account_adjustments {
-                let Some(balance) = account.balance(Some(adjustment.currency)) else {
-                    log::error!(
-                        "Cannot settle funding: no account balance for currency {}",
-                        adjustment.currency
-                    );
-                    return false;
-                };
-
-                if balance.total.checked_add(*adjustment).is_none()
-                    || balance.free.checked_add(*adjustment).is_none()
-                {
-                    log::error!(
-                        "Cannot settle funding: {} account adjustment exceeds Money bounds",
-                        adjustment.currency
-                    );
-                    return false;
-                }
-            }
+        if !self.validate_funding_account_adjustments(
+            funding_rate.instrument_id,
+            account_venue,
+            &mut account_adjustments,
+        ) {
+            return false;
         }
 
         let ts_init = self.clock.borrow().timestamp_ns();
@@ -1524,6 +1388,116 @@ impl SimulatedExchange {
             adjusted_positions.push((original, adjustment));
         }
 
+        if !self.apply_funding_adjustments(&adjusted_positions, &account_adjustments) {
+            return false;
+        }
+
+        self.funding_settlements.insert(settlement_key);
+        let settlement_topic = switchboard::get_funding_settlement_topic(settlement.instrument_id);
+        msgbus::publish_any(settlement_topic, &settlement);
+
+        for (_, adjustment) in adjusted_positions {
+            let strategy_id = adjustment.strategy_id;
+            let event = PositionEvent::PositionAdjusted(adjustment);
+            let topic = switchboard::get_event_position_topic(strategy_id);
+            msgbus::publish_position_event(topic, &event);
+        }
+
+        true
+    }
+
+    fn prepare_funding_instrument(&mut self, instrument_id: InstrumentId) -> bool {
+        if self.matching_engines.contains_key(&instrument_id) {
+            return true;
+        }
+
+        let instrument = {
+            let cache = self.cache.as_ref().borrow();
+            cache.instrument(&instrument_id).cloned()
+        };
+
+        let Some(instrument) = instrument else {
+            log::warn!(
+                "Cannot settle funding for {instrument_id}: no matching engine or instrument"
+            );
+            return false;
+        };
+
+        if let Err(e) = self.add_instrument(instrument) {
+            log::error!("Cannot settle funding for {instrument_id}: failed to add instrument: {e}");
+            return false;
+        }
+
+        true
+    }
+
+    fn validate_funding_account_adjustments(
+        &self,
+        instrument_id: InstrumentId,
+        account_venue: Venue,
+        account_adjustments: &mut [Money],
+    ) -> bool {
+        if self.frozen_account {
+            return true;
+        }
+
+        let cache = self.cache.borrow();
+
+        let Some(account) = cache.account_for_venue(&account_venue) else {
+            log::error!("Cannot settle funding: no account for venue {account_venue}");
+            return false;
+        };
+
+        // A single-currency account holds only its base currency, so the cash
+        // adjustment is converted there; position PnL keeps the settlement currency
+        if let Some(base_currency) = account.base_currency() {
+            for adjustment in account_adjustments.iter_mut() {
+                if adjustment.currency == base_currency {
+                    continue;
+                }
+
+                let Some(converted) = convert_funding_adjustment(
+                    &cache,
+                    instrument_id,
+                    account_venue,
+                    base_currency,
+                    *adjustment,
+                ) else {
+                    return false;
+                };
+
+                *adjustment = converted;
+            }
+        }
+
+        for adjustment in account_adjustments.iter() {
+            let Some(balance) = account.balance(Some(adjustment.currency)) else {
+                log::error!(
+                    "Cannot settle funding: no account balance for currency {}",
+                    adjustment.currency
+                );
+                return false;
+            };
+
+            if balance.total.checked_add(*adjustment).is_none()
+                || balance.free.checked_add(*adjustment).is_none()
+            {
+                log::error!(
+                    "Cannot settle funding: {} account adjustment exceeds Money bounds",
+                    adjustment.currency
+                );
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn apply_funding_adjustments(
+        &self,
+        adjusted_positions: &[(Position, PositionAdjusted)],
+        account_adjustments: &[Money],
+    ) -> bool {
         {
             let mut cache = self.cache.borrow_mut();
 
@@ -1534,9 +1508,8 @@ impl SimulatedExchange {
                         original.id
                     );
 
-                    // Inclusive of `index`: the failed update applies the adjustment to the
-                    // cached position before attempting to persist it, so the position whose
-                    // update returned the error also needs reverting.
+                    // Include the failing position in case its adjustment was applied before
+                    // a backing integrity check rejected it.
                     revert_funding_adjustments(
                         &mut cache,
                         &adjusted_positions[..=index],
@@ -1547,25 +1520,12 @@ impl SimulatedExchange {
             }
         }
 
-        for adjustment in &account_adjustments {
+        for adjustment in account_adjustments {
             if !self.adjust_account_balance(*adjustment, true) {
                 let mut cache = self.cache.borrow_mut();
-                revert_funding_adjustments(&mut cache, &adjusted_positions, "account adjustment");
+                revert_funding_adjustments(&mut cache, adjusted_positions, "account adjustment");
                 return false;
             }
-        }
-
-        self.funding_settlements.insert(settlement_key);
-        let settlement_topic = switchboard::get_funding_settlement_topic(settlement.instrument_id);
-        msgbus::publish_any(settlement_topic, &settlement);
-
-        for (_, adjustment) in adjusted_positions {
-            let event = PositionEvent::PositionAdjusted(adjustment);
-            let PositionEvent::PositionAdjusted(adjustment) = &event else {
-                continue;
-            };
-            let topic = switchboard::get_event_position_topic(adjustment.strategy_id);
-            msgbus::publish_position_event(topic, &event);
         }
 
         true
@@ -1602,6 +1562,9 @@ impl SimulatedExchange {
     /// Advances the exchange clock and processes all pending inflight and queued trading commands
     /// up to `ts_now`.
     ///
+    /// Does nothing while a callback failure is latched, until [`Self::reset`] clears it.
+    /// [`Self::process_modules`] returns the latched error.
+    ///
     /// # Panics
     ///
     /// Panics if the exchange clock is not a [`VirtualClock`] or popping an inflight command fails
@@ -1615,6 +1578,10 @@ impl SimulatedExchange {
     }
 
     fn process_commands(&mut self, ts_now: UnixNanos, scope: SettlementScope) {
+        if self.callback_error.is_some() {
+            return;
+        }
+
         self.set_clock_time(ts_now);
 
         let mut deferred = Vec::new();
@@ -1655,10 +1622,10 @@ impl SimulatedExchange {
     ///
     /// # Errors
     ///
-    /// Returns an error if a simulation module fails. The exchange retains the failure and
-    /// rejects further processing until reset.
+    /// Returns an error if a latency model or simulation module fails.
+    /// The exchange retains the failure and rejects further processing until reset.
     pub fn process_modules(&mut self, ts_now: UnixNanos) -> anyhow::Result<()> {
-        self.check_module_error()?;
+        self.check_callback_error()?;
 
         if self.frozen_account || self.exec_client.is_none() {
             return Ok(());
@@ -1719,20 +1686,30 @@ impl SimulatedExchange {
             self.generate_fresh_account_state();
         }
 
-        let mut module_error = None;
+        let mut callback_error = None;
 
         for (module_index, module) in self.modules.iter().enumerate() {
             if let Err(e) = module.reset()
-                && module_error.is_none()
+                && callback_error.is_none()
             {
-                module_error = Some(format!(
+                callback_error = Some(format!(
                     "Simulation module {module_index} reset failed: {e:#}"
                 ));
             }
         }
 
-        for matching_engine in self.matching_engines.values_mut() {
+        for (instrument_id, matching_engine) in &mut self.matching_engines {
             matching_engine.reset();
+
+            if let Some(instrument) = self.initial_instruments.get(instrument_id) {
+                if let Err(e) = self.cache.borrow_mut().add_instrument(instrument.clone()) {
+                    callback_error.get_or_insert_with(|| e.to_string());
+                    continue;
+                }
+
+                matching_engine.update_instrument(instrument.clone())?;
+                self.instruments.insert(*instrument_id, instrument.clone());
+            }
         }
 
         self.pending_funding_rates.clear();
@@ -1743,8 +1720,8 @@ impl SimulatedExchange {
         self.inflight_counter.clear();
 
         log::info!("Resetting exchange state");
-        self.module_error = module_error;
-        self.check_module_error()
+        self.callback_error = callback_error;
+        self.check_callback_error()
     }
 
     /// Logs diagnostic information from all simulation modules.
@@ -1820,26 +1797,14 @@ impl SimulatedExchange {
                 continue;
             };
 
-            let (upnl_f64, all_priced) = {
+            let upnl_f64 = {
                 let cache = self.cache.borrow();
-                let mut upnl = 0.0_f64;
-                let mut all_priced = true;
-
-                for &i in indices {
-                    let p = &open_positions[i];
-                    if let Some(pnl) = cache.calculate_unrealized_pnl(p) {
-                        upnl += pnl.as_f64();
-                    } else {
-                        all_priced = false;
-                        break;
-                    }
-                }
-                (upnl, all_priced)
+                liquidation_unrealized_total(&cache, &open_positions, indices)
             };
 
-            if !all_priced {
+            let Some(upnl_f64) = upnl_f64 else {
                 continue; // defer until all positions are priced
-            }
+            };
 
             let equity = balance_f64 + upnl_f64;
             let maintenance = margin_account.total_maintenance_margin(currency).as_f64();
@@ -1872,6 +1837,8 @@ impl SimulatedExchange {
                 );
             }
         }
+
+        self.drain_oto_commands();
     }
 
     fn process_trading_command(&mut self, command: TradingCommand) {
@@ -1882,23 +1849,8 @@ impl SimulatedExchange {
             "Matching engine not found for instrument {instrument_id}",
         );
 
-        let command = match command {
-            TradingCommand::ModifyOrder(ref command)
-                if self.process_modify_submitted_order(command) =>
-            {
-                return;
-            }
-            TradingCommand::ModifyOrders(mut command) => {
-                command
-                    .modifies
-                    .retain(|modify| !self.process_modify_submitted_order(modify));
-
-                if command.modifies.is_empty() {
-                    return;
-                }
-                TradingCommand::ModifyOrders(command)
-            }
-            command => command,
+        let Some(command) = self.normalize_trading_command(command) else {
+            return;
         };
 
         let account_id = if let Some(exec_client) = &self.exec_client {
@@ -1908,20 +1860,9 @@ impl SimulatedExchange {
         };
 
         if let TradingCommand::SubmitOrderList(ref command) = command {
-            let mut orders: Vec<OrderAny> = self
-                .cache
-                .borrow()
-                .orders_for_ids(&command.order_list.client_order_ids, command);
+            self.process_order_list(command, account_id);
 
-            for order in &mut orders {
-                let order_instrument_id = order.instrument_id();
-                if let Some(matching_engine) = self.matching_engines.get_mut(&order_instrument_id) {
-                    matching_engine.process_order(order, account_id);
-                } else {
-                    panic!("Matching engine not found for instrument {order_instrument_id}");
-                }
-            }
-
+            self.drain_oto_commands();
             return;
         }
 
@@ -1955,6 +1896,68 @@ impl SimulatedExchange {
             }
         } else {
             panic!("Matching engine not found for instrument {instrument_id}");
+        }
+
+        self.drain_oto_commands();
+    }
+
+    fn normalize_trading_command(&self, command: TradingCommand) -> Option<TradingCommand> {
+        match command {
+            TradingCommand::ModifyOrder(ref command)
+                if self.process_modify_submitted_order(command) =>
+            {
+                None
+            }
+            TradingCommand::ModifyOrders(mut command) => {
+                command
+                    .modifies
+                    .retain(|modify| !self.process_modify_submitted_order(modify));
+
+                if command.modifies.is_empty() {
+                    return None;
+                }
+
+                Some(TradingCommand::ModifyOrders(command))
+            }
+            command => Some(command),
+        }
+    }
+
+    fn process_order_list(&mut self, command: &SubmitOrderList, account_id: AccountId) {
+        let mut orders: Vec<OrderAny> = self
+            .cache
+            .borrow()
+            .orders_for_ids(&command.order_list.client_order_ids, command);
+
+        for order in &mut orders {
+            let order_instrument_id = order.instrument_id();
+            if let Some(matching_engine) = self.matching_engines.get_mut(&order_instrument_id) {
+                matching_engine.process_order(order, account_id);
+            } else {
+                panic!("Matching engine not found for instrument {order_instrument_id}");
+            }
+        }
+    }
+
+    fn drain_oto_commands(&mut self) {
+        while let Some(command) = self.matching_orders.pop_command() {
+            let instrument_id = command.instrument_id();
+            if let Some(engine) = self.matching_engines.get_mut(&instrument_id) {
+                engine.process_oto_command(&command);
+            } else {
+                log::error!("Cannot process OTO action: no matching engine for {instrument_id}");
+            }
+
+            if let OtoCommand::Release {
+                parent_quantity: Some(quantity),
+                parent_order_id,
+                parent_instrument_id,
+                ..
+            } = command
+                && let Some(engine) = self.matching_engines.get_mut(&parent_instrument_id)
+            {
+                engine.process_oto_resize(parent_order_id, quantity);
+            }
         }
     }
 
@@ -2110,6 +2113,208 @@ impl Drop for DeferEventsGuard {
     }
 }
 
+struct FundingValuation {
+    positions: Vec<(Position, Money)>,
+    account_adjustments: Vec<Money>,
+}
+
+fn value_funding_positions(
+    funding_rate: &FundingRateUpdate,
+    settlement_price: Price,
+    open_positions: Vec<Position>,
+    settlement_currency: Currency,
+) -> Option<FundingValuation> {
+    let mut valued_positions = Vec::with_capacity(open_positions.len());
+    let mut account_adjustments: AHashMap<Currency, Money> = AHashMap::new();
+
+    for position in open_positions {
+        let pnl_change = value_funding_position(
+            funding_rate,
+            settlement_price,
+            &position,
+            settlement_currency,
+        )?;
+
+        let total_adjustment =
+            if let Some(current) = account_adjustments.get(&pnl_change.currency).copied() {
+                let Some(total) = current.checked_add(pnl_change) else {
+                    log::error!(
+                        "Cannot settle funding for {}: aggregate account adjustment overflow",
+                        funding_rate.instrument_id
+                    );
+                    return None;
+                };
+
+                total
+            } else {
+                pnl_change
+            };
+
+        account_adjustments.insert(pnl_change.currency, total_adjustment);
+        valued_positions.push((position, pnl_change));
+    }
+
+    let mut account_adjustments = account_adjustments.into_values().collect::<Vec<_>>();
+    account_adjustments.sort_unstable_by_key(|adjustment| adjustment.currency.code);
+
+    Some(FundingValuation {
+        positions: valued_positions,
+        account_adjustments,
+    })
+}
+
+fn value_funding_position(
+    funding_rate: &FundingRateUpdate,
+    settlement_price: Price,
+    position: &Position,
+    settlement_currency: Currency,
+) -> Option<Money> {
+    if position.settlement_currency != settlement_currency {
+        log::error!(
+            "Cannot settle funding for {}: position settlement currencies differ",
+            funding_rate.instrument_id
+        );
+        return None;
+    }
+
+    let notional = match position.try_notional_value(settlement_price) {
+        Ok(notional) => notional,
+        Err(e) => {
+            log::error!(
+                "Cannot settle funding for position {}: invalid notional value: {e}",
+                position.id
+            );
+            return None;
+        }
+    };
+
+    let side = if position.signed_qty > Decimal::ZERO {
+        -Decimal::ONE
+    } else {
+        Decimal::ONE
+    };
+
+    let Some(amount) = notional
+        .as_decimal()
+        .checked_mul(funding_rate.rate)
+        .and_then(|value| value.checked_mul(side))
+    else {
+        log::error!(
+            "Cannot settle funding for position {}: funding amount overflow",
+            position.id
+        );
+        return None;
+    };
+
+    let pnl_change = match Money::from_decimal(amount, notional.currency) {
+        Ok(money) => money,
+        Err(e) => {
+            log::error!(
+                "Cannot settle funding for position {}: invalid funding amount: {e}",
+                position.id
+            );
+            return None;
+        }
+    };
+
+    if pnl_change.currency != settlement_currency {
+        log::error!(
+            "Cannot settle funding for position {}: settlement currency {} differs from funding currency {}",
+            position.id,
+            settlement_currency,
+            pnl_change.currency
+        );
+        return None;
+    }
+
+    if let Some(realized) = position.realized_pnl {
+        if realized.currency != pnl_change.currency {
+            log::error!(
+                "Cannot settle funding for position {}: realized PnL currency {} differs from funding currency {}",
+                position.id,
+                realized.currency,
+                pnl_change.currency
+            );
+            return None;
+        }
+
+        if realized.checked_add(pnl_change).is_none() {
+            log::error!(
+                "Cannot settle funding for position {}: realized PnL overflow",
+                position.id
+            );
+            return None;
+        }
+    }
+
+    Some(pnl_change)
+}
+
+fn convert_funding_adjustment(
+    cache: &Cache,
+    instrument_id: InstrumentId,
+    account_venue: Venue,
+    base_currency: Currency,
+    adjustment: Money,
+) -> Option<Money> {
+    let xrate = match cache.try_get_xrate(
+        account_venue,
+        adjustment.currency,
+        base_currency,
+        PriceType::Mid,
+    ) {
+        Ok(Some(xrate)) => xrate,
+        Ok(None) => {
+            log::warn!(
+                "Cannot settle funding for {}: no exchange rate from {} to {base_currency}",
+                instrument_id,
+                adjustment.currency
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!(
+                "Cannot settle funding for {}: exchange rate from {} to {base_currency}: {e}",
+                instrument_id,
+                adjustment.currency
+            );
+            return None;
+        }
+    };
+
+    let Some(amount) = adjustment.as_decimal().checked_mul(xrate) else {
+        log::error!("Cannot settle funding for {instrument_id}: currency conversion overflow");
+        return None;
+    };
+
+    let converted = match Money::from_decimal(amount, base_currency) {
+        Ok(money) => money,
+        Err(e) => {
+            log::error!(
+                "Cannot settle funding for {instrument_id}: invalid converted adjustment: {e}"
+            );
+            return None;
+        }
+    };
+
+    Some(converted)
+}
+
+fn liquidation_unrealized_total(
+    cache: &Cache,
+    positions: &[Position],
+    indices: &[usize],
+) -> Option<f64> {
+    let mut upnl = 0.0_f64;
+    let mut bar_types = None;
+    for &i in indices {
+        let pnl = liquidation_unrealized_pnl(cache, &positions[i], &mut bar_types)?;
+        upnl += pnl.as_f64();
+    }
+
+    Some(upnl)
+}
+
 // Reverts funding adjustments applied in place, newest first, restoring and persisting each
 // position from the snapshot taken before settlement
 fn revert_funding_adjustments(
@@ -2127,6 +2332,127 @@ fn revert_funding_adjustments(
     }
 }
 
+// Values a position for the liquidation check with the portfolio's price fallback: mark price,
+// then the side-appropriate quote, then the last trade, then the most recent bar close.
+fn liquidation_unrealized_pnl(
+    cache: &Cache,
+    position: &Position,
+    bar_types: &mut Option<AHashMap<InstrumentId, Vec<BarType>>>,
+) -> Option<Money> {
+    let instrument_id = &position.instrument_id;
+    let price_type = match position.side {
+        PositionSide::Long => PriceType::Bid,
+        PositionSide::Short => PriceType::Ask,
+        PositionSide::Flat => return Some(Money::zero(position.settlement_currency)),
+    };
+
+    let allows_non_positive = || {
+        cache
+            .instrument(instrument_id)
+            .is_some_and(Instrument::allows_negative_price)
+    };
+    let is_valid = |price: &Price| {
+        !price.is_undefined()
+            && !price.is_error()
+            && (price.as_decimal() > Decimal::ZERO || allows_non_positive())
+    };
+    let quote_price = || {
+        cache.quote(instrument_id).and_then(|quote| {
+            let (price, size) = match price_type {
+                PriceType::Bid => (quote.bid_price, quote.bid_size),
+                _ => (quote.ask_price, quote.ask_size),
+            };
+            (is_valid(&price) && (price.as_decimal() > Decimal::ZERO || size.is_positive()))
+                .then_some(price)
+        })
+    };
+
+    // Bars closing together rank in the fallback order above, then mid, then the opposite quote
+    // side, then by bar type, so the choice never depends on cache iteration order.
+    let bar_rank = |bar: &Bar| match bar.bar_type.spec().price_type {
+        PriceType::Mark => 0,
+        bar_price_type if bar_price_type == price_type => 1,
+        PriceType::Last => 2,
+        PriceType::Mid => 3,
+        PriceType::Bid | PriceType::Ask => 4,
+    };
+
+    // In a backtest `ts_init` is the bar close for open- and close-stamped bars alike
+    let bar_close = || {
+        // Index once per currency valuation, before any liquidation callbacks can change the cache
+        let bar_types = bar_types.get_or_insert_with(|| liquidation_bar_types(cache));
+        bar_types
+            .get(instrument_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|bar_type| cache.bar(bar_type))
+            .filter(|bar| is_valid(&bar.close))
+            .min_by_key(|bar| (Reverse(bar.ts_init), bar_rank(bar), bar.bar_type))
+            .map(|bar| bar.close)
+    };
+
+    let Some(price) = cache
+        .price(instrument_id, PriceType::Mark)
+        .filter(is_valid)
+        .or_else(quote_price)
+        .or_else(|| cache.price(instrument_id, PriceType::Last).filter(is_valid))
+        .or_else(bar_close)
+    else {
+        log::warn!(
+            "Cannot value {} for liquidation, no mark, quote, trade or bar for {instrument_id}",
+            position.id,
+        );
+        return None;
+    };
+
+    position
+        .try_unrealized_pnl(price)
+        .inspect_err(|e| {
+            log::error!("Cannot calculate unrealized PnL for {}: {e}", position.id);
+        })
+        .ok()
+}
+
+fn liquidation_bar_types(cache: &Cache) -> AHashMap<InstrumentId, Vec<BarType>> {
+    let mut by_instrument: AHashMap<InstrumentId, Vec<BarType>> = AHashMap::new();
+
+    for source in [AggregationSource::External, AggregationSource::Internal] {
+        for bar_type in cache.bar_types(None, None, source) {
+            by_instrument
+                .entry(bar_type.instrument_id())
+                .or_default()
+                .push(*bar_type);
+        }
+    }
+
+    by_instrument
+}
+
+// Compares two instruments' tradable definitions on their serialized form without event
+// timestamps, so every field (including free-form `info`) takes part, and a serialization
+// failure compares as changed so a different definition is never accepted.
+fn instrument_definitions_match(a: &InstrumentAny, b: &InstrumentAny) -> bool {
+    fn normalized(instrument: &InstrumentAny) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(instrument).ok()?;
+
+        if let Some(definition) = value
+            .as_object_mut()
+            .and_then(|obj| obj.values_mut().next())
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            definition.remove("ts_event");
+            definition.remove("ts_init");
+        }
+
+        Some(value)
+    }
+
+    match (normalized(a), normalized(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_common::messages::execution::{QueryAccount, QueryOrder, SubmitOrder};
@@ -2137,17 +2463,337 @@ mod tests {
     };
     use nautilus_model::{
         accounts::MarginAccount,
-        enums::{AccountType, BookType, OrderSide, OrderType},
+        data::BarSpecification,
+        enums::{AccountType, BarAggregation, BookType, OrderSide, OrderType},
         events::AccountState,
-        identifiers::{ClientOrderId, StrategyId, TraderId},
-        instruments::{CurrencyPair, InstrumentAny, stubs::audusd_sim},
+        identifiers::{ClientOrderId, StrategyId, TradeId, TraderId},
+        instruments::{
+            CurrencyPair, InstrumentAny,
+            stubs::{audusd_sim, futures_contract_es, gbpusd_sim},
+        },
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         stubs::TestDefault,
-        types::AccountBalance,
+        types::{
+            AccountBalance,
+            money::MONEY_RAW_MAX,
+            price::{PRICE_ERROR, PRICE_UNDEF},
+        },
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::execution_client::BacktestExecutionClient;
+
+    #[derive(Clone, Copy)]
+    enum LiquidationPriceSource {
+        Mark,
+        Quote,
+        Trade,
+        Bar,
+    }
+
+    #[rstest]
+    #[case::mark(LiquidationPriceSource::Mark)]
+    #[case::quote(LiquidationPriceSource::Quote)]
+    #[case::trade(LiquidationPriceSource::Trade)]
+    #[case::bar(LiquidationPriceSource::Bar)]
+    fn test_liquidation_rejects_sentinel_prices(
+        #[case] source: LiquidationPriceSource,
+        #[values(
+            InstrumentAny::CurrencyPair(audusd_sim()),
+            InstrumentAny::FuturesContract(futures_contract_es(None, None))
+        )]
+        instrument: InstrumentAny,
+        #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+        #[values(Price::from_raw(PRICE_UNDEF, 0), Price::from_raw(PRICE_ERROR, 0))] sentinel: Price,
+        #[values(false, true)] has_fallback: bool,
+    ) {
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument.clone()).unwrap();
+        let position = liquidation_position(&instrument, side);
+        let ts = UnixNanos::from(2);
+        let bar_spec = BarSpecification::new(1, BarAggregation::Minute, PriceType::Last);
+        let bar_type = BarType::new(instrument.id(), bar_spec, AggregationSource::External);
+
+        if has_fallback {
+            let value = match side {
+                OrderSide::Buy => dec!(90),
+                OrderSide::Sell => dec!(110),
+            };
+
+            let close = Price::from_decimal_dp(value, instrument.price_precision()).unwrap();
+
+            let bar = Bar::new(
+                bar_type,
+                close,
+                close,
+                close,
+                close,
+                Quantity::from("1"),
+                ts,
+                ts,
+            );
+            cache.add_bar(bar).unwrap();
+        }
+
+        match source {
+            LiquidationPriceSource::Mark => {
+                let mark = MarkPriceUpdate::new(instrument.id(), sentinel, ts, ts);
+                cache.add_mark_price(mark).unwrap();
+            }
+            LiquidationPriceSource::Quote => {
+                let valid = Price::from("100");
+                let (bid, ask) = match side {
+                    OrderSide::Buy => (sentinel, valid),
+                    OrderSide::Sell => (valid, sentinel),
+                };
+
+                let quote = QuoteTick::new(
+                    instrument.id(),
+                    bid,
+                    ask,
+                    Quantity::from("1"),
+                    Quantity::from("2"),
+                    ts,
+                    ts,
+                );
+                cache.add_quote(quote).unwrap();
+            }
+            LiquidationPriceSource::Trade => {
+                let trade = TradeTick::new(
+                    instrument.id(),
+                    sentinel,
+                    Quantity::from("1"),
+                    AggressorSide::Sell,
+                    TradeId::from("T-SENTINEL"),
+                    ts,
+                    ts,
+                );
+                cache.add_trade(trade).unwrap();
+            }
+            LiquidationPriceSource::Bar => {
+                let invalid_spec =
+                    BarSpecification::new(1, BarAggregation::Second, PriceType::Last);
+                let invalid_type =
+                    BarType::new(instrument.id(), invalid_spec, AggregationSource::Internal);
+                let later = UnixNanos::from(3);
+
+                let bar = Bar::new(
+                    invalid_type,
+                    sentinel,
+                    sentinel,
+                    sentinel,
+                    sentinel,
+                    Quantity::from("1"),
+                    later,
+                    later,
+                );
+                cache.add_bar(bar).unwrap();
+            }
+        }
+
+        let mut bar_types = None;
+        let actual = liquidation_unrealized_pnl(&cache, &position, &mut bar_types);
+
+        let expected = has_fallback.then(|| {
+            let amount = dec!(-10) * instrument.multiplier().as_decimal();
+            Money::from_decimal(amount, instrument.settlement_currency()).unwrap()
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_liquidation_bar_index_keeps_instruments_and_sides_separate(#[case] reverse: bool) {
+        let audusd = InstrumentAny::CurrencyPair(audusd_sim());
+        let gbpusd = InstrumentAny::CurrencyPair(gbpusd_sim());
+        let mut cache = Cache::default();
+        for instrument in [&audusd, &gbpusd] {
+            cache.add_instrument(instrument.clone()).unwrap();
+        }
+
+        let ts = UnixNanos::from(2);
+
+        for (instrument, price_type, value, source) in [
+            (
+                &audusd,
+                PriceType::Bid,
+                dec!(90),
+                AggregationSource::External,
+            ),
+            (
+                &audusd,
+                PriceType::Ask,
+                dec!(110),
+                AggregationSource::Internal,
+            ),
+            (
+                &gbpusd,
+                PriceType::Last,
+                dec!(100),
+                AggregationSource::External,
+            ),
+        ] {
+            let spec = BarSpecification::new(1, BarAggregation::Minute, price_type);
+            let bar_type = BarType::new(instrument.id(), spec, source);
+            let close = Price::from_decimal_dp(value, instrument.price_precision()).unwrap();
+
+            let bar = Bar::new(
+                bar_type,
+                close,
+                close,
+                close,
+                close,
+                Quantity::from("1"),
+                ts,
+                ts,
+            );
+            cache.add_bar(bar).unwrap();
+        }
+
+        let mut positions = [
+            (liquidation_position(&audusd, OrderSide::Buy), dec!(-10)),
+            (liquidation_position(&audusd, OrderSide::Sell), dec!(-10)),
+            (liquidation_position(&gbpusd, OrderSide::Buy), dec!(0)),
+        ];
+
+        if reverse {
+            positions.reverse();
+        }
+
+        let mut bar_types = None;
+        let actual: Vec<_> = positions
+            .iter()
+            .map(|(position, _)| liquidation_unrealized_pnl(&cache, position, &mut bar_types))
+            .collect();
+        let expected: Vec<_> = positions
+            .iter()
+            .map(|(_, amount)| Some(Money::from_decimal(*amount, Currency::USD()).unwrap()))
+            .collect();
+
+        assert_eq!(actual, expected);
+    }
+
+    fn liquidation_position(instrument: &InstrumentAny, side: OrderSide) -> Position {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(instrument.id())
+            .side(side)
+            .quantity(Quantity::from("1"))
+            .build();
+        let price = Price::from_decimal_dp(dec!(100), instrument.price_precision()).unwrap();
+        let fill = TestOrderEventStubs::filled(
+            &order,
+            instrument,
+            None,
+            None,
+            Some(price),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        Position::new(instrument, fill.into())
+    }
+
+    #[rstest]
+    #[case::position_failure(false)]
+    #[case::account_failure(true)]
+    fn test_funding_application_rolls_back_positions(#[case] account_failure: bool) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let exchange = Rc::new(RefCell::new(setup_exchange(Dispatch::Queued)));
+        let cache = exchange.borrow().cache.clone();
+        let clock = exchange.borrow().clock.clone();
+
+        let client = BacktestExecutionClient::new(
+            TraderId::test_default(),
+            AccountId::test_default(),
+            &exchange,
+            cache.clone(),
+            clock,
+            None,
+            None,
+        );
+
+        exchange.borrow_mut().register_client(Rc::new(client));
+        let mut adjusted_positions = Vec::new();
+
+        for (index, id) in ["P-FUND-A", "P-FUND-B"].into_iter().enumerate() {
+            let mut original = liquidation_position(&instrument, OrderSide::Buy);
+            original.id = id.into();
+            cache
+                .borrow_mut()
+                .add_position(&original, OmsType::Hedging)
+                .unwrap();
+
+            let currency = if index == 1 && !account_failure {
+                Currency::AUD()
+            } else {
+                Currency::USD()
+            };
+
+            let pnl_change = Money::from_decimal(dec!(-3.25), currency).unwrap();
+
+            let adjustment = PositionAdjusted::new(
+                original.trader_id,
+                original.strategy_id,
+                original.instrument_id,
+                original.id,
+                original.account_id,
+                PositionAdjustmentType::Funding,
+                None,
+                Some(pnl_change),
+                None,
+                UUID4::new(),
+                UnixNanos::from(2),
+                UnixNanos::from(3),
+            );
+
+            adjusted_positions.push((original, adjustment));
+        }
+
+        let applied = exchange
+            .borrow()
+            .apply_funding_adjustments(&adjusted_positions, &[Money::from("-6.50 USD")]);
+
+        assert!(!applied);
+
+        for (original, _) in adjusted_positions {
+            let actual = cache.borrow().position_owned(&original.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&actual).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+    }
+
+    #[rstest]
+    #[case::decimal_overflow(Decimal::MAX)]
+    #[case::money_bounds(Money::from_raw(MONEY_RAW_MAX, Currency::USD()).as_decimal())]
+    fn test_funding_valuation_rejects_overflow(#[case] rate: Decimal) {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position = liquidation_position(&instrument, OrderSide::Buy);
+
+        let funding_rate = FundingRateUpdate::new(
+            instrument.id(),
+            rate,
+            Some(480),
+            None,
+            UnixNanos::from(2),
+            UnixNanos::from(3),
+        );
+
+        let valued = value_funding_position(
+            &funding_rate,
+            Price::from("100.00000"),
+            &position,
+            Currency::USD(),
+        );
+        assert_eq!(valued, None);
+    }
 
     /// The three `send` dispatch modes a query must be intercepted ahead of.
     #[derive(Clone, Copy)]
@@ -2187,6 +2833,123 @@ mod tests {
         }
 
         SimulatedExchange::new(config, cache, clock).unwrap()
+    }
+
+    #[rstest]
+    fn test_modify_order_priority_config_reaches_matching_engine(
+        #[values(
+            OrderPriorityResetPolicy::PriceChange,
+            OrderPriorityResetPolicy::PriceOrQuantityIncrease,
+            OrderPriorityResetPolicy::AnyModify
+        )]
+        policy: OrderPriorityResetPolicy,
+    ) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::from("1_000 USD")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .order_priority_reset_policy(policy)
+            .build()
+            .unwrap();
+        let mut exchange = SimulatedExchange::new(config, cache.clone(), clock).unwrap();
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        exchange.add_instrument(instrument.clone()).unwrap();
+        let engine = exchange.matching_engines.get_mut(&instrument.id()).unwrap();
+        engine.set_event_handler(Rc::new(move |event| {
+            cache.borrow_mut().update_order(&event).unwrap();
+        }));
+
+        let ids = [
+            ClientOrderId::from("MODIFY-FIRST"),
+            ClientOrderId::from("MODIFY-SECOND"),
+        ];
+
+        for id in ids {
+            let mut order = OrderTestBuilder::new(OrderType::Limit)
+                .instrument_id(instrument.id())
+                .client_order_id(id)
+                .side(OrderSide::Buy)
+                .price(Price::from("1.00000"))
+                .quantity(Quantity::from("5"))
+                .submit(true)
+                .build();
+            exchange
+                .cache
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+            engine.process_order(&mut order, AccountId::from("SIM-001"));
+        }
+
+        let order = exchange.cache.borrow().order(&ids[0]).unwrap().clone();
+        engine.process_modify(
+            &ModifyOrder::new(
+                order.trader_id(),
+                None,
+                order.strategy_id(),
+                order.instrument_id(),
+                ids[0],
+                order.venue_order_id(),
+                Some(Quantity::from("3")),
+                None,
+                None,
+                UUID4::new(),
+                1.into(),
+                None,
+                None,
+            ),
+            AccountId::from("SIM-001"),
+        );
+
+        let expected = if policy == OrderPriorityResetPolicy::AnyModify {
+            vec![ids[1], ids[0]]
+        } else {
+            ids.to_vec()
+        };
+
+        assert_eq!(
+            engine
+                .get_core()
+                .get_orders_bid()
+                .iter()
+                .map(|o| o.client_order_id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            exchange.cache.borrow().order(&ids[0]).unwrap().quantity(),
+            Quantity::from("3")
+        );
+    }
+
+    #[rstest]
+    fn test_replay_instrument_expiration_change_is_rejected() {
+        let mut exchange = setup_exchange(Dispatch::Queued);
+        let mut option = nautilus_model::instruments::stubs::option_contract_appl();
+        option.id = InstrumentId::from("TEST.SIM");
+        let original = InstrumentAny::OptionContract(option.clone());
+        exchange.add_instrument(original.clone()).unwrap();
+        exchange.update_instrument(&original).unwrap();
+        option.expiration_ns = UnixNanos::from(10);
+
+        let error = exchange
+            .update_instrument(&InstrumentAny::OptionContract(option))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("Cannot change expiration"));
+        let cache = exchange.cache.borrow();
+        for instrument in [
+            &exchange.instruments[&original.id()],
+            &exchange.matching_engines[&original.id()].instrument,
+            cache.instrument(&original.id()).unwrap(),
+        ] {
+            assert_eq!(instrument.expiration_ns(), original.expiration_ns());
+        }
     }
 
     #[rstest]
@@ -2319,6 +3082,65 @@ mod tests {
     }
 
     #[rstest]
+    fn test_add_identical_instrument_is_noop(audusd_sim: CurrencyPair) {
+        let mut exchange = setup_exchange(Dispatch::Immediate);
+        exchange
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim.clone()))
+            .unwrap();
+
+        let mut restamped = audusd_sim.clone();
+        restamped.ts_event = UnixNanos::from(1);
+        restamped.ts_init = UnixNanos::from(1);
+        exchange
+            .add_instrument(InstrumentAny::CurrencyPair(restamped))
+            .unwrap();
+
+        assert_eq!(exchange.instruments.len(), 1);
+        assert_eq!(exchange.matching_engines.len(), 1);
+        assert_eq!(exchange.matching_engines[&audusd_sim.id].raw_id, 1);
+        assert_eq!(exchange.last_raw_id, 1);
+        assert_eq!(
+            exchange.instruments[&audusd_sim.id].ts_init(),
+            UnixNanos::default()
+        );
+    }
+
+    #[rstest]
+    #[case::price_increment(|pair: &mut CurrencyPair| {
+        pair.price_precision = 4;
+        pair.price_increment = Price::from("0.0001");
+    })]
+    #[case::lot_size(|pair: &mut CurrencyPair| pair.lot_size = Some(Quantity::from(100)))]
+    #[case::margin_init(|pair: &mut CurrencyPair| pair.margin_init = dec!(0.5))]
+    #[case::max_quantity(|pair: &mut CurrencyPair| pair.max_quantity = Some(Quantity::from(10)))]
+    fn test_add_changed_instrument_is_rejected_without_state_change(
+        audusd_sim: CurrencyPair,
+        #[case] change: fn(&mut CurrencyPair),
+    ) {
+        let mut exchange = setup_exchange(Dispatch::Immediate);
+        exchange
+            .add_instrument(InstrumentAny::CurrencyPair(audusd_sim.clone()))
+            .unwrap();
+        let mut changed = audusd_sim.clone();
+        change(&mut changed);
+
+        let result = exchange.add_instrument(InstrumentAny::CurrencyPair(changed));
+
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Instrument AUD/USD.SIM is already registered with a different definition"
+        );
+        assert_eq!(exchange.instruments.len(), 1);
+        assert_eq!(exchange.matching_engines.len(), 1);
+        assert_eq!(exchange.matching_engines[&audusd_sim.id].raw_id, 1);
+        assert_eq!(exchange.last_raw_id, 1);
+        assert_eq!(
+            serde_json::to_value(&exchange.instruments[&audusd_sim.id]).unwrap(),
+            serde_json::to_value(InstrumentAny::CurrencyPair(audusd_sim)).unwrap()
+        );
+    }
+
+    #[rstest]
     fn test_reset_clears_inflight_counter() {
         let mut exchange = setup_exchange(Dispatch::Latency);
         let account = MarginAccount::new(
@@ -2385,5 +3207,115 @@ mod tests {
         exchange.reset().unwrap();
 
         assert!(exchange.inflight_counter.is_empty());
+    }
+
+    #[cfg(feature = "python")]
+    mod python_latency {
+        use std::ffi::CString;
+
+        use nautilus_common::messages::execution::CancelAllOrders;
+        use nautilus_execution::python::latency::{PyLatencyModel, pyobject_to_latency_model_any};
+        use pyo3::{prelude::*, types::PyDict};
+
+        use super::*;
+
+        #[rstest]
+        fn test_python_latency_schedules_once_with_clock_and_command_time() {
+            let mut exchange = setup_exchange(Dispatch::Latency);
+            exchange.set_clock_time(UnixNanos::new(500));
+            let (model, obj) = recorded_latency("11");
+            exchange.set_latency_model(model);
+            exchange.send(cancel_command());
+
+            let calls = Python::attach(|py| {
+                obj.bind(py)
+                    .getattr("calls")
+                    .unwrap()
+                    .extract::<Vec<(u64, u64)>>()
+                    .unwrap()
+            });
+
+            assert_eq!(calls, vec![(100, 500)]);
+            assert_eq!(
+                exchange.max_inflight_command_ts(),
+                Some(UnixNanos::new(111))
+            );
+            assert_eq!(exchange.inflight_queue.len(), 1);
+            assert_eq!(
+                exchange.inflight_counter.get(&UnixNanos::new(111)),
+                Some(&1)
+            );
+            assert!(exchange.callback_error.is_none());
+        }
+
+        #[rstest]
+        #[case("-1", "Python LatencyModel.get_delete_latency failed:")]
+        #[case("2 ** 64 - 1", "Latency arrival timestamp exceeds u64 nanoseconds")]
+        #[case(
+            "(_ for _ in ()).throw(ValueError('sample failed'))",
+            "ValueError: sample failed"
+        )]
+        fn test_python_latency_failure_latches_without_queuing(
+            #[case] delay: &str,
+            #[case] message: &str,
+        ) {
+            let mut exchange = setup_exchange(Dispatch::Latency);
+            let (model, obj) = recorded_latency(delay);
+            exchange.set_latency_model(model);
+            exchange.send(cancel_command());
+            exchange.send(cancel_command());
+
+            let calls = Python::attach(|py| {
+                obj.bind(py)
+                    .getattr("calls")
+                    .unwrap()
+                    .extract::<Vec<(u64, u64)>>()
+                    .unwrap()
+            });
+
+            assert_eq!(calls, vec![(100, 0)]);
+            assert!(
+                exchange
+                    .check_callback_error()
+                    .unwrap_err()
+                    .to_string()
+                    .contains(message)
+            );
+            assert_eq!(exchange.max_inflight_command_ts(), None);
+            assert!(exchange.inflight_queue.is_empty());
+            assert!(exchange.message_queue.is_empty());
+            assert!(exchange.inflight_counter.is_empty());
+        }
+
+        fn cancel_command() -> TradingCommand {
+            TradingCommand::CancelAllOrders(CancelAllOrders::new(
+                TraderId::test_default(),
+                None,
+                StrategyId::test_default(),
+                InstrumentId::from("AUD/USD.SIM"),
+                None,
+                UUID4::new(),
+                UnixNanos::new(100),
+                None,
+                None,
+            ))
+        }
+
+        fn recorded_latency(delay: &str) -> (LatencyModelHandle, Py<PyAny>) {
+            Python::initialize();
+            Python::attach(|py| {
+                let locals = PyDict::new(py);
+                locals
+                    .set_item("LatencyModel", py.get_type::<PyLatencyModel>())
+                    .unwrap();
+                let source = format!(
+                    "type('RecordedLatency', (LatencyModel,), {{'calls': [], 'get_delete_latency': lambda self, command, ts_now: self.calls.append((command.ts_init, ts_now)) or ({delay})}})()"
+                );
+                let source = CString::new(source).unwrap();
+                let obj = py.eval(&source, Some(&locals), None).unwrap();
+                let model = pyobject_to_latency_model_any(&obj).unwrap().into();
+                (model, obj.unbind())
+            })
+        }
     }
 }

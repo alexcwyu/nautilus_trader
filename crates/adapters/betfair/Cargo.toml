@@ -74,6 +74,8 @@ bon = { workspace = true }
 bytes = { workspace = true }
 bzip2 = { workspace = true }
 flate2 = { workspace = true }
+http = { workspace = true }
+indexmap = { workspace = true }
 jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
@@ -102,16 +104,24 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 nautilus-trading = { workspace = true }
 
 axum = { workspace = true }
+criterion = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
 proptest = { workspace = true }
+rcgen = { workspace = true }
 rstest = { workspace = true }
 rust_decimal_macros = { workspace = true }
 rustls = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-rustls = { workspace = true }
 toml = { workspace = true }
 webpki-roots = { workspace = true }
+
+[[bench]]
+name = "fill_tracker_criterion"
+path = "benches/fill_tracker_criterion.rs"
+harness = false
 
 # Run with `cargo run -p nautilus-betfair --example betfair-data-tester --features examples`
 [[example]]

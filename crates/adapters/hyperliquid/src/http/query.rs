@@ -13,12 +13,15 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use serde::Serialize;
+use serde::{Serialize, ser::SerializeStruct};
 
 use crate::{
-    common::enums::{HyperliquidBarInterval, HyperliquidInfoRequestType},
+    common::{
+        enums::{HyperliquidBarInterval, HyperliquidInfoRequestType},
+        parse::is_false_or_none,
+    },
     http::models::{
-        HyperliquidExchangeBuilderFee, HyperliquidExchangeCancelByCloidRequest,
+        Cloid, HyperliquidExchangeBuilderFee, HyperliquidExchangeCancelByCloidRequest,
         HyperliquidExchangeGrouping, HyperliquidExchangeModifyOrderRequest,
         HyperliquidExchangePlaceOrderRequest,
     },
@@ -65,10 +68,12 @@ pub struct OrderParams {
 }
 
 /// Parameters for canceling orders.
+///
+/// The fast-cancel flag is serialized only when true.
 #[derive(Debug, Clone, Serialize)]
 pub struct CancelParams {
     pub cancels: Vec<HyperliquidExchangeCancelByCloidRequest>,
-    #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "f", skip_serializing_if = "is_false_or_none")]
     pub fast: Option<bool>,
 }
 
@@ -110,9 +115,21 @@ pub struct RecentTradesParams {
 }
 
 /// Parameters for user fills request.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct UserFillsParams {
     pub user: String,
+}
+
+impl Serialize for UserFillsParams {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("UserFillsParams", 2)?;
+        state.serialize_field("user", &self.user)?;
+        state.serialize_field("aggregateByTime", &false)?;
+        state.end()
+    }
 }
 
 /// Parameters for order status request.
@@ -120,6 +137,16 @@ pub struct UserFillsParams {
 pub struct OrderStatusParams {
     pub user: String,
     pub oid: u64,
+}
+
+/// Parameters for order status request by CLOID.
+///
+/// Hyperliquid names this field `oid`, but accepts a CLOID in place of the numeric order ID.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderStatusByCloidParams {
+    pub user: String,
+    #[serde(rename = "oid")]
+    pub cloid: Cloid,
 }
 
 /// Parameters for open orders request.
@@ -178,6 +205,7 @@ pub enum InfoRequestParams {
     RecentTrades(RecentTradesParams),
     UserFills(UserFillsParams),
     OrderStatus(OrderStatusParams),
+    OrderStatusByCloid(OrderStatusByCloidParams),
     OpenOrders(OpenOrdersParams),
     ClearinghouseState(ClearinghouseStateParams),
     SpotClearinghouseState(SpotClearinghouseStateParams),
@@ -289,6 +317,17 @@ impl InfoRequest {
             params: InfoRequestParams::OrderStatus(OrderStatusParams {
                 user: user.to_string(),
                 oid,
+            }),
+        }
+    }
+
+    /// Creates a request to get order status for a user by CLOID.
+    pub(crate) fn order_status_by_cloid(user: &str, cloid: Cloid) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::OrderStatus,
+            params: InfoRequestParams::OrderStatusByCloid(OrderStatusByCloidParams {
+                user: user.to_string(),
+                cloid,
             }),
         }
     }
@@ -530,6 +569,40 @@ mod tests {
     };
 
     #[rstest]
+    fn test_cancel_action_serialization(
+        #[values(None, Some(false), Some(true))] fast: Option<bool>,
+        #[values(false, true)] by_cloid: bool,
+    ) {
+        let cancels = vec![HyperliquidExchangeCancelByCloidRequest {
+            asset: 7,
+            cloid: Cloid::from_hex("0x0123456789abcdef0123456789abcdef").unwrap(),
+        }];
+
+        let (mut action, name) = if by_cloid {
+            (ExchangeAction::cancel_by_cloid(cancels), "cancel_by_cloid")
+        } else {
+            (ExchangeAction::cancel(cancels), "query_cancel")
+        };
+
+        let ExchangeActionParams::Cancel(params) = &mut action.params else {
+            panic!("Expected cancel parameters");
+        };
+
+        params.fast = fast;
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/cancel_actions.json")).unwrap();
+        let expected = &fixtures[name][if fast == Some(true) { "fast" } else { "normal" }];
+        let json = serde_json::to_value(&action).unwrap();
+        let msgpack = rmp_serde::to_vec_named(&action).unwrap();
+
+        assert_eq!(json, expected["json"]);
+        assert_eq!(
+            nautilus_core::hex::encode(msgpack),
+            expected["msgpack"].as_str().unwrap()
+        );
+    }
+
+    #[rstest]
     fn test_info_request_meta() {
         let req = InfoRequest::meta();
 
@@ -572,6 +645,27 @@ mod tests {
         assert_eq!(req.request_type, HyperliquidInfoRequestType::RecentTrades);
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"type":"recentTrades","coin":"BTC"}"#);
+    }
+
+    #[rstest]
+    fn test_info_request_order_status_serialization() {
+        let cloid = Cloid::from_hex("0x00000000000000000000000000000abc").unwrap();
+        let by_oid = serde_json::to_value(InfoRequest::order_status("0xabc", 42)).unwrap();
+        let by_cloid =
+            serde_json::to_value(InfoRequest::order_status_by_cloid("0xabc", cloid)).unwrap();
+
+        assert_eq!(
+            by_oid,
+            serde_json::json!({"type": "orderStatus", "user": "0xabc", "oid": 42})
+        );
+        assert_eq!(
+            by_cloid,
+            serde_json::json!({
+                "type": "orderStatus",
+                "user": "0xabc",
+                "oid": "0x00000000000000000000000000000abc",
+            })
+        );
     }
 
     #[rstest]

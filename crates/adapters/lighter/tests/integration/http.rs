@@ -22,6 +22,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -49,13 +50,14 @@ use nautilus_lighter::{
         query::{
             LighterAccountActiveOrdersQuery, LighterAccountActiveOrdersQueryBuilder,
             LighterAccountInactiveOrdersQuery, LighterAccountInactiveOrdersQueryBuilder,
-            LighterAccountLookup, LighterAccountQuery, LighterCandlesQuery,
-            LighterCandlesQueryBuilder, LighterFundingsQuery, LighterMakerOnlyApiKeysQueryBuilder,
-            LighterNextNonceQuery, LighterOrderBookDetailsQuery,
-            LighterOrderBookDetailsQueryBuilder, LighterOrderBookOrdersQuery,
-            LighterOrderBooksQuery, LighterOrderBooksQueryBuilder, LighterRecentTradesQuery,
-            LighterSortDirection, LighterTradeQueryType, LighterTradeRole, LighterTradeSortBy,
-            LighterTradesQuery, LighterTradesQueryBuilder,
+            LighterAccountLookup, LighterAccountOrdersQuery, LighterAccountOrdersQueryBuilder,
+            LighterAccountQuery, LighterCandlesQuery, LighterCandlesQueryBuilder,
+            LighterFundingsQuery, LighterMakerOnlyApiKeysQuery,
+            LighterMakerOnlyApiKeysQueryBuilder, LighterNextNonceQuery,
+            LighterOrderBookDetailsQuery, LighterOrderBookDetailsQueryBuilder,
+            LighterOrderBookOrdersQuery, LighterOrderBooksQuery, LighterOrderBooksQueryBuilder,
+            LighterRecentTradesQuery, LighterSortDirection, LighterTradeQueryType,
+            LighterTradeRole, LighterTradeSortBy, LighterTradesQuery, LighterTradesQueryBuilder,
         },
     },
 };
@@ -73,6 +75,8 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryManager},
 };
+use nautilus_testkit::http::assert_http_redirect_rejected;
+use rstest::rstest;
 use rust_decimal::Decimal;
 
 const HTTP_NEXT_NONCE: &str = include_str!("../../test_data/http_next_nonce.json");
@@ -119,6 +123,23 @@ struct LatestFundingsState {
 struct CappedHistoryState {
     calls: Arc<AtomicUsize>,
     row_page: Option<usize>,
+}
+
+#[tokio::test]
+async fn test_authenticated_client_rejects_redirects() {
+    assert_http_redirect_rejected(|url| async move {
+        let client =
+            LighterRawHttpClient::new(LighterEnvironment::Testnet, Some(url), 3, None).unwrap();
+        let query = LighterOrderBooksQuery::default();
+        let error = client.get_order_books(&query).await.unwrap_err();
+
+        let LighterHttpError::Http { status, .. } = error else {
+            panic!("expected HTTP redirect status, was {error:?}");
+        };
+
+        status
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -206,6 +227,150 @@ async fn raw_client_get_trades_sends_paginated_query_and_parses_response() {
     assert_eq!(response.trades.len(), 1);
 }
 
+#[rstest]
+#[case::trades("trades")]
+#[case::active("accountActiveOrders")]
+#[case::inactive("accountInactiveOrders")]
+#[case::orders("accountOrders")]
+#[case::maker_only("getMakerOnlyApiKeys")]
+#[tokio::test]
+async fn raw_client_sends_auth_only_in_header(
+    #[case] endpoint: &str,
+    #[values(None, Some("header-token"))] authorization: Option<&'static str>,
+    #[values(None, Some("legacy-token"))] auth: Option<&'static str>,
+) {
+    let expected_header = authorization.or(auth);
+    let mut expected_params = HashMap::from([("account_index".to_string(), "712440".to_string())]);
+
+    match endpoint {
+        "trades" => {
+            expected_params.extend([
+                ("market_id".to_string(), "3".to_string()),
+                ("sort_by".to_string(), "timestamp".to_string()),
+                ("limit".to_string(), "25".to_string()),
+            ]);
+        }
+        "accountActiveOrders" => {
+            expected_params.insert("market_id".to_string(), "3".to_string());
+        }
+        "accountInactiveOrders" => {
+            expected_params.insert("limit".to_string(), "25".to_string());
+        }
+        "accountOrders" => {
+            expected_params.insert("client_order_indexes".to_string(), "42,43".to_string());
+        }
+        "getMakerOnlyApiKeys" => {}
+        _ => unreachable!(),
+    }
+
+    let body = match endpoint {
+        "trades" => HTTP_RECENT_TRADES.to_string(),
+        "getMakerOnlyApiKeys" => {
+            serde_json::json!({"code": 200, "api_key_indexes": [5]}).to_string()
+        }
+        _ => HTTP_ORDERS.to_string(),
+    };
+
+    let path = format!("/api/v1/{endpoint}");
+
+    let base_url = spawn_server(Router::new().route(
+        &path,
+        get(
+            move |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| {
+                let expected_params = expected_params.clone();
+                let body = body.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .map(|value| value.to_str().unwrap()),
+                        expected_header
+                    );
+                    assert_eq!(params, expected_params);
+                    (StatusCode::OK, body).into_response()
+                }
+            },
+        ),
+    ))
+    .await;
+
+    let client = raw_client(base_url);
+    let authorization = authorization.map(SecretString::from);
+    let auth = auth.map(SecretString::from);
+
+    let code = match endpoint {
+        "trades" => {
+            client
+                .get_trades(&LighterTradesQuery {
+                    authorization,
+                    auth,
+                    market_id: Some(3),
+                    account_index: Some(712_440),
+                    sort_by: LighterTradeSortBy::Timestamp,
+                    limit: 25,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .code
+        }
+        "accountActiveOrders" => {
+            client
+                .get_account_active_orders(&LighterAccountActiveOrdersQuery {
+                    authorization,
+                    auth,
+                    account_index: 712_440,
+                    market_id: 3,
+                })
+                .await
+                .unwrap()
+                .code
+        }
+        "accountInactiveOrders" => {
+            client
+                .get_account_inactive_orders(&LighterAccountInactiveOrdersQuery {
+                    authorization,
+                    auth,
+                    account_index: 712_440,
+                    market_id: None,
+                    ask_filter: None,
+                    between_timestamps: None,
+                    cursor: None,
+                    limit: 25,
+                })
+                .await
+                .unwrap()
+                .code
+        }
+        "accountOrders" => {
+            client
+                .get_account_orders(&LighterAccountOrdersQuery {
+                    authorization,
+                    auth,
+                    account_index: 712_440,
+                    client_order_indexes: vec![42, 43],
+                })
+                .await
+                .unwrap()
+                .code
+        }
+        "getMakerOnlyApiKeys" => {
+            client
+                .get_maker_only_api_keys(&LighterMakerOnlyApiKeysQuery {
+                    authorization,
+                    auth,
+                    account_index: 712_440,
+                })
+                .await
+                .unwrap()
+                .code
+        }
+        _ => unreachable!(),
+    };
+
+    assert_eq!(code, 200);
+}
+
 #[tokio::test]
 async fn raw_client_get_candles_sends_query_and_parses_response() {
     let base_url = spawn_server(Router::new().route("/api/v1/candles", get(handle_candles))).await;
@@ -273,7 +438,7 @@ async fn raw_client_get_trades_serializes_lighter_rest_page_size() {
 }
 
 #[tokio::test]
-async fn raw_client_get_account_orders_sends_auth_queries_and_parses_response() {
+async fn raw_client_get_account_orders_sends_auth_headers_and_parses_response() {
     let base_url = spawn_server(
         Router::new()
             .route(
@@ -315,6 +480,90 @@ async fn raw_client_get_account_orders_sends_auth_queries_and_parses_response() 
 
     assert_eq!(active.orders.len(), 1);
     assert_eq!(inactive.next_cursor.as_deref(), Some("cursor-1"));
+}
+
+#[rstest]
+#[case::single(vec![42])]
+#[case::multiple(vec![42, 43, 44])]
+#[tokio::test]
+async fn raw_client_get_account_orders_serializes_client_order_indexes(#[case] indexes: Vec<i64>) {
+    let expected_indexes = indexes.clone();
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/accountOrders",
+        get(
+            move |headers: HeaderMap,
+                  Query(params): Query<HashMap<String, String>>,
+                  Query(query): Query<LighterAccountOrdersQuery>| {
+                let expected_indexes = expected_indexes.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get("authorization")
+                            .map(|value| value.to_str().unwrap()),
+                        Some("auth-token")
+                    );
+                    assert!(!params.contains_key("authorization"));
+                    assert!(!params.contains_key("auth"));
+                    assert_eq!(query.account_index, 712_440);
+                    assert_eq!(query.client_order_indexes, expected_indexes);
+                    (StatusCode::OK, HTTP_ORDERS).into_response()
+                }
+            },
+        ),
+    ))
+    .await;
+
+    let client = raw_client(base_url);
+    let query = LighterAccountOrdersQueryBuilder::default()
+        .auth("auth-token")
+        .account_index(712_440)
+        .client_order_indexes(indexes)
+        .build()
+        .unwrap();
+
+    let response = client.get_account_orders(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(response.message, None);
+    assert_eq!(response.next_cursor.as_deref(), Some("cursor-1"));
+    assert_eq!(response.orders.len(), 1);
+    assert_eq!(response.orders[0].client_order_index, 42);
+}
+
+#[rstest]
+#[case::empty(vec![])]
+#[case::too_many((1..=21).collect::<Vec<i64>>())]
+#[tokio::test]
+async fn raw_client_get_account_orders_rejects_invalid_index_counts_before_request(
+    #[case] indexes: Vec<i64>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    let base_url = spawn_server(Router::new().route(
+        "/api/v1/accountOrders",
+        get(move || {
+            let calls = Arc::clone(&requests);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, HTTP_ORDERS).into_response()
+            }
+        }),
+    ))
+    .await;
+
+    let client = raw_client(base_url);
+    let query = LighterAccountOrdersQueryBuilder::default()
+        .account_index(712_440)
+        .client_order_indexes(indexes)
+        .build()
+        .unwrap();
+
+    let error = client.get_account_orders(&query).await.unwrap_err();
+
+    assert!(
+        matches!(error, LighterHttpError::Parse(message) if message.contains("between 1 and 20"))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -509,7 +758,7 @@ async fn raw_client_send_tx_maps_success_body_errors() {
     ));
     assert!(matches!(
         rate_limit_error,
-        LighterHttpError::RateLimit(message) if message == "slow down"
+        LighterHttpError::RateLimit { message, .. } if message == "slow down"
     ));
 }
 
@@ -525,7 +774,7 @@ async fn raw_client_maps_rate_limit_status() {
 
     let error = client.get_recent_trades(&query).await.unwrap_err();
 
-    assert!(matches!(error, LighterHttpError::RateLimit(_)));
+    assert!(matches!(error, LighterHttpError::RateLimit { .. }));
 }
 
 #[tokio::test]
@@ -555,7 +804,7 @@ async fn raw_client_maps_405_status_as_rate_limit() {
 
     let error = client.get_order_books(&query).await.unwrap_err();
 
-    assert!(matches!(error, LighterHttpError::RateLimit(_)));
+    assert!(matches!(error, LighterHttpError::RateLimit { .. }));
 }
 
 #[tokio::test]
@@ -569,7 +818,7 @@ async fn raw_client_maps_structured_rate_limit_code() {
 
     assert!(matches!(
         error,
-        LighterHttpError::RateLimit(message) if message == "slow down"
+        LighterHttpError::RateLimit { message, .. } if message == "slow down"
     ));
 }
 
@@ -603,7 +852,7 @@ async fn raw_client_maps_success_body_errors() {
     ));
     assert!(matches!(
         rate_limit_error,
-        LighterHttpError::RateLimit(message) if message == "slow down"
+        LighterHttpError::RateLimit { message, .. } if message == "slow down"
     ));
 }
 
@@ -779,6 +1028,150 @@ async fn raw_client_send_tx_post_is_single_shot_on_5xx() {
     let error = client.send_tx(&request).await.unwrap_err();
 
     assert!(matches!(error, LighterHttpError::Http { status: 503, .. }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[rstest]
+#[case::rate_limit(StatusCode::TOO_MANY_REQUESTS, false)]
+#[case::firewall(StatusCode::METHOD_NOT_ALLOWED, false)]
+#[case::server_busy(StatusCode::SERVICE_UNAVAILABLE, false)]
+#[case::venue_rate_limit(StatusCode::OK, true)]
+#[tokio::test]
+async fn raw_client_honors_retry_after_before_retrying(
+    #[case] status: StatusCode,
+    #[case] venue_rate_limit: bool,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    let router = Router::new().route(
+        "/api/v1/orderBooks",
+        get(move || {
+            let calls = Arc::clone(&requests);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let body = if venue_rate_limit {
+                        include_str!("../../test_data/http_rate_limit_synthetic.json")
+                    } else {
+                        "busy"
+                    };
+
+                    (status, [("retry-after", "1")], body).into_response()
+                } else {
+                    (StatusCode::OK, HTTP_ORDER_BOOKS).into_response()
+                }
+            }
+        }),
+    );
+
+    let base_url = spawn_server(router).await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+    let started = Instant::now();
+
+    let response = client.get_order_books(&query).await.unwrap();
+
+    assert_eq!(response.code, 200);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+}
+
+#[rstest]
+#[case::rate_limit(StatusCode::TOO_MANY_REQUESTS)]
+#[case::firewall(StatusCode::METHOD_NOT_ALLOWED)]
+#[case::server_busy(StatusCode::SERVICE_UNAVAILABLE)]
+#[tokio::test]
+async fn raw_client_stops_when_retry_after_exceeds_budget(#[case] status: StatusCode) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    let router = Router::new().route(
+        "/api/v1/orderBooks",
+        get(move || {
+            let calls = Arc::clone(&requests);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (status, [("retry-after", "120")], "busy").into_response()
+            }
+        }),
+    );
+
+    let base_url = spawn_server(router).await;
+    let client = raw_client(base_url);
+    let query = LighterOrderBooksQueryBuilder::default().build().unwrap();
+
+    let error = client.get_order_books(&query).await.unwrap_err();
+
+    let retry_after = match error {
+        LighterHttpError::RateLimit {
+            message,
+            retry_after,
+        } => {
+            assert_eq!(message, "busy");
+            retry_after
+        }
+        LighterHttpError::Http {
+            status: actual,
+            body,
+            retry_after,
+        } => {
+            assert_eq!(actual, status.as_u16());
+            assert_eq!(body, "busy");
+            retry_after
+        }
+        other => panic!("expected response error, was {other:?}"),
+    };
+
+    assert_eq!(retry_after, Some(Duration::from_secs(120)));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[rstest]
+#[case::send_tx("/api/v1/sendTx")]
+#[case::send_tx_batch("/api/v1/sendTxBatch")]
+#[case::referral("/api/v1/referral/use")]
+#[tokio::test]
+async fn raw_client_writes_remain_single_shot_with_retry_after(#[case] endpoint: &str) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&calls);
+    let router = Router::new().route(
+        endpoint,
+        post(move || {
+            let calls = Arc::clone(&requests);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "1")],
+                    "busy",
+                )
+                    .into_response()
+            }
+        }),
+    );
+
+    let base_url = spawn_server(router).await;
+    let client = raw_client(base_url);
+
+    let error = match endpoint {
+        "/api/v1/sendTx" => {
+            let request = LighterSendTxRequest::new(LighterTxType::CreateOrder as u8, "{}");
+            client.send_tx(&request).await.unwrap_err()
+        }
+        "/api/v1/sendTxBatch" => {
+            let tx_types = serde_json::to_string(&[LighterTxType::CreateOrder as u8]).unwrap();
+            let tx_infos = serde_json::to_string(&["{}"]).unwrap();
+            let request = LighterSendTxBatchRequest::new(tx_types, tx_infos);
+            client.send_tx_batch(&request).await.unwrap_err()
+        }
+        "/api/v1/referral/use" => client
+            .use_referral("address", "referral", "token")
+            .await
+            .unwrap_err(),
+        _ => unreachable!("unsupported write endpoint"),
+    };
+
+    assert!(
+        matches!(error, LighterHttpError::RateLimit { message, retry_after: Some(delay) } if message == "busy" && delay == Duration::from_secs(1))
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
@@ -984,13 +1377,13 @@ async fn domain_client_request_funding_rates_parses_signed_rates() {
 
     assert_eq!(funding_rates.len(), 2);
     assert_eq!(funding_rates[0].instrument_id, instrument.id());
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
     assert_eq!(funding_rates[0].interval, Some(60));
     assert_eq!(
         funding_rates[0].ts_event,
         UnixNanos::from(1_778_702_400_000_000_000),
     );
-    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 4));
+    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 6));
 }
 
 #[tokio::test]
@@ -1033,11 +1426,11 @@ async fn domain_client_request_funding_rates_paginates_range() {
         funding_rates[0].ts_event,
         millis_to_unix_nanos(state.start_ms)
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
     assert_eq!(funding_rates[1].ts_event, millis_to_unix_nanos(boundary_ms));
-    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 4));
+    assert_eq!(funding_rates[1].rate, Decimal::new(-2, 6));
     assert_eq!(funding_rates[2].ts_event, millis_to_unix_nanos(end_ms));
-    assert_eq!(funding_rates[2].rate, Decimal::new(1, 4));
+    assert_eq!(funding_rates[2].rate, Decimal::new(1, 6));
 }
 
 #[tokio::test]
@@ -1080,12 +1473,12 @@ async fn domain_client_request_funding_rates_caps_to_limit_across_pages() {
         funding_rates[0].ts_event,
         millis_to_unix_nanos(state.start_ms)
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
     assert_eq!(
         funding_rates[1].ts_event,
         millis_to_unix_nanos(state.start_ms + interval_ms)
     );
-    assert_eq!(funding_rates[1].rate, Decimal::new(3, 4));
+    assert_eq!(funding_rates[1].rate, Decimal::new(3, 6));
 }
 
 #[tokio::test]
@@ -1121,12 +1514,12 @@ async fn domain_client_request_funding_rates_without_start_returns_latest_limit(
         funding_rates[0].ts_event,
         millis_to_unix_nanos(state.end_ms - interval_ms)
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(7, 4));
+    assert_eq!(funding_rates[0].rate, Decimal::new(7, 6));
     assert_eq!(
         funding_rates[1].ts_event,
         millis_to_unix_nanos(state.end_ms)
     );
-    assert_eq!(funding_rates[1].rate, Decimal::new(-8, 4));
+    assert_eq!(funding_rates[1].rate, Decimal::new(-8, 6));
 }
 
 #[tokio::test]
@@ -1170,7 +1563,7 @@ async fn domain_client_request_funding_rates_accepts_limit_on_final_capped_page(
         funding_rates[0].instrument_id,
         create_test_instrument().id()
     );
-    assert_eq!(funding_rates[0].rate, Decimal::new(12, 4));
+    assert_eq!(funding_rates[0].rate, Decimal::new(12, 6));
     assert_eq!(funding_rates[0].interval, Some(60));
     assert_eq!(funding_rates[0].next_funding_ns, None);
     assert_eq!(funding_rates[0].ts_event, expected_ts);
@@ -1941,14 +2334,19 @@ async fn handle_paginated_candles(
     }
 }
 
-async fn handle_trades(Query(query): Query<LighterTradesQuery>) -> Response {
+async fn handle_trades(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    Query(query): Query<LighterTradesQuery>,
+) -> Response {
     assert_eq!(
-        query
-            .authorization
-            .as_ref()
-            .map(SecretString::expose_secret),
+        headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap()),
         Some("bearer-token")
     );
+    assert!(!params.contains_key("authorization"));
+    assert!(!params.contains_key("auth"));
     assert_eq!(query.market_id, Some(0));
     assert_eq!(query.account_index, Some(712_440));
     assert_eq!(query.order_index, Some(281_476_929_510_110));
@@ -1970,27 +2368,36 @@ async fn handle_trades_with_page_size_limit(Query(query): Query<LighterTradesQue
 }
 
 async fn handle_account_active_orders(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
     Query(query): Query<LighterAccountActiveOrdersQuery>,
 ) -> Response {
     assert_eq!(
-        query.auth.as_ref().map(SecretString::expose_secret),
+        headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap()),
         Some("auth-token")
     );
+    assert!(!params.contains_key("authorization"));
+    assert!(!params.contains_key("auth"));
     assert_eq!(query.account_index, 712_440);
     assert_eq!(query.market_id, 0);
     (StatusCode::OK, HTTP_ORDERS).into_response()
 }
 
 async fn handle_account_inactive_orders(
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
     Query(query): Query<LighterAccountInactiveOrdersQuery>,
 ) -> Response {
     assert_eq!(
-        query
-            .authorization
-            .as_ref()
-            .map(SecretString::expose_secret),
+        headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap()),
         Some("bearer-token")
     );
+    assert!(!params.contains_key("authorization"));
+    assert!(!params.contains_key("auth"));
     assert_eq!(query.account_index, 712_440);
     assert_eq!(query.market_id, Some(0));
     assert_eq!(query.ask_filter, Some(1));

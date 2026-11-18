@@ -27,7 +27,7 @@ use std::{
 
 use ahash::AHashSet;
 use async_trait::async_trait;
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use nautilus_common::{
     cache::Cache,
@@ -43,7 +43,7 @@ use nautilus_common::{
         },
     },
     msgbus::{
-        self, MessagingSwitchboard,
+        self, MessagingSwitchboard, TypedHandler,
         stubs::{
             TypedMessageSavingHandler, get_any_saving_handler,
             get_typed_into_message_saving_handler, get_typed_message_saving_handler,
@@ -63,7 +63,7 @@ use nautilus_live::{
     execution::submission::{
         SubmissionRecoveryExhausted, SubmissionRecoveryPolicy, SubmissionRecoverySource,
     },
-    manager::{ExecutionManager, ExecutionManagerConfig},
+    manager::{ExecutionManager, ExecutionManagerConfig, ReconciliationResult},
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
@@ -72,11 +72,12 @@ use nautilus_model::{
         OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
     },
     events::{
-        OrderEventAny, OrderFilled,
+        OrderEventAny, OrderFilled, PositionEvent,
         account::state::AccountState,
         order::spec::{
-            OrderAcceptedSpec, OrderCancelRejectedSpec, OrderModifyRejectedSpec,
-            OrderPendingCancelSpec, OrderPendingUpdateSpec, OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderCancelRejectedSpec, OrderFillVoidedSpec,
+            OrderModifyRejectedSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
+            OrderUpdatedSpec,
         },
     },
     identifiers::{
@@ -85,7 +86,10 @@ use nautilus_model::{
     },
     instruments::{
         Instrument, InstrumentAny,
-        stubs::{binary_option, btcusd_bybit, crypto_perpetual_ethusdt, currency_pair_btcusdt},
+        stubs::{
+            binary_option, btcusd_bybit, crypto_perpetual_ethusdt, currency_pair_btcusdt,
+            equity_aapl,
+        },
     },
     orders::{
         Order, OrderAny, OrderTestBuilder,
@@ -93,8 +97,10 @@ use nautilus_model::{
     },
     position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
+    stubs::TestDefault,
     types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
+use nautilus_testkit::cache::TestCacheDatabaseControl;
 use parking_lot::Mutex;
 use rstest::rstest;
 use rust_decimal::Decimal;
@@ -124,8 +130,12 @@ impl TestContext {
     }
 
     fn with_config(config: ExecutionManagerConfig) -> Self {
+        Self::with_cache(Cache::default(), config)
+    }
+
+    fn with_cache(cache: Cache, config: ExecutionManagerConfig) -> Self {
         let clock = Rc::new(RefCell::new(VirtualClock::new()));
-        let cache = Rc::new(RefCell::new(Cache::default()));
+        let cache = Rc::new(RefCell::new(cache));
 
         // Add test account to cache (required for position creation in ExecutionEngine)
         let account_state = AccountState::new(
@@ -143,6 +153,7 @@ impl TestContext {
             UnixNanos::default(),
             Some(Currency::USDT()),
         );
+
         let account = AccountAny::Margin(MarginAccount::new(account_state, true));
         cache.borrow_mut().add_account(account).unwrap();
 
@@ -211,6 +222,16 @@ impl TestContext {
             .map(|o| o.clone())
     }
 
+    fn require_authoritative_fills(&self) {
+        let mut client = MockExecutionClient::new(Vec::new());
+        client.requires_authoritative_fills = true;
+        client.oms_type = OmsType::Netting;
+        let mut engine = self.exec_engine.borrow_mut();
+        engine.deregister_client(test_client_id()).unwrap();
+        engine.register_client(Box::new(client)).unwrap();
+        engine.register_oms_type(StrategyId::external(), OmsType::Netting);
+    }
+
     fn add_margin_account(&self, account_id: AccountId) {
         let account_state = AccountState::new(
             account_id,
@@ -227,6 +248,7 @@ impl TestContext {
             UnixNanos::default(),
             Some(Currency::USDT()),
         );
+
         let account = AccountAny::Margin(MarginAccount::new(account_state, true));
         self.cache.borrow_mut().add_account(account).unwrap();
     }
@@ -373,6 +395,7 @@ fn create_mass_status(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(order_reports);
     mass_status.add_fill_reports(fill_reports);
     mass_status
@@ -385,10 +408,11 @@ struct ManagerLogCapture {
 impl Log for ManagerLogCapture {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         metadata.level() <= Level::Warn
-            && matches!(
+            && (matches!(
                 metadata.target(),
                 "nautilus_live::execution::manager" | "nautilus_live::execution::reconciliation"
-            )
+            ) || metadata.target() == "nautilus_common::cache"
+                && metadata.level() == Level::Error)
     }
 
     fn log(&self, record: &Record<'_>) {
@@ -425,6 +449,234 @@ fn test_fill_deduplication_new_fill_not_processed() {
         test_instrument_id(),
         trade_id
     ));
+}
+
+#[rstest]
+#[case::unchanged(None, "3.000", "0.75 USDT")]
+#[case::partial_opening(Some("0.500"), "2.500", "0.625 USDT")]
+#[case::entire_opening(Some("1.000"), "2.000", "0.50 USDT")]
+#[case::partial_closing(Some("1.500"), "1.500", "0.375 USDT")]
+fn test_position_fill_report_accounts_for_virtual_flip(
+    #[case] voided_qty: Option<&str>,
+    #[case] remaining_qty: &str,
+    #[case] remaining_commission: &str,
+    #[values(false, true)] rebuild_index: bool,
+) {
+    let ctx = TestContext::new();
+    let instrument = test_instrument();
+    let position_id = PositionId::from("P-FLIP-SOURCE");
+    let position =
+        create_test_position(&instrument, position_id, OrderSide::Buy, "2.000", "3000.00");
+    ctx.add_instrument(instrument.clone());
+    ctx.add_position(&position);
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-FLIP-ROUTE"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("5.000"))
+        .build();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(order.strategy_id(), OmsType::Hedging);
+    ctx.add_order(order.clone());
+    ctx.exec_engine
+        .borrow_mut()
+        .process(&TestOrderEventStubs::submitted(&order, test_account_id()));
+    ctx.exec_engine
+        .borrow_mut()
+        .process(&TestOrderEventStubs::accepted(
+            &order,
+            test_account_id(),
+            VenueOrderId::from("V-FLIP-ROUTE"),
+        ));
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("T-FLIP-ROUTE")),
+        Some(position_id),
+        Some(Price::from("3100.00")),
+        Some(Quantity::from("3.000")),
+        Some(LiquiditySide::Taker),
+        Some(Money::from("0.75 USDT")),
+        None,
+        Some(test_account_id()),
+    );
+    ctx.exec_engine.borrow_mut().process(&fill);
+
+    let OrderEventAny::Filled(fill) = fill else {
+        unreachable!()
+    };
+
+    let mut report = FillReport::new(
+        fill.account_id,
+        fill.instrument_id,
+        fill.venue_order_id,
+        fill.trade_id,
+        fill.order_side,
+        fill.last_qty,
+        fill.last_px,
+        fill.commission.unwrap(),
+        fill.liquidity_side,
+        Some(fill.client_order_id),
+        Some(position_id),
+        fill.ts_event,
+        fill.ts_init,
+        None,
+    );
+
+    if let Some(voided_qty) = voided_qty {
+        let voided_qty = Quantity::from(voided_qty);
+        let voided = OrderFillVoidedSpec::builder()
+            .trader_id(fill.trader_id)
+            .strategy_id(fill.strategy_id)
+            .instrument_id(fill.instrument_id)
+            .client_order_id(fill.client_order_id)
+            .venue_order_id(fill.venue_order_id)
+            .account_id(fill.account_id)
+            .trade_id(fill.trade_id)
+            .voided_qty(voided_qty)
+            .order_side(fill.order_side)
+            .order_type(fill.order_type)
+            .last_px(fill.last_px)
+            .currency(fill.currency)
+            .liquidity_side(fill.liquidity_side)
+            .position_id(position_id)
+            .commission_voided(
+                Money::from_decimal(voided_qty.as_decimal() * dec!(0.25), Currency::USDT())
+                    .unwrap(),
+            )
+            .is_reopened(true)
+            .build();
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&OrderEventAny::FillVoided(voided));
+        assert!(!ctx.manager.position_contains_fill_report(&report));
+        report.last_qty = Quantity::from(remaining_qty);
+        report.commission = Money::from(remaining_commission);
+    }
+
+    if rebuild_index {
+        let mut cache = ctx.cache.borrow_mut();
+        cache.clear_index();
+        cache.build_index();
+    }
+
+    assert!(ctx.manager.position_contains_fill_report(&report));
+    ctx.manager
+        .prepare_position_fill_report(&mut report, &[])
+        .unwrap();
+    assert_eq!(report.venue_position_id, Some(position_id));
+
+    let accepted_report = report.clone();
+    report.last_qty = Quantity::from("1.000");
+    assert!(!ctx.manager.position_contains_fill_report(&report));
+    report = accepted_report.clone();
+    report.commission = Money::from("0.01 USDT");
+    assert!(!ctx.manager.position_contains_fill_report(&report));
+    report = accepted_report.clone();
+    report.venue_position_id = Some(PositionId::from("P-UNRELATED"));
+    assert!(!ctx.manager.position_contains_fill_report(&report));
+    assert!(
+        ctx.manager
+            .prepare_position_fill_report(&mut report, &[])
+            .is_err()
+    );
+    report = accepted_report;
+    report.venue_position_id = None;
+    ctx.manager
+        .prepare_position_fill_report(&mut report, &[])
+        .unwrap();
+    assert_eq!(
+        report.venue_position_id,
+        ctx.cache
+            .borrow()
+            .position_id(&fill.client_order_id)
+            .copied()
+    );
+    assert!(ctx.manager.position_contains_fill_report(&report));
+}
+
+#[rstest]
+fn test_position_fill_report_preserves_netting_void_behavior(
+    #[values(false, true)] rebuild_index: bool,
+) {
+    let ctx = TestContext::new();
+    let instrument = test_instrument();
+
+    let position_id = PositionId::new(format!(
+        "{}-{}",
+        instrument.id(),
+        StrategyId::test_default()
+    ));
+
+    let position =
+        create_test_position(&instrument, position_id, OrderSide::Buy, "2.000", "3000.00");
+    let mut fill = position.events[0].clone();
+    fill.commission = Some(Money::from("0.50 USDT"));
+    let mut position = Position::new(&instrument, fill.clone());
+
+    let voided = OrderFillVoidedSpec::builder()
+        .trader_id(fill.trader_id)
+        .strategy_id(fill.strategy_id)
+        .instrument_id(fill.instrument_id)
+        .client_order_id(fill.client_order_id)
+        .venue_order_id(fill.venue_order_id)
+        .account_id(fill.account_id)
+        .trade_id(fill.trade_id)
+        .voided_qty(Quantity::from("1.000"))
+        .order_side(fill.order_side)
+        .order_type(fill.order_type)
+        .last_px(fill.last_px)
+        .currency(fill.currency)
+        .liquidity_side(fill.liquidity_side)
+        .position_id(position_id)
+        .commission_voided(Money::from("0.25 USDT"))
+        .is_reopened(true)
+        .build();
+    position
+        .apply_fill_void(
+            voided,
+            Quantity::from("1.000"),
+            Some(Money::from("0.25 USDT")),
+        )
+        .unwrap();
+    ctx.add_instrument(instrument);
+    ctx.cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    if rebuild_index {
+        let mut cache = ctx.cache.borrow_mut();
+        cache.clear_index();
+        cache.build_index();
+    }
+
+    let report = FillReport::new(
+        fill.account_id,
+        fill.instrument_id,
+        fill.venue_order_id,
+        fill.trade_id,
+        fill.order_side,
+        fill.last_qty,
+        fill.last_px,
+        fill.commission.unwrap(),
+        fill.liquidity_side,
+        Some(fill.client_order_id),
+        None,
+        fill.ts_event,
+        fill.ts_init,
+        None,
+    );
+
+    let mut corrected_report = report.clone();
+    corrected_report.last_qty = Quantity::from("1.000");
+    corrected_report.commission = Money::from("0.25 USDT");
+
+    assert_eq!(position.quantity, Quantity::from("1.000"));
+    assert!(ctx.manager.position_contains_fill_report(&report));
+    assert!(!ctx.manager.position_contains_fill_report(&corrected_report));
 }
 
 #[rstest]
@@ -594,8 +846,7 @@ async fn test_observe_order_report_clears_inflight_tracking() {
     let order = create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    // Register as inflight
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // Simulate venue responding with an OrderStatusReport
     let order_report = create_order_report(
@@ -640,7 +891,7 @@ async fn test_observe_pending_order_report_keeps_inflight_tracking() {
         create_submitted_order("O-PENDING", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // Venue reports PendingUpdate (interim acknowledgement, not terminal)
     let order_report = create_order_report(
@@ -691,6 +942,7 @@ fn test_observe_fill_report_does_not_mark_fill_processed() {
         UnixNanos::from(2_000_000),
         None, // report_id
     );
+
     let report = ExecutionReport::Fill(Box::new(fill_report));
 
     ctx.manager.observe_execution_report(&report);
@@ -718,10 +970,29 @@ fn test_observe_position_report_records_activity() {
         None, // venue_position_id
         Some(dec!(3000.0)),
     );
+
     let report = ExecutionReport::Position(Box::new(position_report));
 
-    // Should complete without panic - position activity is recorded internally
+    let key = (instrument_id, test_account_id());
+    let other_account = (instrument_id, AccountId::from("BINANCE-002"));
+    let other_instrument = (test_instrument_id2(), test_account_id());
+    for (instrument_id, account_id) in [key, other_account, other_instrument] {
+        ctx.manager
+            .record_position_activity(instrument_id, account_id);
+    }
+
+    let check = ctx.manager.prepare_position_report_check(UUID4::new(), &[]);
+    let before = [key, other_account, other_instrument]
+        .map(|key| ctx.manager.position_report_check_is_current(&check, &key));
+
     ctx.manager.observe_execution_report(&report);
+
+    assert_eq!(before, [true, true, true]);
+    assert_eq!(
+        [key, other_account, other_instrument]
+            .map(|key| ctx.manager.position_report_check_is_current(&check, &key)),
+        [false, true, true],
+    );
 }
 
 #[tokio::test]
@@ -776,7 +1047,6 @@ async fn test_reconcile_mass_status_creates_external_order_accepted() {
     assert_eq!(result.events.len(), 1);
     assert!(matches!(result.events[0], OrderEventAny::Accepted(_)));
 
-    // Verify order was added to cache
     let client_order_id = ClientOrderId::from("V-EXT-001");
     let order = ctx.get_order(&client_order_id);
     assert!(order.is_some());
@@ -923,6 +1193,7 @@ async fn test_reconcile_mass_status_warns_on_untrusted_cached_client_origin(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![create_order_report(
         report_has_client_order_id.then_some(client_order_id),
         venue_order_id,
@@ -990,6 +1261,7 @@ async fn test_reconcile_mass_status_warns_on_venue_only_fill_from_other_client()
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_fill_reports(vec![FillReport::new(
         test_account_id(),
         instrument_id,
@@ -1099,6 +1371,7 @@ async fn test_reconcile_mass_status_publishes_external_order_initialized() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         VenueOrderId::from("V-EXT-PUBLISH-MASS"),
@@ -1324,7 +1597,6 @@ async fn test_external_order_canceled_with_partial_fill() {
     .with_avg_px(dec!(3000.00));
     mass_status.add_order_reports(vec![report]);
 
-    // Add fill report for the partial fill
     let fill = FillReport::new(
         test_account_id(),
         instrument_id,
@@ -1341,6 +1613,7 @@ async fn test_external_order_canceled_with_partial_fill() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1358,7 +1631,6 @@ async fn test_external_order_canceled_with_partial_fill() {
         assert_eq!(filled.trade_id, TradeId::from("T-PARTIAL-001"));
     }
 
-    // Verify order state in cache
     let cache = ctx.cache.borrow();
     let orders = cache.orders(None, None, None, None, None);
     assert_eq!(orders.len(), 1);
@@ -1387,6 +1659,7 @@ async fn test_external_terminal_order_with_incomplete_real_fills_infers_residual
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         venue_order_id,
@@ -1416,6 +1689,7 @@ async fn test_external_terminal_order_with_incomplete_real_fills_infers_residual
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1461,7 +1735,6 @@ async fn test_cached_order_canceled_with_fills() {
 
     ctx.add_instrument(test_instrument());
 
-    // Create and cache an accepted order
     let mut order = create_submitted_order(
         "O-CANCEL-FILL",
         instrument_id,
@@ -1493,7 +1766,6 @@ async fn test_cached_order_canceled_with_fills() {
     .with_avg_px(dec!(3000.00));
     mass_status.add_order_reports(vec![report]);
 
-    // Add fill report
     let fill = FillReport::new(
         test_account_id(),
         instrument_id,
@@ -1510,6 +1782,7 @@ async fn test_cached_order_canceled_with_fills() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1521,10 +1794,176 @@ async fn test_cached_order_canceled_with_fills() {
     assert!(matches!(result.events[0], OrderEventAny::Filled(_)));
     assert!(matches!(result.events[1], OrderEventAny::Canceled(_)));
 
-    // Verify order state
     let cached_order = ctx.get_order(&client_order_id).unwrap();
     assert_eq!(cached_order.status(), OrderStatus::Canceled);
     assert_eq!(cached_order.filled_qty(), Quantity::from("1.0"));
+}
+
+#[rstest]
+#[case::partial(OrderStatus::PartiallyFilled, "0.2", "0.5", dec!(3002))]
+#[case::filled(OrderStatus::Filled, "1.2", "1.5", dec!(3004))]
+#[tokio::test]
+async fn test_mass_reconciliation_applies_replacement_alias_fills_before_inference(
+    #[case] status: OrderStatus,
+    #[case] child_quantity: &str,
+    #[case] cumulative_quantity: &str,
+    #[case] average: Decimal,
+    #[values(false, true)] parent_label: bool,
+    #[values(false, true)] duplicate_parent: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-REPLACE-MASS");
+    let parent_id = VenueOrderId::from("V-REPLACE-PARENT");
+    let current_id = VenueOrderId::from("V-REPLACE-CURRENT");
+    let parent_trade = TradeId::from("T-REPLACE-PARENT");
+    let child_trade = TradeId::from("T-REPLACE-CURRENT");
+    ctx.add_instrument(test_instrument());
+    let mut order = create_submitted_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        "1.0",
+        "3000.00",
+    );
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            test_account_id(),
+            parent_id,
+        ))
+        .unwrap();
+    order
+        .apply(OrderEventAny::Updated(
+            OrderUpdatedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(instrument_id)
+                .client_order_id(client_order_id)
+                .account_id(test_account_id())
+                .venue_order_id(current_id)
+                .quantity(Quantity::from("1.5"))
+                .price(Price::from("3005.00"))
+                .build(),
+        ))
+        .unwrap();
+    ctx.add_order(order);
+    let report = create_order_report(
+        Some(client_order_id),
+        current_id,
+        instrument_id,
+        status,
+        Quantity::from("1.5"),
+        Quantity::from(cumulative_quantity),
+    )
+    .with_price(Price::from("3005.00"))
+    .with_avg_px(average);
+
+    let parent_fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        parent_id,
+        parent_trade,
+        OrderSide::Buy,
+        Quantity::from("0.3"),
+        Price::from("3000.00"),
+        Money::from("0.03 USDT"),
+        LiquiditySide::Maker,
+        parent_label.then_some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+
+    let child_fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        current_id,
+        child_trade,
+        OrderSide::Buy,
+        Quantity::from(child_quantity),
+        Price::from("3005.00"),
+        Money::from("0.05 USDT"),
+        LiquiditySide::Taker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(10_000_000),
+        None,
+    );
+
+    let parent_report = create_order_report(
+        Some(client_order_id),
+        parent_id,
+        instrument_id,
+        OrderStatus::Canceled,
+        Quantity::from("1.0"),
+        Quantity::from("0.3"),
+    )
+    .with_price(Price::from("3000.00"))
+    .with_avg_px(dec!(3000));
+    mass_status.add_order_reports(vec![parent_report, report]);
+    mass_status.add_fill_reports(if duplicate_parent {
+        vec![child_fill, parent_fill.clone(), parent_fill]
+    } else {
+        vec![child_fill, parent_fill]
+    });
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let repeated = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let order = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(order.quantity(), Quantity::from("1.5"));
+    assert_eq!(order.filled_qty(), Quantity::from(cumulative_quantity));
+    assert_eq!(order.avg_px(), Some(average));
+    assert_eq!(order.venue_order_id(), Some(current_id));
+    assert_eq!(order.status(), status);
+    assert_eq!(order.trade_ids().len(), 2);
+    assert!(order.trade_ids().contains(&&parent_trade));
+    assert!(order.trade_ids().contains(&&child_trade));
+    assert_eq!(
+        order.commissions().get(&Currency::USDT()),
+        Some(&Money::from("0.08 USDT"))
+    );
+
+    let fills: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(fills.len(), 2);
+    assert_eq!(fills[0].venue_order_id, parent_id);
+    assert_eq!(fills[0].trade_id, parent_trade);
+    assert_eq!(fills[0].last_qty, Quantity::from("0.3"));
+    assert_eq!(fills[0].last_px, Price::from("3000.00"));
+    assert_eq!(fills[0].commission, Some(Money::from("0.03 USDT")));
+    assert_eq!(fills[1].venue_order_id, current_id);
+    assert_eq!(fills[1].trade_id, child_trade);
+    assert_eq!(fills[1].last_qty, Quantity::from(child_quantity));
+    assert_eq!(fills[1].last_px, Price::from("3005.00"));
+    assert_eq!(fills[1].commission, Some(Money::from("0.05 USDT")));
+    assert!(repeated.events.is_empty());
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from(cumulative_quantity));
+    assert_eq!(positions[0].commissions(), vec![Money::from("0.08 USDT")]);
 }
 
 #[tokio::test]
@@ -1687,6 +2126,7 @@ async fn test_external_order_filled_uses_real_fills() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill1, fill2]);
 
     let result = ctx
@@ -1712,7 +2152,6 @@ async fn test_external_order_filled_uses_real_fills() {
         assert_eq!(filled2.last_px, Price::from("3001.00"));
     }
 
-    // Verify order state in cache
     {
         let cache = ctx.cache.borrow();
         let orders = cache.orders(None, None, None, None, None);
@@ -1932,6 +2371,7 @@ async fn test_external_order_filled_with_partial_fills_generates_inferred() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -1961,7 +2401,6 @@ async fn test_external_order_filled_with_partial_fills_generates_inferred() {
         assert_eq!(filled2.last_qty, Quantity::from("1.000"));
     }
 
-    // Verify order is fully filled
     let cache = ctx.cache.borrow();
     let orders = cache.orders(None, None, None, None, None);
     assert_eq!(orders.len(), 1);
@@ -2255,6 +2694,7 @@ async fn test_claim_external_orders_duplicate_fails_without_overwriting() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         VenueOrderId::from("V-EXT-DUPLICATE"),
@@ -2311,6 +2751,7 @@ async fn test_reconcile_mass_status_processes_fills_for_cached_order() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -2358,6 +2799,7 @@ async fn test_reconcile_mass_status_deduplicates_fills() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill.clone(), fill]);
 
     let result = ctx
@@ -3036,6 +3478,7 @@ async fn test_retained_fill_projects_missing_order_without_reapplying(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(UnixNanos::from(2_000_000)), true);
     let mut order_report = create_order_report(
         include_client_order_id.then_some(client_order_id),
@@ -3079,8 +3522,8 @@ async fn test_retained_fill_projects_missing_order_without_reapplying(
         venue_position_id,
         Some(dec!(3000.00)),
     );
-    mass_status.add_order_reports(vec![order_report]);
 
+    mass_status.add_order_reports(vec![order_report]);
     if include_fill_report {
         mass_status.add_fill_reports(vec![fill_report]);
     }
@@ -3176,6 +3619,7 @@ async fn test_inferred_delta_for_retained_order_applies_new_economics(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -3273,6 +3717,7 @@ async fn test_missing_venue_order_id_collision_is_scoped_by_instrument() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         venue_order_id,
@@ -3426,6 +3871,7 @@ async fn test_partially_known_fills_apply_only_new_economics(
         None,
         Some(dec!(3033.333333)),
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![known_fill_report, new_fill_report]);
     mass_status.add_position_reports(vec![position_report]);
@@ -3538,6 +3984,7 @@ async fn test_partial_window_known_fill_does_not_reapply_economics(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report_for_side(
         Some(closing_order_id),
         closing_venue_order_id,
@@ -3577,6 +4024,7 @@ async fn test_partial_window_known_fill_does_not_reapply_economics(
         None,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
     mass_status.add_position_reports(vec![position_report]);
@@ -3625,6 +4073,7 @@ async fn test_split_lighter_reduce_only_lifecycle_preserves_explicit_flat() {
         close_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     let order_report = OrderStatusReport::new(
         test_account_id(),
@@ -3674,6 +4123,7 @@ async fn test_split_lighter_reduce_only_lifecycle_preserves_explicit_flat() {
         None,
         None,
     );
+
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
     mass_status.add_position_reports(vec![flat_report]);
@@ -3843,6 +4293,7 @@ async fn test_bounded_complete_lifecycle_applies_beside_split_close() {
         split_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![opening_order, closing_order, split_order]);
     mass_status.add_fill_reports(vec![opening_fill, opening_fill_2, closing_fill, split_fill]);
@@ -3980,6 +4431,7 @@ async fn test_bounded_hedge_fill_applies_economics_once() {
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
@@ -4201,6 +4653,7 @@ async fn test_bounded_reduce_only_history_reconciles_flat_or_remains_unresolved(
         closing_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![closing_order]);
     mass_status.add_fill_reports(vec![closing_fill]);
@@ -4263,7 +4716,7 @@ async fn test_bounded_reduce_only_history_reconciles_flat_or_remains_unresolved(
         assert!(position.is_open());
         assert_eq!(position.is_long(), closing_side == OrderSide::Buy);
         assert_eq!(position.quantity, Quantity::from("0.500"));
-        assert_eq!(position.avg_px_open, 3100.0);
+        assert_eq!(position.avg_px_open, dec!(3100.0));
         assert_eq!(position.trade_ids.len(), 1);
         assert!(position.trade_ids.contains(&closing_trade_id));
         assert_eq!(position.commissions(), vec![Money::from("0.10 USDT")]);
@@ -4334,9 +4787,9 @@ async fn test_incomplete_bounded_reports_project_fills_order_only(#[case] has_fi
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), false);
     mass_status.add_order_reports(vec![order_report]);
-
     if has_fill_report {
         mass_status.add_fill_reports(vec![fill_report]);
     }
@@ -4435,6 +4888,7 @@ async fn test_bounded_active_partial_order_preserves_order_and_reconciles_flat()
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_position_reports(vec![flat_report]);
@@ -4544,6 +4998,7 @@ async fn test_bounded_nonflat_position_requires_coherent_historical_fill(
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
@@ -4591,7 +5046,7 @@ async fn test_bounded_nonflat_position_requires_coherent_historical_fill(
     assert!(position.is_open());
     assert!(position.is_long());
     assert_eq!(position.quantity, Quantity::from("1.000"));
-    assert_eq!(position.avg_px_open, 3000.0);
+    assert_eq!(position.avg_px_open, dec!(3000.0));
     assert!(position.trade_ids.contains(&trade_id));
     assert_eq!(
         position.trade_ids.len(),
@@ -4664,6 +5119,7 @@ async fn test_bounded_history_distinguishes_missing_and_explicit_flat_reports(
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![order_report]);
     mass_status.add_fill_reports(vec![fill_report]);
@@ -4791,6 +5247,7 @@ async fn test_bounded_interleaved_multi_fill_orders_reconcile_explicit_flat() {
         opening_ts_2,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![opening_order, closing_order]);
     mass_status.add_fill_reports(vec![opening_fill, opening_fill_2, closing_fill]);
@@ -4830,7 +5287,6 @@ async fn test_bounded_interleaved_multi_fill_orders_reconcile_explicit_flat() {
     assert_eq!(result.external_orders.len(), 2);
 
     let cache = ctx.cache.borrow();
-
     for venue_order_id in [opening_venue_order_id, closing_venue_order_id] {
         let order = cache
             .order(&ClientOrderId::from(venue_order_id.as_str()))
@@ -4921,6 +5377,7 @@ async fn test_bounded_same_timestamp_orders_reconcile_explicit_flat() {
         fill_ts,
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(cutoff), true);
     mass_status.add_order_reports(vec![opening_order, closing_order]);
     mass_status.add_fill_reports(vec![opening_fill, closing_fill]);
@@ -4959,7 +5416,6 @@ async fn test_bounded_same_timestamp_orders_reconcile_explicit_flat() {
     assert_eq!(result.external_orders.len(), 2);
 
     let cache = ctx.cache.borrow();
-
     for venue_order_id in [opening_venue_order_id, closing_venue_order_id] {
         let order = cache
             .order(&ClientOrderId::from(venue_order_id.as_str()))
@@ -4990,6 +5446,281 @@ async fn test_bounded_same_timestamp_orders_reconcile_explicit_flat() {
         .collect();
 
     assert_eq!(portfolio_events, expected_portfolio_events);
+}
+
+/// An order whose fills span a position lifecycle keeps its pre-boundary fill as order-only.
+///
+/// A sell that closes a long and opens a short crosses zero inside the order. The closing fill
+/// stays on the order, so its filled quantity settles at the real price rather than an inferred
+/// one, and it does not apply to the position.
+#[tokio::test]
+async fn test_order_spanning_two_lifecycles_keeps_pre_boundary_fill_order_only() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let open_order_id = ClientOrderId::from("O-LIFECYCLE-OPEN");
+    let open_venue_order_id = VenueOrderId::from("V-LIFECYCLE-OPEN");
+    let open_trade_id = TradeId::from("T-LIFECYCLE-OPEN");
+    let flip_order_id = ClientOrderId::from("O-LIFECYCLE-FLIP");
+    let flip_venue_order_id = VenueOrderId::from("V-LIFECYCLE-FLIP");
+    let close_trade_id = TradeId::from("T-LIFECYCLE-CLOSE");
+    let short_trade_id = TradeId::from("T-LIFECYCLE-SHORT");
+    let position_id = PositionId::new(format!("{instrument_id}-{strategy_id}"));
+
+    ctx.add_instrument(instrument);
+    ctx.manager
+        .claim_external_orders(instrument_id, strategy_id)
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    // The long that the flip closes, opened and filled before the crossing.
+    let open_report = create_order_report(
+        Some(open_order_id),
+        open_venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("1.000"),
+        Quantity::from("1.000"),
+    )
+    .with_avg_px(dec!(3000.0));
+
+    let open_fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        open_venue_order_id,
+        open_trade_id,
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Maker,
+        Some(open_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+
+    // The sell spanning the crossing: one fill closes the long, the next opens the short. Its
+    // order price sits below both fill prices, so an inferred remainder would be visible.
+    let flip_report = create_order_report_for_side(
+        Some(flip_order_id),
+        flip_venue_order_id,
+        instrument_id,
+        OrderSide::Sell,
+        OrderStatus::Filled,
+        Quantity::from("2.000"),
+        Quantity::from("2.000"),
+    )
+    .with_price(Price::from("3000.00"))
+    .with_avg_px(dec!(3150.0));
+
+    let close_fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        flip_venue_order_id,
+        close_trade_id,
+        OrderSide::Sell,
+        Quantity::from("1.000"),
+        Price::from("3100.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Taker,
+        Some(flip_order_id),
+        None,
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    let short_fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        flip_venue_order_id,
+        short_trade_id,
+        OrderSide::Sell,
+        Quantity::from("1.000"),
+        Price::from("3200.00"),
+        Money::from("0.50 USDT"),
+        LiquiditySide::Taker,
+        Some(flip_order_id),
+        None,
+        UnixNanos::from(3_000_000),
+        UnixNanos::from(3_000_000),
+        None,
+    );
+
+    let position_report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Short,
+        Quantity::from("1.000"),
+        UnixNanos::from(3_000_000),
+        UnixNanos::from(3_000_000),
+        None,
+        None,
+        Some(dec!(3200.00)),
+    );
+
+    mass_status.add_order_reports(vec![open_report, flip_report]);
+    mass_status.add_fill_reports(vec![open_fill, close_fill, short_fill]);
+    mass_status.add_position_reports(vec![position_report]);
+
+    ctx.manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    let cache = ctx.cache.borrow();
+    let flip_order = cache.order(&flip_order_id).unwrap();
+    assert_eq!(flip_order.status(), OrderStatus::Filled);
+    assert_eq!(flip_order.filled_qty(), Quantity::from("2.000"));
+    assert!(
+        flip_order.trade_ids().contains(&&close_trade_id),
+        "the closing fill must settle the order rather than be inferred: {:?}",
+        flip_order.trade_ids()
+    );
+    assert!(flip_order.trade_ids().contains(&&short_trade_id));
+    assert_eq!(
+        flip_order.avg_px(),
+        Some(dec!(3150.0)),
+        "both real fills price the order; nothing is inferred at the 3000 order price"
+    );
+
+    let position = cache.position(&position_id).unwrap();
+    assert_eq!(position.side, PositionSide::Short);
+    assert_eq!(position.quantity, Quantity::from("1.000"));
+    assert!(
+        !position.trade_ids.contains(&close_trade_id),
+        "the pre-boundary fill must not apply to the current lifecycle"
+    );
+    assert!(position.trade_ids.contains(&short_trade_id));
+}
+
+/// A partially filled cached order recovers its remaining executions at their real prices.
+///
+/// With 0.600 of 1.000 already recorded and the final 0.400 executing offline, the fills page
+/// carries only that 0.400. Reconciliation matches it to the cached order rather than inferring
+/// it, so the adapter must not withhold the report for not covering the full quantity on its own.
+#[tokio::test]
+async fn test_partially_filled_cached_order_recovers_remaining_fills_at_real_prices() {
+    let mut ctx = TestContext::new();
+    let instrument = test_instrument();
+    let instrument_id = instrument.id();
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    let client_order_id = ClientOrderId::from("O-PARTIAL-CACHED");
+    let venue_order_id = VenueOrderId::from("V-PARTIAL-CACHED");
+    let cached_trade_id = TradeId::from("T-PARTIAL-CACHED");
+    let remaining_trade_id = TradeId::from("T-PARTIAL-REMAINING");
+    let position_id = PositionId::new(format!("{instrument_id}-{strategy_id}"));
+
+    ctx.add_instrument(instrument.clone());
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(client_order_id)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("3000.00"))
+        .build();
+    apply_submitted_and_accepted(&mut order, venue_order_id);
+    let cached_fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(cached_trade_id),
+        Some(position_id),
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("0.600")),
+        Some(LiquiditySide::Maker),
+        Some(Money::from("0.30 USDT")),
+        Some(UnixNanos::from(1_000_000)),
+        Some(test_account_id()),
+    );
+    order.apply(cached_fill).unwrap();
+
+    {
+        let mut cache = ctx.cache.borrow_mut();
+        cache
+            .add_order(order, None, Some(test_client_id()), false)
+            .unwrap();
+        cache
+            .add_venue_order_id(&client_order_id, &venue_order_id, false)
+            .unwrap();
+    }
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        Some(UUID4::new()),
+    );
+
+    let order_report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("1.000"),
+        Quantity::from("1.000"),
+    )
+    .with_avg_px(dec!(3050.0));
+
+    let remaining_fill = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        remaining_trade_id,
+        OrderSide::Buy,
+        Quantity::from("0.400"),
+        Price::from("3125.00"),
+        Money::from("0.20 USDT"),
+        LiquiditySide::Taker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+    );
+
+    mass_status.add_order_reports(vec![order_report]);
+    mass_status.add_fill_reports(vec![remaining_fill]);
+
+    ctx.manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    let cache = ctx.cache.borrow();
+    let order = cache.order(&client_order_id).unwrap();
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from("1.000"));
+    assert!(order.trade_ids().contains(&&cached_trade_id));
+    assert!(
+        order.trade_ids().contains(&&remaining_trade_id),
+        "the remaining execution must be applied from its fill report: {:?}",
+        order.trade_ids()
+    );
+    assert_eq!(
+        order.trade_ids().len(),
+        2,
+        "no inferred fill alongside the real ones"
+    );
+    assert_eq!(
+        order.avg_px(),
+        Some(dec!(3050.0)),
+        "0.600 at 3000 and 0.400 at 3125 price the order; nothing is inferred"
+    );
 }
 
 #[expect(
@@ -5044,6 +5775,1729 @@ fn create_bounded_fill_lifecycle(
     );
 
     (order_report, fill_report)
+}
+
+#[rstest]
+#[case::cached_unbounded(ClosingOrder::Cached, false)]
+#[case::cached_bounded(ClosingOrder::Cached, true)]
+#[case::claimed_unbounded(ClosingOrder::Claimed, false)]
+#[case::claimed_bounded(ClosingOrder::Claimed, true)]
+fn test_closing_order_fills_close_restored_position_without_coverage(
+    #[case] closing: ClosingOrder,
+    #[case] bounded: bool,
+) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) = prepare_closing_scenario_order(&mut ctx, closing);
+
+    let mass_status = closing_scenario_mass_status(bounded, reported_order_id);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(
+        result.external_orders.len(),
+        usize::from(matches!(closing, ClosingOrder::Claimed))
+    );
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+    assert_closing_scenario_position_events(&position_events);
+}
+
+#[rstest]
+#[case::cached_unbounded(ClosingOrder::Cached, false)]
+#[case::cached_bounded(ClosingOrder::Cached, true)]
+#[case::claimed_unbounded(ClosingOrder::Claimed, false)]
+#[case::claimed_bounded(ClosingOrder::Claimed, true)]
+#[tokio::test]
+async fn test_closing_order_fills_recorded_once_across_restart_without_coverage(
+    #[case] closing: ClosingOrder,
+    #[case] bounded: bool,
+) {
+    let (closing_order_id, reported_order_id, restored) = {
+        let mut ctx =
+            closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+        cache_closing_scenario_open_long(&ctx, &test_instrument());
+        let (closing_order_id, reported_order_id) =
+            prepare_closing_scenario_order(&mut ctx, closing);
+
+        let mass_status = closing_scenario_mass_status(bounded, reported_order_id);
+        let (result, _) = reconcile_closing_scenario(&mut ctx, &mass_status);
+        assert_eq!(count_filled_events(&result.events), 2);
+        assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+
+        (
+            closing_order_id,
+            reported_order_id,
+            restore_closing_cache(&ctx.cache.borrow()),
+        )
+    };
+
+    let mut ctx = closing_scenario_context(restored, ExecutionManagerConfig::default(), false);
+    claim_closing_scenario_instrument(&mut ctx, closing);
+
+    let mass_status = closing_scenario_mass_status(bounded, reported_order_id);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert!(result.external_orders.is_empty());
+    assert_eq!(count_filled_events(&result.events), 0);
+    assert!(
+        position_events.is_empty(),
+        "restart must not re-apply fills, found {position_events:?}"
+    );
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+}
+
+fn assert_unclaimed_closing_scenario_state(cache: &Cache, bounded: bool) {
+    let closing_order_id = ClientOrderId::from(closing_scenario_venue_order_id().as_str());
+    if bounded {
+        assert_closing_scenario_order_only(cache, closing_order_id);
+        return;
+    }
+
+    assert_closing_scenario_order_filled(cache, closing_order_id);
+    assert_closing_scenario_position_unchanged(cache);
+
+    let external_position_id = PositionId::new(format!("{}-EXTERNAL", test_instrument_id()));
+    assert_eq!(
+        closing_scenario_instrument_position_ids(cache),
+        vec![external_position_id, closing_scenario_position_id()]
+    );
+    let external_position = cache
+        .position(&external_position_id)
+        .expect("external position cached");
+    assert!(external_position.is_open());
+    assert_eq!(external_position.side, PositionSide::Short);
+    assert_eq!(external_position.quantity, Quantity::from("1.000"));
+    assert_eq!(
+        external_position.commissions(),
+        vec![Money::from("0.62 USDT")]
+    );
+    assert_eq!(
+        external_position.trade_ids,
+        [TradeId::from("T-CLOSE-1"), TradeId::from("T-CLOSE-2")]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+}
+
+#[rstest]
+#[case::unbounded(false)]
+#[case::bounded(true)]
+#[tokio::test]
+async fn test_unclaimed_external_closing_order_fills_leave_restored_position_open(
+    #[case] bounded: bool,
+) {
+    let restored = {
+        let mut ctx =
+            closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+        cache_closing_scenario_open_long(&ctx, &test_instrument());
+        let (_, reported_order_id) =
+            prepare_closing_scenario_order(&mut ctx, ClosingOrder::Unclaimed);
+
+        let mass_status = closing_scenario_mass_status(bounded, reported_order_id);
+        let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+        assert!(result.unresolved_positions.is_empty());
+        assert_eq!(result.external_orders.len(), 1);
+        assert_eq!(count_filled_events(&result.events), 2);
+        assert_unclaimed_closing_scenario_state(&ctx.cache.borrow(), bounded);
+        if bounded {
+            assert!(position_events.is_empty(), "found {position_events:?}");
+        } else {
+            assert_eq!(position_events.len(), 2, "found {position_events:?}");
+            assert!(matches!(
+                position_events[0],
+                PositionEvent::PositionOpened(_)
+            ));
+            assert!(matches!(
+                position_events[1],
+                PositionEvent::PositionChanged(_)
+            ));
+        }
+
+        restore_closing_cache(&ctx.cache.borrow())
+    };
+
+    let mut ctx = closing_scenario_context(restored, ExecutionManagerConfig::default(), false);
+
+    let mass_status = closing_scenario_mass_status(bounded, None);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert!(result.external_orders.is_empty());
+    assert_eq!(count_filled_events(&result.events), 0);
+    assert!(
+        position_events.is_empty(),
+        "restart must not re-apply fills, found {position_events:?}"
+    );
+    assert_unclaimed_closing_scenario_state(&ctx.cache.borrow(), bounded);
+}
+
+#[rstest]
+#[case::cached(ClosingOrder::Cached)]
+#[case::claimed(ClosingOrder::Claimed)]
+#[tokio::test]
+async fn test_bounded_closing_fills_stay_order_only_when_engine_oms_is_hedging(
+    #[case] closing: ClosingOrder,
+) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(closing_scenario_strategy_id(), OmsType::Hedging);
+    let (closing_order_id, reported_order_id) = prepare_closing_scenario_order(&mut ctx, closing);
+
+    let mass_status = closing_scenario_mass_status(true, reported_order_id);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert!(position_events.is_empty(), "found {position_events:?}");
+    assert_closing_scenario_order_only(&ctx.cache.borrow(), closing_order_id);
+}
+
+#[rstest]
+#[case::indexed(true)]
+#[case::explicit(false)]
+fn test_bounded_closing_fills_close_known_hedging_position(#[case] indexed: bool) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_position(
+        &ctx,
+        &test_instrument(),
+        test_account_id(),
+        OmsType::Hedging,
+        OrderSide::Buy,
+    );
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(closing_scenario_strategy_id(), OmsType::Hedging);
+    let (order_id, reported_id) = prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 1_000_000),
+        None,
+    );
+
+    mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+    mass.add_order_reports(vec![closing_scenario_closing_order_report(reported_id)]);
+    let mut fills = closing_scenario_closing_fill_reports(reported_id);
+
+    if indexed {
+        ctx.cache
+            .borrow_mut()
+            .add_position_id(
+                &closing_scenario_position_id(),
+                &test_venue(),
+                &order_id,
+                &closing_scenario_strategy_id(),
+            )
+            .unwrap();
+    } else {
+        for fill in &mut fills {
+            fill.venue_position_id = Some(closing_scenario_position_id());
+        }
+    }
+
+    mass.add_fill_reports(fills);
+
+    let (_, events) = reconcile_closing_scenario(&mut ctx, &mass);
+
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), order_id);
+    assert_closing_scenario_position_events(&events);
+}
+
+#[rstest]
+#[case::covered_cached(ClosingOrder::Cached, true, true, false)]
+#[case::covered_claimed(ClosingOrder::Claimed, true, true, false)]
+#[case::incomplete_cached(ClosingOrder::Cached, false, false, false)]
+#[case::incomplete_claimed(ClosingOrder::Claimed, false, false, false)]
+#[case::filtered_cached(ClosingOrder::Cached, false, true, true)]
+#[case::filtered_claimed(ClosingOrder::Claimed, false, true, true)]
+fn test_bounded_closing_order_fills_stay_order_only(
+    #[case] closing: ClosingOrder,
+    #[case] covered: bool,
+    #[case] reports_complete: bool,
+    #[case] filter_position_reports: bool,
+) {
+    let config = ExecutionManagerConfig {
+        filter_position_reports,
+        ..ExecutionManagerConfig::default()
+    };
+
+    let mut ctx = closing_scenario_context(Cache::default(), config, covered);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) = prepare_closing_scenario_order(&mut ctx, closing);
+
+    let mut mass_status = closing_scenario_mass_status(true, reported_order_id);
+    mass_status.set_report_window(
+        Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)),
+        reports_complete,
+    );
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert!(position_events.is_empty(), "found {position_events:?}");
+    assert_closing_scenario_order_only(&ctx.cache.borrow(), closing_order_id);
+}
+
+#[rstest]
+#[case::cached(ClosingOrder::Cached)]
+#[case::claimed(ClosingOrder::Claimed)]
+fn test_bounded_closing_order_fills_without_retained_position_stay_order_only(
+    #[case] closing: ClosingOrder,
+) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    let (closing_order_id, reported_order_id) = prepare_closing_scenario_order(&mut ctx, closing);
+
+    let mass_status = closing_scenario_mass_status(true, reported_order_id);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert!(position_events.is_empty(), "found {position_events:?}");
+    assert_closing_scenario_order_filled(&ctx.cache.borrow(), closing_order_id);
+    assert!(closing_scenario_instrument_position_ids(&ctx.cache.borrow()).is_empty());
+}
+
+#[rstest]
+#[case::crossing(OrderSide::Sell)]
+#[case::extending(OrderSide::Buy)]
+fn test_bounded_closing_fills_do_not_reopen_or_flip_position(#[case] extra_side: OrderSide) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) =
+        prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
+
+    let extra_order_id = ClientOrderId::from("O-EXTRA");
+    let extra_venue_order_id = VenueOrderId::from("V-EXTRA");
+    let mut extra_order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(extra_order_id)
+        .strategy_id(closing_scenario_strategy_id())
+        .instrument_id(test_instrument_id())
+        .side(extra_side)
+        .quantity(Quantity::from("0.500"))
+        .price(Price::from("3130.00"))
+        .build();
+    apply_submitted_and_accepted(&mut extra_order, extra_venue_order_id);
+    ctx.add_order(extra_order);
+
+    let (mut extra_report, mut extra_fill) = create_bounded_fill_lifecycle(
+        test_instrument_id(),
+        extra_venue_order_id,
+        TradeId::from("T-EXTRA"),
+        extra_side,
+        "0.500",
+        "3130.00",
+        false,
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 500_000),
+    );
+    extra_report.client_order_id = Some(extra_order_id);
+    extra_fill.client_order_id = Some(extra_order_id);
+
+    let mut mass_status = closing_scenario_mass_status(true, reported_order_id);
+    mass_status.add_order_reports(vec![extra_report]);
+    mass_status.add_fill_reports(vec![extra_fill]);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 3);
+    assert_closing_scenario_position_events(&position_events);
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+    let extra_order = ctx.get_order(&extra_order_id).expect("extra order cached");
+    assert_eq!(extra_order.status(), OrderStatus::Filled);
+    assert_eq!(extra_order.filled_qty(), Quantity::from("0.500"));
+}
+
+#[rstest]
+#[case::cached_addition(true)]
+#[case::unclaimed_addition(false)]
+#[tokio::test]
+async fn test_bounded_addition_before_close_warns_for_order_only_addition(
+    #[case] cached_addition: bool,
+) {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) =
+        prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
+
+    let add_venue_order_id = VenueOrderId::from("V-WARN-ADD");
+
+    let add_order_id = if cached_addition {
+        ClientOrderId::from("O-WARN-ADD")
+    } else {
+        ClientOrderId::from(add_venue_order_id.as_str())
+    };
+
+    let add_report_order_id = cached_addition.then_some(add_order_id);
+    if cached_addition {
+        let mut add_order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(add_order_id)
+            .strategy_id(closing_scenario_strategy_id())
+            .instrument_id(test_instrument_id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("2900.00"))
+            .build();
+        apply_submitted_and_accepted(&mut add_order, add_venue_order_id);
+        ctx.add_order(add_order);
+    }
+
+    let (mut add_report, mut add_fill) = create_bounded_fill_lifecycle(
+        test_instrument_id(),
+        add_venue_order_id,
+        TradeId::from("T-WARN-ADD"),
+        OrderSide::Buy,
+        "1.000",
+        "2900.00",
+        false,
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1 - 500_000),
+    );
+    add_report.client_order_id = add_report_order_id;
+    add_fill.client_order_id = add_report_order_id;
+
+    let mut mass_status = closing_scenario_mass_status(true, reported_order_id);
+    mass_status.add_order_reports(vec![add_report]);
+    mass_status.add_fill_reports(vec![add_fill.clone()]);
+    let (result, _) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 3);
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+    let add_order = ctx.get_order(&add_order_id).expect("addition order cached");
+    assert_eq!(add_order.status(), OrderStatus::Filled);
+
+    let target = if cached_addition {
+        format!("not to position {}", closing_scenario_position_id())
+    } else {
+        "with no resolvable position".to_string()
+    };
+
+    assert_eq!(
+        withheld_fill_warnings("T-WARN-ADD"),
+        vec![format!(
+            "Applied 1 bounded fill(s) for {} on {} to order state only, {target} \
+             (T-WARN-ADD ({add_order_id})): exposure and PnL may need manual reconciliation",
+            test_instrument_id(),
+            test_account_id(),
+        )]
+    );
+
+    // The restart reports the addition's fill without its order report, so the fill is
+    // rebuilt against the cached order that already holds it
+    MANAGER_LOG_CAPTURE.messages.lock().clear();
+    let mut ctx = closing_scenario_context(
+        restore_closing_cache(&ctx.cache.borrow()),
+        ExecutionManagerConfig::default(),
+        false,
+    );
+    let mut mass_status = closing_scenario_mass_status(true, reported_order_id);
+    mass_status.add_fill_reports(vec![add_fill]);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert_eq!(count_filled_events(&result.events), 1);
+    assert!(position_events.is_empty(), "found {position_events:?}");
+    assert!(
+        withheld_fill_warnings("T-WARN-ADD").is_empty(),
+        "found {:?}",
+        MANAGER_LOG_CAPTURE.messages.lock()
+    );
+}
+
+#[rstest]
+#[case::recovered(ClosingOrder::Cached, false, true, false, true, false)]
+#[case::covered(ClosingOrder::Cached, true, true, false, true, false)]
+#[case::incomplete_cached(ClosingOrder::Cached, false, false, false, true, true)]
+#[case::incomplete_claimed(ClosingOrder::Claimed, false, false, false, true, true)]
+#[case::filtered(ClosingOrder::Cached, false, true, true, true, true)]
+#[case::unbounded(ClosingOrder::Cached, false, true, false, false, false)]
+#[tokio::test]
+async fn test_bounded_order_only_fills_warn_without_bulk_position_coverage(
+    #[case] closing: ClosingOrder,
+    #[case] covered: bool,
+    #[case] reports_complete: bool,
+    #[case] filter_position_reports: bool,
+    #[case] bounded: bool,
+    #[case] warns: bool,
+) {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let tag = "WARN-GATE";
+
+    let config = ExecutionManagerConfig {
+        filter_position_reports,
+        ..ExecutionManagerConfig::default()
+    };
+
+    let mut ctx = closing_scenario_context(Cache::default(), config, covered);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) =
+        prepare_closing_scenario_order_for(&mut ctx, closing, tag);
+    let (order_report, fill_reports) = withheld_scenario_reports(tag, reported_order_id);
+    let mass_status =
+        withheld_scenario_mass_status(bounded, reports_complete, vec![order_report], fill_reports);
+
+    let (result, _) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .position(&closing_scenario_position_id())
+            .unwrap()
+            .is_closed(),
+        !covered && !warns
+    );
+
+    let warnings = withheld_fill_warnings(tag);
+
+    if warns {
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Applied 2 bounded fill(s) for {} on {} to order state only, not to position {} \
+                 (T-{tag}-1 ({closing_order_id}), T-{tag}-2 ({closing_order_id})): exposure and \
+                 PnL may need manual reconciliation",
+                test_instrument_id(),
+                test_account_id(),
+                closing_scenario_position_id(),
+            )]
+        );
+    } else {
+        assert!(warnings.is_empty(), "found {warnings:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_bounded_filled_order_without_executions_warns() {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let tag = "WARN-INFERRED";
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) =
+        prepare_closing_scenario_order_for(&mut ctx, ClosingOrder::Cached, tag);
+    let (order_report, _) = withheld_scenario_reports(tag, reported_order_id);
+    let mass_status = withheld_scenario_mass_status(true, true, vec![order_report], Vec::new());
+
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 1);
+    assert!(position_events.is_empty(), "found {position_events:?}");
+    assert_closing_scenario_position_unchanged(&ctx.cache.borrow());
+
+    let warnings = withheld_fill_warnings(&format!("({closing_order_id})"));
+    assert_eq!(warnings.len(), 1, "found {warnings:?}");
+    assert!(
+        warnings[0].starts_with(&format!(
+            "Applied 1 bounded fill(s) for {} on {} to order state only, not to position {} (",
+            test_instrument_id(),
+            test_account_id(),
+            closing_scenario_position_id(),
+        )),
+        "found {warnings:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_withheld_fill_warning_follows_coverage_per_instrument() {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let mut ctx = TestContext::with_cache(Cache::default(), ExecutionManagerConfig::default());
+
+    {
+        let mut engine = ctx.exec_engine.borrow_mut();
+        engine.deregister_client(test_client_id()).unwrap();
+        engine
+            .register_client(Box::new(
+                MockExecutionClient::new(Vec::new())
+                    .with_uncovered_instrument(test_instrument_id()),
+            ))
+            .unwrap();
+    }
+
+    ctx.add_instrument(test_instrument());
+    ctx.add_instrument(test_instrument2());
+    register_closing_scenario_oms(&ctx);
+
+    let (covered_report, covered_fill) = create_bounded_fill_lifecycle(
+        test_instrument_id2(),
+        VenueOrderId::from("V-WARN-COVERED"),
+        TradeId::from("T-WARN-COVERED"),
+        OrderSide::Buy,
+        "1",
+        "50000.0",
+        false,
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1),
+    );
+    let (uncovered_report, uncovered_fill) = create_bounded_fill_lifecycle(
+        test_instrument_id(),
+        VenueOrderId::from("V-WARN-UNCOVERED"),
+        TradeId::from("T-WARN-UNCOVERED"),
+        OrderSide::Buy,
+        "1.000",
+        "3000.00",
+        false,
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+    );
+    let mass_status = withheld_scenario_mass_status(
+        true,
+        false,
+        vec![covered_report, uncovered_report],
+        vec![covered_fill, uncovered_fill],
+    );
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert!(withheld_fill_warnings("T-WARN-COVERED").is_empty());
+    assert_eq!(
+        withheld_fill_warnings("T-WARN-UNCOVERED"),
+        vec![format!(
+            "Applied 1 bounded fill(s) for {} on {} to order state only, with no resolvable \
+             position (T-WARN-UNCOVERED (V-WARN-UNCOVERED)): exposure and PnL may need manual \
+             reconciliation",
+            test_instrument_id(),
+            test_account_id(),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_withheld_fill_warning_omits_fill_rejected_by_projection() {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let tag = "WARN-OVERFILL";
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) =
+        prepare_closing_scenario_order_for(&mut ctx, ClosingOrder::Cached, tag);
+    let (_, mut fill_reports) = withheld_scenario_reports(tag, reported_order_id);
+    let mut overfill = fill_reports[1].clone();
+    overfill.trade_id = TradeId::new(format!("T-{tag}-3"));
+    overfill.last_qty = Quantity::from("0.500");
+    overfill.ts_event = UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 500_000);
+    fill_reports.push(overfill);
+    let mass_status = withheld_scenario_mass_status(true, false, Vec::new(), fill_reports);
+
+    let (result, _) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert_eq!(count_filled_events(&result.events), 3);
+    let order = ctx
+        .get_order(&closing_order_id)
+        .expect("closing order cached");
+    assert_eq!(order.filled_qty(), Quantity::from("1.000"));
+    assert_eq!(
+        withheld_fill_warnings(tag),
+        vec![format!(
+            "Applied 2 bounded fill(s) for {} on {} to order state only, not to position {} \
+             (T-{tag}-1 ({closing_order_id}), T-{tag}-2 ({closing_order_id})): exposure and \
+             PnL may need manual reconciliation",
+            test_instrument_id(),
+            test_account_id(),
+            closing_scenario_position_id(),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_bounded_fill_in_retained_state_does_not_warn() {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let tag = "WARN-RETAINED";
+    let instrument = test_instrument();
+    let venue_order_id = VenueOrderId::new(format!("V-{tag}"));
+    let trade_id = TradeId::new(format!("T-{tag}-1"));
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+
+    let mut retained_order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(ClientOrderId::new(format!("O-{tag}")))
+        .strategy_id(closing_scenario_strategy_id())
+        .instrument_id(test_instrument_id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("3000.00"))
+        .build();
+    apply_submitted_and_accepted(&mut retained_order, venue_order_id);
+    let retained_fill = TestOrderEventStubs::filled(
+        &retained_order,
+        &instrument,
+        Some(trade_id),
+        Some(closing_scenario_position_id()),
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("1.000")),
+        Some(LiquiditySide::Taker),
+        Some(Money::from("0.20 USDT")),
+        Some(UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1)),
+        Some(test_account_id()),
+    );
+    let position = Position::new(&instrument, retained_fill.into());
+    ctx.cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let (order_report, fill_report) = create_bounded_fill_lifecycle(
+        test_instrument_id(),
+        venue_order_id,
+        trade_id,
+        OrderSide::Buy,
+        "1.000",
+        "3000.00",
+        false,
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1),
+    );
+    let mass_status =
+        withheld_scenario_mass_status(true, true, vec![order_report], vec![fill_report]);
+
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass_status);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(count_filled_events(&result.events), 1);
+    assert!(position_events.is_empty(), "found {position_events:?}");
+    let cache = ctx.cache.borrow();
+    let position = cache
+        .position(&closing_scenario_position_id())
+        .expect("retained position cached");
+    assert_eq!(position.quantity, Quantity::from("1.000"));
+    assert_eq!(position.events.len(), 1);
+    drop(position);
+    drop(cache);
+    assert!(
+        withheld_fill_warnings(tag).is_empty(),
+        "found {:?}",
+        MANAGER_LOG_CAPTURE.messages.lock()
+    );
+}
+
+#[tokio::test]
+async fn test_bounded_real_fill_after_restored_inference_stays_order_only() {
+    let (closing_order_id, inferred_trade_id, restored) = {
+        let mut ctx =
+            closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+        cache_closing_scenario_open_long(&ctx, &test_instrument());
+        let (closing_order_id, _) = prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
+        let mut report = closing_scenario_closing_order_report(Some(closing_order_id));
+        report.filled_qty = Quantity::from("0.400");
+        report.order_status = OrderStatus::PartiallyFilled;
+        report.avg_px = Some(dec!(3100));
+
+        let mut mass = ExecutionMassStatus::new(
+            test_client_id(),
+            test_account_id(),
+            test_venue(),
+            UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1),
+            None,
+        );
+
+        mass.add_order_reports(vec![report]);
+        let (result, _) = reconcile_closing_scenario(&mut ctx, &mass);
+
+        let inferred_trade_id = result
+            .events
+            .iter()
+            .find_map(|event| match event {
+                OrderEventAny::Filled(fill) => Some(fill.trade_id),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            ctx.cache
+                .borrow()
+                .position(&closing_scenario_position_id())
+                .unwrap()
+                .quantity,
+            Quantity::from("0.600")
+        );
+
+        (
+            closing_order_id,
+            inferred_trade_id,
+            restore_closing_cache(&ctx.cache.borrow()),
+        )
+    };
+
+    let mut ctx = closing_scenario_context(restored, ExecutionManagerConfig::default(), false);
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+        None,
+    );
+
+    mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+    let fill = closing_scenario_closing_fill_reports(Some(closing_order_id)).remove(0);
+    mass.add_fill_reports(vec![fill]);
+
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+    let cache = ctx.cache.borrow();
+    let position = cache.position(&closing_scenario_position_id()).unwrap();
+    assert_eq!(count_filled_events(&result.events), 1);
+    assert!(position_events.is_empty());
+    assert_eq!(position.quantity, Quantity::from("0.600"));
+    assert_eq!(position.realized_pnl, Some(Money::from("39.40 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("0.60 USDT")]);
+    assert_eq!(
+        position.trade_ids,
+        [TradeId::from("T-OPEN"), inferred_trade_id]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+    assert_eq!(
+        closing_scenario_instrument_position_ids(&cache),
+        vec![closing_scenario_position_id()]
+    );
+}
+
+#[rstest]
+#[case::canceled(OrderStatus::Canceled)]
+#[case::expired(OrderStatus::Expired)]
+fn test_bounded_terminal_closing_order_with_complete_fills_closes_position(
+    #[case] status: OrderStatus,
+) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let order_id = ClientOrderId::from("O-CLOSE");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(order_id)
+        .strategy_id(closing_scenario_strategy_id())
+        .instrument_id(test_instrument_id())
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("2.000"))
+        .price(Price::from("3100.00"))
+        .build();
+    apply_submitted_and_accepted(&mut order, closing_scenario_venue_order_id());
+    ctx.add_order(order);
+    let mut mass = closing_scenario_mass_status(true, Some(order_id));
+    let mut report = closing_scenario_closing_order_report(Some(order_id));
+    report.quantity = Quantity::from("2.000");
+    report.order_status = status;
+    mass.add_order_reports(vec![report]);
+
+    let (_, events) = reconcile_closing_scenario(&mut ctx, &mass);
+
+    let cache = ctx.cache.borrow();
+    let order = cache.order(&order_id).unwrap();
+    assert_eq!(order.status(), status);
+    assert_eq!(order.filled_qty(), Quantity::from("1.000"));
+    assert_eq!(order.avg_px(), Some(dec!(3112)));
+    let position = cache.position(&closing_scenario_position_id()).unwrap();
+    assert_eq!(position.side, PositionSide::Flat);
+    assert_eq!(position.quantity, Quantity::from("0.000"));
+    assert_eq!(position.realized_pnl, Some(Money::from("110.78 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("1.22 USDT")]);
+    assert_eq!(position.closing_order_id, Some(order_id));
+    assert_eq!(
+        position.trade_ids,
+        ["T-OPEN", "T-CLOSE-1", "T-CLOSE-2"]
+            .into_iter()
+            .map(TradeId::from)
+            .collect()
+    );
+    assert_eq!(
+        closing_scenario_instrument_position_ids(&cache),
+        vec![closing_scenario_position_id()]
+    );
+    assert_closing_scenario_position_events(&events);
+}
+
+#[rstest]
+fn test_bounded_closing_recovery_applies_explicit_fill_without_inferred_remainder() {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) =
+        prepare_closing_scenario_order(&mut ctx, ClosingOrder::Claimed);
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+        None,
+    );
+
+    mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+    let report = closing_scenario_closing_order_report(reported_order_id).with_avg_px(dec!(3112));
+    let fill = closing_scenario_closing_fill_reports(reported_order_id).remove(0);
+    mass.add_order_reports(vec![report]);
+    mass.add_fill_reports(vec![fill]);
+
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+    assert_eq!(count_filled_events(&result.events), 2);
+    assert_eq!(position_events.len(), 1);
+    assert!(matches!(
+        position_events[0],
+        PositionEvent::PositionChanged(_)
+    ));
+    let cache = ctx.cache.borrow();
+    let order = cache.order(&closing_order_id).unwrap();
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from("1.000"));
+    assert_eq!(order.trade_ids().len(), 2);
+    let position = cache.position(&closing_scenario_position_id()).unwrap();
+    assert_eq!(position.quantity, Quantity::from("0.600"));
+    assert_eq!(position.realized_pnl, Some(Money::from("39.15 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("0.85 USDT")]);
+    assert_eq!(
+        position.trade_ids,
+        ["T-OPEN", "T-CLOSE-1"]
+            .into_iter()
+            .map(TradeId::from)
+            .collect()
+    );
+    assert_eq!(
+        closing_scenario_instrument_position_ids(&cache),
+        vec![closing_scenario_position_id()]
+    );
+}
+
+#[rstest]
+#[case::cached(ClosingOrder::Cached)]
+#[case::claimed(ClosingOrder::Claimed)]
+fn test_bounded_closing_fills_close_retained_short(#[case] closing: ClosingOrder) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_position(
+        &ctx,
+        &test_instrument(),
+        test_account_id(),
+        OmsType::Netting,
+        OrderSide::Sell,
+    );
+
+    let reported_id = if matches!(closing, ClosingOrder::Cached) {
+        let mut order = OrderTestBuilder::new(OrderType::Limit)
+            .client_order_id(ClientOrderId::from("O-CLOSE"))
+            .strategy_id(closing_scenario_strategy_id())
+            .instrument_id(test_instrument_id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("2900.00"))
+            .build();
+        apply_submitted_and_accepted(&mut order, closing_scenario_venue_order_id());
+        ctx.add_order(order);
+        Some(ClientOrderId::from("O-CLOSE"))
+    } else {
+        claim_closing_scenario_instrument(&mut ctx, closing);
+        None
+    };
+
+    let mut report = closing_scenario_closing_order_report(reported_id);
+    report.order_side = Some(OrderSide::Buy);
+    report.avg_px = Some(dec!(2888));
+    let mut fills = closing_scenario_closing_fill_reports(reported_id);
+    fills[0].order_side = OrderSide::Buy;
+    fills[0].last_px = Price::from("2900.00");
+    fills[1].order_side = OrderSide::Buy;
+    fills[1].last_px = Price::from("2880.00");
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+        None,
+    );
+
+    mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+    mass.add_order_reports(vec![report]);
+    mass.add_fill_reports(fills);
+
+    let (_, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+    let cache = ctx.cache.borrow();
+    let order_id = reported_id
+        .unwrap_or_else(|| ClientOrderId::from(closing_scenario_venue_order_id().as_str()));
+    assert_closing_scenario_recorded_once(&cache, order_id);
+    assert_closing_scenario_position_events(&position_events);
+}
+
+#[rstest]
+#[case::cached(ClosingOrder::Cached)]
+#[case::claimed(ClosingOrder::Claimed)]
+fn test_bounded_closing_recovery_does_not_apply_mismatched_instrument_fill(
+    #[case] closing: ClosingOrder,
+) {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (closing_order_id, reported_order_id) = prepare_closing_scenario_order(&mut ctx, closing);
+    let mut fills = closing_scenario_closing_fill_reports(reported_order_id);
+    fills[1].instrument_id = test_instrument_id2();
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+        None,
+    );
+
+    mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+    mass.add_order_reports(vec![closing_scenario_closing_order_report(
+        reported_order_id,
+    )]);
+    mass.add_fill_reports(fills);
+
+    let (_, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+    assert_eq!(position_events.len(), 1);
+    assert!(matches!(
+        position_events[0],
+        PositionEvent::PositionChanged(_)
+    ));
+    let cache = ctx.cache.borrow();
+    assert_closing_scenario_order_filled(&cache, closing_order_id);
+    let position = cache.position(&closing_scenario_position_id()).unwrap();
+    assert_eq!(position.quantity, Quantity::from("0.600"));
+    assert_eq!(position.realized_pnl, Some(Money::from("39.15 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("0.85 USDT")]);
+    assert_eq!(
+        position.trade_ids,
+        ["T-OPEN", "T-CLOSE-1"]
+            .into_iter()
+            .map(TradeId::from)
+            .collect()
+    );
+}
+
+#[rstest]
+#[case::cached(ClosingOrder::Cached)]
+#[case::claimed(ClosingOrder::Claimed)]
+#[tokio::test]
+async fn test_bounded_partial_close_then_remaining_fills_after_restore(
+    #[case] closing: ClosingOrder,
+) {
+    let (closing_order_id, reported_order_id, restored) = {
+        let mut ctx =
+            closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+        cache_closing_scenario_open_long(&ctx, &test_instrument());
+        let (closing_order_id, reported_order_id) =
+            prepare_closing_scenario_order(&mut ctx, closing);
+        let mut report = closing_scenario_closing_order_report(reported_order_id);
+        report.order_status = OrderStatus::PartiallyFilled;
+        report.filled_qty = Quantity::from("0.400");
+        report.avg_px = Some(dec!(3100));
+
+        let mut mass = ExecutionMassStatus::new(
+            test_client_id(),
+            test_account_id(),
+            test_venue(),
+            UnixNanos::from(CLOSING_SCENARIO_FILL_TS_1),
+            None,
+        );
+
+        mass.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+        mass.add_order_reports(vec![report]);
+        mass.add_fill_reports(vec![
+            closing_scenario_closing_fill_reports(reported_order_id).remove(0),
+        ]);
+        let (_, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+        let cache = ctx.cache.borrow();
+        let position = cache.position(&closing_scenario_position_id()).unwrap();
+        assert_eq!(position.quantity, Quantity::from("0.600"));
+        assert_eq!(position.realized_pnl, Some(Money::from("39.15 USDT")));
+        assert_eq!(position.commissions(), vec![Money::from("0.85 USDT")]);
+        assert_eq!(position_events.len(), 1);
+
+        (
+            closing_order_id,
+            reported_order_id,
+            restore_closing_cache(&ctx.cache.borrow()),
+        )
+    };
+
+    let mut ctx = closing_scenario_context(restored, ExecutionManagerConfig::default(), false);
+    claim_closing_scenario_instrument(&mut ctx, closing);
+    let mass = closing_scenario_mass_status(true, reported_order_id);
+    let (result, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+    assert_eq!(count_filled_events(&result.events), 1);
+    assert_eq!(position_events.len(), 1);
+    assert!(matches!(
+        position_events[0],
+        PositionEvent::PositionClosed(_)
+    ));
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+
+    let (replay, position_events) = reconcile_closing_scenario(&mut ctx, &mass);
+    assert_eq!(count_filled_events(&replay.events), 0);
+    assert!(position_events.is_empty());
+    assert_closing_scenario_recorded_once(&ctx.cache.borrow(), closing_order_id);
+}
+
+#[rstest]
+fn test_bounded_closing_fills_recheck_position_after_each_application() {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (order_id, reported_id) = prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
+    let other_id = PositionId::from("OTHER-POSITION");
+    let other_order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(ClientOrderId::from("O-OTHER"))
+        .strategy_id(closing_scenario_strategy_id())
+        .instrument_id(test_instrument_id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("0.200"))
+        .price(Price::from("3000.00"))
+        .build();
+    let fill = TestOrderEventStubs::filled(
+        &other_order,
+        &test_instrument(),
+        Some(TradeId::from("T-OTHER")),
+        Some(other_id),
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("0.200")),
+        Some(LiquiditySide::Maker),
+        Some(Money::from("0.12 USDT")),
+        Some(UnixNanos::from(CLOSING_SCENARIO_OPENING_TS)),
+        Some(test_account_id()),
+    );
+    let other = Position::new(&test_instrument(), fill.into());
+    ctx.cache
+        .borrow_mut()
+        .add_position(&other, OmsType::Netting)
+        .unwrap();
+
+    let handler = TypedHandler::from({
+        let cache = ctx.cache.clone();
+        move |_: &PositionEvent| {
+            cache
+                .borrow_mut()
+                .add_position_id(
+                    &other_id,
+                    &test_venue(),
+                    &order_id,
+                    &closing_scenario_strategy_id(),
+                )
+                .unwrap();
+        }
+    });
+
+    msgbus::subscribe_position_events("events.position.*".into(), handler.clone(), None);
+    let mass = closing_scenario_mass_status(true, reported_id);
+    let (_, events) = reconcile_closing_scenario(&mut ctx, &mass);
+    msgbus::unsubscribe_position_events("events.position.*".into(), &handler);
+
+    let cache = ctx.cache.borrow();
+    let position = cache.position(&closing_scenario_position_id()).unwrap();
+    assert_eq!(position.quantity, Quantity::from("0.600"));
+    assert_eq!(position.realized_pnl, Some(Money::from("39.15 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("0.85 USDT")]);
+    let other = cache.position(&other_id).unwrap();
+    assert_eq!(other.quantity, Quantity::from("0.200"));
+    assert_eq!(other.realized_pnl, Some(Money::from("-0.12 USDT")));
+    assert_eq!(other.commissions(), vec![Money::from("0.12 USDT")]);
+    assert_eq!(events.len(), 1);
+    assert_closing_scenario_order_filled(&cache, order_id);
+}
+
+#[rstest]
+fn test_bounded_closing_fills_respect_target_lifecycle_across_strategies() {
+    let mut ctx =
+        closing_scenario_context(Cache::default(), ExecutionManagerConfig::default(), false);
+    cache_closing_scenario_open_long(&ctx, &test_instrument());
+    let (order_id, reported_id) = prepare_closing_scenario_order(&mut ctx, ClosingOrder::Cached);
+    let external_id = PositionId::new(format!("{}-EXTERNAL", test_instrument_id()));
+
+    {
+        let mut cache = ctx.cache.borrow_mut();
+        let mut position = cache
+            .position_owned(&closing_scenario_position_id())
+            .unwrap();
+        cache.purge_position(position.id, false).unwrap();
+        position.id = external_id;
+        position.strategy_id = StrategyId::external();
+        position.ts_opened = UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 1);
+        cache.add_position(&position, OmsType::Netting).unwrap();
+        cache
+            .add_position_id(
+                &external_id,
+                &test_venue(),
+                &order_id,
+                &closing_scenario_strategy_id(),
+            )
+            .unwrap();
+    }
+
+    let mass = closing_scenario_mass_status(true, reported_id);
+    let (_, events) = reconcile_closing_scenario(&mut ctx, &mass);
+
+    let cache = ctx.cache.borrow();
+    let position = cache.position(&external_id).unwrap();
+    assert_eq!(position.quantity, Quantity::from("1.000"));
+    assert_eq!(position.realized_pnl, Some(Money::from("-0.60 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("0.60 USDT")]);
+    assert_eq!(
+        position.trade_ids,
+        [TradeId::from("T-OPEN")].into_iter().collect()
+    );
+    assert!(events.is_empty());
+    assert_closing_scenario_order_filled(&cache, order_id);
+}
+
+fn restore_closing_cache(cache: &Cache) -> Cache {
+    let orders: Vec<_> = cache
+        .orders(None, None, None, None, None)
+        .into_iter()
+        .map(|order| {
+            (
+                order.clone(),
+                cache.position_id(&order.client_order_id()).copied(),
+                cache.client_id(&order.client_order_id()).copied(),
+            )
+        })
+        .collect();
+
+    let positions: Vec<_> = cache
+        .positions(None, None, None, None, None)
+        .into_iter()
+        .map(|position| (position.clone(), cache.oms_type(&position.id).unwrap()))
+        .collect();
+    let orders = serde_json::to_vec(&orders).unwrap();
+    let orders: Vec<(OrderAny, Option<PositionId>, Option<ClientId>)> =
+        serde_json::from_slice(&orders).unwrap();
+    let positions = serde_json::to_vec(&positions).unwrap();
+    let positions: Vec<(Position, OmsType)> = serde_json::from_slice(&positions).unwrap();
+    let mut restored = Cache::default();
+    for (order, position_id, client_id) in orders {
+        restored
+            .add_order(order, position_id, client_id, false)
+            .unwrap();
+    }
+
+    for (position, oms_type) in positions {
+        restored.add_position(&position, oms_type).unwrap();
+    }
+
+    restored.build_index();
+    restored
+}
+
+const CLOSING_SCENARIO_TAG: &str = "CLOSE";
+const CLOSING_SCENARIO_OPENING_TS: u64 = 1_000_000_000_000;
+const CLOSING_SCENARIO_WINDOW_START: u64 = 2_000_000_000_000;
+const CLOSING_SCENARIO_ACCEPTED_TS: u64 = 2_000_000_500_000;
+const CLOSING_SCENARIO_FILL_TS_1: u64 = 2_000_001_000_000;
+const CLOSING_SCENARIO_FILL_TS_2: u64 = 2_000_002_000_000;
+
+fn closing_scenario_strategy_id() -> StrategyId {
+    StrategyId::from("STRATEGY-001")
+}
+
+fn closing_scenario_position_id() -> PositionId {
+    PositionId::new(format!(
+        "{}-{}",
+        test_instrument_id(),
+        closing_scenario_strategy_id()
+    ))
+}
+
+fn closing_scenario_venue_order_id() -> VenueOrderId {
+    VenueOrderId::new(format!("V-{CLOSING_SCENARIO_TAG}"))
+}
+
+fn register_closing_scenario_oms(ctx: &TestContext) {
+    let mut engine = ctx.exec_engine.borrow_mut();
+    engine.register_oms_type(closing_scenario_strategy_id(), OmsType::Netting);
+    engine.register_oms_type(StrategyId::from("EXTERNAL"), OmsType::Netting);
+}
+
+fn cache_closing_scenario_open_long(ctx: &TestContext, instrument: &InstrumentAny) {
+    cache_closing_scenario_open_position(
+        ctx,
+        instrument,
+        test_account_id(),
+        OmsType::Netting,
+        OrderSide::Buy,
+    );
+}
+
+fn cache_closing_scenario_open_position(
+    ctx: &TestContext,
+    instrument: &InstrumentAny,
+    account_id: AccountId,
+    oms_type: OmsType,
+    opening_side: OrderSide,
+) {
+    let position_id = closing_scenario_position_id();
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .client_order_id(ClientOrderId::from("O-OPEN"))
+        .strategy_id(closing_scenario_strategy_id())
+        .instrument_id(instrument.id())
+        .side(opening_side)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("3000.00"))
+        .build();
+    apply_submitted_and_accepted(&mut order, VenueOrderId::from("V-OPEN"));
+    let filled = TestOrderEventStubs::filled(
+        &order,
+        instrument,
+        Some(TradeId::from("T-OPEN")),
+        Some(position_id),
+        Some(Price::from("3000.00")),
+        Some(Quantity::from("1.000")),
+        Some(LiquiditySide::Maker),
+        Some(Money::from("0.60 USDT")),
+        Some(UnixNanos::from(CLOSING_SCENARIO_OPENING_TS)),
+        Some(account_id),
+    );
+    order.apply(filled.clone()).unwrap();
+    let position = Position::new(instrument, filled.into());
+    assert_eq!(position.realized_pnl, Some(Money::from("-0.60 USDT")));
+
+    let mut cache = ctx.cache.borrow_mut();
+    cache
+        .add_order(order, Some(position_id), Some(test_client_id()), false)
+        .unwrap();
+    cache.add_position(&position, oms_type).unwrap();
+}
+
+fn closing_scenario_opening_order_report() -> OrderStatusReport {
+    let ts = UnixNanos::from(CLOSING_SCENARIO_OPENING_TS);
+    OrderStatusReport::new(
+        test_account_id(),
+        test_instrument_id(),
+        Some(ClientOrderId::from("O-OPEN")),
+        VenueOrderId::from("V-OPEN"),
+        OrderSide::Buy.into(),
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("1.000"),
+        Quantity::from("1.000"),
+        ts,
+        ts,
+        ts,
+        None,
+    )
+    .with_price(Price::from("3000.00"))
+    .with_avg_px(dec!(3000.00))
+}
+
+fn closing_scenario_opening_fill_report() -> FillReport {
+    let ts = UnixNanos::from(CLOSING_SCENARIO_OPENING_TS);
+
+    FillReport::new(
+        test_account_id(),
+        test_instrument_id(),
+        VenueOrderId::from("V-OPEN"),
+        TradeId::from("T-OPEN"),
+        OrderSide::Buy,
+        Quantity::from("1.000"),
+        Price::from("3000.00"),
+        Money::from("0.60 USDT"),
+        LiquiditySide::Maker,
+        Some(ClientOrderId::from("O-OPEN")),
+        None,
+        ts,
+        ts,
+        None,
+    )
+}
+
+fn closing_scenario_closing_order_report(
+    client_order_id: Option<ClientOrderId>,
+) -> OrderStatusReport {
+    OrderStatusReport::new(
+        test_account_id(),
+        test_instrument_id(),
+        client_order_id,
+        closing_scenario_venue_order_id(),
+        OrderSide::Sell.into(),
+        OrderType::Limit,
+        TimeInForce::Gtc,
+        OrderStatus::Filled,
+        Quantity::from("1.000"),
+        Quantity::from("1.000"),
+        UnixNanos::from(CLOSING_SCENARIO_ACCEPTED_TS),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2),
+        None,
+    )
+    .with_price(Price::from("3100.00"))
+    .with_avg_px(dec!(3112.00))
+}
+
+fn closing_scenario_closing_fill_reports(
+    client_order_id: Option<ClientOrderId>,
+) -> Vec<FillReport> {
+    [
+        (
+            "T-CLOSE-1",
+            "0.400",
+            "3100.00",
+            "0.25 USDT",
+            CLOSING_SCENARIO_FILL_TS_1,
+        ),
+        (
+            "T-CLOSE-2",
+            "0.600",
+            "3120.00",
+            "0.37 USDT",
+            CLOSING_SCENARIO_FILL_TS_2,
+        ),
+    ]
+    .into_iter()
+    .map(|(trade_id, quantity, price, commission, ts)| {
+        FillReport::new(
+            test_account_id(),
+            test_instrument_id(),
+            closing_scenario_venue_order_id(),
+            TradeId::from(trade_id),
+            OrderSide::Sell,
+            Quantity::from(quantity),
+            Price::from(price),
+            Money::from(commission),
+            LiquiditySide::Taker,
+            client_order_id,
+            None,
+            UnixNanos::from(ts),
+            UnixNanos::from(ts),
+            None,
+        )
+    })
+    .collect()
+}
+
+fn closing_scenario_mass_status(
+    bounded: bool,
+    closing_client_order_id: Option<ClientOrderId>,
+) -> ExecutionMassStatus {
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 1_000_000),
+        Some(UUID4::new()),
+    );
+
+    let mut order_reports = vec![closing_scenario_closing_order_report(
+        closing_client_order_id,
+    )];
+    let mut fill_reports = closing_scenario_closing_fill_reports(closing_client_order_id);
+
+    if bounded {
+        mass_status.set_report_window(Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)), true);
+    } else {
+        order_reports.insert(0, closing_scenario_opening_order_report());
+        fill_reports.insert(0, closing_scenario_opening_fill_report());
+    }
+
+    mass_status.add_order_reports(order_reports);
+    mass_status.add_fill_reports(fill_reports);
+    mass_status
+}
+
+fn capture_position_events() -> (Rc<RefCell<Vec<PositionEvent>>>, TypedHandler<PositionEvent>) {
+    let received = Rc::new(RefCell::new(Vec::<PositionEvent>::new()));
+
+    let handler = TypedHandler::from({
+        let received = received.clone();
+        move |event: &PositionEvent| received.borrow_mut().push(event.clone())
+    });
+
+    msgbus::subscribe_position_events("events.position.*".into(), handler.clone(), None);
+    (received, handler)
+}
+
+fn release_position_events(handler: &TypedHandler<PositionEvent>) {
+    msgbus::unsubscribe_position_events("events.position.*".into(), handler);
+}
+
+fn count_filled_events(events: &[OrderEventAny]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+        .count()
+}
+
+fn assert_closing_scenario_recorded_once(cache: &Cache, closing_order_id: ClientOrderId) {
+    let instrument_id = test_instrument_id();
+    let account_id = test_account_id();
+
+    assert_closing_scenario_order_filled(cache, closing_order_id);
+
+    let position_ids = cache
+        .positions(None, Some(&instrument_id), None, Some(&account_id), None)
+        .iter()
+        .map(|position| position.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        position_ids,
+        vec![closing_scenario_position_id()],
+        "a closing fill must not open an opposite position"
+    );
+    let position = cache
+        .position(&closing_scenario_position_id())
+        .expect("restored position cached");
+    assert!(
+        position.is_closed(),
+        "restored position must be closed by its closing fills, found side {:?} quantity {} realized_pnl {:?} trade_ids {:?}",
+        position.side,
+        position.quantity,
+        position.realized_pnl,
+        position.trade_ids,
+    );
+    assert_eq!(position.side, PositionSide::Flat);
+    assert_eq!(position.quantity, Quantity::from("0.000"));
+    assert_eq!(position.signed_decimal_qty(), dec!(0));
+    assert_eq!(position.realized_pnl, Some(Money::from("110.78 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("1.22 USDT")]);
+    assert_eq!(
+        position.trade_ids,
+        [
+            TradeId::from("T-OPEN"),
+            TradeId::from("T-CLOSE-1"),
+            TradeId::from("T-CLOSE-2"),
+        ]
+        .into_iter()
+        .collect::<AHashSet<_>>()
+    );
+    assert_eq!(position.events.len(), 3);
+    assert_eq!(position.closing_order_id, Some(closing_order_id));
+    assert_eq!(
+        position.ts_closed,
+        Some(UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2))
+    );
+    drop(position);
+
+    assert_eq!(
+        cache
+            .positions_open(None, Some(&instrument_id), None, Some(&account_id), None)
+            .len(),
+        0
+    );
+    assert_eq!(
+        cache
+            .positions_closed(None, Some(&instrument_id), None, Some(&account_id), None)
+            .len(),
+        1
+    );
+}
+
+fn assert_closing_scenario_position_events(events: &[PositionEvent]) {
+    assert_eq!(
+        events.len(),
+        2,
+        "expected PositionChanged then PositionClosed, found {events:?}"
+    );
+    assert!(matches!(events[0], PositionEvent::PositionChanged(_)));
+    assert!(matches!(events[1], PositionEvent::PositionClosed(_)));
+}
+
+fn assert_closing_scenario_order_filled(cache: &Cache, closing_order_id: ClientOrderId) {
+    let order = cache
+        .order(&closing_order_id)
+        .expect("closing order cached");
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.filled_qty(), Quantity::from("1.000"));
+    assert_eq!(
+        order.trade_ids().into_iter().copied().collect::<Vec<_>>(),
+        vec![TradeId::from("T-CLOSE-1"), TradeId::from("T-CLOSE-2")]
+    );
+}
+
+fn assert_closing_scenario_position_unchanged(cache: &Cache) {
+    let position = cache
+        .position(&closing_scenario_position_id())
+        .expect("restored position cached");
+    assert!(position.is_open());
+    assert_eq!(position.side, PositionSide::Long);
+    assert_eq!(position.quantity, Quantity::from("1.000"));
+    assert_eq!(position.realized_pnl, Some(Money::from("-0.60 USDT")));
+    assert_eq!(position.commissions(), vec![Money::from("0.60 USDT")]);
+    assert_eq!(
+        position.trade_ids,
+        [TradeId::from("T-OPEN")]
+            .into_iter()
+            .collect::<AHashSet<_>>()
+    );
+    assert_eq!(position.events.len(), 1);
+}
+
+fn closing_scenario_instrument_position_ids(cache: &Cache) -> Vec<PositionId> {
+    let mut position_ids: Vec<PositionId> = cache
+        .positions(None, Some(&test_instrument_id()), None, None, None)
+        .iter()
+        .map(|position| position.id)
+        .collect();
+    position_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    position_ids
+}
+
+fn assert_closing_scenario_order_only(cache: &Cache, closing_order_id: ClientOrderId) {
+    assert_closing_scenario_order_filled(cache, closing_order_id);
+    assert_closing_scenario_position_unchanged(cache);
+    assert_eq!(
+        closing_scenario_instrument_position_ids(cache),
+        vec![closing_scenario_position_id()]
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ClosingOrder {
+    // The strategy's order `O-CLOSE` is cached before reconciliation.
+    Cached,
+    // The order is placed outside the node and its instrument is claimed for the strategy.
+    Claimed,
+    // The order is placed outside the node and its instrument is not claimed.
+    Unclaimed,
+}
+
+fn closing_scenario_context(
+    cache: Cache,
+    config: ExecutionManagerConfig,
+    covered: bool,
+) -> TestContext {
+    let ctx = TestContext::with_cache(cache, config);
+
+    {
+        let mut engine = ctx.exec_engine.borrow_mut();
+        engine.deregister_client(test_client_id()).unwrap();
+        engine
+            .register_client(Box::new(
+                MockExecutionClient::new(Vec::new()).with_bulk_position_coverage(covered),
+            ))
+            .unwrap();
+    }
+
+    ctx.add_instrument(test_instrument());
+    register_closing_scenario_oms(&ctx);
+    ctx
+}
+
+fn claim_closing_scenario_instrument(ctx: &mut TestContext, closing: ClosingOrder) {
+    if matches!(closing, ClosingOrder::Claimed) {
+        ctx.manager
+            .claim_external_orders(test_instrument_id(), closing_scenario_strategy_id())
+            .unwrap();
+    }
+}
+
+fn prepare_closing_scenario_order(
+    ctx: &mut TestContext,
+    closing: ClosingOrder,
+) -> (ClientOrderId, Option<ClientOrderId>) {
+    prepare_closing_scenario_order_for(ctx, closing, CLOSING_SCENARIO_TAG)
+}
+
+fn prepare_closing_scenario_order_for(
+    ctx: &mut TestContext,
+    closing: ClosingOrder,
+    tag: &str,
+) -> (ClientOrderId, Option<ClientOrderId>) {
+    let venue_order_id = VenueOrderId::new(format!("V-{tag}"));
+
+    match closing {
+        ClosingOrder::Cached => {
+            let client_order_id = ClientOrderId::new(format!("O-{tag}"));
+            let mut order = OrderTestBuilder::new(OrderType::Limit)
+                .client_order_id(client_order_id)
+                .strategy_id(closing_scenario_strategy_id())
+                .instrument_id(test_instrument_id())
+                .side(OrderSide::Sell)
+                .quantity(Quantity::from("1.000"))
+                .price(Price::from("3100.00"))
+                .build();
+            apply_submitted_and_accepted(&mut order, venue_order_id);
+            ctx.add_order(order);
+            (client_order_id, Some(client_order_id))
+        }
+        ClosingOrder::Claimed | ClosingOrder::Unclaimed => {
+            claim_closing_scenario_instrument(ctx, closing);
+            (ClientOrderId::from(venue_order_id.as_str()), None)
+        }
+    }
+}
+
+fn reconcile_closing_scenario(
+    ctx: &mut TestContext,
+    mass_status: &ExecutionMassStatus,
+) -> (ReconciliationResult, Vec<PositionEvent>) {
+    let (position_events, handler) = capture_position_events();
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(mass_status, &ctx.exec_engine);
+    release_position_events(&handler);
+    let position_events = position_events.borrow().clone();
+    (result, position_events)
+}
+
+fn withheld_scenario_reports(
+    tag: &str,
+    client_order_id: Option<ClientOrderId>,
+) -> (OrderStatusReport, Vec<FillReport>) {
+    let venue_order_id = VenueOrderId::new(format!("V-{tag}"));
+    let mut order_report = closing_scenario_closing_order_report(client_order_id);
+    order_report.venue_order_id = venue_order_id;
+
+    let fill_reports = closing_scenario_closing_fill_reports(client_order_id)
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut fill)| {
+            fill.venue_order_id = venue_order_id;
+            fill.trade_id = TradeId::new(format!("T-{tag}-{}", index + 1));
+            fill
+        })
+        .collect();
+
+    (order_report, fill_reports)
+}
+
+fn withheld_scenario_mass_status(
+    bounded: bool,
+    reports_complete: bool,
+    order_reports: Vec<OrderStatusReport>,
+    fill_reports: Vec<FillReport>,
+) -> ExecutionMassStatus {
+    let mut mass_status = create_mass_status(order_reports, fill_reports);
+    mass_status.ts_init = UnixNanos::from(CLOSING_SCENARIO_FILL_TS_2 + 1_000_000);
+    if bounded {
+        mass_status.set_report_window(
+            Some(UnixNanos::from(CLOSING_SCENARIO_WINDOW_START)),
+            reports_complete,
+        );
+    }
+
+    mass_status
+}
+
+fn withheld_fill_warnings(needle: &str) -> Vec<String> {
+    MANAGER_LOG_CAPTURE
+        .messages
+        .lock()
+        .iter()
+        .filter(|message| message.contains("to order state only") && message.contains(needle))
+        .cloned()
+        .collect()
 }
 
 #[tokio::test]
@@ -5107,6 +7561,7 @@ async fn test_fill_before_retained_netting_lifecycle_projects_order_only() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let old_order_report = create_order_report(
         Some(old_order_id),
         old_venue_order_id,
@@ -5171,6 +7626,7 @@ async fn test_fill_before_retained_netting_lifecycle_projects_order_only() {
         None,
         Some(dec!(3200.00)),
     );
+
     mass_status.add_order_reports(vec![old_order_report, current_order_report]);
     mass_status.add_fill_reports(vec![old_fill_report, current_fill_report]);
     mass_status.add_position_reports(vec![position_report]);
@@ -5232,6 +7688,7 @@ async fn test_filled_report_with_reduced_quantity_closes_partially_filled_order(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -5250,6 +7707,235 @@ async fn test_filled_report_with_reduced_quantity_closes_partially_filled_order(
     assert_eq!(order.status(), OrderStatus::Filled);
     assert_eq!(order.quantity(), Quantity::from("5.000"));
     assert_eq!(order.filled_qty(), Quantity::from("5.000"));
+}
+
+#[rstest]
+#[case::market(OrderType::Market, "0.00296487", "0.00296475", LiquiditySide::Taker)]
+#[case::limit(
+    OrderType::Limit,
+    "10.00000000",
+    "5.00000000",
+    LiquiditySide::NoLiquiditySide
+)]
+#[tokio::test]
+async fn test_filled_report_with_reduced_quantity_closes_accepted_order(
+    #[case] order_type: OrderType,
+    #[case] requested_qty: Quantity,
+    #[case] filled_qty: Quantity,
+    #[case] liquidity_side: LiquiditySide,
+) {
+    let mut ctx = TestContext::new();
+    let mut pair = currency_pair_btcusdt();
+    pair.size_precision = 8;
+    pair.size_increment = Quantity::from("0.00000001");
+    let instrument = InstrumentAny::CurrencyPair(pair);
+    let instrument_id = instrument.id();
+    let client_order_id = ClientOrderId::from("O-ACCEPTED-SHORT-FILL");
+    let venue_order_id = VenueOrderId::from("V-ACCEPTED-SHORT-FILL");
+    let commission = Money::from("0.37 USDT");
+
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .deregister_client(test_client_id())
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_client(Box::new(
+            MockExecutionClient::new(Vec::new())
+                .with_commission(commission, Rc::new(Cell::new(false))),
+        ))
+        .unwrap();
+
+    let mut order = OrderTestBuilder::new(order_type)
+        .client_order_id(client_order_id)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Buy)
+        .quantity(requested_qty)
+        .price(Price::from("65000.00"))
+        .build();
+    apply_submitted_and_accepted(&mut order, venue_order_id);
+    let mut report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        filled_qty,
+        filled_qty,
+    )
+    .with_avg_px(dec!(65001.25));
+    report.order_type = order_type;
+    report.price = order.price();
+    ctx.add_order(order);
+    let mass_status = create_mass_status(vec![report.clone()], Vec::new());
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let order = ctx.get_order(&client_order_id).unwrap();
+    let replayed = OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+    let repeated = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let mut late_fill = create_fill_report(
+        client_order_id,
+        venue_order_id,
+        instrument_id,
+        TradeId::from("T-LATE-SHORT-FILL"),
+        &filled_qty.to_string(),
+    );
+    late_fill.last_px = Price::from("65001.25");
+    late_fill.commission = commission;
+    let late = ctx.manager.reconcile_execution_mass_status(
+        &create_mass_status(vec![report.clone()], vec![late_fill]),
+        &ctx.exec_engine,
+    );
+    let after_repeated = ctx.get_order(&client_order_id).unwrap();
+
+    assert_eq!(result.events.len(), 2);
+
+    let OrderEventAny::Updated(updated) = &result.events[0] else {
+        panic!("Expected quantity update before fill");
+    };
+
+    let OrderEventAny::Filled(fill) = &result.events[1] else {
+        panic!("Expected inferred fill after quantity update");
+    };
+
+    assert_eq!(updated.quantity, filled_qty);
+    assert!(updated.reconciliation);
+    assert_eq!(fill.client_order_id, client_order_id);
+    assert_eq!(fill.venue_order_id, venue_order_id);
+    assert_eq!(fill.account_id, test_account_id());
+    assert_eq!(fill.instrument_id, instrument_id);
+    assert_eq!(fill.order_type, order_type);
+    assert_eq!(fill.order_side, OrderSide::Buy);
+    assert_eq!(fill.last_qty, filled_qty);
+    assert_eq!(fill.last_px, Price::from("65001.25"));
+    assert_eq!(fill.currency, Currency::USDT());
+    assert_eq!(fill.commission, Some(commission));
+    assert_eq!(fill.liquidity_side, liquidity_side);
+    assert_eq!(fill.ts_event, report.ts_last);
+    assert!(fill.reconciliation);
+
+    for reconciled in [&order, &replayed, &after_repeated] {
+        assert_eq!(reconciled.status(), OrderStatus::Filled);
+        assert_eq!(reconciled.quantity(), filled_qty);
+        assert_eq!(reconciled.filled_qty(), filled_qty);
+        assert_eq!(reconciled.leaves_qty(), Quantity::zero(8));
+        assert_eq!(reconciled.avg_px(), Some(dec!(65001.25)));
+        assert_eq!(reconciled.ts_closed(), Some(report.ts_last));
+        assert_eq!(reconciled.trade_ids(), vec![&fill.trade_id]);
+        assert_eq!(
+            reconciled.commissions().get(&Currency::USDT()),
+            Some(&commission)
+        );
+    }
+
+    assert!(repeated.events.is_empty());
+    assert!(late.events.is_empty());
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, filled_qty);
+    assert_eq!(positions[0].signed_decimal_qty(), filled_qty.as_decimal());
+    assert_eq!(positions[0].commissions(), vec![commission]);
+    assert_eq!(positions[0].trade_ids, AHashSet::from([fill.trade_id]));
+}
+
+#[tokio::test]
+async fn test_short_fill_snapshot_retries_unavailable_commission() {
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-SHORT-FILL-COMMISSION");
+    let venue_order_id = VenueOrderId::from("V-SHORT-FILL-COMMISSION");
+    let commission = Money::from("0.29 USDT");
+    let commission_failure = Rc::new(Cell::new(true));
+
+    ctx.add_instrument(test_instrument());
+    ctx.exec_engine
+        .borrow_mut()
+        .deregister_client(test_client_id())
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_client(Box::new(
+            MockExecutionClient::new(Vec::new())
+                .with_commission(commission, commission_failure.clone()),
+        ))
+        .unwrap();
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .client_order_id(client_order_id)
+        .instrument_id(instrument_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("10.000"))
+        .build();
+    apply_submitted_and_accepted(&mut order, venue_order_id);
+    ctx.add_order(order);
+    let mut report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument_id,
+        OrderStatus::Filled,
+        Quantity::from("5.000"),
+        Quantity::from("5.000"),
+    )
+    .with_avg_px(dec!(3001.50));
+    report.order_type = OrderType::Market;
+    report.price = None;
+    let mass_status = create_mass_status(vec![report], Vec::new());
+
+    let failed = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let unfilled = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(failed.events.len(), 1);
+    assert!(matches!(failed.events[0], OrderEventAny::Updated(_)));
+    assert_eq!(unfilled.status(), OrderStatus::Accepted);
+    assert_eq!(unfilled.quantity(), Quantity::from("5.000"));
+    assert_eq!(unfilled.filled_qty(), Quantity::zero(3));
+    assert_eq!(unfilled.leaves_qty(), Quantity::from("5.000"));
+    assert!(unfilled.commissions().is_empty());
+    assert!(
+        ctx.cache
+            .borrow()
+            .positions_open(None, None, None, None, None)
+            .is_empty()
+    );
+
+    commission_failure.set(false);
+    let retried = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let repeated = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let order = ctx.get_order(&client_order_id).unwrap();
+
+    assert_eq!(retried.events.len(), 1);
+
+    let OrderEventAny::Filled(fill) = &retried.events[0] else {
+        panic!("Expected inferred fill after commission becomes available");
+    };
+
+    assert_eq!(fill.last_qty, Quantity::from("5.000"));
+    assert_eq!(fill.last_px, Price::from("3001.50"));
+    assert_eq!(fill.commission, Some(commission));
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.quantity(), Quantity::from("5.000"));
+    assert_eq!(order.filled_qty(), Quantity::from("5.000"));
+    assert_eq!(order.leaves_qty(), Quantity::zero(3));
+    assert_eq!(
+        order.commissions().get(&Currency::USDT()),
+        Some(&commission)
+    );
+    assert!(repeated.events.is_empty());
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].quantity, Quantity::from("5.000"));
+    assert_eq!(positions[0].commissions(), vec![commission]);
+    assert_eq!(positions[0].trade_ids, AHashSet::from([fill.trade_id]));
 }
 
 #[tokio::test]
@@ -5335,6 +8021,7 @@ async fn test_reconcile_mass_status_sorts_events_chronologically() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill2, fill1]);
 
     let result = ctx
@@ -5372,13 +8059,13 @@ async fn test_inflight_order_generates_rejection_after_max_retries(
     // Order must be submitted (have account_id) to generate rejection
     let order = create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order.clone());
-
     if submission {
         ctx.manager
             .register_submission(order.init_event(), Some(test_client_id()));
     } else {
-        ctx.manager.register_inflight(client_order_id);
+        ctx.manager.register_inflight(client_order_id, UUID4::new());
     }
+
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await; // 200ms, past threshold
 
@@ -5418,6 +8105,7 @@ async fn test_submission_registry_preserves_identity_and_bounded_queries(#[case]
         submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
         ..Default::default()
     });
+
     ctx.add_instrument(test_instrument());
     let order = create_submitted_order(
         "O-REGISTRY",
@@ -5443,9 +8131,11 @@ async fn test_submission_registry_preserves_identity_and_bounded_queries(#[case]
         if check < budget {
             assert!(result.events.is_empty());
             assert_eq!(result.queries.len(), 1);
+
             let TradingCommand::QueryOrder(query) = &result.queries[0] else {
                 panic!("Recovery must only query an existing submission");
             };
+
             assert_eq!(query.trader_id, initialized.trader_id);
             assert_eq!(query.client_id, Some(test_client_id()));
             assert_eq!(query.strategy_id, initialized.strategy_id);
@@ -5527,6 +8217,7 @@ async fn test_submission_registry_before_cache_insertion(#[case] filtered: bool)
         },
         ..Default::default()
     });
+
     ctx.manager
         .register_submission(order.init_event(), Some(test_client_id()));
     ctx.advance_both(dst::time::Duration::from_millis(101))
@@ -5538,6 +8229,7 @@ async fn test_submission_registry_before_cache_insertion(#[case] filtered: bool)
     assert!(result.queries.is_empty());
     assert!(result.events.is_empty());
     assert_eq!(diagnostics.len(), usize::from(!filtered));
+
     if !filtered {
         assert_eq!(
             diagnostics[0],
@@ -5553,6 +8245,7 @@ async fn test_submission_registry_before_cache_insertion(#[case] filtered: bool)
             },
         );
     }
+
     assert!(
         ctx.manager
             .take_submission_recovery_exhaustions()
@@ -5573,6 +8266,7 @@ async fn test_submission_registry_applied_acceptance_prevents_exhaustion() {
         submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
         ..Default::default()
     });
+
     ctx.add_instrument(test_instrument());
     let order = create_submitted_order(
         "O-DELAYED-ACCEPT",
@@ -5628,6 +8322,7 @@ async fn test_submission_registry_survives_unacknowledged_command_response(
         submission_recovery_policy: policy,
         ..Default::default()
     });
+
     let order = create_submitted_order(
         "O-REGISTRY-RESPONSE",
         test_instrument_id(),
@@ -5667,9 +8362,11 @@ async fn test_submission_registry_survives_unacknowledged_command_response(
                 .build(),
         )
     };
+
     ctx.manager.observe_order_event(&pending);
     ctx.cache.borrow_mut().update_order(&pending).unwrap();
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
+
     let event = match response {
         "cancel_rejected" => OrderEventAny::CancelRejected(
             OrderCancelRejectedSpec::builder()
@@ -5701,6 +8398,7 @@ async fn test_submission_registry_survives_unacknowledged_command_response(
                 .build(),
         ),
     };
+
     ctx.manager.observe_order_event(&event);
     ctx.cache.borrow_mut().update_order(&event).unwrap();
     assert_eq!(
@@ -5720,6 +8418,7 @@ async fn test_submission_registry_survives_unacknowledged_command_response(
     ctx.advance_both(dst::time::Duration::from_millis(101))
         .await;
     let mut result = ctx.manager.check_inflight_orders();
+
     if !tracking {
         assert_eq!(result.queries.len(), 1);
         assert!(result.events.is_empty());
@@ -5757,6 +8456,7 @@ async fn test_submission_registry_survives_unacknowledged_command_response(
     } else {
         Vec::new()
     };
+
     assert_eq!(ctx.manager.take_submission_recovery_exhaustions(), expected);
     assert!(
         ctx.manager
@@ -5794,6 +8494,7 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
         submission_recovery_policy: policy,
         ..Default::default()
     });
+
     ctx.add_instrument(test_instrument());
     let order = create_limit_order(
         "O-REGISTRY-INTERLEAVED",
@@ -5815,8 +8516,10 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
         );
         ctx.cache.borrow_mut().update_order(&accepted).unwrap();
     }
+
     ctx.manager
         .register_submission(order.init_event(), Some(test_client_id()));
+
     let pending = if pending_status == OrderStatus::PendingCancel {
         OrderEventAny::PendingCancel(
             OrderPendingCancelSpec::builder()
@@ -5838,8 +8541,9 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
                 .build(),
         )
     };
+
     ctx.cache.borrow_mut().update_order(&pending).unwrap();
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     let client = MockExecutionClient::new(Vec::new());
     let tracked = policy == SubmissionRecoveryPolicy::RetainUnresolved && !acknowledged;
     let mut queries = 0;
@@ -5852,10 +8556,10 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
         assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
         let result = ctx.manager.check_inflight_orders();
         queries += result.queries.len();
-
         for event in &result.events {
             ctx.cache.borrow_mut().update_order(event).unwrap();
         }
+
         resolutions.extend(result.events);
         diagnostics.extend(ctx.manager.take_submission_recovery_exhaustions());
     }
@@ -5871,6 +8575,7 @@ async fn test_submission_registry_interleaved_missing_checks_preserve_budget(
         pending_status
     );
     assert_eq!(diagnostics.len(), usize::from(tracked));
+
     if tracked {
         assert_eq!(diagnostics[0].client_order_id, client_order_id);
         assert_eq!(diagnostics[0].source, SubmissionRecoverySource::Inflight);
@@ -5957,7 +8662,7 @@ async fn test_retained_submission_survives_recovery_and_accepts_late_evidence(
     duplicate.strategy_id = StrategyId::from("OTHER-002");
     ctx.manager
         .register_submission(&duplicate, Some(ClientId::from("OTHER")));
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.manager.clear_recon_tracking(&client_order_id, true);
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
@@ -5999,6 +8704,7 @@ async fn test_submission_retention_is_scoped_to_client(
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     });
 
@@ -6041,7 +8747,6 @@ async fn test_submission_retention_is_scoped_to_client(
     ctx.advance_both(dst::time::Duration::from_millis(101))
         .await;
     let result = ctx.manager.check_inflight_orders();
-
     for event in &result.events {
         ctx.cache.borrow_mut().update_order(event).unwrap();
     }
@@ -6091,6 +8796,7 @@ async fn test_inflight_timeout_uses_monotonic_gate_and_domain_event_timestamp() 
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -6102,7 +8808,7 @@ async fn test_inflight_timeout_uses_monotonic_gate_and_domain_event_timestamp() 
     let order = create_submitted_order("O-SPLIT", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     let domain_ts = ctx.clock.borrow().timestamp_ns();
     advance_clock(dst::time::Duration::from_millis(200)).await;
 
@@ -6142,7 +8848,7 @@ async fn test_inflight_check_skips_filtered_order_ids() {
     );
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(filtered_id);
+    ctx.manager.register_inflight(filtered_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
@@ -6164,7 +8870,7 @@ fn test_config_default_values() {
     assert_eq!(config.inflight_max_retries, 5);
     assert_eq!(
         config.submission_recovery_policy,
-        SubmissionRecoveryPolicy::ResolveLocally,
+        SubmissionRecoveryPolicy::RetainUnresolved,
     );
 }
 
@@ -6176,20 +8882,150 @@ fn test_config_with_trader_id() {
     assert_eq!(config.trader_id, trader_id);
 }
 
+const PURGE_MINUTE_NS: u64 = 60_000_000_000;
+
 #[rstest]
-fn test_purge_operations_do_nothing_when_disabled() {
+#[case::disabled(None, None, None, PURGE_MINUTE_NS, [false; 3])]
+#[case::immediate(Some(0), Some(0), Some(0), PURGE_MINUTE_NS, [true; 3])]
+#[case::orders_before(Some(1), None, None, PURGE_MINUTE_NS - 1, [false; 3])]
+#[case::orders_at(Some(1), None, None, PURGE_MINUTE_NS, [true, false, false])]
+#[case::positions_before(None, Some(1), None, PURGE_MINUTE_NS - 1, [false; 3])]
+#[case::positions_at(None, Some(1), None, PURGE_MINUTE_NS, [false, true, false])]
+#[case::accounts_before(None, None, Some(1), PURGE_MINUTE_NS - 1, [false; 3])]
+#[case::accounts_at(None, None, Some(1), PURGE_MINUTE_NS, [false, false, true])]
+fn test_purge_operations_respect_retention_config(
+    #[case] orders_mins: Option<u32>,
+    #[case] positions_mins: Option<u32>,
+    #[case] accounts_mins: Option<u32>,
+    #[case] elapsed_ns: u64,
+    #[case] purged: [bool; 3],
+    #[values(false, true)] purge_from_database: bool,
+) {
     let config = ExecutionManagerConfig {
-        purge_closed_orders_buffer_mins: None,
-        purge_closed_positions_buffer_mins: None,
-        purge_account_events_lookback_mins: None,
+        purge_closed_orders_buffer_mins: orders_mins,
+        purge_closed_positions_buffer_mins: positions_mins,
+        purge_account_events_lookback_mins: accounts_mins,
+        purge_from_database,
         ..Default::default()
     };
 
     let mut ctx = TestContext::with_config(config);
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let order = create_submitted_order(
+        "O-PURGE",
+        instrument.id(),
+        OrderSide::Buy,
+        "1.000",
+        "3000.00",
+    );
+    ctx.add_order(order.clone());
+    let accepted =
+        TestOrderEventStubs::accepted(&order, test_account_id(), VenueOrderId::from("V-PURGE"));
+    let canceled = TestOrderEventStubs::canceled(
+        &order,
+        test_account_id(),
+        Some(VenueOrderId::from("V-PURGE")),
+    );
+    ctx.cache.borrow_mut().update_order(&accepted).unwrap();
+    ctx.cache.borrow_mut().update_order(&canceled).unwrap();
+    let mut position = create_test_position(
+        &instrument,
+        PositionId::from("P-PURGE"),
+        OrderSide::Buy,
+        "2.000",
+        "3000.00",
+    );
+    ctx.add_position(&position);
+    let closing_order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-PURGE-POSITION-CLOSE"))
+        .side(OrderSide::Sell)
+        .quantity(position.quantity)
+        .build();
+
+    let OrderEventAny::Filled(fill) = OrderFilledTestBuilder::new(&closing_order, &instrument)
+        .account_id(test_account_id())
+        .position_id(position.id)
+        .trade_id(TradeId::from("T-PURGE-CLOSE"))
+        .last_px(Price::from("3000.00"))
+        .build()
+    else {
+        panic!("expected a closing fill");
+    };
+
+    position.apply(&fill);
+    ctx.cache.borrow_mut().update_position(&position).unwrap();
+    let first = ctx
+        .cache
+        .borrow()
+        .account(&test_account_id())
+        .unwrap()
+        .last_event()
+        .unwrap();
+    let mut second = first.clone();
+    second.event_id = UUID4::new();
+    second.ts_event = UnixNanos::from(1);
+    second.ts_init = UnixNanos::from(2);
+    ctx.cache
+        .borrow_mut()
+        .update_account_state(&second)
+        .unwrap();
+    ctx.advance_time(elapsed_ns);
+    assert!(ctx.cache.borrow().is_order_closed(&order.client_order_id()));
+    assert!(ctx.cache.borrow().is_position_closed(&position.id));
+
+    let (database, database_control) = TestCacheDatabaseControl::create();
+    ctx.cache.borrow_mut().set_database(Box::new(database));
+    let mut expected_database_events = Vec::new();
+
+    if purge_from_database {
+        if purged[0] {
+            expected_database_events.push(format!("delete_order:{}", order.client_order_id()));
+        }
+
+        if purged[1] {
+            expected_database_events.push(format!("delete_position:{}", position.id));
+        }
+
+        if purged[2] {
+            expected_database_events.push(format!(
+                "delete_account_event:{}:{}",
+                test_account_id(),
+                first.event_id
+            ));
+        }
+    }
 
     ctx.manager.purge_closed_orders();
     ctx.manager.purge_closed_positions();
     ctx.manager.purge_account_events();
+
+    assert_eq!(database_control.events(), expected_database_events);
+    let cache = ctx.cache.borrow();
+    assert_eq!(
+        cache
+            .order(&order.client_order_id())
+            .map(|order| order.status()),
+        (!purged[0]).then_some(OrderStatus::Canceled)
+    );
+    assert_eq!(
+        cache
+            .position(&position.id)
+            .map(|position| position.quantity),
+        (!purged[1]).then_some(Quantity::zero(3))
+    );
+
+    let expected_events = if purged[2] {
+        vec![second]
+    } else {
+        vec![first, second]
+    };
+
+    assert_eq!(
+        serde_json::to_value(cache.account(&test_account_id()).unwrap().events()).unwrap(),
+        serde_json::to_value(expected_events).unwrap()
+    );
 }
 
 #[tokio::test]
@@ -6205,7 +9041,6 @@ async fn test_reconcile_mass_status_accepted_order_canceled_at_venue() {
     let mut order =
         create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
 
-    // Apply accepted event to put order in ACCEPTED state
     let accepted = TestOrderEventStubs::accepted(&order, test_account_id(), venue_order_id);
     order.apply(accepted).unwrap();
     ctx.add_order(order);
@@ -6296,6 +9131,7 @@ async fn test_inflight_increments_retry_count_before_max() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 3,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -6307,7 +9143,7 @@ async fn test_inflight_increments_retry_count_before_max() {
     let order = create_submitted_order("O-001", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // First check - past threshold, retry count becomes 1, generates QueryOrder
     ctx.advance_both(dst::time::Duration::from_millis(200))
@@ -6332,19 +9168,16 @@ async fn test_inflight_increments_retry_count_before_max() {
     assert!(result3.queries.is_empty());
 }
 
-#[rstest]
-#[case::resolve_locally(SubmissionRecoveryPolicy::ResolveLocally)]
-#[case::retain_unresolved(SubmissionRecoveryPolicy::RetainUnresolved)]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_pending_update_generates_canceled(#[case] policy: SubmissionRecoveryPolicy) {
+async fn test_inflight_pending_update_generates_canceled() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
-        submission_recovery_policy: policy,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -6365,7 +9198,7 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
     );
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await; // 200ms, past threshold
 
@@ -6385,22 +9218,20 @@ async fn test_inflight_pending_update_generates_canceled(#[case] policy: Submiss
 
     if let OrderEventAny::Canceled(canceled) = &result.events[0] {
         assert_eq!(canceled.client_order_id, client_order_id);
+        assert_eq!(canceled.reason.as_deref(), Some("INFLIGHT_TIMEOUT"));
     }
 }
 
-#[rstest]
-#[case::resolve_locally(SubmissionRecoveryPolicy::ResolveLocally)]
-#[case::retain_unresolved(SubmissionRecoveryPolicy::RetainUnresolved)]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: SubmissionRecoveryPolicy) {
+async fn test_inflight_pending_cancel_generates_canceled() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
-        submission_recovery_policy: policy,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -6421,7 +9252,7 @@ async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: Submiss
     );
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
@@ -6441,7 +9272,147 @@ async fn test_inflight_pending_cancel_generates_canceled(#[case] policy: Submiss
 
     if let OrderEventAny::Canceled(canceled) = &result.events[0] {
         assert_eq!(canceled.client_order_id, client_order_id);
+        assert_eq!(canceled.reason.as_deref(), Some("INFLIGHT_TIMEOUT"));
     }
+}
+
+#[rstest]
+#[case::pending_update(true, false)]
+#[case::pending_cancel(false, true)]
+#[case::pending_cancel_after_update(true, true)]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_inflight_pending_command_restores_status_under_retention(
+    #[case] pending_update: bool,
+    #[case] pending_cancel: bool,
+) {
+    let config = ExecutionManagerConfig {
+        inflight_threshold_ms: 100,
+        inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
+        ..Default::default()
+    };
+
+    let mut ctx = TestContext::with_config(config);
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from("O-PENDING");
+    let venue_order_id = VenueOrderId::from("V-003");
+    ctx.add_instrument(test_instrument());
+
+    let mut order = if pending_update {
+        create_pending_update_order(
+            "O-PENDING",
+            instrument_id,
+            OrderSide::Buy,
+            "1.0",
+            "3000.00",
+            venue_order_id,
+        )
+    } else {
+        create_pending_cancel_order(
+            "O-PENDING",
+            instrument_id,
+            OrderSide::Buy,
+            "1.0",
+            "3000.00",
+            venue_order_id,
+        )
+    };
+
+    if pending_update && pending_cancel {
+        let pending = OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(test_account_id())
+                .venue_order_id(venue_order_id)
+                .build(),
+        );
+        order.apply(pending).unwrap();
+    }
+
+    ctx.add_order(order);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
+    ctx.advance_both(dst::time::Duration::from_millis(200))
+        .await;
+
+    let result = ctx.manager.check_inflight_orders();
+    for event in &result.events {
+        ctx.manager.observe_order_event(event);
+        ctx.exec_engine.borrow_mut().process(event);
+    }
+
+    let mut expected = Vec::new();
+    if pending_cancel {
+        expected.push("CancelRejected");
+    }
+
+    if pending_update {
+        expected.push("ModifyRejected");
+    }
+
+    let rejections: Vec<_> = result
+        .events
+        .iter()
+        .map(|event| match event {
+            OrderEventAny::CancelRejected(event) => (
+                "CancelRejected",
+                event.client_order_id,
+                event.reason.as_str(),
+                event.reconciliation,
+                event.venue_order_id,
+                event.account_id,
+            ),
+            OrderEventAny::ModifyRejected(event) => (
+                "ModifyRejected",
+                event.client_order_id,
+                event.reason.as_str(),
+                event.reconciliation,
+                event.venue_order_id,
+                event.account_id,
+            ),
+            other => panic!("Expected a command rejection, was {other:?}"),
+        })
+        .collect();
+
+    let expected: Vec<_> = expected
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                client_order_id,
+                "INFLIGHT_TIMEOUT",
+                true,
+                Some(venue_order_id),
+                Some(test_account_id()),
+            )
+        })
+        .collect();
+
+    let order = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(rejections, expected);
+    assert!(
+        ctx.manager
+            .take_submission_recovery_exhaustions()
+            .is_empty()
+    );
+    assert_eq!(order.status(), OrderStatus::Accepted);
+    assert_eq!(order.ts_closed(), None);
+    assert!(!order.has_pending_update_command());
+    assert!(!order.has_pending_cancel_command());
+    assert!(
+        ctx.cache
+            .borrow()
+            .orders_open(None, None, None, None, None)
+            .into_iter()
+            .any(|order| order.client_order_id() == client_order_id)
+    );
+    assert!(ctx.manager.check_inflight_orders().events.is_empty());
 }
 
 #[cfg_attr(
@@ -6464,7 +9435,7 @@ async fn test_inflight_generates_query_before_max_retries() {
     let order = create_submitted_order("O-QUERY", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // First check - past threshold, retry 1 < max 3 -> generates QueryOrder
     ctx.advance_both(dst::time::Duration::from_millis(200))
@@ -6493,6 +9464,7 @@ async fn test_inflight_no_query_at_max_retries() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 2,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -6504,7 +9476,7 @@ async fn test_inflight_no_query_at_max_retries() {
     let order = create_submitted_order("O-MAX", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // First check - intermediate, generates query
     ctx.advance_both(dst::time::Duration::from_millis(200))
@@ -6551,7 +9523,7 @@ async fn test_inflight_query_preserves_client_id_routing() {
     let order = create_submitted_order("O-ROUTED", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order_with_client_id(order, client_id);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
@@ -6596,7 +9568,7 @@ async fn test_inflight_query_throttled_within_threshold() {
     );
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // First check past threshold generates a query
     ctx.advance_both(dst::time::Duration::from_millis(200))
@@ -6644,7 +9616,7 @@ async fn test_inflight_accepted_order_at_max_retries_no_event() {
     );
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
@@ -6677,7 +9649,7 @@ async fn test_inflight_order_not_in_cache_at_max_retries_no_event() {
     let client_order_id = ClientOrderId::from("O-MISSING");
 
     // Register inflight without adding order to cache
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
@@ -6702,6 +9674,7 @@ async fn test_inflight_terminal_event_clears_tracking() {
     let config = ExecutionManagerConfig {
         inflight_threshold_ms: 100,
         inflight_max_retries: 1,
+        submission_recovery_policy: SubmissionRecoveryPolicy::ResolveLocally,
         ..Default::default()
     };
 
@@ -6713,7 +9686,7 @@ async fn test_inflight_terminal_event_clears_tracking() {
     let order = create_submitted_order("O-TERM", instrument_id, OrderSide::Buy, "1.0", "3000.00");
     ctx.add_order(order);
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
     ctx.advance_both(dst::time::Duration::from_millis(200))
         .await;
 
@@ -6750,7 +9723,7 @@ fn test_observe_fill_report_without_client_order_id_uses_cache_fallback() {
     insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
 
     // Register inflight so we can verify activity recording deferred the check
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // Create fill report without client_order_id
     let fill_report = FillReport::new(
@@ -6769,6 +9742,7 @@ fn test_observe_fill_report_without_client_order_id_uses_cache_fallback() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     let report = ExecutionReport::Fill(Box::new(fill_report));
 
     // observe should resolve client_order_id via cache and record activity
@@ -6882,7 +9856,7 @@ async fn test_clear_recon_tracking_removes_inflight() {
     let mut ctx = TestContext::with_config(config);
     let client_order_id = ClientOrderId::from("O-001");
 
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // Simulate order being resolved externally (e.g., accepted by venue)
     ctx.manager.clear_recon_tracking(&client_order_id, true);
@@ -7316,7 +10290,6 @@ async fn test_fill_qty_mismatch_venue_less_generates_fill_void(#[case] echo_cach
         Quantity::from("3.0"), // Less than our 5
     );
     mass_status.add_order_reports(vec![report]);
-
     if echo_cached_fill {
         mass_status.add_fill_reports(vec![create_fill_report(
             client_order_id,
@@ -7337,9 +10310,24 @@ async fn test_fill_qty_mismatch_venue_less_generates_fill_void(#[case] echo_cach
         .order_owned(&client_order_id)
         .expect("order cached");
 
-    assert_eq!(result.events.len(), 1);
+    let expected_events = if echo_cached_fill {
+        // The echoed fill report prices the trade at 3000.00 while the cached fill recorded
+        // 1.0, so reconciliation first restates the trade's price, then voids the decrease
+        let OrderEventAny::Filled(restatement) = &result.events[0] else {
+            panic!("expected price restatement fill event");
+        };
 
-    let OrderEventAny::FillVoided(voided) = &result.events[0] else {
+        assert_eq!(restatement.trade_id, trade_id);
+        assert_eq!(restatement.last_qty, Quantity::from("5.0"));
+        assert_eq!(restatement.last_px, Price::from("3000.00"));
+        2
+    } else {
+        1
+    };
+
+    assert_eq!(result.events.len(), expected_events);
+
+    let OrderEventAny::FillVoided(voided) = &result.events[expected_events - 1] else {
         panic!("expected OrderFillVoided event");
     };
 
@@ -7350,6 +10338,14 @@ async fn test_fill_qty_mismatch_venue_less_generates_fill_void(#[case] echo_cach
     assert_eq!(order.status(), OrderStatus::PartiallyFilled);
     assert_eq!(order.filled_qty(), Quantity::from("3.0"));
     assert_eq!(order.voided_qty(), Quantity::from("2.0"));
+    assert_eq!(
+        order.avg_px(),
+        if echo_cached_fill {
+            Some(dec!(3000.00))
+        } else {
+            Some(dec!(1.0))
+        }
+    );
 }
 
 #[tokio::test]
@@ -7556,6 +10552,7 @@ async fn test_mass_status_skips_exact_duplicate_orders() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -7655,6 +10652,7 @@ async fn test_mass_status_reconciles_when_status_differs() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -7702,6 +10700,7 @@ async fn test_mass_status_reconciles_when_filled_qty_differs() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(client_order_id),
         venue_order_id,
@@ -7760,6 +10759,7 @@ async fn test_mass_status_matches_order_by_venue_order_id() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         None,
         venue_order_id,
@@ -7819,6 +10819,7 @@ async fn test_mass_status_matches_order_by_venue_order_id_with_mismatched_client
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let report = create_order_report(
         Some(wrong_client_order_id),
         venue_order_id,
@@ -7883,6 +10884,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_accepted_orders()
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![report]);
 
     let _events = ctx
@@ -7923,6 +10925,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_external_orders()
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![report]);
 
     let result = ctx
@@ -7999,6 +11002,7 @@ async fn test_reconcile_mass_status_indexes_venue_order_id_for_filled_orders() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![report]);
 
     let _events = ctx
@@ -8052,6 +11056,7 @@ async fn test_reconcile_mass_status_skips_orders_without_loaded_instruments() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_order_reports(vec![loaded_report, unloaded_report]);
 
     let _events = ctx
@@ -8098,6 +11103,7 @@ async fn test_reconcile_mass_status_creates_position_from_position_report() {
         None,
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -8136,6 +11142,7 @@ async fn test_mass_status_netting_client_recovers_venue_position_id(
 
     let mut client = MockExecutionClient::new(Vec::new());
     client.oms_type = OmsType::Netting;
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -8150,6 +11157,7 @@ async fn test_mass_status_netting_client_recovers_venue_position_id(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![PositionStatusReport::new(
         test_account_id(),
         instrument_id,
@@ -8342,6 +11350,7 @@ async fn test_mass_status_netting_ignores_duplicate_position_reports(
 
     let mut client = MockExecutionClient::new(Vec::new());
     client.oms_type = OmsType::Netting;
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -8498,6 +11507,7 @@ async fn test_mass_status_entry_price_aggregates_each_side(
 
     let instrument = test_instrument();
     let instrument_id = instrument.id();
+
     let positions = [
         create_test_position(
             &instrument,
@@ -8523,7 +11533,6 @@ async fn test_mass_status_entry_price_aggregates_each_side(
     ];
 
     ctx.add_instrument(instrument);
-
     for position in &positions {
         ctx.cache
             .borrow_mut()
@@ -8631,7 +11640,7 @@ async fn test_mass_status_reduction_uses_reported_average_and_validates_remainin
     assert_eq!(fill.last_px, Price::from("3100.00"));
     let position = ctx.cache.borrow().position_owned(&position_id).unwrap();
     assert_eq!(position.quantity, Quantity::from("10.000"));
-    assert_eq!(position.avg_px_open, 3000.0);
+    assert_eq!(position.avg_px_open, dec!(3000.0));
     assert_eq!(
         result.unresolved_positions,
         vec![format!(
@@ -8707,7 +11716,7 @@ async fn test_mass_status_opening_only_average_skips_entry_price_check(
 
     assert!(result.events.is_empty());
     assert_eq!(result.unresolved_positions, expected_unresolved);
-    assert_eq!(position.avg_px_open, 55000.0);
+    assert_eq!(position.avg_px_open, dec!(55000.0));
     assert_eq!(
         ctx.cache.borrow().position_owned(&position.id),
         Some(position)
@@ -8760,7 +11769,7 @@ async fn test_mass_status_opening_only_average_recovers_empty_cache() {
     assert!(result.unresolved_positions.is_empty());
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].signed_decimal_qty(), dec!(1));
-    assert_eq!(positions[0].avg_px_open, 60000.0);
+    assert_eq!(positions[0].avg_px_open, dec!(60000.0));
 }
 
 #[rstest]
@@ -8852,6 +11861,7 @@ async fn test_mass_status_opening_only_average_applies_full_history(
 
     let mut client = MockExecutionClient::new(Vec::new());
     client.oms_type = OmsType::Netting;
+
     {
         let mut engine = ctx.exec_engine.borrow_mut();
         engine.deregister_client(test_client_id()).unwrap();
@@ -8921,7 +11931,7 @@ async fn test_mass_status_opening_only_average_applies_full_history(
     assert_eq!(result.unresolved_positions, expected_unresolved);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].signed_decimal_qty(), dec!(1));
-    assert_eq!(positions[0].avg_px_open, 55000.0);
+    assert_eq!(positions[0].avg_px_open, dec!(55000.0));
     assert_eq!(
         positions[0].trade_ids,
         AHashSet::from([TradeId::from("1"), TradeId::from("2"), TradeId::from("3")])
@@ -8965,7 +11975,6 @@ async fn test_mass_status_entry_price_combines_side_report_metadata(
     });
 
     ctx.add_instrument(instrument);
-
     for position in &positions {
         ctx.cache
             .borrow_mut()
@@ -9108,6 +12117,7 @@ async fn test_mass_status_coarse_average_keeps_retained_position(
         None,
         Some(dec!(0.5599)),
     );
+
     report.avg_px_open_precision = avg_px_open_precision;
     ctx.add_instrument(instrument);
     ctx.add_margin_account(account_id);
@@ -9138,6 +12148,7 @@ async fn test_mass_status_coarse_average_keeps_retained_position(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_position_reports(vec![report]);
     ctx.exec_engine
         .borrow_mut()
@@ -9164,9 +12175,72 @@ async fn test_mass_status_coarse_average_keeps_retained_position(
     );
 }
 
+// An equity held across the fill lookback: the cache keeps the fills' average (all at 40.66),
+// while the venue reports an average cost with commissions in it, rounded to the tick (40.67)
+#[rstest]
+#[case::marked(Some(2), false)]
+#[case::unmarked(None, true)]
+#[tokio::test]
+async fn test_mass_status_average_cost_with_commission_keeps_retained_position(
+    #[case] avg_px_open_precision: Option<u8>,
+    #[case] unresolved: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument = InstrumentAny::Equity(equity_aapl());
+    let instrument_id = instrument.id();
+    let position = create_test_position(
+        &instrument,
+        PositionId::from("P-EQUITY"),
+        OrderSide::Buy,
+        "2342",
+        "40.66",
+    );
+    ctx.add_instrument(instrument);
+    ctx.cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let mut report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        PositionSide::Long,
+        Quantity::from("2342"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        None,
+        Some(dec!(40.67)),
+    );
+
+    report.avg_px_open_precision = avg_px_open_precision;
+    let mut mass_status = create_mass_status(vec![], vec![]);
+    mass_status.add_position_reports(vec![report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+
+    let expected_unresolved = if unresolved {
+        vec![format!(
+            "account={}, instrument={instrument_id}, venue_position_id=None, venue_quantity=2342: position recovery did not restore the reported average entry price",
+            test_account_id(),
+        )]
+    } else {
+        Vec::new()
+    };
+
+    assert!(result.events.is_empty());
+    assert_eq!(result.unresolved_positions, expected_unresolved);
+    assert_eq!(
+        ctx.cache.borrow().position_owned(&position.id),
+        Some(position)
+    );
+}
+
 #[rstest]
 #[case::marked_keeps_cached_average(Some(4), "0.560")]
-#[case::unmarked_solves_weighted_average(None, "0.060")]
+#[case::unmarked_solves_weighted_average(None, "0.0599")]
 #[tokio::test]
 async fn test_mass_status_coarse_average_prices_increase(
     #[case] avg_px_open_precision: Option<u8>,
@@ -9194,6 +12268,7 @@ async fn test_mass_status_coarse_average_prices_increase(
         None,
         Some(dec!(0.5599)),
     );
+
     report.avg_px_open_precision = avg_px_open_precision;
     ctx.add_instrument(instrument);
     ctx.cache
@@ -9216,6 +12291,191 @@ async fn test_mass_status_coarse_average_prices_increase(
         )]
     );
     assert!(result.unresolved_positions.is_empty());
+}
+
+#[rstest]
+#[case::off_tick(dec!(2.4564), "0.001")]
+#[case::low_price(dec!(0.85237), "0.001")]
+#[case::fine_tick(dec!(0.123456), "0.0001")]
+#[case::within_tolerance(dec!(2.45621), "0.001")]
+#[case::high_price(dec!(84060.35), "0.1")]
+#[tokio::test]
+async fn test_mass_status_recovers_off_tick_position_average(
+    #[case] avg_px: Decimal,
+    #[case] price_increment: &str,
+    #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+    #[values(false, true)] hedging: bool,
+) {
+    let mut ctx = TestContext::new();
+    let mut instrument = crypto_perpetual_ethusdt();
+    instrument.price_increment = Price::from(price_increment);
+    instrument.price_precision = instrument.price_increment.precision;
+    instrument.max_price = None;
+    let instrument = InstrumentAny::CryptoPerpetual(instrument);
+    let instrument_id = instrument.id();
+    ctx.add_instrument(instrument);
+    ctx.exec_engine.borrow_mut().register_oms_type(
+        StrategyId::external(),
+        if hedging {
+            OmsType::Hedging
+        } else {
+            OmsType::Netting
+        },
+    );
+
+    let position_side = if side == OrderSide::Buy {
+        PositionSide::Long
+    } else {
+        PositionSide::Short
+    };
+
+    let report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        position_side,
+        Quantity::from("3.000"),
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+        hedging.then_some(PositionId::from("P-OFF-TICK")),
+        Some(avg_px),
+    );
+
+    let mut mass_status = create_mass_status(vec![], vec![]);
+    mass_status.add_position_reports(vec![report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(
+        None,
+        Some(&instrument_id),
+        None,
+        Some(&test_account_id()),
+        None,
+    );
+
+    assert!(
+        result.unresolved_positions.is_empty(),
+        "{:?}",
+        result.unresolved_positions
+    );
+    assert_eq!(
+        filled_events(&result.events),
+        vec![(
+            side,
+            Quantity::from("3.000"),
+            Price::from_decimal(avg_px).unwrap()
+        )]
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].side, position_side);
+    assert_eq!(positions[0].quantity, Quantity::from("3.000"));
+
+    // Position stores its average as f64, compare at the reported decimal precision
+    assert_eq!(
+        Decimal::from_str_exact(&positions[0].avg_px_open.to_string())
+            .unwrap()
+            .round_dp(avg_px.scale()),
+        avg_px
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_mass_status_recovers_off_tick_average_with_partial_fill_history(
+    #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+) {
+    let mut ctx = TestContext::new();
+    let mut instrument = crypto_perpetual_ethusdt();
+    instrument.price_precision = 3;
+    instrument.price_increment = Price::from("0.001");
+    let instrument = InstrumentAny::CryptoPerpetual(instrument);
+    let instrument_id = instrument.id();
+    ctx.add_instrument(instrument);
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(StrategyId::external(), OmsType::Netting);
+
+    let mut orders = Vec::new();
+    let mut fills = Vec::new();
+
+    for (id, quantity, price, ts) in [
+        ("1", "1.000", "2.456", 1_000_000),
+        ("2", "2.000", "2.457", 2_000_000),
+    ] {
+        let (order, fill) = create_bounded_fill_lifecycle(
+            instrument_id,
+            VenueOrderId::from(id),
+            TradeId::from(id),
+            side,
+            quantity,
+            price,
+            false,
+            UnixNanos::from(ts),
+        );
+        orders.push(order);
+        fills.push(fill);
+    }
+
+    let position_side = if side == OrderSide::Buy {
+        PositionSide::Long
+    } else {
+        PositionSide::Short
+    };
+
+    let avg_px = dec!(2.42568);
+
+    let report = PositionStatusReport::new(
+        test_account_id(),
+        instrument_id,
+        position_side,
+        Quantity::from("10.000"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        Some(avg_px),
+    );
+
+    let mut mass_status = create_mass_status(orders, fills);
+    mass_status.add_position_reports(vec![report]);
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(
+        None,
+        Some(&instrument_id),
+        None,
+        Some(&test_account_id()),
+        None,
+    );
+
+    assert!(
+        result.unresolved_positions.is_empty(),
+        "{:?}",
+        result.unresolved_positions
+    );
+    assert_eq!(
+        filled_events(&result.events),
+        vec![
+            (side, Quantity::from("7.000"), Price::from("2.4124")),
+            (side, Quantity::from("1.000"), Price::from("2.456")),
+            (side, Quantity::from("2.000"), Price::from("2.457")),
+        ]
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].side, position_side);
+    assert_eq!(positions[0].quantity, Quantity::from("10.000"));
+    assert_eq!(
+        Decimal::from_str_exact(&positions[0].avg_px_open.to_string())
+            .unwrap()
+            .round_dp(avg_px.scale()),
+        avg_px
+    );
 }
 
 #[rstest]
@@ -9267,6 +12527,7 @@ async fn test_mass_status_reports_unresolved_position_prerequisite(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![report]);
     let result = ctx
         .manager
@@ -9316,6 +12577,7 @@ async fn test_mass_status_synchronized_position_does_not_require_entry_price(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![report.clone()]);
     let recovered = ctx
         .manager
@@ -9331,6 +12593,7 @@ async fn test_mass_status_synchronized_position_does_not_require_entry_price(
         UnixNanos::default(),
         None,
     );
+
     mass_status.add_position_reports(vec![report]);
     let synchronized = ctx
         .manager
@@ -9376,6 +12639,7 @@ async fn test_reconcile_mass_status_skips_flat_position_report() {
         None,
         None,
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -9416,6 +12680,7 @@ async fn test_reconcile_mass_status_skips_position_report_when_filtered() {
         None,
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -9452,6 +12717,7 @@ async fn test_reconcile_mass_status_creates_short_position_from_report() {
         None,
         Some(dec!(2950.25)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -9512,6 +12778,7 @@ async fn test_reconcile_mass_status_skips_position_report_when_fills_exist() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add a position report for the same instrument (would duplicate if not skipped)
@@ -9526,6 +12793,7 @@ async fn test_reconcile_mass_status_skips_position_report_when_fills_exist() {
         None,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -9742,7 +13010,6 @@ async fn test_reconcile_mass_status_iterates_all_position_reports() {
     assert!(has_buy_fill, "Should have BUY fill for long position");
     assert!(has_sell_fill, "Should have SELL fill for short position");
 
-    // Verify both positions exist in cache
     let cache = ctx.cache.borrow();
     let positions = cache.positions(None, None, None, None, None);
     assert_eq!(positions.len(), 2, "Should have 2 positions in cache");
@@ -9774,6 +13041,7 @@ async fn test_reconcile_mass_status_routes_to_hedging_with_venue_position_id() {
         Some(PositionId::from("P-HEDGE-001")),
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -9810,6 +13078,7 @@ async fn test_reconcile_mass_status_routes_to_netting_without_venue_position_id(
         None, // No venue_position_id
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -9904,7 +13173,7 @@ async fn test_reconcile_mass_status_reconciles_partial_hedge_fill_to_position_re
         .position_owned(&venue_position_id)
         .unwrap();
     assert_eq!(position.quantity, Quantity::from("5.0"));
-    assert_eq!(position.avg_px_open, 3000.0);
+    assert_eq!(position.avg_px_open, dec!(3000.0));
 }
 
 #[tokio::test]
@@ -9926,6 +13195,7 @@ async fn test_reconcile_mass_status_leaves_hedge_reversal_identity_unresolved() 
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.set_report_window(Some(UnixNanos::from(1)), false);
 
     mass_status.add_fill_reports(vec![FillReport::new(
@@ -9986,7 +13256,7 @@ async fn test_reconcile_mass_status_leaves_hedge_reversal_identity_unresolved() 
     );
     assert_eq!(positions[0].side, PositionSide::Long);
     assert_eq!(positions[0].quantity, Quantity::from("5.0"));
-    assert_eq!(positions[0].avg_px_open, 3000.0);
+    assert_eq!(positions[0].avg_px_open, dec!(3000.0));
     assert_eq!(positions[0].realized_pnl, Some(Money::from("0 USDT")));
 }
 
@@ -10091,7 +13361,7 @@ async fn test_reconcile_mass_status_skips_only_position_with_fill_position_id_co
     assert_eq!(other_position.instrument_id, instrument_id);
     assert_eq!(other_position.side, PositionSide::Short);
     assert_eq!(other_position.quantity, Quantity::from("3.0"));
-    assert_eq!(other_position.avg_px_open, 3100.0);
+    assert_eq!(other_position.avg_px_open, dec!(3100.0));
 }
 
 #[tokio::test]
@@ -10198,6 +13468,7 @@ async fn test_reconcile_mass_status_skips_hedge_position_when_fills_lack_positio
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add a hedge position report WITH venue_position_id
@@ -10212,6 +13483,7 @@ async fn test_reconcile_mass_status_skips_hedge_position_when_fills_lack_positio
         Some(PositionId::from("P-HEDGE-001")), // Has venue_position_id
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10268,6 +13540,7 @@ async fn test_reconcile_hedge_does_not_skip_unrelated_positions() {
         UnixNanos::from(1_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add position reports for BOTH positions
@@ -10294,6 +13567,7 @@ async fn test_reconcile_hedge_does_not_skip_unrelated_positions() {
         Some(position_id_2), // Different position
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report_1, position_report_2]);
 
     let result = ctx
@@ -10349,6 +13623,7 @@ async fn test_reconcile_hedge_position_matching_quantities() {
         Some(position_id),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10401,6 +13676,7 @@ async fn test_reconcile_hedge_position_discrepancy_generates_order() {
         Some(position_id),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10446,6 +13722,7 @@ async fn test_reconcile_missing_hedge_position_generates_order() {
         Some(PositionId::from("P-MISSING-001")),
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10497,6 +13774,7 @@ async fn test_reconcile_hedge_position_discrepancy_disabled() {
         Some(position_id),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10537,6 +13815,7 @@ async fn test_reconcile_hedge_position_both_flat() {
         Some(PositionId::from("P-FLAT-001")),
         None,
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10579,6 +13858,7 @@ async fn test_reconcile_hedge_short_position() {
         Some(PositionId::from("P-SHORT-001")),
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -10761,6 +14041,7 @@ async fn test_adjust_fills_creates_synthetic_for_partial_window() {
         None, // Netting mode
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     // Only have fills for 2.0 (partial window - missing opening fills)
@@ -10792,6 +14073,7 @@ async fn test_adjust_fills_creates_synthetic_for_partial_window() {
         UnixNanos::from(1_000_001),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -10852,6 +14134,7 @@ async fn test_missing_orders_disabled_skips_synthetic_fill_recovery(#[case] hedg
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let venue_position_id = hedging.then(|| PositionId::from("ETHUSDT-PERP.BINANCE-LONG"));
     mass_status.add_fill_reports(vec![FillReport::new(
         test_account_id(),
@@ -11131,6 +14414,7 @@ async fn test_position_reconciliation_order_has_reconciliation_tag() {
         None,
         Some(dec!(3000.50)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -11138,6 +14422,24 @@ async fn test_position_reconciliation_order_has_reconciliation_tag() {
         .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
 
     assert!(!result.events.is_empty());
+
+    let fills: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(fills.len(), 1);
+    let fill = fills[0];
+    assert_eq!(fill.last_qty, Quantity::from("5.0"));
+    assert_eq!(fill.last_px, Price::from("3000.50"));
+    assert_eq!(fill.order_side, OrderSide::Buy);
+    assert_eq!(fill.commission, None);
+    assert!(fill.reconciliation);
+    assert!(fill.to_string().contains("commission=None,"));
 
     // Get the synthetic order created and verify it has the RECONCILIATION tag
     if let OrderEventAny::Accepted(accepted) = &result.events[0] {
@@ -11152,6 +14454,11 @@ async fn test_position_reconciliation_order_has_reconciliation_tag() {
     } else {
         panic!("Expected Accepted event, was {:?}", result.events[0]);
     }
+
+    let repeated = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert!(repeated.events.is_empty());
 }
 
 #[rstest]
@@ -11186,6 +14493,7 @@ async fn test_replayed_fill_does_not_reopen_reconciled_position(
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_position_reports(vec![PositionStatusReport::new(
         test_account_id(),
         instrument_id,
@@ -11220,6 +14528,7 @@ async fn test_replayed_fill_does_not_reopen_reconciled_position(
         UnixNanos::from(1_000_000),
         None,
     );
+
     ctx.exec_engine
         .borrow_mut()
         .reconcile_fill_report(&replayed);
@@ -11363,6 +14672,7 @@ async fn test_cross_zero_unbuildable_open_leg_has_no_side_effects() {
         None,
         Some(dec!(3100.00)),
     );
+
     report.signed_decimal_qty = -dec!(10000000000000000000);
     let client = MockPositionExecutionClient::new(vec![], vec![report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&client];
@@ -11453,6 +14763,7 @@ async fn test_cross_zero_unbuildable_open_leg_retries_without_poisoning_order_id
         None,
         Some(dec!(3100.00)),
     );
+
     unbuildable_report.signed_decimal_qty = -dec!(10000000000000000000);
     let unbuildable_client = MockPositionExecutionClient::new(vec![], vec![unbuildable_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&unbuildable_client];
@@ -11473,6 +14784,7 @@ async fn test_cross_zero_unbuildable_open_leg_retries_without_poisoning_order_id
         None,
         Some(dec!(3100.00)),
     );
+
     let valid_client = MockPositionExecutionClient::new(vec![], vec![valid_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&valid_client];
 
@@ -11556,6 +14868,7 @@ async fn test_netting_position_cross_zero_long_to_short() {
         None, // Netting mode
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -11634,6 +14947,7 @@ async fn test_netting_position_cross_zero_short_to_long() {
         None, // Netting mode
         Some(dec!(2900.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -11712,6 +15026,7 @@ async fn test_netting_position_flat_report_closes_cached_position() {
         None, // Netting mode
         None, // No avg_px for flat
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -11792,7 +15107,6 @@ async fn test_expired_order_applies_fills_before_terminal_event() {
     );
     mass_status.add_order_reports(vec![report]);
 
-    // Add fill report for the partial fill
     let fill = FillReport::new(
         test_account_id(),
         instrument_id,
@@ -11809,6 +15123,7 @@ async fn test_expired_order_applies_fills_before_terminal_event() {
         UnixNanos::from(1_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -11894,6 +15209,7 @@ async fn test_partial_window_adjustment_skips_hedge_mode_instruments() {
         UnixNanos::from(1_000_001),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     // Add hedge mode position report (has venue_position_id)
@@ -11910,6 +15226,7 @@ async fn test_partial_window_adjustment_skips_hedge_mode_instruments() {
         Some(hedge_position_id), // Hedge mode - has venue_position_id
         Some(dec!(100.0)),       // avg_px_open
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12223,6 +15540,7 @@ async fn test_mass_status_preserves_symbol_scoped_trade_ids() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     mass_status.add_fill_reports(vec![fill1, fill2]);
 
     let result = ctx
@@ -12646,7 +15964,6 @@ async fn test_replace_current_lifecycle_preserves_working_orders(
     assert_eq!(synthetic.last_qty, Quantity::from("1.000"));
     assert!(result.unresolved_positions.is_empty());
     let cache = ctx.cache.borrow();
-
     if terminal_report {
         let terminal = cache.order(&ClientOrderId::from("C-003")).unwrap();
         assert_eq!(terminal.status(), OrderStatus::Filled);
@@ -12665,7 +15982,7 @@ async fn test_replace_current_lifecycle_preserves_working_orders(
     let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].signed_decimal_qty(), dec!(1));
-    assert_eq!(positions[0].avg_px_open, 3142.04);
+    assert_eq!(positions[0].avg_px_open, dec!(3142.04));
     drop(positions);
     drop(order);
     drop(cache);
@@ -12682,7 +15999,7 @@ async fn test_replace_current_lifecycle_preserves_working_orders(
     let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].signed_decimal_qty(), dec!(1));
-    assert_eq!(positions[0].avg_px_open, 3142.04);
+    assert_eq!(positions[0].avg_px_open, dec!(3142.04));
     drop(positions);
     drop(cache);
 
@@ -12711,7 +16028,7 @@ async fn test_replace_current_lifecycle_preserves_working_orders(
     let positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].signed_decimal_qty(), dec!(2));
-    assert_eq!(positions[0].avg_px_open, 3171.02);
+    assert_eq!(positions[0].avg_px_open, dec!(3171.02));
     assert_eq!(positions[0].trade_ids.len(), 2);
     assert!(positions[0].trade_ids.contains(&TradeId::from("T-005")));
     assert!(!positions[0].trade_ids.contains(&TradeId::from("T-004")));
@@ -12753,6 +16070,7 @@ async fn test_cross_zero_with_missing_cached_avg_px_returns_none() {
         None,
         Some(dec!(3100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12803,6 +16121,7 @@ async fn test_cross_zero_with_missing_venue_avg_px_closes_only() {
         None,
         None, // No avg_px - cannot open new position
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -12933,6 +16252,7 @@ async fn test_hedge_mode_with_filter_unclaimed_external_allows_synthetic() {
         Some(PositionId::new("HEDGE-001")),
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let result = ctx
@@ -13031,6 +16351,7 @@ async fn test_duplicate_order_reports_reconciles_last_report() {
         UnixNanos::from(2_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let _result = ctx
@@ -13399,6 +16720,149 @@ async fn test_working_order_with_new_fills_updates_correctly() {
     );
 }
 
+#[rstest]
+#[case::orphan(false)]
+#[case::with_order_status(true)]
+#[tokio::test]
+async fn test_mass_status_recovers_later_fill_for_fill_report_order(
+    #[case] with_order_status: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument_id = test_instrument_id();
+    ctx.add_instrument(test_instrument());
+    let venue_order_id = VenueOrderId::from("V-FILL-REPORT");
+    let client_order_id = ClientOrderId::from("V-FILL-REPORT");
+    let position_id = PositionId::from("P-FILL-REPORT");
+    let position = create_test_position(
+        &test_instrument(),
+        position_id,
+        OrderSide::Sell,
+        "3.0",
+        "3200.00",
+    );
+    ctx.add_position(&position);
+
+    let first = FillReport::new(
+        test_account_id(),
+        instrument_id,
+        venue_order_id,
+        TradeId::from("T-FILL-1"),
+        OrderSide::Buy,
+        Quantity::from("1.0"),
+        Price::from("3000.00"),
+        Money::from("0.10 USDT"),
+        LiquiditySide::Taker,
+        None,
+        Some(position_id),
+        UnixNanos::from(1_000),
+        UnixNanos::from(1_000),
+        None,
+    );
+
+    ctx.exec_engine.borrow_mut().reconcile_fill_report(&first);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Filled
+    );
+    let mut second = first.clone();
+    second.report_id = UUID4::new();
+    second.trade_id = TradeId::from("T-FILL-2");
+    second.last_qty = Quantity::from("2.0");
+    second.last_px = Price::from("3100.00");
+    second.commission = Money::from("0.25 USDT");
+    second.ts_event = UnixNanos::from(2_000);
+
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(3_000),
+        None,
+    );
+
+    mass_status.add_fill_reports(vec![first.clone(), second.clone()]);
+
+    if with_order_status {
+        let status = OrderStatusReport::new(
+            test_account_id(),
+            instrument_id,
+            None,
+            venue_order_id,
+            OrderSide::Buy.into(),
+            OrderType::Market,
+            TimeInForce::Ioc,
+            OrderStatus::Filled,
+            Quantity::from("3.0"),
+            Quantity::from("3.0"),
+            UnixNanos::from(1_000),
+            UnixNanos::from(2_000),
+            UnixNanos::from(3_000),
+            None,
+        )
+        .with_avg_px(dec!(9200) / dec!(3));
+        mass_status.add_order_reports(vec![status]);
+    }
+
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let order = ctx.get_order(&client_order_id).unwrap();
+    let position = ctx.cache.borrow().position_owned(&position_id).unwrap();
+
+    let fills: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) => {
+                Some((fill.trade_id, fill.last_qty, fill.last_px, fill.commission))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let mut expected_fills = vec![];
+    if !with_order_status {
+        expected_fills.push((
+            first.trade_id,
+            first.last_qty,
+            first.last_px,
+            Some(first.commission),
+        ));
+    }
+
+    expected_fills.push((
+        second.trade_id,
+        second.last_qty,
+        second.last_px,
+        Some(second.commission),
+    ));
+    assert_eq!(fills, expected_fills);
+    assert_eq!(order.quantity(), Quantity::from("3.0"));
+    assert_eq!(order.filled_qty(), Quantity::from("3.0"));
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.trade_ids(), vec![&first.trade_id, &second.trade_id]);
+    assert_eq!(position.quantity, Quantity::from("0.0"));
+    assert_eq!(position.side, PositionSide::Flat);
+    assert_eq!(position.avg_px_open, dec!(3200));
+    assert_eq!(
+        position.commissions(),
+        vec![Money::from("2 USD"), Money::from("0.35 USDT")]
+    );
+
+    let replay = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert_eq!(replay.events, Vec::<OrderEventAny>::new());
+    assert_eq!(
+        serde_json::to_value(ctx.get_order(&client_order_id).unwrap()).unwrap(),
+        serde_json::to_value(order).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(ctx.cache.borrow().position_owned(&position_id).unwrap()).unwrap(),
+        serde_json::to_value(position).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn test_orphan_fills_without_order_reports_processed() {
     let mut ctx = TestContext::new();
@@ -13473,7 +16937,7 @@ async fn test_orphan_fills_without_order_reports_processed() {
     assert_eq!(position.instrument_id, instrument_id);
     assert_eq!(position.side, PositionSide::Long);
     assert_eq!(position.quantity, Quantity::from("2.0"));
-    assert_eq!(position.avg_px_open, 3062.5);
+    assert_eq!(position.avg_px_open, dec!(3062.5));
 
     let replay = ctx
         .manager
@@ -13786,6 +17250,7 @@ async fn test_filtered_client_order_ids_skips_orphan_fills() {
         UnixNanos::from(1_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -13817,7 +17282,6 @@ async fn test_filtered_client_order_ids_skips_orphan_fills_via_venue_order_id_lo
     let instrument_id = test_instrument_id();
     ctx.add_instrument(test_instrument());
 
-    // Add the order to cache
     let mut order = OrderTestBuilder::new(OrderType::Limit)
         .client_order_id(filtered_id)
         .instrument_id(instrument_id)
@@ -13855,6 +17319,7 @@ async fn test_filtered_client_order_ids_skips_orphan_fills_via_venue_order_id_lo
         UnixNanos::from(1_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill]);
 
     let result = ctx
@@ -13987,6 +17452,7 @@ async fn test_reconciliation_instrument_ids_filters_position_reports() {
         None,
         Some(dec!(100.00)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let _result = ctx
@@ -14006,7 +17472,11 @@ async fn test_reconciliation_instrument_ids_filters_position_reports() {
 }
 
 struct MockExecutionClient {
+    order_venue_ids: IndexMap<ClientOrderId, Vec<VenueOrderId>>,
+    bulk_position_coverage: bool,
+    uncovered_instrument_ids: IndexSet<InstrumentId>,
     retain_unresolved_submissions: bool,
+    requires_authoritative_fills: bool,
     client_id: ClientId,
     account_id: AccountId,
     venue: Venue,
@@ -14030,7 +17500,11 @@ struct MockExecutionClient {
 impl MockExecutionClient {
     fn new(order_reports: Vec<OrderStatusReport>) -> Self {
         Self {
+            bulk_position_coverage: true,
+            uncovered_instrument_ids: IndexSet::new(),
             retain_unresolved_submissions: false,
+            requires_authoritative_fills: false,
+            order_venue_ids: IndexMap::new(),
             client_id: test_client_id(),
             account_id: test_account_id(),
             venue: test_venue(),
@@ -14054,7 +17528,11 @@ impl MockExecutionClient {
 
     fn for_venue(client_id: ClientId, venue: Venue, order_reports: Vec<OrderStatusReport>) -> Self {
         Self {
+            bulk_position_coverage: true,
+            uncovered_instrument_ids: IndexSet::new(),
             retain_unresolved_submissions: false,
+            requires_authoritative_fills: false,
+            order_venue_ids: IndexMap::new(),
             client_id,
             account_id: test_account_id(),
             venue,
@@ -14078,7 +17556,11 @@ impl MockExecutionClient {
 
     fn failing(client_id: ClientId, venue: Venue) -> Self {
         Self {
+            bulk_position_coverage: true,
+            uncovered_instrument_ids: IndexSet::new(),
             retain_unresolved_submissions: false,
+            requires_authoritative_fills: false,
+            order_venue_ids: IndexMap::new(),
             client_id,
             account_id: test_account_id(),
             venue,
@@ -14098,6 +17580,16 @@ impl MockExecutionClient {
             on_order_report_query: RefCell::new(None),
             on_order_reports_query: RefCell::new(None),
         }
+    }
+
+    fn with_bulk_position_coverage(mut self, covered: bool) -> Self {
+        self.bulk_position_coverage = covered;
+        self
+    }
+
+    fn with_uncovered_instrument(mut self, instrument_id: InstrumentId) -> Self {
+        self.uncovered_instrument_ids.insert(instrument_id);
+        self
     }
 
     fn with_account_id(mut self, account_id: AccountId) -> Self {
@@ -14144,6 +17636,21 @@ impl MockExecutionClient {
 
 #[async_trait(?Send)]
 impl ExecutionClient for MockExecutionClient {
+    fn requires_authoritative_fills(&self) -> bool {
+        self.requires_authoritative_fills
+    }
+
+    fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
+        self.bulk_position_coverage && !self.uncovered_instrument_ids.contains(&instrument_id)
+    }
+
+    fn venue_order_ids(
+        &self,
+        _mass_status: &ExecutionMassStatus,
+    ) -> Option<IndexMap<ClientOrderId, Vec<VenueOrderId>>> {
+        (!self.order_venue_ids.is_empty()).then(|| self.order_venue_ids.clone())
+    }
+
     fn retain_unresolved_submissions(&self) -> bool {
         self.retain_unresolved_submissions
     }
@@ -14817,6 +18324,335 @@ async fn test_check_open_orders_proceeds_without_local_activity(#[case] has_clie
     }
 }
 
+#[tokio::test]
+async fn test_targeted_closing_fill_after_startup_snapshot_does_not_reopen_position() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_open_only: false,
+        open_check_threshold_ns: DurationNanos::ZERO,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.require_authoritative_fills();
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let opening_id = ClientOrderId::from("O-RETAINED-OPENING");
+    let closing_id = ClientOrderId::from("O-MISSING-CLOSE");
+    let opening_venue = VenueOrderId::from("V-RETAINED-OPENING");
+    let closing_venue = VenueOrderId::from("V-MISSING-CLOSE");
+
+    for (client_id, venue_id, side) in [
+        (opening_id, opening_venue, OrderSide::Buy),
+        (closing_id, closing_venue, OrderSide::Sell),
+    ] {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(StrategyId::external())
+            .client_order_id(client_id)
+            .instrument_id(instrument.id())
+            .side(side)
+            .quantity(Quantity::from("4.0"))
+            .price(Price::from("3000.0"))
+            .build();
+        ctx.add_order(order.clone());
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::submitted(&order, test_account_id()));
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::accepted(
+                &order,
+                test_account_id(),
+                venue_id,
+            ));
+    }
+
+    let opening = create_fill_report(
+        opening_id,
+        opening_venue,
+        instrument.id(),
+        TradeId::from("T-RETAINED-OPENING"),
+        "4.0",
+    );
+    ctx.exec_engine.borrow_mut().reconcile_fill_report(&opening);
+    let report = create_order_report_for_side(
+        Some(closing_id),
+        closing_venue,
+        instrument.id(),
+        OrderSide::Sell,
+        OrderStatus::Filled,
+        Quantity::from("4.0"),
+        Quantity::from("4.0"),
+    )
+    .with_avg_px(dec!(3000.0));
+    let mut closing = create_fill_report(
+        closing_id,
+        closing_venue,
+        instrument.id(),
+        TradeId::from("T-MISSING-CLOSE"),
+        "4.0",
+    );
+    closing.order_side = OrderSide::Sell;
+    closing.ts_event = UnixNanos::from(1_100_000);
+    let mut startup = create_mass_status(vec![report.clone()], Vec::new());
+    startup.set_report_window(Some(UnixNanos::from(1_500_000)), true);
+    startup.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument.id(),
+        PositionSide::Flat,
+        Quantity::from("0.0"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        None,
+    )]);
+    ctx.advance_time(3_000_000);
+    ctx.manager
+        .reconcile_execution_mass_status(&startup, &ctx.exec_engine);
+
+    let snapshot = {
+        let cache = ctx.cache.borrow();
+        assert_eq!(
+            cache
+                .positions_open(None, Some(&instrument.id()), None, None, None)
+                .len(),
+            0
+        );
+        let positions = cache.positions(None, Some(&instrument.id()), None, None, None);
+        assert_eq!(positions.len(), 1);
+        positions[0].clone()
+    };
+
+    let mut client = MockExecutionClient::new(vec![report.clone()])
+        .with_order_report(report)
+        .with_fill_reports(vec![closing.clone()]);
+    client.requires_authoritative_fills = true;
+    for _ in 0..2 {
+        for event in ctx.manager.check_open_orders(&[&client]).await {
+            ctx.exec_engine.borrow_mut().process(&event);
+            if matches!(event, OrderEventAny::Filled(_)) {
+                ctx.exec_engine.borrow_mut().process(&event);
+            }
+        }
+    }
+
+    let recovered = ctx.get_order(&closing_id).unwrap();
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions(None, Some(&instrument.id()), None, None, None);
+    assert_eq!(recovered.status(), OrderStatus::Filled);
+    assert_eq!(recovered.filled_qty(), closing.last_qty);
+    assert_eq!(recovered.trade_ids(), vec![&closing.trade_id]);
+    assert_eq!(
+        recovered.commissions(),
+        &IndexMap::from([(closing.commission.currency, closing.commission)])
+    );
+    assert_eq!(
+        cache
+            .positions_open(None, Some(&instrument.id()), None, None, None)
+            .len(),
+        0
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].signed_decimal_qty(), Decimal::ZERO);
+    assert_eq!(positions[0].events, snapshot.events);
+    assert_eq!(positions[0].realized_pnl, snapshot.realized_pnl);
+    assert_eq!(positions[0].commissions(), snapshot.commissions());
+}
+
+#[rstest]
+#[case::uncached(false, "0.0", false)]
+#[case::cached(true, "0.0", false)]
+#[case::retained(true, "4.0", false)]
+#[case::strategy_cached(true, "0.0", true)]
+#[tokio::test]
+async fn test_targeted_fill_after_startup_snapshot_projects_order_only(
+    #[case] cached: bool,
+    #[case] retained_qty: Quantity,
+    #[case] strategy_owned: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_open_only: false,
+        open_check_threshold_ns: DurationNanos::ZERO,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let client_order_id = ClientOrderId::from("O-STARTUP-GAP");
+    let venue_order_id = VenueOrderId::from("V-STARTUP-GAP");
+    ctx.require_authoritative_fills();
+
+    if cached {
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .strategy_id(if strategy_owned {
+                StrategyId::from("S-OWNED")
+            } else {
+                StrategyId::external()
+            })
+            .client_order_id(client_order_id)
+            .instrument_id(instrument.id())
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("10.0"))
+            .price(Price::from("3000.0"))
+            .build();
+
+        ctx.add_order(order.clone());
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::submitted(&order, test_account_id()));
+        ctx.exec_engine
+            .borrow_mut()
+            .process(&TestOrderEventStubs::accepted(
+                &order,
+                test_account_id(),
+                venue_order_id,
+            ));
+
+        if retained_qty.is_positive() {
+            let retained = create_fill_report(
+                client_order_id,
+                venue_order_id,
+                instrument.id(),
+                TradeId::from("T-RETAINED"),
+                "4.0",
+            );
+            ctx.exec_engine
+                .borrow_mut()
+                .reconcile_fill_report(&retained);
+        }
+    }
+
+    let report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        instrument.id(),
+        OrderStatus::Filled,
+        Quantity::from("10.0"),
+        Quantity::from("10.0"),
+    )
+    .with_avg_px(dec!(3000.0));
+
+    let mut fill = create_fill_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        TradeId::from("T-STARTUP-GAP"),
+        if retained_qty.is_zero() {
+            "10.0"
+        } else {
+            "6.0"
+        },
+    );
+
+    fill.ts_event = UnixNanos::from(1_100_000);
+    let mut startup = create_mass_status(vec![report.clone()], Vec::new());
+    startup.set_report_window(Some(UnixNanos::from(1_500_000)), true);
+    startup.add_position_reports(vec![PositionStatusReport::new(
+        test_account_id(),
+        instrument.id(),
+        PositionSide::Long,
+        Quantity::from("10.0"),
+        UnixNanos::from(2_000_000),
+        UnixNanos::from(2_000_000),
+        None,
+        None,
+        Some(dec!(3000.0)),
+    )]);
+    ctx.advance_time(3_000_000);
+    ctx.manager
+        .reconcile_execution_mass_status(&startup, &ctx.exec_engine);
+    let original = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(
+        original.status(),
+        if retained_qty.is_zero() {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::PartiallyFilled
+        }
+    );
+    assert_eq!(original.filled_qty(), retained_qty);
+
+    let mut expected_trade_ids = if retained_qty.is_zero() {
+        Vec::new()
+    } else {
+        vec![TradeId::from("T-RETAINED")]
+    };
+
+    assert_eq!(
+        original
+            .trade_ids()
+            .into_iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected_trade_ids
+    );
+
+    let position = {
+        let cache = ctx.cache.borrow();
+        let positions = cache.positions_open(None, Some(&instrument.id()), None, None, None);
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].signed_decimal_qty(), dec!(10.0));
+        positions[0].clone()
+    };
+
+    assert_eq!(
+        position.events.last().unwrap().ts_event,
+        UnixNanos::from(3_000_000)
+    );
+
+    let mut client = MockExecutionClient::new(vec![report.clone()])
+        .with_order_report(report)
+        .with_fill_reports(vec![fill.clone()]);
+    client.requires_authoritative_fills = true;
+    for _ in 0..2 {
+        let events = ctx.manager.check_open_orders(&[&client]).await;
+        for event in &events {
+            ctx.exec_engine.borrow_mut().process(event);
+            if matches!(event, OrderEventAny::Filled(_)) {
+                ctx.exec_engine.borrow_mut().process(event);
+            }
+        }
+    }
+
+    expected_trade_ids.push(fill.trade_id);
+    let recovered = ctx.get_order(&client_order_id).unwrap();
+    let queries = client.fill_report_queries.borrow();
+    let cache = ctx.cache.borrow();
+    let positions = cache.positions_open(None, Some(&instrument.id()), None, None, None);
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].venue_order_id, Some(venue_order_id));
+    assert_eq!(queries[0].start, None);
+    assert_eq!(queries[0].end, None);
+    assert_eq!(recovered.status(), OrderStatus::Filled);
+    assert_eq!(recovered.filled_qty(), Quantity::from("10.0"));
+    assert_eq!(
+        recovered
+            .trade_ids()
+            .into_iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        expected_trade_ids
+    );
+    assert_eq!(
+        recovered.commissions(),
+        &IndexMap::from([(
+            fill.commission.currency,
+            if retained_qty.is_zero() {
+                fill.commission
+            } else {
+                Money::from("1.00 USDT")
+            }
+        )])
+    );
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].id, position.id);
+    assert_eq!(positions[0].signed_decimal_qty(), dec!(10.0));
+    assert_eq!(positions[0].events, position.events);
+    assert_eq!(positions[0].realized_pnl, position.realized_pnl);
+    assert_eq!(positions[0].commissions(), position.commissions());
+}
+
 #[rstest]
 #[case::bulk("bulk", false, "2.0")]
 #[case::bulk_inflight("bulk", true, "2.0")]
@@ -14900,7 +18736,6 @@ async fn test_terminal_reconciliation_and_stream_fill_apply_once(
         );
     } else {
         let events = ctx.manager.check_open_orders(&[&client]).await;
-
         for event in events {
             ctx.exec_engine.borrow_mut().process(&event);
         }
@@ -14911,16 +18746,13 @@ async fn test_terminal_reconciliation_and_stream_fill_apply_once(
     let recovered = ctx.get_order(&client_order_id).unwrap();
     let repeated_client = MockExecutionClient::new(vec![report]).with_fill_reports(vec![fill]);
     let repeated = ctx.manager.check_open_orders(&[&repeated_client]).await;
-
     for event in &repeated {
         ctx.exec_engine.borrow_mut().process(event);
     }
 
     let reconciled = ctx.get_order(&client_order_id).unwrap();
-
     for _ in 0..2 {
         let events = ctx.manager.check_open_orders(&[&repeated_client]).await;
-
         for event in events {
             ctx.exec_engine.borrow_mut().process(&event);
         }
@@ -15053,7 +18885,6 @@ async fn test_terminal_reconciliation_defers_unexplained_fill_gap(
         "partial" => vec![first.clone()],
         "foreign" | "account" | "instrument" | "side" => {
             let mut foreign = first.clone();
-
             match response {
                 "account" => foreign.account_id = AccountId::from("OTHER-001"),
                 "instrument" => foreign.instrument_id = InstrumentId::from("BTCUSDT.BINANCE"),
@@ -15110,7 +18941,6 @@ async fn test_terminal_reconciliation_defers_unexplained_fill_gap(
         );
     } else {
         let events = ctx.manager.check_open_orders(&[&retry]).await;
-
         for event in events {
             ctx.exec_engine.borrow_mut().process(&event);
         }
@@ -15160,22 +18990,27 @@ async fn test_terminal_reconciliation_defers_unexplained_fill_gap(
 }
 
 #[rstest]
-#[case::bulk_canceled(false, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
-#[case::bulk_expired(false, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
-#[case::targeted_canceled(true, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
-#[case::targeted_expired(true, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
-#[case::bulk_canceled_full(false, OrderStatus::Canceled, "10.0", OrderStatus::Filled, 1)]
-#[case::bulk_expired_full(false, OrderStatus::Expired, "10.0", OrderStatus::Filled, 1)]
+#[case::bulk_canceled(false, false, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
+#[case::bulk_expired(false, false, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
+#[case::targeted_canceled(true, false, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
+#[case::targeted_expired(true, false, OrderStatus::Expired, "4.5", OrderStatus::Expired, 2)]
+#[case::targeted_filled(true, false, OrderStatus::Filled, "10.0", OrderStatus::Filled, 1)]
+#[case::bulk_canceled_full(false, false, OrderStatus::Canceled, "10.0", OrderStatus::Filled, 1)]
+#[case::bulk_expired_full(false, false, OrderStatus::Expired, "10.0", OrderStatus::Filled, 1)]
+#[case::open_only_canceled(true, true, OrderStatus::Canceled, "4.5", OrderStatus::Canceled, 2)]
+#[case::open_only_filled(true, true, OrderStatus::Filled, "10.0", OrderStatus::Filled, 1)]
 #[tokio::test]
 async fn test_check_open_orders_terminal_report_applies_fills(
     #[case] targeted: bool,
+    #[case] open_only: bool,
     #[case] report_status: OrderStatus,
     #[case] filled_qty: Quantity,
     #[case] expected_status: OrderStatus,
     #[case] event_count: usize,
 ) {
     let mut ctx = TestContext::with_config(ExecutionManagerConfig {
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         open_check_missing_retries: 1,
         ..Default::default()
     });
@@ -15206,13 +19041,14 @@ async fn test_check_open_orders_terminal_report_applies_fills(
     reported_fill.last_px = Price::from("101.25");
     reported_fill.commission = commission;
 
-    let client = if targeted {
+    let mut client = if targeted {
         MockExecutionClient::new(Vec::new()).with_order_report(report.clone())
     } else {
         MockExecutionClient::new(vec![report.clone()])
     }
     .with_fill_reports(vec![reported_fill]);
 
+    client.requires_authoritative_fills = report_status == OrderStatus::Filled;
     client.fail_fill_reports.set(true);
 
     let failed = ctx.manager.check_open_orders(&[&client]).await;
@@ -15453,6 +19289,7 @@ async fn test_check_open_orders_submitted_missing_at_venue_obeys_recovery_policy
         );
         assert_eq!(mock_client.order_report_query_count.get(), 0);
     }
+
     let events = ctx.manager.check_open_orders(&clients).await;
 
     let client_order_id = ClientOrderId::from("O-001");
@@ -15472,6 +19309,7 @@ async fn test_check_open_orders_submitted_missing_at_venue_obeys_recovery_policy
     } else {
         Vec::new()
     };
+
     assert_eq!(ctx.manager.take_submission_recovery_exhaustions(), expected);
     assert!(
         ctx.manager
@@ -15528,6 +19366,7 @@ async fn test_submission_registry_missing_checks_do_not_exhaust_without_absence(
         submission_recovery_policy: SubmissionRecoveryPolicy::RetainUnresolved,
         ..Default::default()
     });
+
     ctx.add_instrument(test_instrument());
     let order = create_limit_order(
         "O-REGISTRY-MISSING",
@@ -15542,6 +19381,7 @@ async fn test_submission_registry_missing_checks_do_not_exhaust_without_absence(
         .register_submission(order.init_event(), Some(test_client_id()));
     ctx.add_order(order);
     ctx.cache.borrow_mut().update_order(&submitted).unwrap();
+
     let client = match scenario {
         "accepted" | "wrong_identity" => MockExecutionClient::new(Vec::new()).with_order_report(
             create_order_report(
@@ -15566,6 +19406,7 @@ async fn test_submission_registry_missing_checks_do_not_exhaust_without_absence(
     let events = ctx.manager.check_open_orders(&[&client]).await;
 
     assert_eq!(client.order_report_query_count.get(), query_count);
+
     if scenario == "accepted" {
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], OrderEventAny::Accepted(accepted)
@@ -15573,6 +19414,7 @@ async fn test_submission_registry_missing_checks_do_not_exhaust_without_absence(
     } else {
         assert!(events.is_empty());
     }
+
     assert_eq!(
         ctx.get_order(&client_order_id).unwrap().status(),
         OrderStatus::Submitted
@@ -15688,11 +19530,13 @@ async fn test_check_open_orders_mismatched_targeted_report_defers_resolution() {
 
 #[rstest]
 #[tokio::test]
-async fn test_check_open_orders_caps_targeted_queries_per_cycle() {
+async fn test_check_open_orders_caps_targeted_queries_per_cycle(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 1,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
         max_single_order_queries_per_cycle: 1,
         single_order_query_delay_ms: 0,
         ..Default::default()
@@ -15722,7 +19566,7 @@ async fn test_check_open_orders_caps_targeted_queries_per_cycle() {
 
     let events = ctx.manager.check_open_orders(&clients).await;
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), usize::from(!open_only));
     assert_eq!(mock_a.order_report_query_count.get(), 1);
     assert_eq!(mock_b.order_report_query_count.get(), 0);
 }
@@ -15890,16 +19734,20 @@ async fn test_check_open_orders_partially_filled_missing_at_venue_generates_canc
     assert_eq!(order.filled_qty(), Quantity::from("4.0"));
 }
 
+#[rstest]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_check_open_orders_failed_client_does_not_advance_missing_retries() {
+async fn test_check_open_orders_failed_client_does_not_advance_missing_retries(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 2,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         ..Default::default()
     };
 
@@ -15941,11 +19789,19 @@ async fn test_check_open_orders_failed_client_does_not_advance_missing_retries()
     let clients: Vec<&dyn ExecutionClient> = vec![&healthy_client, &recovered_client];
     let second_events = ctx.manager.check_open_orders(&clients).await;
 
-    assert_eq!(second_events.len(), 1);
-    assert!(
-        matches!(&second_events[0], OrderEventAny::Rejected(rejected) if rejected.client_order_id == healthy_order_id),
-        "only the healthy venue order should exhaust its retry budget",
-    );
+    assert_eq!(healthy_client.order_report_query_count.get(), 1);
+    assert_eq!(recovered_client.order_report_query_count.get(), 0);
+
+    if open_only {
+        assert!(second_events.is_empty());
+    } else {
+        assert_eq!(second_events.len(), 1);
+        assert!(
+            matches!(&second_events[0], OrderEventAny::Rejected(rejected)
+            if rejected.client_order_id == healthy_order_id)
+        );
+    }
+
     assert_eq!(
         ctx.get_order(&failed_order_id).unwrap().status(),
         OrderStatus::Accepted,
@@ -16091,16 +19947,20 @@ async fn test_check_open_orders_failed_routing_client_fallback_coverage_does_not
     );
 }
 
+#[rstest]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_check_open_orders_positive_report_resets_missing_retry_ladder() {
+async fn test_check_open_orders_positive_report_resets_missing_retry_ladder(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 2,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         ..Default::default()
     };
 
@@ -16155,6 +20015,10 @@ async fn test_check_open_orders_positive_report_resets_missing_retry_ladder() {
         ctx.get_order(&client_order_id).unwrap().status(),
         OrderStatus::Accepted,
     );
+    assert_eq!(empty_again.order_report_query_count.get(), 0);
+    let fourth_events = ctx.manager.check_open_orders(&clients).await;
+    assert_eq!(empty_again.order_report_query_count.get(), 1);
+    assert_eq!(fourth_events.len(), usize::from(!open_only));
 }
 
 #[cfg_attr(
@@ -16226,16 +20090,20 @@ async fn test_check_open_orders_venue_id_only_report_resets_missing_retry_ladder
     );
 }
 
+#[rstest]
 #[cfg_attr(
     not(all(feature = "simulation", madsim)),
     tokio::test(start_paused = true)
 )]
 #[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
-async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state() {
+async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state(
+    #[values(false, true)] open_only: bool,
+) {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
         open_check_missing_retries: 2,
-        open_check_open_only: false,
+        open_check_open_only: open_only,
+        single_order_query_delay_ms: 0,
         ..Default::default()
     };
 
@@ -16249,7 +20117,6 @@ async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state(
     // The callback fires inside the report query, after the prepare-time
     // snapshot captured the order as an open missing-candidate.
     let cache = ctx.cache.clone();
-
     let client =
         MockExecutionClient::new(vec![]).with_on_order_reports_query(Box::new(move || {
             let order = cache.borrow().order(&client_order_id).unwrap().clone();
@@ -16263,6 +20130,7 @@ async fn test_check_open_orders_order_closed_during_query_leaves_no_retry_state(
     let events = ctx.manager.check_open_orders(&clients).await;
 
     assert!(events.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
     assert_eq!(
         ctx.manager.recon_check_retry_count(&client_order_id),
         0,
@@ -16311,7 +20179,7 @@ async fn test_check_open_orders_deferred_pending_order_keeps_inflight_registrati
         ctx.get_order(&client_order_id).unwrap().status(),
         OrderStatus::PendingCancel,
     );
-    ctx.manager.register_inflight(client_order_id);
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
 
     // Prime one inflight retry so the retained check carries a nonzero count
     ctx.advance_both(dst::time::Duration::from_millis(200))
@@ -16347,6 +20215,349 @@ async fn test_check_open_orders_deferred_pending_order_keeps_inflight_registrati
 
 #[rstest]
 #[tokio::test]
+async fn test_check_open_orders_open_only_negative_query_keeps_order_open(
+    #[values(false, true)] failed: bool,
+    #[values(false, true)] partially_filled: bool,
+) {
+    let _guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 2,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    let instrument = test_instrument();
+    ctx.add_instrument(instrument.clone());
+    let client_order_id = ClientOrderId::from("O-OPEN-NEGATIVE");
+    let venue_order_id = VenueOrderId::from("V-OPEN-NEGATIVE");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+    if partially_filled {
+        let order = ctx.get_order(&client_order_id).unwrap();
+        let fill = OrderFilledTestBuilder::new(&order, &instrument)
+            .last_qty(Quantity::from("4.0"))
+            .without_position_id()
+            .build();
+        ctx.cache.borrow_mut().update_order(&fill).unwrap();
+    }
+
+    let before = ctx.get_order(&client_order_id).unwrap();
+    let mut client = MockExecutionClient::new(Vec::new());
+    client.fail_order_report = failed;
+    for expected_queries in [0, 1, 1, 2] {
+        let events = ctx.manager.check_open_orders(&[&client]).await;
+        assert!(events.is_empty());
+        assert_eq!(client.order_report_query_count.get(), expected_queries);
+        assert_eq!(ctx.get_order(&client_order_id).unwrap(), before);
+    }
+
+    let warnings = MANAGER_LOG_CAPTURE.messages.lock();
+    let warnings: Vec<_> = warnings
+        .iter()
+        .filter(|message| message.contains(client_order_id.as_str()))
+        .collect();
+    assert_eq!(warnings.len(), 2, "found {warnings:?}");
+
+    let expected = if failed {
+        "Failed targeted order status query"
+    } else {
+        "Keeping O-OPEN-NEGATIVE open: targeted order status query found no report"
+    };
+
+    assert!(warnings.iter().all(|message| message.starts_with(expected)));
+    assert!(
+        ctx.manager
+            .take_submission_recovery_exhaustions()
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_bulk_failure_warning_rearms_after_recovery(
+    #[values(false, true)] open_only: bool,
+) {
+    let _guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_open_only: open_only,
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 2,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-BULK-FAILURE-WARN");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-BULK-FAILURE-WARN"),
+        test_client_id(),
+    );
+    let before = ctx.get_order(&client_order_id).unwrap();
+    let mut client = MockExecutionClient::failing(test_client_id(), test_venue());
+
+    let attempts = 3;
+    for _ in 0..attempts {
+        assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    }
+
+    let warnings = MANAGER_LOG_CAPTURE
+        .messages
+        .lock()
+        .iter()
+        .filter(|message| message.contains(client_order_id.as_str()))
+        .count();
+    assert_eq!(warnings, if open_only { 1 } else { attempts });
+
+    client.fail_order_reports = false;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    client.fail_order_reports = true;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+
+    let warnings = MANAGER_LOG_CAPTURE
+        .messages
+        .lock()
+        .iter()
+        .filter(|message| message.contains(client_order_id.as_str()))
+        .count();
+    assert_eq!(warnings, if open_only { 2 } else { attempts + 1 });
+    assert_eq!(ctx.get_order(&client_order_id).unwrap(), before);
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+}
+
+#[tokio::test]
+async fn test_check_open_orders_open_only_does_not_reopen_order_closed_during_targeted_query() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 1,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-CLOSED-DURING-TARGET");
+    let venue_order_id = VenueOrderId::from("V-CLOSED-DURING-TARGET");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+    let report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Accepted,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let mut expected = ctx.get_order(&client_order_id).unwrap();
+    let canceled =
+        TestOrderEventStubs::canceled(&expected, test_account_id(), Some(venue_order_id));
+    expected.apply(canceled.clone()).unwrap();
+    let cache = ctx.cache.clone();
+    let client = MockExecutionClient::new(Vec::new())
+        .with_order_report(report)
+        .with_on_order_report_query(Box::new(move || {
+            cache.borrow_mut().update_order(&canceled).unwrap();
+        }));
+
+    let events = ctx.manager.check_open_orders(&[&client]).await;
+
+    assert!(events.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 1);
+    assert_eq!(ctx.get_order(&client_order_id).unwrap(), expected);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_check_open_orders_missing_lookback_skips_query(
+    #[values(false, true)] open_only: bool,
+) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 1,
+        open_check_open_only: open_only,
+        open_check_lookback_mins: Some(1),
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-LOOKBACK-MISSING");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-LOOKBACK-MISSING"),
+        test_client_id(),
+    );
+    let before = ctx.get_order(&client_order_id).unwrap();
+    ctx.advance_time(DurationNanos::from_mins(2).as_u64());
+    let client = MockExecutionClient::new(Vec::new());
+
+    let events = ctx.manager.check_open_orders(&[&client]).await;
+
+    assert!(events.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.get_order(&client_order_id).unwrap(), before);
+}
+
+#[rstest]
+#[case::cancel(false)]
+#[case::modify(true)]
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_check_open_orders_open_only_queries_after_inflight_timeout(#[case] modify: bool) {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::ZERO,
+        open_check_missing_retries: 2,
+        inflight_threshold_ms: 10,
+        inflight_max_retries: 2,
+        single_order_query_delay_ms: 0,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-OPEN-RESTORED");
+    let venue_order_id = VenueOrderId::from("V-OPEN-RESTORED");
+    insert_accepted_limit_order(&ctx, client_order_id, venue_order_id, test_client_id());
+    let order = ctx.get_order(&client_order_id).unwrap();
+
+    let pending = if modify {
+        OrderEventAny::PendingUpdate(
+            OrderPendingUpdateSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(client_order_id)
+                .venue_order_id(venue_order_id)
+                .account_id(test_account_id())
+                .build(),
+        )
+    } else {
+        OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(client_order_id)
+                .venue_order_id(venue_order_id)
+                .account_id(test_account_id())
+                .build(),
+        )
+    };
+
+    ctx.manager.register_inflight(client_order_id, UUID4::new());
+    let report = create_order_report(
+        Some(client_order_id),
+        venue_order_id,
+        test_instrument_id(),
+        OrderStatus::Canceled,
+        Quantity::from("10.0"),
+        Quantity::zero(1),
+    );
+    let client = MockExecutionClient::new(Vec::new()).with_order_report(report);
+
+    for _ in 0..2 {
+        assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    }
+
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+    ctx.cache.borrow_mut().update_order(&pending).unwrap();
+
+    ctx.advance_both(dst::time::Duration::from_millis(20)).await;
+    let inflight = ctx.manager.check_inflight_orders();
+    assert_eq!(inflight.queries.len(), 1);
+    assert!(inflight.events.is_empty());
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 1);
+
+    ctx.advance_both(dst::time::Duration::from_millis(20)).await;
+    let exhausted = ctx.manager.check_inflight_orders();
+    assert!(exhausted.queries.is_empty());
+    assert_eq!(exhausted.events.len(), 1);
+
+    match &exhausted.events[0] {
+        OrderEventAny::ModifyRejected(event) if modify => {
+            assert_eq!(event.reason, "INFLIGHT_TIMEOUT");
+            assert_eq!(event.client_order_id, client_order_id);
+        }
+        OrderEventAny::CancelRejected(event) if !modify => {
+            assert_eq!(event.reason, "INFLIGHT_TIMEOUT");
+            assert_eq!(event.client_order_id, client_order_id);
+        }
+        event => panic!("Expected command rejection, was {event:?}"),
+    }
+
+    ctx.exec_engine.borrow_mut().process(&exhausted.events[0]);
+    ctx.manager.observe_order_event(&exhausted.events[0]);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Accepted
+    );
+    assert_eq!(ctx.manager.recon_check_retry_count(&client_order_id), 0);
+
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    let events = ctx.manager.check_open_orders(&[&client]).await;
+    assert_eq!(client.order_report_query_count.get(), 1);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(&events[0], OrderEventAny::Canceled(event)
+        if event.client_order_id == client_order_id && event.venue_order_id == Some(venue_order_id)));
+    ctx.exec_engine.borrow_mut().process(&events[0]);
+    assert_eq!(
+        ctx.get_order(&client_order_id).unwrap().status(),
+        OrderStatus::Canceled
+    );
+}
+
+#[cfg_attr(
+    not(all(feature = "simulation", madsim)),
+    tokio::test(start_paused = true)
+)]
+#[cfg_attr(all(feature = "simulation", madsim), madsim::test)]
+async fn test_check_open_orders_open_only_defers_recent_queries_and_activity() {
+    let mut ctx = TestContext::with_config(ExecutionManagerConfig {
+        open_check_threshold_ns: DurationNanos::from_millis(100),
+        open_check_missing_retries: 1,
+        single_order_query_delay_ms: 200,
+        ..Default::default()
+    });
+
+    ctx.add_instrument(test_instrument());
+    let client_order_id = ClientOrderId::from("O-OPEN-RECENT");
+    insert_accepted_limit_order(
+        &ctx,
+        client_order_id,
+        VenueOrderId::from("V-OPEN-RECENT"),
+        test_client_id(),
+    );
+    ctx.manager.record_local_activity(client_order_id);
+    let client = MockExecutionClient::new(Vec::new());
+
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 0);
+    ctx.advance_both(dst::time::Duration::from_millis(101))
+        .await;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 1);
+    ctx.advance_both(dst::time::Duration::from_millis(199))
+        .await;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 1);
+    ctx.advance_both(dst::time::Duration::from_millis(1)).await;
+    assert!(ctx.manager.check_open_orders(&[&client]).await.is_empty());
+    assert_eq!(client.order_report_query_count.get(), 2);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_check_open_orders_open_only_missing_venue_order_does_not_reject() {
     let config = ExecutionManagerConfig {
         open_check_threshold_ns: DurationNanos::ZERO,
@@ -16375,6 +20586,7 @@ async fn test_check_open_orders_open_only_missing_venue_order_does_not_reject() 
     let events = ctx.manager.check_open_orders(&clients).await;
 
     assert!(events.is_empty());
+    assert_eq!(mock_client.order_report_query_count.get(), 0);
     let cached_order = ctx.get_order(&ClientOrderId::from("O-OPEN-ONLY")).unwrap();
     assert_eq!(cached_order.status(), OrderStatus::Submitted);
 }
@@ -16537,6 +20749,7 @@ async fn test_position_check_reconciles_venue_only_nonflat_report() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -16569,7 +20782,6 @@ async fn test_position_check_respects_disabled_order_generation(
     let position_id = PositionId::from("P-GENERATION-DISABLED");
     let position = create_test_position(&instrument, position_id, OrderSide::Buy, "3.0", "3000.00");
     ctx.add_instrument(instrument);
-
     if has_position {
         ctx.add_position(&position);
     }
@@ -16585,6 +20797,7 @@ async fn test_position_check_respects_disabled_order_generation(
         None,
         Some(dec!(3100.00)),
     );
+
     let client = MockPositionExecutionClient::new(Vec::new(), vec![report]);
 
     let events = ctx.manager.check_positions_consistency(&[&client]).await;
@@ -16627,6 +20840,7 @@ async fn test_position_check_updates_reported_hedge_position() {
         Some(position_id),
         Some(dec!(3100.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
     let client = MockPositionExecutionClient::new(vec![], vec![report]);
@@ -16692,6 +20906,7 @@ async fn test_position_check_cross_zero_preserves_both_hedge_position_ids() {
         Some(open_position_id),
         Some(dec!(3100.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
     let client = MockPositionExecutionClient::new(vec![], vec![report]);
@@ -16821,6 +21036,7 @@ async fn test_position_check_rereads_position_opened_during_request() {
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
 
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report])
@@ -16872,6 +21088,7 @@ async fn test_position_check_uses_current_avg_px_after_request() {
         None,
         Some(dec!(3200.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&stale_position);
 
@@ -17399,6 +21616,7 @@ async fn test_position_check_uses_client_tolerance_for_observed_smoke_difference
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
 
@@ -17447,6 +21665,7 @@ async fn test_position_check_uses_routing_client_tolerance() {
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_margin_account(account_id);
     ctx.add_position(&position);
@@ -17511,6 +21730,7 @@ async fn test_mass_status_netting_uses_routing_client_tolerance(
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_margin_account(account_id);
     ctx.add_position(&position);
@@ -17549,6 +21769,7 @@ async fn test_mass_status_netting_uses_routing_client_tolerance(
         None,
         Some(dec!(3000.00)),
     );
+
     mass_status.add_position_reports(vec![drift_report]);
 
     ctx.exec_engine
@@ -17621,6 +21842,7 @@ async fn test_routing_clients_on_same_venue_use_account_tolerances_independently
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_margin_account(tolerant_account_id);
     ctx.add_margin_account(strict_account_id);
@@ -17690,6 +21912,7 @@ async fn test_position_check_reconciles_at_client_tolerance_boundary() {
         None,
         Some(dec!(3000.00)),
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
 
@@ -17909,6 +22132,7 @@ async fn test_position_check_aggregates_hedge_positions_before_comparing_report(
         None,
         Some(dec!(3050.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -18025,6 +22249,7 @@ async fn test_position_check_skips_reports_outside_reconciliation_instruments() 
         None,
         Some(dec!(50000.0)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![report.clone()]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
     let queried_clients = IndexSet::from([mock_client.client_id()]);
@@ -18099,7 +22324,6 @@ async fn test_position_check_matching_hedge_reports_is_order_invariant(
         dec!(3100.00),
     );
     let mut reports = vec![report_long, report_short];
-
     if reverse_reports {
         reports.reverse();
     }
@@ -18255,6 +22479,7 @@ async fn test_position_check_flat_and_nonflat_reports_use_nonflat_report() {
         None,
         None,
     );
+
     ctx.add_instrument(instrument);
     ctx.add_position(&position);
 
@@ -18676,6 +22901,7 @@ async fn test_position_check_flat_venue_report_does_not_protect_stale_counter() 
         None,
         None,
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![flat_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -18760,6 +22986,7 @@ async fn test_position_check_nonflat_venue_report_protects_counter() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report.clone()]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -18974,6 +23201,7 @@ async fn test_position_check_grace_survives_accelerated_trading_clock() {
         ts_event, // ts_init
         None,     // report_id
     );
+
     ctx.manager
         .observe_execution_report(&ExecutionReport::Fill(Box::new(fill_report)));
 
@@ -18995,6 +23223,7 @@ async fn test_position_check_grace_survives_accelerated_trading_clock() {
         None, // venue_position_id
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -19053,6 +23282,7 @@ async fn test_position_check_grace_expires_on_monotonic_clock() {
         ts_event,
         None,
     );
+
     ctx.manager
         .observe_execution_report(&ExecutionReport::Fill(Box::new(fill_report)));
 
@@ -19069,6 +23299,7 @@ async fn test_position_check_grace_expires_on_monotonic_clock() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![venue_report]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -19134,6 +23365,7 @@ async fn test_check_positions_consistency_processes_only_discrepant_account() {
         None,
         Some(dec!(3000.00)),
     );
+
     let mock_client = MockPositionExecutionClient::new(vec![], vec![report_a]);
     let clients: Vec<&dyn ExecutionClient> = vec![&mock_client];
 
@@ -19286,6 +23518,7 @@ async fn test_reconcile_mass_status_publishes_raw_reports_for_capture() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report(
         None,
         VenueOrderId::from("V-RAW-CAPTURE"),
@@ -19312,6 +23545,7 @@ async fn test_reconcile_mass_status_publishes_raw_reports_for_capture() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill_report.clone()]);
 
     let position_report = PositionStatusReport::new(
@@ -19325,6 +23559,7 @@ async fn test_reconcile_mass_status_publishes_raw_reports_for_capture() {
         None,
         Some(dec!(3000.0)),
     );
+
     mass_status.add_position_reports(vec![position_report.clone()]);
 
     let _ = ctx
@@ -19389,6 +23624,7 @@ async fn test_reconcile_mass_status_does_not_capture_synthetic_reports() {
         UnixNanos::default(),
         Some(UUID4::new()),
     );
+
     let order_report = create_order_report(
         None,
         venue_order_id,
@@ -19415,6 +23651,7 @@ async fn test_reconcile_mass_status_does_not_capture_synthetic_reports() {
         UnixNanos::from(2_000_000),
         None,
     );
+
     mass_status.add_fill_reports(vec![fill_report.clone()]);
 
     let position_report = PositionStatusReport::new(
@@ -19428,6 +23665,7 @@ async fn test_reconcile_mass_status_does_not_capture_synthetic_reports() {
         None, // netting mode triggers adjust_mass_status_fills
         Some(dec!(3000.0)),
     );
+
     mass_status.add_position_reports(vec![position_report]);
 
     let _ = ctx
@@ -19496,6 +23734,7 @@ async fn test_mass_status_zero_quantity_fill_does_not_consume_trade_id(#[case] b
         UnixNanos::from(1_000_000),
         None,
     );
+
     let mut zero = valid.clone();
     zero.last_qty = Quantity::zero(1);
     zero.commission = Money::from("123.45 USDT");
@@ -19646,4 +23885,576 @@ async fn test_zero_quantity_fill_does_not_suppress_hedge_position_report() {
         cache.position(&position_id).unwrap().quantity,
         Quantity::from("5.0")
     );
+}
+
+#[rstest]
+#[case::ordinary(false, false)]
+#[case::duplicate(true, false)]
+#[case::flat_crossing(false, true)]
+#[tokio::test]
+async fn test_fresh_cache_replacement_chain_preserves_native_fills(
+    #[values(false, true)] child_fill: bool,
+    #[values(false, true)] reverse_reports: bool,
+    #[values(false, true)] parent_label: bool,
+    #[case] duplicate_fill: bool,
+    #[case] crosses_flat: bool,
+) {
+    let _log_guard = MANAGER_LOG_TEST_LOCK.lock().await;
+    install_manager_log_capture();
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let strategy_id = StrategyId::from("STRATEGY-001");
+    ctx.manager
+        .claim_external_orders(test_instrument_id(), strategy_id)
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(strategy_id, OmsType::Netting);
+    let mut client = MockExecutionClient::new(Vec::new());
+    client.order_venue_ids.insert(
+        ClientOrderId::from("O-FRESH-CHAIN"),
+        vec![
+            VenueOrderId::from("V-FRESH-ROOT"),
+            VenueOrderId::from("V-FRESH-MIDDLE"),
+            VenueOrderId::from("V-FRESH-CURRENT"),
+        ],
+    );
+
+    {
+        let mut engine = ctx.exec_engine.borrow_mut();
+        engine.deregister_client(test_client_id()).unwrap();
+        engine.register_client(Box::new(client)).unwrap();
+    }
+
+    let cid = ClientOrderId::from("O-FRESH-CHAIN");
+    let root_id = VenueOrderId::from("V-FRESH-ROOT");
+    let middle_id = VenueOrderId::from("V-FRESH-MIDDLE");
+    let current_id = VenueOrderId::from("V-FRESH-CURRENT");
+
+    let filled = if child_fill { "0.5" } else { "0.3" };
+    let average = if child_fill {
+        dec!(3500)
+    } else {
+        dec!(10300) / dec!(3)
+    };
+
+    let mut reports = vec![
+        create_order_report(
+            Some(cid),
+            root_id,
+            test_instrument_id(),
+            OrderStatus::Canceled,
+            Quantity::from("1.0"),
+            Quantity::from("0.2"),
+        ),
+        create_order_report(
+            Some(cid),
+            middle_id,
+            test_instrument_id(),
+            OrderStatus::Canceled,
+            Quantity::from("0.8"),
+            Quantity::from("0.1"),
+        ),
+        create_order_report(
+            Some(cid),
+            current_id,
+            test_instrument_id(),
+            OrderStatus::PartiallyFilled,
+            Quantity::from("1.0"),
+            Quantity::from(filled),
+        )
+        .with_avg_px(average),
+    ];
+
+    for (index, report) in reports.iter_mut().enumerate() {
+        report.ts_accepted = UnixNanos::from(100 + index as u64 * 50);
+        report.ts_last = UnixNanos::from(900 + index as u64 * 50);
+        report.price = Some(Price::from("3605.00"));
+    }
+
+    reports[2].ts_accepted = UnixNanos::from(100);
+    if reverse_reports {
+        reports.reverse();
+    }
+
+    let root_fill = FillReport::new(
+        test_account_id(),
+        test_instrument_id(),
+        root_id,
+        TradeId::from("T-FRESH-ROOT"),
+        OrderSide::Buy,
+        Quantity::from("0.2"),
+        Price::from("3400.00"),
+        Money::from("0.02 USDT"),
+        LiquiditySide::Maker,
+        parent_label.then_some(cid),
+        None,
+        UnixNanos::from(200),
+        UnixNanos::from(2000),
+        None,
+    );
+
+    let middle_fill = FillReport::new(
+        test_account_id(),
+        test_instrument_id(),
+        middle_id,
+        TradeId::from("T-FRESH-MIDDLE"),
+        OrderSide::Buy,
+        Quantity::from("0.1"),
+        Price::from("3500.00"),
+        Money::from("0.03 USDT"),
+        LiquiditySide::Taker,
+        parent_label.then_some(cid),
+        None,
+        UnixNanos::from(250),
+        UnixNanos::from(2000),
+        None,
+    );
+
+    let mut fills = vec![middle_fill, root_fill.clone()];
+    if child_fill {
+        fills.push(FillReport::new(
+            test_account_id(),
+            test_instrument_id(),
+            current_id,
+            TradeId::from("T-FRESH-CURRENT"),
+            OrderSide::Buy,
+            Quantity::from("0.2"),
+            Price::from("3600.00"),
+            Money::from("0.05 USDT"),
+            LiquiditySide::Taker,
+            Some(cid),
+            None,
+            UnixNanos::from(300),
+            UnixNanos::from(2000),
+            None,
+        ));
+    }
+
+    if duplicate_fill {
+        fills.push(root_fill);
+    }
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(2000),
+        None,
+    );
+
+    mass.add_order_reports(reports);
+    mass.add_fill_reports(fills);
+
+    if crosses_flat {
+        let close_id = VenueOrderId::from("V-FRESH-CLOSE");
+        mass.add_order_reports(vec![
+            create_order_report_for_side(
+                Some(ClientOrderId::from("O-FRESH-CLOSE")),
+                close_id,
+                test_instrument_id(),
+                OrderSide::Sell,
+                OrderStatus::Filled,
+                Quantity::from("0.3"),
+                Quantity::from("0.3"),
+            )
+            .with_avg_px(dec!(3550)),
+        ]);
+        mass.add_fill_reports(vec![FillReport::new(
+            test_account_id(),
+            test_instrument_id(),
+            close_id,
+            TradeId::from("T-FRESH-CLOSE"),
+            OrderSide::Sell,
+            Quantity::from("0.3"),
+            Price::from("3550.00"),
+            Money::from("0.07 USDT"),
+            LiquiditySide::Taker,
+            Some(ClientOrderId::from("O-FRESH-CLOSE")),
+            None,
+            UnixNanos::from(275),
+            UnixNanos::from(2000),
+            None,
+        )]);
+        mass.add_position_reports(vec![PositionStatusReport::new(
+            test_account_id(),
+            test_instrument_id(),
+            if child_fill {
+                PositionSide::Long
+            } else {
+                PositionSide::Flat
+            },
+            Quantity::from(if child_fill { "0.2" } else { "0.0" }),
+            UnixNanos::from(1000),
+            UnixNanos::from(2000),
+            None,
+            None,
+            Some(dec!(3600)),
+        )]);
+    }
+
+    let first = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass, &ctx.exec_engine);
+    let repeated = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass, &ctx.exec_engine);
+    let order = ctx.get_order(&cid).unwrap();
+
+    let fills: Vec<_> = first
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            OrderEventAny::Filled(fill) if fill.client_order_id == cid => Some(fill),
+            _ => None,
+        })
+        .collect();
+
+    let mut expected_trades = vec![
+        TradeId::from("T-FRESH-ROOT"),
+        TradeId::from("T-FRESH-MIDDLE"),
+    ];
+
+    if child_fill {
+        expected_trades.push(TradeId::from("T-FRESH-CURRENT"));
+    }
+
+    assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(order.venue_order_id(), Some(current_id));
+    assert_eq!(
+        order.venue_order_ids(),
+        vec![&root_id, &middle_id, &current_id]
+    );
+    assert_eq!(order.quantity(), Quantity::from("1.0"));
+    assert_eq!(order.filled_qty(), Quantity::from(filled));
+    assert_eq!(order.avg_px(), Some(average));
+    assert_eq!(
+        order.trade_ids(),
+        expected_trades.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        order.commissions().get(&Currency::USDT()),
+        Some(&Money::from(if child_fill {
+            "0.10 USDT"
+        } else {
+            "0.05 USDT"
+        }))
+    );
+    assert_eq!(fills.len(), if child_fill { 3 } else { 2 });
+    assert_eq!(fills[0].venue_order_id, root_id);
+    assert_eq!(fills[0].trade_id, TradeId::from("T-FRESH-ROOT"));
+    assert_eq!(fills[0].last_qty, Quantity::from("0.2"));
+    assert_eq!(fills[0].last_px, Price::from("3400.00"));
+    assert_eq!(fills[0].commission, Some(Money::from("0.02 USDT")));
+    assert_eq!(fills[0].liquidity_side, LiquiditySide::Maker);
+    assert_eq!(fills[0].ts_event, UnixNanos::from(200));
+    assert_eq!(fills[1].venue_order_id, middle_id);
+    assert_eq!(fills[1].trade_id, TradeId::from("T-FRESH-MIDDLE"));
+    assert_eq!(fills[1].last_qty, Quantity::from("0.1"));
+    assert_eq!(fills[1].last_px, Price::from("3500.00"));
+    assert_eq!(fills[1].commission, Some(Money::from("0.03 USDT")));
+    assert_eq!(fills[1].liquidity_side, LiquiditySide::Taker);
+    assert_eq!(fills[1].ts_event, UnixNanos::from(250));
+
+    if child_fill {
+        assert_eq!(fills[2].venue_order_id, current_id);
+        assert_eq!(fills[2].trade_id, TradeId::from("T-FRESH-CURRENT"));
+        assert_eq!(fills[2].last_qty, Quantity::from("0.2"));
+        assert_eq!(fills[2].last_px, Price::from("3600.00"));
+        assert_eq!(fills[2].commission, Some(Money::from("0.05 USDT")));
+        assert_eq!(fills[2].liquidity_side, LiquiditySide::Taker);
+        assert_eq!(fills[2].ts_event, UnixNanos::from(300));
+    }
+
+    assert!(
+        repeated
+            .events
+            .iter()
+            .all(|event| crosses_flat && event.client_order_id() != cid)
+    );
+    assert!(!MANAGER_LOG_CAPTURE.messages.lock().iter().any(|message| {
+        message.starts_with("Error indexing venue order ID")
+            || message.starts_with("Cannot initialize venue order ID history")
+    }));
+    let cache = ctx.cache.borrow();
+    assert_eq!(
+        cache.orders(None, None, None, None, None).len(),
+        1 + usize::from(crosses_flat)
+    );
+    assert_eq!(cache.venue_order_id(&cid), Some(&current_id));
+
+    for id in [root_id, middle_id, current_id] {
+        assert_eq!(cache.client_order_id(&id), Some(&cid));
+    }
+
+    let positions = cache.positions_open(None, Some(&test_instrument_id()), None, None, None);
+    assert_eq!(positions.len(), usize::from(!crosses_flat || child_fill));
+
+    if positions.is_empty() {
+        return;
+    }
+
+    assert_eq!(
+        positions[0].quantity,
+        Quantity::from(if crosses_flat { "0.2" } else { filled })
+    );
+    assert_eq!(
+        positions[0].trade_ids,
+        if crosses_flat {
+            vec![TradeId::from("T-FRESH-CURRENT")]
+        } else {
+            expected_trades
+        }
+        .into_iter()
+        .collect()
+    );
+    assert_eq!(
+        positions[0].commissions(),
+        vec![Money::from(if child_fill && !crosses_flat {
+            "0.10 USDT"
+        } else {
+            "0.05 USDT"
+        })]
+    );
+}
+
+#[rstest]
+#[case::ordinary_client(false)]
+#[case::venue_id_history_client(true)]
+#[tokio::test]
+async fn test_fresh_cache_venue_id_history_requires_client_proof(#[case] venue_id_history: bool) {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let mut client = MockExecutionClient::new(Vec::new());
+    if venue_id_history {
+        client.order_venue_ids.insert(
+            ClientOrderId::from("O-LABEL-PROOF"),
+            vec![
+                VenueOrderId::from("V-LABEL-PARENT"),
+                VenueOrderId::from("V-LABEL-CURRENT"),
+            ],
+        );
+    }
+
+    {
+        let mut engine = ctx.exec_engine.borrow_mut();
+        engine.deregister_client(test_client_id()).unwrap();
+        engine.register_client(Box::new(client)).unwrap();
+    }
+
+    let cid = ClientOrderId::from("O-LABEL-PROOF");
+    let parent_id = VenueOrderId::from("V-LABEL-PARENT");
+    let current_id = VenueOrderId::from("V-LABEL-CURRENT");
+    let reports = vec![
+        create_order_report(
+            Some(cid),
+            parent_id,
+            test_instrument_id(),
+            OrderStatus::Canceled,
+            Quantity::from("1.0"),
+            Quantity::from("0.0"),
+        )
+        .with_price(Price::from("3500.00")),
+        create_order_report(
+            Some(cid),
+            current_id,
+            test_instrument_id(),
+            OrderStatus::Accepted,
+            Quantity::from("1.0"),
+            Quantity::from("0.0"),
+        )
+        .with_price(Price::from("3500.00")),
+    ];
+
+    let mut mass = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::from(2000),
+        None,
+    );
+
+    mass.add_order_reports(reports);
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass, &ctx.exec_engine);
+    let order = ctx.get_order(&cid).unwrap();
+    assert_eq!(
+        order.status(),
+        if venue_id_history {
+            OrderStatus::Accepted
+        } else {
+            OrderStatus::Canceled
+        }
+    );
+    assert_eq!(
+        order.venue_order_id(),
+        Some(if venue_id_history {
+            current_id
+        } else {
+            parent_id
+        })
+    );
+    assert_eq!(order.quantity(), Quantity::from("1.0"));
+    assert_eq!(order.filled_qty(), Quantity::from("0.0"));
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Updated(_)))
+            .count(),
+        usize::from(venue_id_history)
+    );
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .orders(None, None, None, None, None)
+            .len(),
+        1
+    );
+}
+
+#[rstest]
+#[case::accepted(OrderStatus::Accepted, "0", true)]
+#[case::partially_filled(OrderStatus::PartiallyFilled, "2", true)]
+#[case::unchanged(OrderStatus::Accepted, "0", false)]
+#[tokio::test]
+async fn test_reconcile_pending_update_working_report(
+    #[case] status: OrderStatus,
+    #[case] filled_qty: &str,
+    #[case] changed: bool,
+) {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let cid = ClientOrderId::from("O-PENDING-AMEND");
+    let vid = VenueOrderId::from("V-PENDING-AMEND");
+    let order = create_pending_update_order(
+        "O-PENDING-AMEND",
+        test_instrument_id(),
+        OrderSide::Buy,
+        "1",
+        "3000.00",
+        vid,
+    );
+    ctx.add_order(order);
+    let mut report = create_order_report(
+        Some(cid),
+        vid,
+        test_instrument_id(),
+        status,
+        Quantity::from(if changed { "3" } else { "1" }),
+        Quantity::from(filled_qty),
+    );
+
+    if changed {
+        report.price = Some(Price::from("3100.00"));
+    }
+
+    if status == OrderStatus::PartiallyFilled {
+        report.avg_px = Some(dec!(3050));
+    }
+
+    let mass = create_mass_status(vec![report], vec![]);
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass, &ctx.exec_engine);
+    let after = ctx.get_order(&cid).unwrap();
+
+    if changed {
+        assert_eq!(
+            result.events.len(),
+            if status == OrderStatus::PartiallyFilled {
+                2
+            } else {
+                1
+            }
+        );
+        assert!(matches!(result.events[0], OrderEventAny::Updated(_)));
+
+        if status == OrderStatus::PartiallyFilled {
+            assert!(matches!(result.events[1], OrderEventAny::Filled(_)));
+        }
+
+        assert_eq!(after.status(), status);
+        assert_eq!(after.quantity(), Quantity::from("3"));
+        assert_eq!(after.price(), Some(Price::from("3100.00")));
+    } else {
+        assert!(result.events.is_empty());
+        assert_eq!(after.status(), OrderStatus::PendingUpdate);
+        assert_eq!(after.quantity(), Quantity::from("1"));
+        assert_eq!(after.price(), Some(Price::from("3000.00")));
+    }
+
+    assert_eq!(after.filled_qty(), Quantity::from(filled_qty));
+}
+
+#[rstest]
+#[case::working(OrderStatus::Accepted)]
+#[case::triggered(OrderStatus::Triggered)]
+#[tokio::test]
+async fn test_reconcile_pending_update_trigger_price(#[case] status: OrderStatus) {
+    let mut ctx = TestContext::new();
+    ctx.add_instrument(test_instrument());
+    let cid = ClientOrderId::from("O-TRIGGER-AMEND");
+    let vid = VenueOrderId::from("V-TRIGGER-AMEND");
+    let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+        .instrument_id(test_instrument_id())
+        .client_order_id(cid)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .price(Price::from("3100.00"))
+        .trigger_price(Price::from("3200.00"))
+        .build();
+    apply_submitted_and_accepted(&mut order, vid);
+    let pending = OrderPendingUpdateSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(order.instrument_id())
+        .client_order_id(cid)
+        .account_id(test_account_id())
+        .venue_order_id(vid)
+        .build();
+    order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+    ctx.add_order(order);
+    let mut report = create_order_report(
+        Some(cid),
+        vid,
+        test_instrument_id(),
+        status,
+        Quantity::from("1"),
+        Quantity::from(0),
+    );
+    report.order_type = OrderType::StopLimit;
+    report.price = Some(Price::from("3100.00"));
+    report.trigger_price = Some(Price::from("3250.00"));
+    report.ts_triggered = Some(report.ts_last);
+    let mass = create_mass_status(vec![report], vec![]);
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass, &ctx.exec_engine);
+    assert_eq!(
+        result.events.len(),
+        if status == OrderStatus::Triggered {
+            2
+        } else {
+            1
+        }
+    );
+
+    let OrderEventAny::Updated(updated) = &result.events[0] else {
+        panic!("expected amendment before trigger, was {:?}", result.events);
+    };
+
+    assert_eq!(updated.trigger_price, Some(Price::from("3250.00")));
+
+    if status == OrderStatus::Triggered {
+        assert!(matches!(result.events[1], OrderEventAny::Triggered(_)));
+    }
+
+    let after = ctx.get_order(&cid).unwrap();
+    assert_eq!(after.status(), status);
+    assert_eq!(after.quantity(), Quantity::from("1"));
+    assert_eq!(after.price(), Some(Price::from("3100.00")));
+    assert_eq!(after.trigger_price(), Some(Price::from("3250.00")));
+    assert_eq!(after.filled_qty(), Quantity::from(0));
 }

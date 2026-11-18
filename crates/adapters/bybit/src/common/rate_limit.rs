@@ -245,14 +245,6 @@ impl SlidingWindows {
             .or_insert_with(|| Window::new(limit, period));
         window.blocked_until = Some(now + duration);
     }
-
-    #[cfg(test)]
-    fn observed_limit(&self, key: &LimitKey) -> Option<u32> {
-        self.windows
-            .lock()
-            .get(key)
-            .and_then(|window| window.observed_limit)
-    }
 }
 
 type ConnectionLimiter = RateLimiter<Ustr, MonotonicClock>;
@@ -572,6 +564,8 @@ fn account_limit(endpoint: &str, category: Option<BybitProductType>) -> (String,
         "/v5/account/borrow" | "/v5/account/no-convert-repay" | "/v5/account/repay" => 1,
         "/v5/account/fee-rate"
         | "/v5/account/set-margin-mode"
+        | "/v5/asset/withdraw/create"
+        | "/v5/asset/withdraw/query-record"
         | "/v5/user/escrow_sub_members"
         | "/v5/user/submembers"
         | "/v5/user/update-api"
@@ -754,7 +748,12 @@ mod tests {
         let windows = SlidingWindows::default();
         let key = test_key("authoritative-orders");
         windows.observe(&key, 10, Duration::from_secs(1), 20, 19, None);
-        assert_eq!(windows.observed_limit(&key), Some(20));
+        let observed_limit = windows
+            .windows
+            .lock()
+            .get(&key)
+            .and_then(|window| window.observed_limit);
+        assert_eq!(observed_limit, Some(20));
     }
 
     #[rstest::rstest]
@@ -763,6 +762,8 @@ mod tests {
     #[case("/v5/account/repay", None, 1)]
     #[case("/v5/account/fee-rate", None, 5)]
     #[case("/v5/account/set-margin-mode", None, 5)]
+    #[case("/v5/asset/withdraw/create", None, 5)]
+    #[case("/v5/asset/withdraw/query-record", None, 5)]
     #[case("/v5/user/escrow_sub_members", None, 5)]
     #[case("/v5/user/submembers", None, 5)]
     #[case("/v5/user/update-api", None, 5)]

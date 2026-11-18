@@ -34,7 +34,6 @@ repos:
       - id: debug-statements
       - id: detect-private-key
       - id: check-added-large-files
-        exclude: ^crates/serialization/generated/capnp/
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-illegal-windows-names
@@ -74,7 +73,7 @@ repos:
         args: [--strict]
 
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
-    rev: v1.30.1
+    rev: v1.32.0
     hooks:
       - id: zizmor
         name: zizmor (security)
@@ -89,15 +88,17 @@ repos:
     hooks:
       - id: yamlfmt
 
-  - repo: https://github.com/hadolint/hadolint
+  - repo: https://github.com/AleksaC/hadolint-py
     rev: v2.15.1
     hooks:
-      - id: hadolint-docker
+      - id: hadolint
         name: dockerfile-lint
         description: Lint Dockerfiles for best practices and errors
+        types: [file]
+        files: (^|/)Dockerfile[^/]*$
 
   - repo: https://github.com/crate-ci/typos
-    rev: v1.50.3
+    rev: v1.52.2
     hooks:
       - id: typos
         description: Enforces American English spelling and checks for common typos
@@ -312,14 +313,6 @@ repos:
         files: "\\.rs$"
         pass_filenames: false
 
-      - id: check-formatting-py
-        name: check formatting (Python)
-        description: Enforces formatting conventions in Python code
-        entry: bash .pre-commit-hooks/check_formatting_py.sh
-        language: system
-        files: "\\.py$"
-        pass_filenames: false
-
       - id: check-docs-conventions
         name: check docs conventions
         description: Enforces documentation conventions
@@ -383,6 +376,18 @@ repos:
             scripts/cargo-features\.bash
           )$
         types: [file]
+        pass_filenames: false
+
+      - id: check-clippy-allowances
+        name: check generated Clippy allowances
+        entry: python3 -B scripts/update-clippy-allowances.py --check
+        language: system
+        files: >-
+          (?x)^(
+            Cargo\.toml|.*\.rs|
+            scripts/(update-clippy-allowances\.py|ci/test_clippy_allowances\.py)|
+            \.pre-commit-config\.yaml
+          )$
         pass_filenames: false
 
       - id: cargo-clippy-network-turmoil-non-linux
@@ -470,7 +475,7 @@ repos:
   #  Python formatting and linting
   ##############################################################################
   - repo: https://github.com/asottile/pyupgrade
-    rev: v3.21.2
+    rev: v3.22.0
     hooks:
       - id: pyupgrade
         args: ["--py313-plus"]
@@ -483,7 +488,7 @@ repos:
         types: [python]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.10
+    rev: v0.17.5
     hooks:
       - id: ruff
         name: ruff
@@ -511,8 +516,17 @@ repos:
           - "--recursive"
           - "--in-place"
 
+  - repo: local
+    hooks:
+      - id: check-formatting-py
+        name: check formatting (Python)
+        description: Enforces statement spacing after Ruff formats Python code
+        entry: bash .pre-commit-hooks/check_formatting_py.sh --fix
+        language: system
+        files: "\\.py$"
+
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.12.22 # Must match [uv] in .nautilus-engineering/tools.toml
+    rev: 0.13.7 # Must match [uv] in .nautilus-engineering/tools.toml
     hooks:
       - id: uv-lock
         args: ["--project", "python"]
@@ -544,7 +558,7 @@ repos:
   #  Markdown formatting and linting
   ##############################################################################
   - repo: https://github.com/DavidAnson/markdownlint-cli2
-    rev: v0.23.3
+    rev: v0.24.1
     hooks:
       - id: markdownlint-cli2
         name: markdownlint

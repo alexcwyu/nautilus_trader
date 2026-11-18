@@ -15,11 +15,11 @@ Add the live crate, your venue adapter, and supporting crates to
 
 ```toml
 [dependencies]
-nautilus-common = "0.65"
-nautilus-live = "0.65"
-nautilus-model = "0.65"
-nautilus-okx = "0.65"
-nautilus-trading = { version = "0.65", features = ["examples"] }
+nautilus-common = "0.67"
+nautilus-live = "0.67"
+nautilus-model = "0.67"
+nautilus-okx = "0.67"
+nautilus-trading = { version = "0.67", features = ["examples"] }
 
 anyhow = "1"
 dotenvy = "0.15"

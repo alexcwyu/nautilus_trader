@@ -116,11 +116,13 @@ BENCHMARK_STATISTICS = [
 ]
 
 ALL_STATISTICS = NO_ARG_STATISTICS + PERIOD_STATISTICS + THRESHOLD_STATISTICS + BENCHMARK_STATISTICS
+
 STATISTIC_METHODS = (
     "calculate_from_positions",
     "calculate_from_realized_pnls",
     "calculate_from_returns",
 )
+
 # `PortfolioStatistic` shares the calculation surface but is the extension point for
 # user-defined statistics, not a built-in, so it stays out of the built-in inventory.
 EXPOSED_STATISTICS = sorted(
@@ -365,6 +367,31 @@ def test_portfolio_analyzer_add_return_and_stats() -> None:
     stats = analyzer.get_performance_stats_returns()
 
     assert len(stats) > 0
+
+
+def test_portfolio_analyzer_stats_are_ordered_by_name() -> None:
+    """
+    Test portfolio analyzer stats are ordered by name.
+    """
+    analyzer = PortfolioAnalyzer()
+    for statistic in (
+        ReturnsAverage(),
+        ReturnsVolatility(),
+        SharpeRatio(),
+        SortinoRatio(),
+        ProfitFactor(),
+        RiskReturnRatio(),
+        ReturnsAverageWin(),
+        ReturnsAverageLoss(),
+    ):
+        analyzer.register_statistic(statistic)
+
+    analyzer.add_return(1_000_000_000, 0.01)
+    analyzer.add_return(2_000_000_000, -0.005)
+
+    stats = analyzer.get_performance_stats_returns()
+
+    assert list(stats) == sorted(stats)
 
 
 def test_portfolio_analyzer_add_position_return() -> None:

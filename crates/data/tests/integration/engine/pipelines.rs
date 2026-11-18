@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use nautilus_common::msgbus::ShareableMessageHandler;
+
 use super::*;
 
 #[rstest]
@@ -58,7 +60,7 @@ fn test_process_pipeline_quote_writes_cache_by_default(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let quote = quote_tick(instrument_id, "1.00000", "1.00010", 1);
     data_engine.process_pipeline(Data::Quote(quote));
@@ -81,7 +83,7 @@ fn test_process_pipeline_skips_cache_when_disabled(
         ..DataEngineConfig::default()
     };
 
-    let mut data_engine = DataEngine::new(clock, cache.clone(), Some(config));
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
 
     let pipeline_topic_str =
         pipeline_topic_of(switchboard::get_quotes_topic(instrument_id).as_ref());
@@ -111,7 +113,7 @@ fn test_process_pipeline_bar_publishes_on_pipeline_topic(stub_msgbus: Rc<RefCell
     let _ = stub_msgbus;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let bar = Bar::default();
     let live_topic = switchboard::get_bars_topic(bar.bar_type);
@@ -173,7 +175,7 @@ fn test_process_pipeline_trade_publishes_on_pipeline_topic_only(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let live_topic = switchboard::get_trades_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -212,7 +214,7 @@ fn test_process_pipeline_mark_price_publishes_on_pipeline_topic_only(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let live_topic = switchboard::get_mark_price_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -257,7 +259,7 @@ fn test_process_pipeline_index_price_publishes_on_pipeline_topic_only(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let live_topic = switchboard::get_index_price_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -303,7 +305,7 @@ fn test_process_pipeline_funding_rate_publishes_on_pipeline_topic_only(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let live_topic = switchboard::get_funding_rate_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -351,7 +353,7 @@ fn test_process_pipeline_instrument_status_publishes_on_pipeline_topic_only(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     let instrument_id = audusd_sim.id;
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let live_topic = switchboard::get_instrument_status_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -585,7 +587,7 @@ fn test_process_pipeline_bar_drops_out_of_sequence(stub_msgbus: Rc<RefCell<Messa
         ..DataEngineConfig::default()
     };
 
-    let mut data_engine = DataEngine::new(clock, cache.clone(), Some(config));
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
 
     let template = Bar::default();
     let bar_type = template.bar_type;
@@ -621,7 +623,7 @@ fn test_process_pipeline_skips_synthetic_quote_republish(stub_msgbus: Rc<RefCell
     let _ = stub_msgbus;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let (synthetic, component_a, component_b) = synthetic_index();
     let synthetic_id = synthetic.id;
@@ -662,7 +664,7 @@ fn test_process_pipeline_skips_synthetic_trade_republish(stub_msgbus: Rc<RefCell
     let _ = stub_msgbus;
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let (synthetic, component_a, component_b) = synthetic_index();
     let synthetic_id = synthetic.id;
@@ -700,7 +702,7 @@ fn test_process_pipeline_depth_skips_derived_quote_emission(stub_msgbus: Rc<RefC
         ..DataEngineConfig::default()
     };
 
-    let mut data_engine = DataEngine::new(clock, cache.clone(), Some(config));
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
 
     let depth = stub_depth10();
     let instrument_id = depth.instrument_id;
@@ -734,7 +736,7 @@ fn test_time_range_pipeline_issues_one_child_at_a_time(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let parent_id = UUID4::new();
@@ -804,7 +806,7 @@ fn test_time_range_pipeline_uses_data_count_feedback(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let params: Params = serde_json::from_value(json!({
@@ -876,12 +878,12 @@ fn test_time_range_pipeline_point_data_uses_single_point_windows(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let parent_id = UUID4::new();
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-point-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-point-parent")));
     msgbus::register_response_handler(&parent_id, handler);
 
     let params: Params = serde_json::from_value(json!({
@@ -1006,14 +1008,14 @@ fn test_time_range_pipeline_updates_parent_request_bar_aggregation(
         .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
         .unwrap();
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder =
-        register_time_range_recorder(&mut data_engine, clock, cache.clone(), client_id, venue);
+        register_time_range_recorder(&mut data_engine, clock, Rc::clone(&cache), client_id, venue);
 
     let bar_type = BarType::from(format!("{instrument_id}-1-SECOND-LAST-INTERNAL").as_str());
     let parent_id = UUID4::new();
     let (handler, saver) =
-        get_any_saving_handler::<TradesResponse>(Some(Ustr::from("time-range-agg-parent")));
+        get_response_saving_handler::<TradesResponse>(Some(Ustr::from("time-range-agg-parent")));
     msgbus::register_response_handler(&parent_id, handler);
 
     let params: Params = serde_json::from_value(json!({
@@ -1107,12 +1109,12 @@ fn test_time_range_pipeline_emits_empty_parent_response(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let parent_id = UUID4::new();
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-parent")));
     msgbus::register_response_handler(&parent_id, handler);
 
     let params: Params = serde_json::from_value(json!({"time_range_generator": ""})).unwrap();
@@ -1164,12 +1166,12 @@ fn test_reset_clears_time_range_pipeline_state(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let parent_id = UUID4::new();
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-reset-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-reset-parent")));
     msgbus::register_response_handler(&parent_id, parent_handler);
 
     let params: Params = serde_json::from_value(json!({
@@ -1191,7 +1193,7 @@ fn test_reset_clears_time_range_pipeline_state(
 
     let child = recorded_time_range_request_quotes(&recorder)[0].clone();
     let (child_handler, child_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-reset-child")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-reset-child")));
     msgbus::register_response_handler(&child.request_id, child_handler);
 
     assert_eq!(data_engine.time_range_pipeline_count(), 1);
@@ -1228,13 +1230,13 @@ fn test_time_range_pipeline_request_join_runs_end_to_end(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let leg_a = UUID4::new();
     let leg_b = UUID4::new();
     let parent_id = UUID4::new();
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-join-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("time-range-join-parent")));
     msgbus::register_response_handler(&parent_id, handler);
 
     let params: Params = serde_json::from_value(json!({
@@ -1324,6 +1326,92 @@ fn test_time_range_pipeline_request_join_runs_end_to_end(
 }
 
 #[rstest]
+fn test_time_range_join_replays_book_snapshot_for_first_window_only(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = clock;
+    advance_test_clock_to(&clock, 10_000_000_000);
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(clock, cache, None);
+
+    let root = UUID4::new();
+    let leg = UUID4::new();
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+
+    let params: Params = serde_json::from_value(json!({
+        "time_range_generator": "",
+        "durations_seconds": [1],
+    }))
+    .unwrap();
+    let start = UnixNanos::from(1_000_000_000);
+    engine
+        .execute_request(RequestCommand::Join(RequestJoin::new(
+            vec![leg],
+            Some(start.to_datetime_utc()),
+            Some(UnixNanos::from(3_000_000_000).to_datetime_utc()),
+            root,
+            UnixNanos::default(),
+            Some(params),
+            None,
+        )))
+        .unwrap();
+
+    let f_last = RecordFlag::F_LAST as u8;
+    let mut midnight =
+        OrderBookDelta::clear(instrument_id, 0, UnixNanos::default(), UnixNanos::default());
+    midnight.flags |= f_last;
+    let closed = delta_with_flag(instrument_id, 1_200_000_000, f_last);
+    let open = delta_with_flag(instrument_id, 1_500_000_000, 0);
+    let close = delta_with_flag(instrument_id, 2_500_000_000, f_last);
+
+    engine.response(leg_book_deltas_response(
+        leg,
+        instrument_id,
+        client_id,
+        vec![midnight, closed, open],
+    ));
+    engine.response(leg_book_deltas_response(
+        leg,
+        instrument_id,
+        client_id,
+        vec![midnight, close],
+    ));
+
+    let mut start_snapshot = OrderBookDelta::clear(instrument_id, 0, start, start);
+    start_snapshot.flags |= f_last;
+
+    let completions: Vec<_> = saver
+        .get_messages()
+        .iter()
+        .map(|envelope| {
+            (
+                envelope.completed(),
+                envelope.failure_reason().map(str::to_owned),
+            )
+        })
+        .collect();
+
+    assert_eq!(
+        delivered_book_deltas(&saver),
+        vec![vec![start_snapshot, closed], vec![open, close], vec![]]
+    );
+    assert_eq!(
+        completions,
+        vec![(false, None), (false, None), (true, None)]
+    );
+}
+
+#[rstest]
 fn test_time_range_pipeline_request_join_rejects_empty_window(
     stub_msgbus: Rc<RefCell<MessageBus>>,
 ) {
@@ -1373,13 +1461,13 @@ fn test_time_range_pipeline_supports_bars_variant(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder =
-        register_time_range_recorder(&mut data_engine, clock, cache.clone(), client_id, venue);
+        register_time_range_recorder(&mut data_engine, clock, Rc::clone(&cache), client_id, venue);
 
     let parent_id = UUID4::new();
     let (handler, saver) =
-        get_any_saving_handler::<BarsResponse>(Some(Ustr::from("time-range-bars-parent")));
+        get_response_saving_handler::<BarsResponse>(Some(Ustr::from("time-range-bars-parent")));
     msgbus::register_response_handler(&parent_id, handler);
 
     let params: Params = serde_json::from_value(json!({"time_range_generator": ""})).unwrap();
@@ -1427,12 +1515,13 @@ fn test_time_range_pipeline_supports_book_deltas_variant(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let parent_id = UUID4::new();
-    let (handler, saver) =
-        get_any_saving_handler::<BookDeltasResponse>(Some(Ustr::from("time-range-deltas-parent")));
+    let (handler, saver) = get_response_saving_handler::<BookDeltasResponse>(Some(Ustr::from(
+        "time-range-deltas-parent",
+    )));
     msgbus::register_response_handler(&parent_id, handler);
     let live_topic = switchboard::get_book_deltas_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -1486,6 +1575,240 @@ fn test_time_range_pipeline_supports_book_deltas_variant(
 }
 
 #[rstest]
+#[case::closed_in_next_window(RecordFlag::F_LAST as u8)]
+#[case::open_at_completion(0)]
+fn test_time_range_pipeline_carries_open_book_event_across_windows(
+    #[case] second_flags: u8,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    advance_test_clock_to(&clock, 10_000_000_000);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
+
+    let live_topic = switchboard::get_book_deltas_topic(instrument_id);
+    let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
+    let pipeline_topic: MStr<Topic> = pipeline_topic_str.as_str().into();
+    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDeltas>(
+        Some(Ustr::from("time-range-deltas-carry")),
+    );
+    msgbus::subscribe_book_deltas(pipeline_topic.into(), pipeline_handler, None);
+
+    let params: Params = serde_json::from_value(json!({
+        "time_range_generator": "",
+        "durations_seconds": [1],
+    }))
+    .unwrap();
+    let parent_id = UUID4::new();
+    let (handler, envelopes) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&parent_id, handler);
+    let req = RequestCommand::BookDeltas(RequestBookDeltas::new(
+        instrument_id,
+        Some(UnixNanos::from(1_000_000_000).to_datetime_utc()),
+        Some(UnixNanos::from(3_000_000_000).to_datetime_utc()),
+        None,
+        Some(client_id),
+        parent_id,
+        UnixNanos::default(),
+        Some(params),
+    ));
+    data_engine.execute_request(req).unwrap();
+
+    let first_window = recorded_time_range_request_book_deltas(&recorder)[0].clone();
+    let first = delta_with_flag(instrument_id, 1_500_000_000, 0);
+    data_engine.response(time_range_book_deltas_response(
+        &first_window,
+        instrument_id,
+        client_id,
+        1,
+        vec![first],
+    ));
+
+    let second_window = recorded_time_range_request_book_deltas(&recorder)[1].clone();
+    let second = delta_with_flag(instrument_id, 2_500_000_000, second_flags);
+    data_engine.response(time_range_book_deltas_response(
+        &second_window,
+        instrument_id,
+        client_id,
+        1,
+        vec![second],
+    ));
+
+    let events: Vec<Vec<OrderBookDelta>> = pipeline_saver
+        .get_messages()
+        .iter()
+        .map(|batch| batch.deltas.clone())
+        .collect();
+    let completed: Vec<bool> = envelopes
+        .get_messages()
+        .iter()
+        .map(DataResponseEnvelope::completed)
+        .collect();
+    assert_eq!(events, vec![vec![first, second]]);
+    assert_eq!(
+        delivered_book_deltas(&envelopes),
+        vec![vec![first, second], vec![]],
+        "the requester receives the event whole, ahead of the final envelope"
+    );
+    assert_eq!(completed, vec![false, true]);
+    assert_eq!(data_engine.time_range_pipeline_count(), 0);
+}
+
+#[rstest]
+#[case::completed(false, false, None)]
+#[case::failed(false, true, Some("Window unavailable"))]
+#[case::completed_mid_event(
+    true,
+    false,
+    Some(
+        "Order book deltas end without an `F_LAST` delta for AUD/USD.SIM \
+         (1 pending, ts_init 1500000000 to 1500000000)"
+    )
+)]
+#[case::failed_mid_event(
+    true,
+    true,
+    Some(
+        "Window unavailable; Order book deltas end without an `F_LAST` delta for AUD/USD.SIM \
+         (1 pending, ts_init 1500000000 to 1500000000)"
+    )
+)]
+fn test_time_range_pipeline_completes_open_book_event_when_join_leg_completes(
+    #[case] source_sets_f_last: bool,
+    #[case] fail_second_window: bool,
+    #[case] expected_failure: Option<&str>,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
+    advance_test_clock_to(&clock, 10_000_000_000);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
+
+    let live_topic = switchboard::get_book_deltas_topic(instrument_id);
+    let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
+    let pipeline_topic: MStr<Topic> = pipeline_topic_str.as_str().into();
+    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDeltas>(
+        Some(Ustr::from("time-range-deltas-join-leg")),
+    );
+    msgbus::subscribe_book_deltas(pipeline_topic.into(), pipeline_handler, None);
+
+    let root = UUID4::new();
+    let leg = UUID4::new();
+    let (root_handler, root_saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, root_handler);
+    let (leg_handler, leg_saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&leg, leg_handler);
+    data_engine
+        .execute_request(RequestCommand::Join(RequestJoin::new(
+            vec![leg],
+            None,
+            None,
+            root,
+            UnixNanos::default(),
+            None,
+            None,
+        )))
+        .unwrap();
+
+    let params: Params = serde_json::from_value(json!({
+        "time_range_generator": "",
+        "durations_seconds": [1],
+    }))
+    .unwrap();
+    data_engine
+        .execute_request(RequestCommand::BookDeltas(RequestBookDeltas::new(
+            instrument_id,
+            Some(UnixNanos::from(1_000_000_000).to_datetime_utc()),
+            Some(UnixNanos::from(3_000_000_000).to_datetime_utc()),
+            None,
+            Some(client_id),
+            leg,
+            UnixNanos::default(),
+            Some(params),
+        )))
+        .unwrap();
+
+    let first_window = recorded_time_range_request_book_deltas(&recorder)[0].clone();
+    let closed = delta_with_flag(instrument_id, 1_200_000_000, RecordFlag::F_LAST as u8);
+    let open = delta_with_flag(instrument_id, 1_500_000_000, 0);
+
+    let first_payload = if source_sets_f_last {
+        vec![closed, open]
+    } else {
+        vec![open]
+    };
+
+    data_engine.response(time_range_book_deltas_response(
+        &first_window,
+        instrument_id,
+        client_id,
+        first_payload.len() as u64,
+        first_payload,
+    ));
+
+    let second_window = recorded_time_range_request_book_deltas(&recorder)[1].clone();
+
+    if fail_second_window {
+        data_engine.request_failed(DataRequestFailed {
+            request_id: second_window.request_id,
+            reason: "Window unavailable".to_owned(),
+            response: None,
+        });
+    } else {
+        data_engine.response(time_range_book_deltas_response(
+            &second_window,
+            instrument_id,
+            client_id,
+            0,
+            Vec::new(),
+        ));
+    }
+
+    let events: Vec<Vec<OrderBookDelta>> = pipeline_saver
+        .get_messages()
+        .iter()
+        .map(|batch| batch.deltas.clone())
+        .collect();
+
+    let completions: Vec<(bool, Option<String>)> = root_saver
+        .get_messages()
+        .iter()
+        .map(|envelope| {
+            (
+                envelope.completed(),
+                envelope.failure_reason().map(str::to_owned),
+            )
+        })
+        .collect();
+
+    let leg_deltas: Vec<Vec<OrderBookDelta>> = delivered_book_deltas(&leg_saver)
+        .into_iter()
+        .filter(|deltas| !deltas.is_empty())
+        .collect();
+
+    let expected_event = if source_sets_f_last { closed } else { open };
+    assert_eq!(events, vec![vec![expected_event]]);
+    assert_eq!(leg_deltas, vec![vec![expected_event]]);
+    assert_eq!(
+        completions,
+        vec![(true, expected_failure.map(str::to_owned))]
+    );
+    assert_eq!(data_engine.time_range_pipeline_count(), 0);
+}
+
+#[rstest]
 fn test_time_range_pipeline_supports_book_depth_variant(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
@@ -1497,12 +1820,13 @@ fn test_time_range_pipeline_supports_book_depth_variant(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder = register_time_range_recorder(&mut data_engine, clock, cache, client_id, venue);
 
     let parent_id = UUID4::new();
-    let (handler, saver) =
-        get_any_saving_handler::<BookDepthResponse>(Some(Ustr::from("time-range-depth-parent")));
+    let (handler, saver) = get_response_saving_handler::<BookDepthResponse>(Some(Ustr::from(
+        "time-range-depth-parent",
+    )));
     msgbus::register_response_handler(&parent_id, handler);
     let live_topic = switchboard::get_book_depth_topic(instrument_id);
     let pipeline_topic_str = pipeline_topic_of(live_topic.as_ref());
@@ -1568,12 +1892,12 @@ fn test_time_range_pipeline_supports_funding_rates_variant(
     let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
     let cache: Rc<RefCell<Cache>> = Rc::new(RefCell::new(Cache::default()));
     advance_test_clock_to(&clock, 10_000_000_000);
-    let mut data_engine = DataEngine::new(clock.clone(), cache.clone(), None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
     let recorder =
-        register_time_range_recorder(&mut data_engine, clock, cache.clone(), client_id, venue);
+        register_time_range_recorder(&mut data_engine, clock, Rc::clone(&cache), client_id, venue);
 
     let parent_id = UUID4::new();
-    let (handler, saver) = get_any_saving_handler::<FundingRatesResponse>(Some(Ustr::from(
+    let (handler, saver) = get_response_saving_handler::<FundingRatesResponse>(Some(Ustr::from(
         "time-range-funding-parent",
     )));
     msgbus::register_response_handler(&parent_id, handler);
@@ -1631,7 +1955,7 @@ fn test_pipeline_single_response_passes_through(
 
     let request_id = UUID4::new();
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-single")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-single")));
     msgbus::register_response_handler(&request_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -1685,7 +2009,7 @@ fn test_pipeline_two_legs_emits_one_rebuilt_response(
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-two")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-two")));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -1749,7 +2073,7 @@ fn test_pipeline_three_legs_fires_on_third_arrival(
     }
 
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-three")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-three")));
     msgbus::register_response_handler(&parent_id, handler);
 
     for (i, leg_id) in legs.iter().enumerate() {
@@ -1800,7 +2124,7 @@ fn test_pipeline_trims_bounds_on_each_leg(
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-trim")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-trim")));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -1855,7 +2179,7 @@ fn test_request_join_two_phase_emits_parent_response(
         .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(10_000_000_000_u64), true);
-    let mut data_engine = DataEngine::new(clock, cache.clone(), None);
+    let mut data_engine = DataEngine::new(clock, Rc::clone(&cache), None);
 
     let leg_a = UUID4::new();
     let leg_b = UUID4::new();
@@ -1875,13 +2199,13 @@ fn test_request_join_two_phase_emits_parent_response(
         .unwrap();
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("join-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("join-parent")));
     msgbus::register_response_handler(&join_id, parent_handler);
     let (leg_a_handler, leg_a_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("join-leg-a")));
+        get_typed_message_saving_handler::<DataResponseEnvelope>(Some(Ustr::from("join-leg-a")));
     msgbus::register_response_handler(&leg_a, leg_a_handler);
     let (leg_b_handler, leg_b_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("join-leg-b")));
+        get_typed_message_saving_handler::<DataResponseEnvelope>(Some(Ustr::from("join-leg-b")));
     msgbus::register_response_handler(&leg_b, leg_b_handler);
 
     data_engine.response(leg_quotes_response(
@@ -1908,9 +2232,11 @@ fn test_request_join_two_phase_emits_parent_response(
     assert_eq!(ts_inits, vec![1_000, 2_000]);
 
     assert_eq!(leg_a_saver.get_messages().len(), 1);
-    assert!(leg_a_saver.get_messages()[0].data.is_empty());
+    assert!(leg_a_saver.get_messages()[0].response().is_none());
+    assert!(leg_a_saver.get_messages()[0].completed());
     assert_eq!(leg_b_saver.get_messages().len(), 1);
-    assert!(leg_b_saver.get_messages()[0].data.is_empty());
+    assert!(leg_b_saver.get_messages()[0].response().is_none());
+    assert!(leg_b_saver.get_messages()[0].completed());
 
     // Joined data must reach the cache via the normal per-variant handler
     // path; the final response routes through `response()` after the
@@ -1983,7 +2309,7 @@ fn test_request_join_trims_to_parent_window(
         .downcast_mut::<VirtualClock>()
         .unwrap()
         .advance_time(UnixNanos::from(10_000_000_000_u64), true);
-    let mut data_engine = DataEngine::new(clock.clone(), cache, None);
+    let mut data_engine = DataEngine::new(Rc::clone(&clock), cache, None);
 
     let leg_a = UUID4::new();
     let leg_b = UUID4::new();
@@ -2006,7 +2332,7 @@ fn test_request_join_trims_to_parent_window(
         .unwrap();
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("join-window")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("join-window")));
     msgbus::register_response_handler(&join_id, parent_handler);
 
     // Legs return wider data than the parent join window; only entries in
@@ -2070,8 +2396,9 @@ fn test_pipeline_two_legs_trims_against_parent_window(
     data_engine.register_request_pipeline_leg(leg_a, parent_id);
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
-    let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-parent-window-trim")));
+    let (handler, saver) = get_response_saving_handler::<QuotesResponse>(Some(Ustr::from(
+        "pipeline-parent-window-trim",
+    )));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -2137,8 +2464,9 @@ fn test_pipeline_two_legs_inherits_parent_bars_window(
     data_engine.register_request_pipeline_leg(leg_a, parent_id);
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
-    let (handler, saver) =
-        get_any_saving_handler::<BarsResponse>(Some(Ustr::from("pipeline-parent-bars-window")));
+    let (handler, saver) = get_response_saving_handler::<BarsResponse>(Some(Ustr::from(
+        "pipeline-parent-bars-window",
+    )));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_bars_response(
@@ -2198,8 +2526,9 @@ fn test_pipeline_two_legs_with_no_parent_window_preserves_leg_bounds(
     data_engine.register_request_pipeline_leg(leg_a, parent_id);
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
-    let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-no-parent-window")));
+    let (handler, saver) = get_response_saving_handler::<QuotesResponse>(Some(Ustr::from(
+        "pipeline-no-parent-window",
+    )));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -2262,7 +2591,7 @@ fn test_pipeline_trims_when_only_parent_start_is_set(
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-trim-start-only")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-trim-start-only")));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -2330,7 +2659,7 @@ fn test_pipeline_trims_when_only_parent_end_is_set(
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
     let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-trim-end-only")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("pipeline-trim-end-only")));
     msgbus::register_response_handler(&parent_id, handler);
 
     data_engine.response(leg_quotes_response(
@@ -2399,10 +2728,10 @@ fn test_reset_clears_pipeline_and_join_state(
     assert_eq!(data_engine.pending_join_request_count(), 1);
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("reset-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("reset-parent")));
     msgbus::register_response_handler(&join_id, parent_handler);
     let (leg_b_handler, leg_b_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("reset-leg-b")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("reset-leg-b")));
     msgbus::register_response_handler(&leg_b, leg_b_handler);
 
     data_engine.reset();
@@ -2505,11 +2834,11 @@ fn test_pipeline_unsupported_variant_drops_response(
     data_engine.new_request_pipeline(parent_request, 1);
     data_engine.register_request_pipeline_leg(leg_id, parent_id);
 
-    let (parent_handler, parent_saver) = get_any_saving_handler::<OptionChainReferencePriceResponse>(
-        Some(Ustr::from("pipeline-unsupported-parent")),
-    );
+    let (parent_handler, parent_saver) = get_response_saving_handler::<
+        OptionChainReferencePriceResponse,
+    >(Some(Ustr::from("pipeline-unsupported-parent")));
     msgbus::register_response_handler(&parent_id, parent_handler);
-    let (leg_handler, leg_saver) = get_any_saving_handler::<OptionChainReferencePriceResponse>(
+    let (leg_handler, leg_saver) = get_response_saving_handler::<OptionChainReferencePriceResponse>(
         Some(Ustr::from("pipeline-unsupported-leg")),
     );
     msgbus::register_response_handler(&leg_id, leg_handler);
@@ -2622,10 +2951,10 @@ fn test_pipeline_reset_mid_buffer_clears_partial_state(
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("mid-reset-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("mid-reset-parent")));
     msgbus::register_response_handler(&parent_id, parent_handler);
     let (leg_b_handler, leg_b_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("mid-reset-leg-b")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("mid-reset-leg-b")));
     msgbus::register_response_handler(&leg_b, leg_b_handler);
 
     data_engine.response(leg_quotes_response(
@@ -2694,10 +3023,11 @@ fn test_request_join_single_leg_fires_immediately(
         .unwrap();
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("single-leg-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("single-leg-parent")));
     msgbus::register_response_handler(&join_id, parent_handler);
-    let (leg_handler, leg_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("single-leg-leg")));
+    let (leg_handler, leg_saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(Some(
+        Ustr::from("single-leg-leg"),
+    ));
     msgbus::register_response_handler(&leg, leg_handler);
 
     data_engine.response(leg_quotes_response(
@@ -2716,7 +3046,8 @@ fn test_request_join_single_leg_fires_immediately(
     assert_eq!(ts_inits, vec![1_000]);
 
     assert_eq!(leg_saver.get_messages().len(), 1);
-    assert!(leg_saver.get_messages()[0].data.is_empty());
+    assert!(leg_saver.get_messages()[0].response().is_none());
+    assert!(leg_saver.get_messages()[0].completed());
 
     assert_eq!(data_engine.request_pipeline_count(), 0);
     assert_eq!(data_engine.pending_join_request_count(), 0);
@@ -2763,7 +3094,7 @@ fn test_request_join_rebuilds_same_instrument_book_deltas_legs(
         )))
         .unwrap();
 
-    let (parent_handler, parent_saver) = get_any_saving_handler::<BookDeltasResponse>(Some(
+    let (parent_handler, parent_saver) = get_response_saving_handler::<BookDeltasResponse>(Some(
         Ustr::from("same-instrument-deltas-parent"),
     ));
     msgbus::register_response_handler(&join_id, parent_handler);
@@ -2834,7 +3165,7 @@ fn test_request_join_mixed_instrument_book_deltas_cleans_up_join_staging(
         )))
         .unwrap();
 
-    let (parent_handler, parent_saver) = get_any_saving_handler::<BookDeltasResponse>(Some(
+    let (parent_handler, parent_saver) = get_response_saving_handler::<BookDeltasResponse>(Some(
         Ustr::from("mixed-instrument-deltas-parent"),
     ));
     msgbus::register_response_handler(&join_id, parent_handler);
@@ -2905,8 +3236,9 @@ fn test_request_join_mixed_variants_cleans_up_join_staging(
         .execute_request(RequestCommand::Join(join))
         .unwrap();
 
-    let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("mixed-variant-parent")));
+    let (parent_handler, parent_saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(
+        Some(Ustr::from("mixed-variant-parent")),
+    );
     msgbus::register_response_handler(&join_id, parent_handler);
 
     data_engine.response(leg_quotes_response(
@@ -2941,9 +3273,14 @@ fn test_request_join_mixed_variants_cleans_up_join_staging(
         None,
     )));
 
-    assert!(
-        parent_saver.get_messages().is_empty(),
-        "mixed-variant rebuild must not emit a parent response",
+    let responses = parent_saver.get_messages();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &join_id);
+    assert!(responses[0].completed());
+    assert!(responses[0].response().is_none());
+    assert_eq!(
+        responses[0].failure_reason(),
+        Some("Request pipeline could not rebuild its response"),
     );
     assert_eq!(
         data_engine.request_pipeline_count(),
@@ -2988,7 +3325,7 @@ fn test_pipeline_one_empty_leg_still_emits_parent(
     data_engine.register_request_pipeline_leg(leg_b, parent_id);
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("empty-leg-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("empty-leg-parent")));
     msgbus::register_response_handler(&parent_id, parent_handler);
 
     data_engine.response(leg_quotes_response(
@@ -3051,7 +3388,7 @@ fn test_request_join_all_empty_legs_emits_empty_parent(
         .unwrap();
 
     let (parent_handler, parent_saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("all-empty-parent")));
+        get_response_saving_handler::<QuotesResponse>(Some(Ustr::from("all-empty-parent")));
     msgbus::register_response_handler(&join_id, parent_handler);
 
     data_engine.response(leg_quotes_response(
@@ -3080,7 +3417,7 @@ fn test_request_join_all_empty_legs_emits_empty_parent(
 
 #[cfg(feature = "streaming")]
 #[rstest]
-fn test_request_quotes_dispatch_failure_aborts_pipeline(
+fn test_request_quotes_dispatch_failure_preserves_catalog_data(
     audusd_sim: CurrencyPair,
     stub_msgbus: Rc<RefCell<MessageBus>>,
     client_id: ClientId,
@@ -3105,8 +3442,9 @@ fn test_request_quotes_dispatch_failure_aborts_pipeline(
     data_engine.register_client(adapter, None);
 
     let parent_id = UUID4::new();
-    let (handler, saver) =
-        get_any_saving_handler::<QuotesResponse>(Some(Ustr::from("abort-pipeline-parent")));
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(Some(
+        Ustr::from("abort-pipeline-parent"),
+    ));
     msgbus::register_response_handler(&parent_id, handler);
 
     let req = RequestCommand::Quotes(RequestQuotes::new(
@@ -3119,23 +3457,344 @@ fn test_request_quotes_dispatch_failure_aborts_pipeline(
         UnixNanos::default(),
         None,
     ));
-    let err = data_engine
-        .execute_request(req)
-        .expect_err("client leg dispatch failure must propagate to the caller");
-    let err_message = format!("{err:#}");
-    assert!(
-        err_message.contains("client refused"),
-        "error must originate in the failing client (was: {err_message})"
-    );
+    data_engine.execute_request(req).unwrap();
+    let responses = saver.get_messages();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &parent_id);
+    assert!(responses[0].completed());
+    let expected = format!("Data client {client_id} request failed");
+    assert_eq!(responses[0].failure_reason(), Some(expected.as_str()));
+
+    let Some(DataResponse::Quotes(response)) = responses[0].response() else {
+        panic!("expected valid catalog data");
+    };
+
     assert_eq!(
-        data_engine.request_pipeline_count(),
-        0,
-        "abort_request_pipeline must drain pipeline state on dispatch failure"
+        response.data.as_ref(),
+        &vec![split_quote(instrument_id, 1_500)]
     );
-    assert!(
-        saver.get_messages().is_empty(),
-        "no rebuilt response must reach the parent handler when dispatch fails"
+    assert_eq!(data_engine.request_pipeline_count(), 0);
+}
+
+#[rstest]
+fn test_time_range_pipeline_dispatch_failure_completes_once(
+    #[values(false, true)] later: bool,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    advance_test_clock_to(&clock, 10_000_000_000);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let root = UUID4::new();
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let received = Rc::clone(&replies);
+    let (retry_handler, retry_saver) =
+        get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+
+    let handler = TypedHandler::from(move |response: &DataResponseEnvelope| {
+        received.borrow_mut().push(response.clone());
+        if response.completed() {
+            msgbus::register_response_handler(&root, retry_handler.clone());
+        }
+    });
+
+    msgbus::register_response_handler(&root, handler);
+
+    let recorder = later.then(|| {
+        register_time_range_recorder(
+            &mut engine,
+            Rc::clone(&clock),
+            Rc::clone(&cache),
+            client_id,
+            venue,
+        )
+    });
+
+    if !later {
+        let client =
+            FailingRequestDataClient::new(client_id, Some(venue), "private provider failure");
+        engine.register_client(
+            DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client)),
+            None,
+        );
+    }
+
+    let request = RequestQuotes::new(
+        audusd_sim.id,
+        Some(UnixNanos::from(1_000_000_000).to_datetime_utc()),
+        Some(UnixNanos::from(5_000_000_000).to_datetime_utc()),
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(7),
+        Some(params_from_json(
+            json!({"time_range_generator": "", "durations_seconds": [2]}),
+        )),
     );
+    let result = engine.execute_request(RequestCommand::Quotes(request));
+    let reason = format!("Data client {client_id} request failed");
+
+    if let Some(recorder) = recorder {
+        result.unwrap();
+        let child = recorded_time_range_request_quotes(&recorder)[0].clone();
+        engine.deregister_client(&client_id);
+        let client =
+            FailingRequestDataClient::new(client_id, Some(venue), "private provider failure");
+        engine.register_client(
+            DataClientAdapter::new(client_id, Some(venue), true, true, Box::new(client)),
+            None,
+        );
+        engine.response(time_range_quote_response(
+            &child,
+            audusd_sim.id,
+            client_id,
+            1,
+            vec![pipeline_quote(audusd_sim.id, 1_500_000_000)],
+        ));
+    } else {
+        assert_eq!(result.unwrap_err().to_string(), reason);
+    }
+
+    let responses = replies.borrow();
+    let last = responses.last().unwrap();
+    assert_eq!(responses.len(), 1 + usize::from(later));
+    assert_eq!(last.correlation_id(), &root);
+    assert_eq!(last.sub_correlation_id(), None);
+    assert!(last.completed());
+    assert!(last.response().is_none());
+    assert_eq!(last.failure_reason(), Some(reason.as_str()));
+    assert_eq!(stub_msgbus.borrow().res_count(), 1 + u64::from(later));
+    assert!(retry_saver.get_messages().is_empty());
+    assert!(stub_msgbus.borrow().get_response_handler(&root).is_some());
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(engine.request_pipeline_count(), 0);
+}
+
+#[rstest]
+fn test_time_range_pipeline_failure_completes_enclosing_join(
+    #[values(false, true)] partial: bool,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let bar_type = BarType::from(format!("{id}-1-TICK-BID-INTERNAL").as_str());
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    advance_test_clock_to(&clock, 10);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let recorder =
+        register_time_range_recorder(&mut engine, clock, Rc::clone(&cache), client_id, venue);
+    let root = UUID4::new();
+    let leg = UUID4::new();
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    engine
+        .execute_request(RequestCommand::Join(RequestJoin::new(
+            vec![leg],
+            None,
+            None,
+            root,
+            UnixNanos::from(11),
+            None,
+            None,
+        )))
+        .unwrap();
+    engine
+        .execute_request(RequestCommand::Quotes(RequestQuotes::new(
+            id,
+            Some(UnixNanos::from(1).to_datetime_utc()),
+            Some(UnixNanos::from(5).to_datetime_utc()),
+            None,
+            Some(client_id),
+            leg,
+            UnixNanos::from(7),
+            Some(params_from_json(json!({"time_range_generator": "", "bar_types": [bar_type.to_string()], "update_subscriptions": false}))),
+        )))
+        .unwrap();
+    let child = recorded_time_range_request_quotes(&recorder)[0].clone();
+    let response = partial
+        .then(|| time_range_quote_response(&child, id, client_id, 1, vec![pipeline_quote(id, 3)]));
+    engine.request_failed(DataRequestFailed {
+        request_id: child.request_id,
+        reason: "Window unavailable".to_owned(),
+        response,
+    });
+
+    let responses = saver.get_messages();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &root);
+    assert_eq!(responses[0].sub_correlation_id(), None);
+    assert!(responses[0].completed());
+    assert_eq!(responses[0].failure_reason(), Some("Window unavailable"));
+
+    if partial {
+        let Some(DataResponse::Quotes(response)) = responses[0].response() else {
+            panic!("Expected partial quotes");
+        };
+
+        assert_eq!(response.instrument_ids, vec![id]);
+        assert_eq!(response.data.as_ref(), &[pipeline_quote(id, 3)]);
+    } else {
+        assert!(responses[0].response().is_none());
+    }
+
+    assert_eq!(cache.borrow().quote_count(&id), usize::from(partial));
+    assert_eq!(cache.borrow().bar_count(&bar_type), usize::from(partial));
+
+    let expected_bar = partial.then(|| {
+        Bar::new(
+            bar_type,
+            Price::from("1.00000"),
+            Price::from("1.00000"),
+            Price::from("1.00000"),
+            Price::from("1.00000"),
+            Quantity::from("1"),
+            UnixNanos::from(3),
+            UnixNanos::from(3),
+        )
+    });
+
+    assert_eq!(cache.borrow().bar(&bar_type), expected_bar.as_ref());
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert_eq!(engine.pending_join_request_count(), 0);
+}
+
+#[rstest]
+fn test_time_range_join_payload_free_success_completes_root(
+    #[values(false, true)] nested: bool,
+    #[values(false, true)] multiple_windows: bool,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+) {
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    advance_test_clock_to(&clock, 10_000_000_000);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = DataEngine::new(clock, cache, None);
+    let windowed = UUID4::new();
+
+    let root = if nested { UUID4::new() } else { windowed };
+    let legs = [UUID4::new(), UUID4::new()];
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+
+    if nested {
+        engine
+            .execute_request(RequestCommand::Join(RequestJoin::new(
+                vec![windowed],
+                None,
+                None,
+                root,
+                UnixNanos::from(17),
+                None,
+                None,
+            )))
+            .unwrap();
+    }
+
+    let mut params = json!({"time_range_generator": ""});
+    if multiple_windows {
+        params["durations_seconds"] = json!([2, 2]);
+    }
+
+    engine
+        .execute_request(RequestCommand::Join(RequestJoin::new(
+            legs.to_vec(),
+            Some(UnixNanos::from(1_000_000_000).to_datetime_utc()),
+            Some(UnixNanos::from(5_000_000_000).to_datetime_utc()),
+            windowed,
+            UnixNanos::from(19),
+            Some(params_from_json(params)),
+            None,
+        )))
+        .unwrap();
+
+    let windows = if multiple_windows { 2 } else { 1 };
+    for window in 0..windows {
+        engine.response_envelope(DataResponseEnvelope::terminal(legs[0], None));
+        assert!(saver.get_messages().is_empty());
+        engine.response_envelope(DataResponseEnvelope::terminal(legs[1], None));
+
+        if window + 1 < windows {
+            assert!(saver.get_messages().is_empty());
+            assert_eq!(engine.time_range_pipeline_count(), 1);
+            assert_eq!(engine.pending_join_request_count(), 1 + usize::from(nested));
+        }
+    }
+
+    let responses = saver.get_messages();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &root);
+    assert_eq!(responses[0].sub_correlation_id(), None);
+    assert!(responses[0].completed());
+    assert!(responses[0].response().is_none());
+    assert_eq!(responses[0].failure_reason(), None);
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert_eq!(engine.pending_join_request_count(), 0);
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert_eq!(
+        stub_msgbus.borrow().res_count(),
+        2 * windows + 1 + u64::from(nested)
+    );
+    assert!(stub_msgbus.borrow().get_response_handler(&root).is_none());
+}
+
+#[rstest]
+#[case::success(None)]
+#[case::failure(Some("Dataset unavailable"))]
+#[case::empty_failure(Some(""))]
+fn test_pipeline_payload_free_completion_preserves_outcome(
+    #[case] reason: Option<&str>,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut engine = DataEngine::new(clock, Rc::new(RefCell::new(Cache::default())), None);
+    let root = UUID4::new();
+    let legs = [UUID4::new(), UUID4::new()];
+
+    let parent = RequestQuotes::new(
+        audusd_sim.id,
+        None,
+        None,
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(19),
+        None,
+    );
+    engine.new_request_pipeline(RequestCommand::Quotes(parent), legs.len());
+    for leg in legs {
+        engine.register_request_pipeline_leg(leg, root);
+    }
+
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    engine.response_envelope(DataResponseEnvelope::terminal(legs[0], None));
+    assert!(saver.get_messages().is_empty());
+    engine.response_envelope(DataResponseEnvelope::terminal(
+        legs[1],
+        reason.map(str::to_owned),
+    ));
+    let responses = saver.get_messages();
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].correlation_id(), &root);
+    assert_eq!(responses[0].sub_correlation_id(), None);
+    assert!(responses[0].completed());
+    assert!(responses[0].response().is_none());
+    assert_eq!(responses[0].failure_reason(), reason);
+    assert_eq!(engine.request_pipeline_count(), 0);
 }
 
 fn pipeline_topic_of(live: &str) -> String {
@@ -3171,7 +3830,7 @@ fn time_range_bar_response(
     DataResponse::Bars(BarsResponse::new(
         request.request_id,
         client_id,
-        request.bar_type,
+        request.single_bar_type().unwrap(),
         bars,
         request.start.map(datetime_to_unix_nanos_for_test),
         request.end.map(datetime_to_unix_nanos_for_test),
@@ -3373,4 +4032,754 @@ fn leg_book_deltas_response(
         UnixNanos::default(),
         None,
     ))
+}
+
+#[rstest]
+#[case::failure_first(true)]
+#[case::failure_last(false)]
+fn test_pipeline_failure_preserves_successful_siblings(
+    #[case] failure_first: bool,
+    #[values("", "dataset unavailable")] reason: &str,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+) {
+    use nautilus_common::messages::data::{DataRequestFailed, DataResponseEnvelope};
+    let _ = stub_msgbus;
+    let mut engine = DataEngine::new(clock, cache, None);
+    let first = InstrumentId::from("AUD/USD.SIM");
+    let second = InstrumentId::from("GBP/USD.SIM");
+    let root = UUID4::new();
+    let good_id = UUID4::new();
+    let failed_id = UUID4::new();
+
+    let request = RequestQuotes::new(
+        [first, second],
+        None,
+        None,
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(41),
+        None,
+    );
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    engine.new_request_pipeline(RequestCommand::Quotes(request), 2);
+    engine.register_request_pipeline_leg(good_id, root);
+    engine.register_request_pipeline_leg(failed_id, root);
+    let quote = quote_tick(first, "1.00000", "1.00010", 23);
+    let good = DataResponse::Quotes(QuotesResponse::new(
+        good_id,
+        client_id,
+        first,
+        vec![quote],
+        None,
+        None,
+        UnixNanos::from(43),
+        None,
+    ));
+
+    let failure = DataRequestFailed {
+        request_id: failed_id,
+        reason: reason.to_owned(),
+        response: None,
+    };
+
+    if failure_first {
+        engine.request_failed(failure.clone());
+    } else {
+        engine.response(good.clone());
+    }
+
+    assert!(saver.get_messages().is_empty());
+
+    if failure_first {
+        engine.response(good);
+    } else {
+        engine.request_failed(failure);
+    }
+
+    let envelopes = saver.get_messages();
+    assert_eq!(envelopes.len(), 1);
+    let envelope = &envelopes[0];
+
+    let Some(DataResponse::Quotes(response)) = envelope.response() else {
+        panic!("expected surviving quote payload");
+    };
+
+    assert_eq!(envelope.correlation_id(), &root);
+    assert!(envelope.completed());
+    assert_eq!(envelope.failure_reason(), Some(reason));
+    assert_eq!(envelope.sub_correlation_id(), None);
+    assert_eq!(response.instrument_ids, vec![first, second]);
+    assert_eq!(response.data.as_ref(), &vec![quote]);
+    assert_eq!(response.correlation_id, root);
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert!(
+        msgbus::get_message_bus()
+            .borrow()
+            .get_response_handler(&root)
+            .is_none()
+    );
+}
+
+#[rstest]
+#[case::success(None)]
+#[case::failure(Some("Dataset unavailable"))]
+#[case::empty_failure(Some(""))]
+fn test_book_pipeline_waits_for_final_partition(
+    #[case] reason: Option<&str>,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+) {
+    let root = UUID4::new();
+    let child = UUID4::new();
+    let parent_symbol = InstrumentId::from("ES.FUT.GLBX");
+    let first = InstrumentId::from("ESM6.GLBX");
+    let second = InstrumentId::from("ESU6.GLBX");
+    let mut engine = DataEngine::new(clock, cache, None);
+
+    let request = RequestBookDeltas::new(
+        parent_symbol,
+        None,
+        None,
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(47),
+        None,
+    );
+    engine.new_request_pipeline(RequestCommand::BookDeltas(request), 1);
+    engine.register_request_pipeline_leg(child, root);
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    let a = delta_with_flag(first, 29, RecordFlag::F_LAST as u8);
+    let b = delta_with_flag(second, 13, RecordFlag::F_LAST as u8);
+    engine.response_envelope(DataResponseEnvelope::new(
+        leg_book_deltas_response(child, first, client_id, vec![a]),
+        false,
+        None,
+    ));
+    assert!(saver.get_messages().is_empty());
+    assert_eq!(engine.request_pipeline_count(), 1);
+
+    let final_partition = DataResponseEnvelope::new(
+        leg_book_deltas_response(child, second, client_id, vec![b]),
+        true,
+        None,
+    );
+
+    let final_partition = if let Some(reason) = reason {
+        final_partition.with_failure(reason.to_owned())
+    } else {
+        final_partition
+    };
+
+    engine.response_envelope(final_partition);
+
+    let envelopes = saver.get_messages();
+    assert_eq!(envelopes.len(), 3);
+
+    for (envelope, id, delta) in [(&envelopes[0], first, a), (&envelopes[1], second, b)] {
+        let Some(DataResponse::BookDeltas(response)) = envelope.response() else {
+            panic!("expected book partition");
+        };
+
+        assert_eq!(envelope.correlation_id(), &root);
+        assert_eq!(envelope.sub_correlation_id(), Some(child));
+        assert!(!envelope.completed());
+        assert_eq!(envelope.failure_reason(), None);
+        assert_eq!(response.instrument_id, id);
+        assert_eq!(response.correlation_id, root);
+        assert_eq!(response.data.as_ref(), &vec![delta]);
+    }
+
+    assert_eq!(envelopes[2].correlation_id(), &root);
+    assert!(envelopes[2].completed());
+    assert!(envelopes[2].response().is_none());
+    assert_eq!(envelopes[2].sub_correlation_id(), None);
+    assert_eq!(envelopes[2].failure_reason(), reason);
+    assert_eq!(engine.request_pipeline_count(), 0);
+    assert!(stub_msgbus.borrow().get_response_handler(&root).is_none());
+}
+
+#[rstest]
+fn test_book_pipeline_fails_request_when_snapshot_replay_cannot_rebuild_book(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let instrument_id = audusd_sim.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order_book(OrderBook::new(instrument_id, BookType::L3_MBO))
+        .unwrap();
+    let mut engine = DataEngine::new(clock, Rc::clone(&cache), None);
+
+    let pipeline_topic =
+        MessagingSwitchboard::default().get_pipeline_book_deltas_topic(instrument_id);
+    let (pipeline_handler, pipeline_saver) =
+        get_typed_message_saving_handler::<OrderBookDeltas>(Some(Ustr::from("replay-failure")));
+    msgbus::subscribe_book_deltas(pipeline_topic.into(), pipeline_handler, None);
+
+    let root = UUID4::new();
+    let child = UUID4::new();
+
+    let request = RequestBookDeltas::new(
+        instrument_id,
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        None,
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(47),
+        None,
+    );
+
+    engine.new_request_pipeline(RequestCommand::BookDeltas(request), 1);
+    engine.register_request_pipeline_leg(child, root);
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+
+    engine.response_envelope(DataResponseEnvelope::new(
+        leg_book_deltas_response(
+            child,
+            instrument_id,
+            client_id,
+            unsided_snapshot_replay_deltas(instrument_id),
+        ),
+        true,
+        None,
+    ));
+
+    let envelopes = saver.get_messages();
+    let cache_update_count = cache
+        .borrow()
+        .order_book(&instrument_id)
+        .expect("seeded book")
+        .update_count;
+    assert_eq!(envelopes.len(), 1);
+    assert_eq!(envelopes[0].correlation_id(), &root);
+    assert!(envelopes[0].completed());
+    assert!(
+        envelopes[0].response().is_none(),
+        "deltas without their snapshot must not reach the requester"
+    );
+    assert_eq!(
+        envelopes[0].failure_reason(),
+        Some(
+            "Failed to rebuild order book AUD/USD.SIM for snapshot replay: \
+             Integrity error: invalid `NoOrderSide` in book"
+        )
+    );
+    assert!(pipeline_saver.get_messages().is_empty());
+    assert_eq!(cache_update_count, 0);
+    assert_eq!(engine.request_pipeline_count(), 0);
+}
+
+#[rstest]
+#[case::snapshot_first(false)]
+#[case::snapshot_last(true)]
+fn test_book_pipeline_withholds_partitions_when_snapshot_replay_cannot_rebuild_book(
+    #[case] snapshot_last: bool,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+) {
+    let _ = stub_msgbus;
+    let failing = audusd_sim.id;
+    let healthy = InstrumentId::from("GBP/USD.SIM");
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(clock, cache, None);
+
+    let pipeline_topic = MessagingSwitchboard::default().get_pipeline_book_deltas_topic(failing);
+    let (pipeline_handler, pipeline_saver) = get_typed_message_saving_handler::<OrderBookDeltas>(
+        Some(Ustr::from("replay-failure-partition")),
+    );
+    msgbus::subscribe_book_deltas(pipeline_topic.into(), pipeline_handler, None);
+
+    let root = UUID4::new();
+    let child = UUID4::new();
+
+    let request = RequestBookDeltas::new(
+        failing,
+        Some(UnixNanos::from(1_000).to_datetime_utc()),
+        None,
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(47),
+        None,
+    );
+
+    engine.new_request_pipeline(RequestCommand::BookDeltas(request), 1);
+    engine.register_request_pipeline_leg(child, root);
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    let healthy_event = delta_with_flag(healthy, 1_500, RecordFlag::F_LAST as u8);
+
+    let mut failing_partitions = vec![
+        unsided_snapshot_replay_deltas(failing),
+        vec![delta_with_flag(failing, 1_800, RecordFlag::F_LAST as u8)],
+    ];
+
+    if snapshot_last {
+        failing_partitions.reverse();
+    }
+
+    for deltas in failing_partitions {
+        engine.response_envelope(DataResponseEnvelope::new(
+            leg_book_deltas_response(child, failing, client_id, deltas),
+            false,
+            None,
+        ));
+    }
+
+    engine.response_envelope(DataResponseEnvelope::new(
+        leg_book_deltas_response(child, healthy, client_id, vec![healthy_event]),
+        true,
+        None,
+    ));
+
+    let envelopes = saver.get_messages();
+    let completed: Vec<bool> = envelopes
+        .iter()
+        .map(DataResponseEnvelope::completed)
+        .collect();
+    assert_eq!(
+        delivered_book_deltas(&saver),
+        vec![vec![healthy_event], vec![]],
+        "no partition of the instrument without a usable book reaches the requester"
+    );
+    assert_eq!(completed, vec![false, true]);
+    assert_eq!(envelopes[0].failure_reason(), None);
+    assert_eq!(
+        envelopes[1].failure_reason(),
+        Some(
+            "Failed to rebuild order book AUD/USD.SIM for snapshot replay: \
+             Integrity error: invalid `NoOrderSide` in book"
+        )
+    );
+    assert!(pipeline_saver.get_messages().is_empty());
+    assert_eq!(engine.request_pipeline_count(), 0);
+}
+
+// A day-start snapshot, then an add the book cannot place before the request start at 1,000
+fn unsided_snapshot_replay_deltas(instrument_id: InstrumentId) -> Vec<OrderBookDelta> {
+    let f_last = RecordFlag::F_LAST as u8;
+    let mut unsided = delta_with_flag(instrument_id, 500, f_last);
+    unsided.order.side = None;
+    unsided.order.order_id = 2;
+
+    vec![
+        delta_with_flag(instrument_id, 0, RecordFlag::F_SNAPSHOT as u8 | f_last),
+        unsided,
+        delta_with_flag(instrument_id, 1_500, f_last),
+    ]
+}
+
+#[rstest]
+#[case::planned_order(false)]
+#[case::reverse_arrival(true)]
+fn test_pipeline_quote_ties_use_instrument_and_planned_child_order(
+    #[case] reverse: bool,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    clock: Rc<RefCell<VirtualClock>>,
+    cache: Rc<RefCell<Cache>>,
+    client_id: ClientId,
+) {
+    use nautilus_common::messages::data::DataResponseEnvelope;
+    let _ = stub_msgbus;
+    let mut engine = DataEngine::new(clock, cache, None);
+    let first = InstrumentId::from("AUD/USD.SIM");
+    let second = InstrumentId::from("GBP/USD.SIM");
+    let root = UUID4::new();
+    let left = UUID4::new();
+    let right = UUID4::new();
+
+    let request = RequestQuotes::new(
+        [first, second],
+        None,
+        None,
+        None,
+        Some(client_id),
+        root,
+        UnixNanos::from(41),
+        None,
+    );
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    engine.new_request_pipeline(RequestCommand::Quotes(request), 2);
+    engine.register_request_pipeline_leg(left, root);
+    engine.register_request_pipeline_leg(right, root);
+    let a = quote_tick(first, "1.00000", "1.00010", 23);
+    let b = quote_tick(first, "1.00020", "1.00030", 23);
+    let c = quote_tick(second, "2.00000", "2.00010", 23);
+    let left_response = DataResponse::Quotes(QuotesResponse::new(
+        left,
+        client_id,
+        [first, second],
+        vec![c, a],
+        None,
+        None,
+        UnixNanos::from(43),
+        None,
+    ));
+    let right_response = DataResponse::Quotes(QuotesResponse::new(
+        right,
+        client_id,
+        first,
+        vec![b],
+        None,
+        None,
+        UnixNanos::from(47),
+        None,
+    ));
+
+    let responses = if reverse {
+        [right_response, left_response]
+    } else {
+        [left_response, right_response]
+    };
+
+    for response in responses {
+        engine.response(response);
+    }
+
+    let results = saver.get_messages();
+    assert_eq!(results.len(), 1);
+
+    let Some(DataResponse::Quotes(response)) = results[0].response() else {
+        panic!("expected quotes");
+    };
+
+    assert_eq!(response.data.as_ref(), &vec![a, b, c]);
+    assert_eq!(response.instrument_ids, vec![first, second]);
+    assert_eq!(results[0].failure_reason(), None);
+    assert_eq!(engine.request_pipeline_count(), 0);
+}
+
+#[rstest]
+#[case::quotes(false)]
+#[case::book_partitions(true)]
+fn test_time_range_pipeline_keeps_chunks_until_payload_free_completion(
+    #[case] books: bool,
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    advance_test_clock_to(&clock, 10);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let recorder = register_time_range_recorder(&mut engine, clock, cache, client_id, venue);
+    let root = UUID4::new();
+    let (handler, saver) = get_typed_message_saving_handler::<DataResponseEnvelope>(None);
+    msgbus::register_response_handler(&root, handler);
+    let params = Some(params_from_json(json!({"time_range_generator": ""})));
+    let start = Some(UnixNanos::from(1).to_datetime_utc());
+    let end = Some(UnixNanos::from(5).to_datetime_utc());
+
+    let request = if books {
+        RequestCommand::BookDeltas(RequestBookDeltas::new(
+            id,
+            start,
+            end,
+            None,
+            Some(client_id),
+            root,
+            UnixNanos::from(7),
+            params,
+        ))
+    } else {
+        RequestCommand::Quotes(RequestQuotes::new(
+            id,
+            start,
+            end,
+            None,
+            Some(client_id),
+            root,
+            UnixNanos::from(7),
+            params,
+        ))
+    };
+
+    engine.execute_request(request).unwrap();
+
+    let child_id = match &recorder.borrow()[0] {
+        DataCommand::Request(request) => *request.request_id(),
+        other => panic!("Expected child request, was {other:?}"),
+    };
+
+    let actual_ids = if books {
+        [id, InstrumentId::from("GBP/USD.SIM")]
+    } else {
+        [id, id]
+    };
+
+    for (ts, actual_id) in [2, 3].into_iter().zip(actual_ids) {
+        let response = if books {
+            DataResponse::BookDeltas(BookDeltasResponse::new(
+                child_id,
+                client_id,
+                actual_id,
+                vec![split_delta(actual_id, ts)],
+                None,
+                None,
+                UnixNanos::from(ts),
+                None,
+            ))
+        } else {
+            DataResponse::Quotes(QuotesResponse::new(
+                child_id,
+                client_id,
+                id,
+                vec![pipeline_quote(id, ts)],
+                None,
+                None,
+                UnixNanos::from(ts),
+                None,
+            ))
+        };
+
+        engine.response_envelope(DataResponseEnvelope::new(response, false, None));
+        assert_eq!(recorder.borrow().len(), 1);
+        assert_eq!(engine.time_range_pipeline_count(), 1);
+        assert!(
+            msgbus::get_message_bus()
+                .borrow()
+                .get_response_handler(&root)
+                .is_some()
+        );
+    }
+
+    engine.response_envelope(DataResponseEnvelope::terminal(child_id, None));
+
+    let replies = saver.get_messages();
+    assert_eq!(replies.len(), 3);
+
+    for ((reply, ts), actual_id) in replies[..2].iter().zip([2, 3]).zip(actual_ids) {
+        assert_eq!(reply.correlation_id(), &root);
+        assert_eq!(reply.sub_correlation_id(), Some(child_id));
+        assert!(!reply.completed());
+        assert_eq!(reply.failure_reason(), None);
+        let response = reply.response().unwrap();
+        assert_eq!(response.correlation_id(), &child_id);
+
+        match response {
+            DataResponse::Quotes(response) => {
+                assert_eq!(response.data.as_ref(), &[pipeline_quote(id, ts)]);
+            }
+            DataResponse::BookDeltas(response) => {
+                assert_eq!(response.instrument_id, actual_id);
+                assert_eq!(response.data.as_ref(), &[split_delta(actual_id, ts)]);
+            }
+            other => panic!("Unexpected response {other:?}"),
+        }
+    }
+
+    let final_reply = &replies[2];
+    assert_eq!(final_reply.correlation_id(), &root);
+    assert!(final_reply.completed());
+    assert_eq!(final_reply.failure_reason(), None);
+    assert_eq!(final_reply.response().unwrap().record_count(), Some(0));
+    assert_eq!(
+        final_reply
+            .response()
+            .unwrap()
+            .params()
+            .unwrap()
+            .get("data_count"),
+        Some(&json!(2))
+    );
+    assert_eq!(engine.time_range_pipeline_count(), 0);
+    assert!(
+        msgbus::get_message_bus()
+            .borrow()
+            .get_response_handler(&root)
+            .is_none()
+    );
+}
+
+#[rstest]
+fn test_request_bar_aggregation_retains_intermediate_trade_chunks(
+    audusd_sim: CurrencyPair,
+    stub_msgbus: Rc<RefCell<MessageBus>>,
+    client_id: ClientId,
+    venue: Venue,
+) {
+    let _ = stub_msgbus;
+    let id = audusd_sim.id;
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    advance_test_clock_to(&clock, 10);
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(audusd_sim))
+        .unwrap();
+    let mut engine = DataEngine::new(Rc::clone(&clock), Rc::clone(&cache), None);
+    let _recorder =
+        register_time_range_recorder(&mut engine, clock, Rc::clone(&cache), client_id, venue);
+    let root = UUID4::new();
+    let bar_type = BarType::from(format!("{id}-2-TICK-LAST-INTERNAL").as_str());
+    let params = Some(params_from_json(
+        json!({"bar_types": [bar_type.to_string()], "update_subscriptions": false}),
+    ));
+    engine
+        .execute_request(RequestCommand::Trades(RequestTrades::new(
+            id,
+            None,
+            None,
+            None,
+            Some(client_id),
+            root,
+            UnixNanos::from(1),
+            params,
+        )))
+        .unwrap();
+    let first = make_trade(id, "0.65000", 1000, "chunk-1", 2);
+    let second = make_trade(id, "0.65010", 1000, "chunk-2", 3);
+    engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            root,
+            client_id,
+            id,
+            vec![first],
+            None,
+            None,
+            UnixNanos::from(2),
+            None,
+        )),
+        false,
+        None,
+    ));
+    assert_eq!(cache.borrow().bar(&bar_type), None);
+
+    engine.response_envelope(DataResponseEnvelope::new(
+        DataResponse::Trades(TradesResponse::new(
+            root,
+            client_id,
+            id,
+            vec![second],
+            None,
+            None,
+            UnixNanos::from(3),
+            None,
+        )),
+        true,
+        None,
+    ));
+
+    let expected = Bar::new(
+        bar_type,
+        Price::from("0.65000"),
+        Price::from("0.65010"),
+        Price::from("0.65000"),
+        Price::from("0.65010"),
+        Quantity::from(2000),
+        UnixNanos::from(3),
+        UnixNanos::from(3),
+    );
+    assert_eq!(cache.borrow().bar(&bar_type), Some(&expected));
+}
+
+#[rstest]
+#[case::any("any", false)]
+#[case::any_cache_disabled("any", true)]
+#[case::owned("owned", false)]
+#[case::owned_cache_disabled("owned", true)]
+#[case::borrowed("borrowed", false)]
+#[case::borrowed_cache_disabled("borrowed", true)]
+#[case::pipeline("pipeline", false)]
+#[case::pipeline_cache_disabled("pipeline", true)]
+fn test_custom_data_is_cached_before_publication(
+    #[case] path: &str,
+    #[case] disable_historical_cache: bool,
+    _stub_msgbus: Rc<RefCell<MessageBus>>,
+) {
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+
+    let config = DataEngineConfig {
+        disable_historical_cache,
+        ..Default::default()
+    };
+
+    let mut engine = DataEngine::new(clock, Rc::clone(&cache), Some(config));
+    let custom = stub_custom_data(8_000, 42, None, Some("CUSTOM.SIM".into()));
+    let live_topic = switchboard::get_custom_topic(&custom.data_type);
+    let pipeline_topic = switchboard::get_pipeline_custom_topic(&custom.data_type);
+    let (live_handler, live_saver) = get_any_saving_handler::<CustomData>(None);
+    let (pipeline_handler, pipeline_saver) = get_any_saving_handler::<CustomData>(None);
+    msgbus::subscribe_any(live_topic.into(), live_handler, None);
+    msgbus::subscribe_any(pipeline_topic.into(), pipeline_handler, None);
+    let observations = Rc::new(RefCell::new(Vec::new()));
+    let observed = Rc::clone(&observations);
+    let observed_cache = Rc::clone(&cache);
+    let handler = ShareableMessageHandler::from_typed(move |item: &CustomData| {
+        let cached = observed_cache
+            .borrow()
+            .custom_data(&item.data_type)
+            .cloned();
+        observed.borrow_mut().push((item.clone(), cached));
+    });
+
+    let topic = if path == "pipeline" {
+        pipeline_topic
+    } else {
+        live_topic
+    };
+
+    msgbus::subscribe_any(topic.into(), handler, None);
+
+    match path {
+        "any" => engine.process(&custom as &dyn Any),
+        "owned" => engine.process_data(Data::Custom(custom.clone())),
+        "borrowed" => engine.process_data_ref(DataRef::Custom(&custom)),
+        "pipeline" => engine.process_pipeline(Data::Custom(custom.clone())),
+        _ => unreachable!(),
+    }
+
+    let expected_cache = if path == "pipeline" && disable_historical_cache {
+        None
+    } else {
+        Some(custom.clone())
+    };
+
+    assert_eq!(
+        *observations.borrow(),
+        vec![(custom.clone(), expected_cache.clone())]
+    );
+    assert_eq!(
+        cache.borrow().custom_data(&custom.data_type).cloned(),
+        expected_cache
+    );
+
+    let (expected_live, expected_pipeline) = if path == "pipeline" {
+        (vec![], vec![custom])
+    } else {
+        (vec![custom], vec![])
+    };
+
+    assert_eq!(live_saver.get_messages(), expected_live);
+    assert_eq!(pipeline_saver.get_messages(), expected_pipeline);
 }

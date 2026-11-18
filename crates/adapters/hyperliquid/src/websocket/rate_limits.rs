@@ -192,16 +192,6 @@ impl WebSocketRateLimits {
             decrement_user_reference(&mut counts.user_references, user.as_deref());
         }
     }
-
-    #[cfg(test)]
-    fn subscription_count(&self) -> usize {
-        self.subscriptions.lock().total
-    }
-
-    #[cfg(test)]
-    fn subscription_user_count(&self) -> usize {
-        self.subscriptions.lock().user_references.len()
-    }
 }
 
 pub(super) fn shared_websocket_limits(
@@ -225,6 +215,8 @@ fn subscription_user(subscription: &SubscriptionRequest) -> Option<&str> {
     match subscription {
         SubscriptionRequest::Notification { user }
         | SubscriptionRequest::WebData2 { user }
+        | SubscriptionRequest::ClearinghouseState { user }
+        | SubscriptionRequest::SpotState { user, .. }
         | SubscriptionRequest::OrderUpdates { user }
         | SubscriptionRequest::UserEvents { user }
         | SubscriptionRequest::UserFills { user, .. }
@@ -237,6 +229,7 @@ fn subscription_user(subscription: &SubscriptionRequest) -> Option<&str> {
         | SubscriptionRequest::AllDexsAssetCtxs
         | SubscriptionRequest::Candle { .. }
         | SubscriptionRequest::L2Book { .. }
+        | SubscriptionRequest::L2 { .. }
         | SubscriptionRequest::Trades { .. }
         | SubscriptionRequest::ActiveAssetCtx { .. }
         | SubscriptionRequest::ActiveSpotAssetCtx { .. }
@@ -263,6 +256,16 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    impl WebSocketRateLimits {
+        fn subscription_count(&self) -> usize {
+            self.subscriptions.lock().total
+        }
+
+        fn subscription_user_count(&self) -> usize {
+            self.subscriptions.lock().user_references.len()
+        }
+    }
 
     fn trades_subscription(index: usize) -> SubscriptionRequest {
         SubscriptionRequest::Trades {

@@ -25,11 +25,11 @@ use nautilus_model::{
         TimeInForce, TrailingOffsetType,
     },
     events::{
-        OrderAccepted, OrderEvent, OrderEventAny, OrderFilled, OrderPendingCancel,
-        OrderPendingUpdate, OrderSubmitted,
+        OrderAccepted, OrderEvent, OrderEventAny, OrderPendingCancel, OrderPendingUpdate,
+        OrderSubmitted, OrderUpdated,
         order::spec::{
-            OrderAcceptedSpec, OrderFilledSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec,
-            OrderSubmittedSpec, OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderCanceledSpec, OrderFilledSpec, OrderPendingCancelSpec,
+            OrderPendingUpdateSpec, OrderRejectedSpec, OrderSubmittedSpec, OrderUpdatedSpec,
         },
     },
     identifiers::{
@@ -48,11 +48,12 @@ use nautilus_model::{
         stubs::{TestOrderEventStubs, TestOrderStubs},
     },
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{Currency, Money, Price, Quantity},
+    types::{Currency, Money, Price, Quantity, fixed::FIXED_PRECISION},
 };
 use rstest::{fixture, rstest};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use ustr::Ustr;
 use uuid::Uuid;
 
 use super::{ids::*, orders::*, positions::*, types::*};
@@ -60,6 +61,39 @@ use super::{ids::*, orders::*, positions::*, types::*};
 #[fixture]
 fn instrument() -> InstrumentAny {
     InstrumentAny::CurrencyPair(audusd_sim())
+}
+
+#[rstest]
+#[case::off_tick(dec!(2.4564), "2.4564")]
+#[case::instrument_precision(dec!(2), "2.00")]
+#[case::trailing_zeros(dec!(2.4564000000000000000000000000), "2.4564")]
+fn test_reconciliation_price_keeps_average_precision(
+    #[case] value: Decimal,
+    #[case] expected: Price,
+) {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+
+    let price = super::reconciliation_price(value, &instrument).unwrap();
+
+    assert_eq!(price, expected);
+    assert_eq!(price.precision, expected.precision);
+}
+
+#[rstest]
+fn test_reconciliation_price_rounds_at_fixed_precision() {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+
+    let price =
+        super::reconciliation_price(dec!(0.1234567890123456789012345678), &instrument).unwrap();
+
+    let expected = if FIXED_PRECISION == 16 {
+        dec!(0.1234567890123457)
+    } else {
+        dec!(0.123456789)
+    };
+
+    assert_eq!(price.as_decimal(), expected);
+    assert_eq!(price.precision, FIXED_PRECISION);
 }
 
 fn create_test_venue_order_id(value: &str) -> VenueOrderId {
@@ -163,50 +197,6 @@ fn build_order_pending_update(
         .ts_init(ts_init)
         .reconciliation(reconciliation)
         .maybe_venue_order_id(venue_order_id)
-        .build()
-}
-
-fn build_order_filled(
-    trader_id: TraderId,
-    strategy_id: StrategyId,
-    instrument_id: InstrumentId,
-    client_order_id: ClientOrderId,
-    venue_order_id: VenueOrderId,
-    account_id: AccountId,
-    trade_id: TradeId,
-    order_side: OrderSide,
-    order_type: OrderType,
-    last_qty: Quantity,
-    last_px: Price,
-    currency: Currency,
-    liquidity_side: LiquiditySide,
-    event_id: UUID4,
-    ts_event: UnixNanos,
-    ts_init: UnixNanos,
-    reconciliation: bool,
-    position_id: Option<PositionId>,
-    commission: Option<Money>,
-) -> OrderFilled {
-    OrderFilledSpec::builder()
-        .trader_id(trader_id)
-        .strategy_id(strategy_id)
-        .instrument_id(instrument_id)
-        .client_order_id(client_order_id)
-        .venue_order_id(venue_order_id)
-        .account_id(account_id)
-        .trade_id(trade_id)
-        .order_side(order_side)
-        .order_type(order_type)
-        .last_qty(last_qty)
-        .last_px(last_px)
-        .currency(currency)
-        .liquidity_side(liquidity_side)
-        .event_id(event_id)
-        .ts_event(ts_event)
-        .ts_init(ts_init)
-        .reconciliation(reconciliation)
-        .maybe_position_id(position_id)
-        .maybe_commission(commission)
         .build()
 }
 
@@ -730,6 +720,22 @@ fn test_adjust_fills_partial_window_synthetic_opening_price(
             existing_fills: fills,
         }
     );
+}
+
+#[rstest]
+fn test_adjust_fills_unpriceable_synthetic_opening_keeps_fills() {
+    let fills = vec![FillSnapshot::new(
+        create_test_venue_order_id("ORDER1"),
+        OrderSide::Buy,
+        dec!(1),
+        dec!(80000),
+        2000,
+    )];
+    let venue_position = venue_position_snapshot(dec!(2), dec!(10000));
+
+    let result = adjust_fills_for_partial_window(&fills, &venue_position, dec!(0.0001));
+
+    assert_eq!(result, FillAdjustmentResult::NoAdjustment);
 }
 
 #[rstest]
@@ -1561,6 +1567,146 @@ fn test_process_mass_status_keeps_working_order_for_either_lifecycle_outcome(
             vec![VenueOrderId::from("ORDER4"), VenueOrderId::from("ORDER5")]
         );
     }
+}
+
+#[rstest]
+#[case::with_synthetic_reports(true)]
+#[case::without_synthetic_reports(false)]
+fn test_process_mass_status_filters_terminal_orders_by_current_fills(
+    instrument: InstrumentAny,
+    #[case] generate_synthetic_reports: bool,
+) {
+    let retained = create_limit_order_report(&instrument, "ORDER4", OrderStatus::Filled, "0.05");
+    let previous = create_limit_order_report(&instrument, "ORDER1", OrderStatus::Filled, "0.05");
+    let unfilled = create_limit_order_report(&instrument, "ORDER9", OrderStatus::Canceled, "0.00");
+    let mass_status = create_two_lifecycle_mass_status(
+        &instrument,
+        vec![previous, retained.clone(), unfilled],
+        Quantity::from("0.10"),
+        dec!(4050.00),
+    );
+
+    let result = if generate_synthetic_reports {
+        process_mass_status_for_reconciliation(&mass_status, &instrument, None).unwrap()
+    } else {
+        process_mass_status_for_reconciliation_without_synthetic_reports(
+            &mass_status,
+            &instrument,
+            None,
+        )
+        .unwrap()
+    };
+
+    let without_synthetic = process_mass_status_for_reconciliation_without_synthetic_reports(
+        &mass_status,
+        &instrument,
+        None,
+    )
+    .unwrap();
+    let mut expected_fills = mass_status.fill_reports();
+    expected_fills
+        .retain(|id, _| *id == VenueOrderId::from("ORDER4") || *id == VenueOrderId::from("ORDER5"));
+
+    assert_eq!(result.orders, without_synthetic.orders);
+    assert_eq!(result.fills, without_synthetic.fills);
+    assert_eq!(result.order_only_ids, without_synthetic.order_only_ids);
+    assert_eq!(
+        result.order_only_fill_keys,
+        without_synthetic.order_only_fill_keys
+    );
+    assert_eq!(
+        result.orders.into_values().collect::<Vec<_>>(),
+        vec![retained]
+    );
+    assert_eq!(result.fills, expected_fills);
+    assert!(result.order_only_ids.is_empty());
+    assert!(result.order_only_fill_keys.is_empty());
+}
+
+#[rstest]
+fn test_process_mass_status_retains_order_spanning_position_lifecycles() {
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let spanning_id = VenueOrderId::from("ORDER4");
+    let mut spanning_order =
+        create_limit_order_report(&instrument, "ORDER4", OrderStatus::Filled, "0.05");
+    // An absent order side preserves each fill's side for zero-crossing detection
+    spanning_order.order_side = None;
+    let original = create_two_lifecycle_mass_status(
+        &instrument,
+        vec![spanning_order.clone()],
+        Quantity::from("0.10"),
+        dec!(4050.00),
+    );
+
+    let fills = original
+        .fill_reports()
+        .into_values()
+        .flatten()
+        .map(|mut fill| {
+            if fill.ts_event <= UnixNanos::from(3_000) {
+                fill.venue_order_id = spanning_id;
+            }
+
+            fill
+        })
+        .collect();
+
+    let mut mass_status = ExecutionMassStatus::new(
+        original.client_id,
+        original.account_id,
+        original.venue,
+        original.ts_init,
+        None,
+    );
+
+    mass_status.add_order_reports(vec![spanning_order.clone()]);
+    mass_status.add_fill_reports(fills);
+    mass_status.add_position_reports(
+        original
+            .position_reports()
+            .into_values()
+            .flatten()
+            .collect(),
+    );
+
+    let result = process_mass_status_for_reconciliation(&mass_status, &instrument, None).unwrap();
+
+    assert_eq!(
+        result.orders.into_values().collect::<Vec<_>>(),
+        vec![spanning_order]
+    );
+    assert_eq!(result.fills, mass_status.fill_reports());
+    assert_eq!(
+        result.fills[&spanning_id]
+            .iter()
+            .map(|fill| fill.trade_id)
+            .collect::<Vec<_>>(),
+        vec![
+            TradeId::from("TRADE1"),
+            TradeId::from("TRADE2"),
+            TradeId::from("TRADE4"),
+        ]
+    );
+    assert_eq!(
+        result
+            .order_only_fill_keys
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                original.account_id,
+                instrument.id(),
+                TradeId::from("TRADE1")
+            ),
+            (
+                original.account_id,
+                instrument.id(),
+                TradeId::from("TRADE2")
+            ),
+        ]
+    );
+    assert!(result.order_only_ids.is_empty());
 }
 
 #[rstest]
@@ -3149,74 +3295,26 @@ fn test_reconcile_fill_report_success(instrument: InstrumentAny) {
 
 #[rstest]
 fn test_reconcile_fill_report_duplicate_detected(instrument: InstrumentAny) {
-    // Create an order
     let mut order = OrderTestBuilder::new(OrderType::Market)
         .instrument_id(instrument.id())
         .side(OrderSide::Buy)
         .quantity(Quantity::from("100"))
         .build();
-
     let account_id = AccountId::from("TEST-001");
     let venue_order_id = VenueOrderId::from("V-001");
     let trade_id = TradeId::from("T-001");
-
-    // Submit the order first
-    let submitted = build_order_submitted(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        order.client_order_id(),
-        account_id,
-        UUID4::new(),
-        UnixNanos::from(500_000),
-        UnixNanos::from(500_000),
-    );
-    order.apply(OrderEventAny::Submitted(submitted)).unwrap();
-
-    // Accept the order
-    let accepted = build_order_accepted(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        order.client_order_id(),
-        venue_order_id,
-        account_id,
-        UUID4::new(),
-        UnixNanos::from(600_000),
-        UnixNanos::from(600_000),
-        false,
-    );
-    order.apply(OrderEventAny::Accepted(accepted)).unwrap();
-
-    // Now apply a fill to the order
-    let filled_event = build_order_filled(
-        order.trader_id(),
-        order.strategy_id(),
-        order.instrument_id(),
-        order.client_order_id(),
-        venue_order_id,
-        account_id,
+    submit_accept(&mut order, account_id, venue_order_id);
+    apply_fill(
+        &mut order,
+        &instrument,
         trade_id,
-        OrderSide::Buy,
-        order.order_type(),
         Quantity::from("50"),
         Price::from("1.00000"),
-        Currency::USD(),
-        LiquiditySide::Taker,
-        UUID4::new(),
-        UnixNanos::from(1_000_000),
-        UnixNanos::from(1_000_000),
-        false,
-        None,
-        None,
     );
-    order.apply(OrderEventAny::Filled(filled_event)).unwrap();
-
-    // Now try to reconcile the same fill - should be rejected as duplicate
     let fill_report = create_test_fill_report(
         instrument.id(),
         venue_order_id,
-        trade_id, // Same trade_id
+        trade_id,
         Quantity::from("50"),
         Price::from("1.00000"),
     );
@@ -3698,6 +3796,201 @@ fn test_reconcile_order_report_already_in_sync(instrument: InstrumentAny) {
 }
 
 #[rstest]
+#[case::partially_filled(OrderStatus::PartiallyFilled, 50)]
+#[case::filled(OrderStatus::Filled, 100)]
+fn test_reconcile_order_report_ignores_accepted_after_fill(
+    instrument: InstrumentAny,
+    #[case] status: OrderStatus,
+    #[case] filled_qty: u64,
+) {
+    let account_id = AccountId::from("SIM-001");
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("T-001")),
+        None,
+        None,
+        Some(Quantity::from(filled_qty)),
+        None,
+        None,
+        None,
+        Some(account_id),
+    );
+    order.apply(fill).unwrap();
+
+    let report = create_test_order_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        Quantity::from(100),
+        Quantity::from(filled_qty),
+    );
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+
+    assert_eq!(order.status(), status);
+    assert!(result.is_none());
+}
+
+#[rstest]
+fn test_reconcile_order_report_ignores_accepted_after_fill_during_pending_command(
+    instrument: InstrumentAny,
+    #[values(OrderStatus::PendingUpdate, OrderStatus::PendingCancel)] status: OrderStatus,
+) {
+    let account_id = AccountId::from("SIM-001");
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    let fill = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("T-001")),
+        None,
+        None,
+        Some(Quantity::from(50)),
+        None,
+        None,
+        None,
+        Some(account_id),
+    );
+    order.apply(fill).unwrap();
+
+    let pending = match status {
+        OrderStatus::PendingUpdate => OrderEventAny::PendingUpdate(build_order_pending_update(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            account_id,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+            Some(venue_order_id),
+        )),
+        OrderStatus::PendingCancel => OrderEventAny::PendingCancel(build_order_pending_cancel(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            account_id,
+            UUID4::new(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            false,
+            Some(venue_order_id),
+        )),
+        other => panic!("unsupported pending status {other:?}"),
+    };
+
+    order.apply(pending).unwrap();
+
+    let report = create_test_order_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+
+    assert!(result.is_none());
+    assert_eq!(order.status(), status);
+    assert_eq!(order.filled_qty(), Quantity::from(50));
+}
+
+#[rstest]
+fn test_reconcile_order_report_ignores_accepted_after_terminal(
+    instrument: InstrumentAny,
+    #[values(OrderStatus::Rejected, OrderStatus::Canceled)] terminal_status: OrderStatus,
+) {
+    let account_id = AccountId::from("SIM-001");
+    let client_order_id = ClientOrderId::from("O-001");
+    let venue_order_id = VenueOrderId::from("V-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    let terminal_event = match terminal_status {
+        OrderStatus::Rejected => OrderEventAny::Rejected(
+            OrderRejectedSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(account_id)
+                .reason(Ustr::from("INFLIGHT_TIMEOUT"))
+                .ts_event(UnixNanos::from(1_000_000))
+                .ts_init(UnixNanos::from(1_000_000))
+                .reconciliation(true)
+                .build(),
+        ),
+        OrderStatus::Canceled => OrderEventAny::Canceled(
+            OrderCanceledSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .ts_event(UnixNanos::from(1_000_000))
+                .ts_init(UnixNanos::from(1_000_000))
+                .reconciliation(true)
+                .maybe_venue_order_id(Some(venue_order_id))
+                .maybe_account_id(Some(account_id))
+                .reason(Ustr::from("INFLIGHT_TIMEOUT"))
+                .build(),
+        ),
+        other => panic!("unsupported terminal status {other:?}"),
+    };
+
+    order.apply(terminal_event).unwrap();
+
+    let mut report = create_test_order_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        Quantity::from(100),
+        Quantity::from(0),
+    );
+    report.ts_last = UnixNanos::from(2_000_000);
+    report.ts_init = UnixNanos::from(2_000_000);
+
+    let result = reconcile_order_report(&order, &report, Some(&instrument), UnixNanos::default());
+
+    assert!(result.is_none());
+    assert_eq!(order.status(), terminal_status);
+    assert_eq!(order.ts_closed(), Some(UnixNanos::from(1_000_000)));
+}
+
+#[rstest]
 fn test_reconcile_order_report_generates_canceled(instrument: InstrumentAny) {
     let client_order_id = ClientOrderId::from("O-001");
     let venue_order_id = VenueOrderId::from("V-001");
@@ -3867,7 +4160,10 @@ fn test_reconcile_canceled_suppressed_for_previously_promoted_venue_order_id(
 }
 
 #[rstest]
-fn test_reconcile_terminal_replaced_leg_ignores_price_drift(instrument: InstrumentAny) {
+fn test_reconcile_terminal_replaced_leg_ignores_price_drift(
+    instrument: InstrumentAny,
+    #[values(OrderStatus::Canceled, OrderStatus::Expired, OrderStatus::Filled)] status: OrderStatus,
+) {
     let client_order_id = ClientOrderId::from("O-001");
     let old_venue_order_id = VenueOrderId::from("V-001");
     let new_venue_order_id = VenueOrderId::from("V-002");
@@ -3886,7 +4182,7 @@ fn test_reconcile_terminal_replaced_leg_ignores_price_drift(instrument: Instrume
         old_venue_order_id,
         instrument.id(),
         OrderType::Limit,
-        OrderStatus::Canceled,
+        status,
         Quantity::from(100),
         Quantity::from(0),
     );
@@ -4647,6 +4943,8 @@ fn test_create_synthetic_venue_order_id_format() {
     );
     let id = create_synthetic_venue_order_id(&fill, InstrumentId::from("AUD/USD.SIM"));
 
+    assert_eq!(id.as_str(), "S-f4240-e4b58780");
+
     // Format: S-{hex_timestamp}-{hash_suffix}
     assert!(id.as_str().starts_with("S-"));
     let parts: Vec<&str> = id.as_str().split('-').collect();
@@ -4666,6 +4964,8 @@ fn test_create_synthetic_trade_id_format() {
     );
 
     let id = create_synthetic_trade_id(&fill);
+
+    assert_eq!(id.as_str(), "S-f4240-4a2000b3");
 
     // Format: S-{hex_timestamp}-{hash_suffix}
     assert!(id.as_str().starts_with("S-"));
@@ -4785,6 +5085,90 @@ fn test_create_inferred_reconciliation_trade_id_differs_across_instruments() {
     );
 
     assert_ne!(first, second);
+}
+
+#[rstest]
+fn test_inferred_reconciliation_trade_ids_returns_only_verified_reconciliation_fills(
+    instrument: InstrumentAny,
+) {
+    let account_id = AccountId::from("TEST-001");
+    let venue_order_id = VenueOrderId::from("V-INFERRED-FILLS");
+    let position_id = PositionId::new(format!("{}-EXTERNAL", instrument.id()));
+    let first_qty = Quantity::from(40);
+    let second_qty = Quantity::from(60);
+    let cumulative_qty = Quantity::from(100);
+    let first_id = create_inferred_reconciliation_trade_id(
+        account_id,
+        instrument.id(),
+        ClientOrderId::from("O-INFERRED-FILLS"),
+        Some(venue_order_id),
+        OrderSide::Buy,
+        OrderType::Limit,
+        first_qty,
+        first_qty,
+        Price::from("1.00000"),
+        position_id,
+        UnixNanos::from(1_000),
+    );
+    let second_id = create_inferred_reconciliation_trade_id(
+        account_id,
+        instrument.id(),
+        ClientOrderId::from("O-INFERRED-FILLS"),
+        Some(venue_order_id),
+        OrderSide::Buy,
+        OrderType::Limit,
+        cumulative_qty,
+        second_qty,
+        Price::from("1.00000"),
+        position_id,
+        UnixNanos::from(2_000),
+    );
+    let decoy_id = TradeId::from("2d89666b-1a1e-5a75-b193-4eb3b454c757");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(ClientOrderId::from("O-INFERRED-FILLS"))
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(200))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+
+    for (trade_id, last_qty, ts_event, reconciliation) in [
+        (first_id, first_qty, 1_000, true),
+        (second_id, second_qty, 2_000, true),
+        (decoy_id, Quantity::from(20), 3_000, false),
+    ] {
+        let fill = OrderFilledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(order.client_order_id())
+            .venue_order_id(venue_order_id)
+            .account_id(account_id)
+            .trade_id(trade_id)
+            .order_side(OrderSide::Buy)
+            .order_type(OrderType::Limit)
+            .last_qty(last_qty)
+            .last_px(Price::from("1.00000"))
+            .currency(instrument.quote_currency())
+            .position_id(position_id)
+            .ts_event(UnixNanos::from(ts_event))
+            .ts_init(UnixNanos::from(ts_event))
+            .reconciliation(reconciliation)
+            .build();
+        order
+            .apply(OrderEventAny::Filled(fill))
+            .expect("test fill must apply");
+    }
+
+    let events = order.events().into_iter().cloned().collect();
+
+    let replayed = OrderAny::from_events(events).expect("order replay must succeed");
+    let inferred_ids = inferred_reconciliation_trade_ids(&replayed).unwrap();
+
+    assert!(is_inferred_reconciliation_trade_id_format(&decoy_id));
+    assert_eq!(replayed.filled_qty(), Quantity::from(120));
+    assert_eq!(inferred_ids, vec![first_id, second_id]);
 }
 
 #[rstest]
@@ -6585,6 +6969,77 @@ fn apply_events(order: &OrderAny, events: &[OrderEventAny]) -> OrderAny {
 }
 
 #[rstest]
+fn test_reconciliation_fill_decrease_voids_restatement_at_original_price(
+    instrument: InstrumentAny,
+) {
+    let client_order_id = ClientOrderId::from("O-RESTATE-VOID");
+    let venue_order_id = VenueOrderId::from("V-RESTATE-VOID");
+    let account_id = AccountId::from("SIM-001");
+    let trade_id = TradeId::from("T-RESTATED");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(2))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    for last_px in [Price::from("1.00000"), Price::from("0.90000")] {
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .trade_id(trade_id)
+                    .order_side(OrderSide::Buy)
+                    .order_type(OrderType::Limit)
+                    .last_qty(Quantity::from(2))
+                    .last_px(last_px)
+                    .currency(instrument.quote_currency())
+                    .event_id(UUID4::new())
+                    .build(),
+            ))
+            .unwrap();
+    }
+
+    let mut report = create_test_order_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Voided,
+        Quantity::from(2),
+        Quantity::from(1),
+    );
+    report.avg_px = Some(dec!(0.9));
+
+    let events = generate_reconciliation_order_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(10),
+    );
+
+    let corrected = match &events[0] {
+        OrderEventAny::FillVoided(event) => event,
+        other => panic!("expected fill correction, was {other:?}"),
+    };
+
+    let after = apply_events(&order, &events);
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(corrected.trade_id, trade_id);
+    assert_eq!(corrected.voided_qty, Quantity::from(1));
+    assert_eq!(corrected.last_px, Price::from("1.00000"));
+    assert_eq!(after.filled_qty(), Quantity::from(1));
+    assert_eq!(after.status(), OrderStatus::Voided);
+}
+
+#[rstest]
 #[case(OrderStatus::Voided, false)]
 #[case(OrderStatus::PartiallyFilled, true)]
 fn test_reconciliation_fill_decrease_carries_terminal_disposition(
@@ -6655,6 +7110,87 @@ fn test_reconciliation_fill_decrease_carries_terminal_disposition(
     assert_eq!(after.filled_qty(), Quantity::from(50));
     assert_eq!(after.voided_qty(), Quantity::from(50));
     assert_eq!(after.status(), report_status);
+    assert!(second_pass.is_empty());
+}
+
+#[rstest]
+fn test_reconciliation_fill_decrease_voids_multiple_fills_in_reverse_order(
+    instrument: InstrumentAny,
+) {
+    let client_order_id = ClientOrderId::from("O-MULTI-FILL-VOID");
+    let venue_order_id = VenueOrderId::from("V-MULTI-FILL-VOID");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .price(Price::from("1.00000"))
+        .build();
+    submit_accept(&mut order, account_id, venue_order_id);
+    for (trade_id, last_qty) in [("T-FIRST", 40), ("T-LAST", 60)] {
+        order
+            .apply(OrderEventAny::Filled(
+                OrderFilledSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(order.instrument_id())
+                    .client_order_id(order.client_order_id())
+                    .venue_order_id(venue_order_id)
+                    .account_id(account_id)
+                    .trade_id(TradeId::from(trade_id))
+                    .order_side(OrderSide::Buy)
+                    .order_type(OrderType::Limit)
+                    .last_qty(Quantity::from(last_qty))
+                    .last_px(Price::from("1.00000"))
+                    .currency(instrument.quote_currency())
+                    .build(),
+            ))
+            .unwrap();
+    }
+
+    let mut report = create_test_order_report(
+        client_order_id,
+        venue_order_id,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::PartiallyFilled,
+        Quantity::from(100),
+        Quantity::from(10),
+    );
+    report.avg_px = Some(dec!(1.0));
+
+    let events = generate_reconciliation_order_snapshot_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(10),
+    );
+    let after = apply_events(&order, &events);
+    let second_pass = generate_reconciliation_order_snapshot_events(
+        &after,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(11),
+    );
+
+    let voids = events
+        .iter()
+        .map(|event| match event {
+            OrderEventAny::FillVoided(event) => (event.trade_id, event.voided_qty),
+            other => panic!("expected fill correction, was {other:?}"),
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        voids,
+        vec![
+            (TradeId::from("T-LAST"), Quantity::from(60)),
+            (TradeId::from("T-FIRST"), Quantity::from(30)),
+        ]
+    );
+    assert_eq!(after.filled_qty(), Quantity::from(10));
+    assert_eq!(after.voided_qty(), Quantity::from(90));
     assert!(second_pass.is_empty());
 }
 
@@ -7279,7 +7815,6 @@ fn test_continuous_reconciliation_keeps_pending_command_on_stale_accepted_snapsh
     Quantity::from(10),
     Price::from("1.00000")
 )]
-#[case::amendment_progress(VenueOrderId::from("V-001"), Quantity::from(0), Price::from("1.10000"))]
 fn test_continuous_reconciliation_does_not_suppress_changed_accepted_snapshot(
     #[case] report_venue_order_id: VenueOrderId,
     #[case] filled_qty: Quantity,
@@ -7748,7 +8283,10 @@ fn test_incremental_inferred_fill_price_and_liquidity_matches_emitted_fill() {
         panic!("expected Filled event");
     };
 
-    assert_eq!(last_px, Price::from("33.33"));
+    assert_eq!(
+        last_px,
+        Price::from_decimal_dp(dec!(33.3333333333333333), FIXED_PRECISION).unwrap()
+    );
     assert_eq!(filled.last_px, last_px);
     assert_eq!(filled.liquidity_side, liquidity_side);
 }
@@ -8085,4 +8623,348 @@ fn test_pending_filled_price_drift_without_covering_quantity_does_not_pre_update
     assert_eq!(unchanged.status(), pending_status);
     assert_eq!(unchanged.quantity(), order.quantity());
     assert_eq!(unchanged.price(), Some(Price::from("0.58000")));
+}
+
+#[rstest]
+#[case::known_parent("V-001", "V-001")]
+#[case::current("V-002", "V-002")]
+#[case::unknown("V-UNKNOWN", "V-002")]
+fn test_reconcile_fill_preserves_known_native_venue_id(
+    instrument: InstrumentAny,
+    #[case] report_id: &str,
+    #[case] expected_id: &str,
+) {
+    let order = build_order_promoted_to_new_leg(
+        &instrument,
+        ClientOrderId::from("O-NATIVE-FILL"),
+        VenueOrderId::from("V-001"),
+        VenueOrderId::from("V-002"),
+        AccountId::from("SIM-001"),
+    );
+    let report = create_test_fill_report(
+        instrument.id(),
+        VenueOrderId::from(report_id),
+        TradeId::from("T-NATIVE-FILL"),
+        Quantity::from(30),
+        Price::from("1.00000"),
+    );
+    let event =
+        reconcile_fill_report(&order, &report, &instrument, UnixNanos::default(), false).unwrap();
+
+    let OrderEventAny::Filled(fill) = event else {
+        panic!("Expected fill");
+    };
+
+    assert_eq!(fill.venue_order_id, VenueOrderId::from(expected_id));
+    assert_eq!(fill.client_order_id, order.client_order_id());
+    assert_eq!(fill.trade_id, report.trade_id);
+    assert_eq!(fill.last_qty, report.last_qty);
+    assert_eq!(fill.last_px, report.last_px);
+    assert_eq!(fill.commission, Some(report.commission));
+    assert_eq!(order.venue_order_id(), Some(VenueOrderId::from("V-002")));
+}
+
+#[rstest]
+#[case::quantity(Quantity::from(150), Price::from("1.00000"))]
+#[case::price(Quantity::from(100), Price::from("1.00100"))]
+#[case::both(Quantity::from(150), Price::from("1.00100"))]
+fn test_pending_update_changed_accepted_report_confirms_amend(
+    #[case] quantity: Quantity,
+    #[case] price: Price,
+    instrument: InstrumentAny,
+) {
+    let cid = ClientOrderId::from("O-001");
+    let vid = VenueOrderId::from("V-001");
+    let order = build_order_with_pending_command(
+        &instrument,
+        cid,
+        vid,
+        AccountId::from("SIM-001"),
+        OrderStatus::PendingUpdate,
+    );
+    let mut report = create_test_order_report(
+        cid,
+        vid,
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Accepted,
+        quantity,
+        Quantity::from(0),
+    );
+    report.price = Some(price);
+    let ts_now = UnixNanos::from(7);
+
+    let direct = reconcile_order_report(&order, &report, Some(&instrument), ts_now).unwrap();
+    let events = generate_reconciliation_order_events(&order, &report, Some(&instrument), ts_now);
+
+    let [OrderEventAny::Updated(updated)] = events.as_slice() else {
+        panic!("expected one update, was {events:?}");
+    };
+
+    let OrderEventAny::Updated(direct) = direct else {
+        panic!("expected direct reconciliation update");
+    };
+
+    for actual in [updated, &direct] {
+        let expected = OrderUpdated::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            cid,
+            quantity,
+            actual.event_id,
+            report.ts_last,
+            ts_now,
+            true,
+            Some(vid),
+            Some(report.account_id),
+            Some(price),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(*actual, expected);
+    }
+
+    let after = apply_events(&order, &events);
+    assert_eq!(after.status(), OrderStatus::Accepted);
+    assert_eq!(after.quantity(), quantity);
+    assert_eq!(after.price(), Some(price));
+    assert_eq!(after.filled_qty(), Quantity::from(0));
+    assert!(
+        generate_reconciliation_order_events(&after, &report, Some(&instrument), ts_now).is_empty()
+    );
+}
+
+#[rstest]
+#[case::quantity(Quantity::from(150), Price::from("0.99000"))]
+#[case::trigger(Quantity::from(100), Price::from("0.98000"))]
+fn test_pending_update_market_stop_report_ignores_execution_cap(
+    #[case] quantity: Quantity,
+    #[case] trigger_price: Price,
+    #[values(
+        OrderType::StopMarket,
+        OrderType::MarketIfTouched,
+        OrderType::TrailingStopMarket
+    )]
+    order_type: OrderType,
+    instrument: InstrumentAny,
+) {
+    let cid = ClientOrderId::from("O-CAP-AMEND");
+    let vid = VenueOrderId::from("V-CAP-AMEND");
+    let account_id = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(order_type)
+        .instrument_id(instrument.id())
+        .client_order_id(cid)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100))
+        .trigger_price(Price::from("0.99000"))
+        .trailing_offset(dec!(0.01))
+        .trailing_offset_type(TrailingOffsetType::Price)
+        .build();
+    submit_accept(&mut order, account_id, vid);
+    let pending = OrderPendingUpdateSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(order.instrument_id())
+        .client_order_id(cid)
+        .account_id(account_id)
+        .venue_order_id(vid)
+        .build();
+    order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+    let mut report = create_test_order_report(
+        cid,
+        vid,
+        instrument.id(),
+        order_type,
+        OrderStatus::Accepted,
+        quantity,
+        Quantity::from(0),
+    );
+    report.price = Some(Price::from("1.00100"));
+    report.trigger_price = Some(trigger_price);
+    let ts_now = UnixNanos::from(7);
+    let direct = reconcile_order_report(&order, &report, Some(&instrument), ts_now).unwrap();
+    let events = generate_reconciliation_order_events(&order, &report, Some(&instrument), ts_now);
+
+    let [OrderEventAny::Updated(updated)] = events.as_slice() else {
+        panic!("expected one market-stop amendment, was {events:?}");
+    };
+
+    let OrderEventAny::Updated(direct) = direct else {
+        panic!("expected direct market-stop amendment");
+    };
+
+    for actual in [updated, &direct] {
+        let expected = OrderUpdated::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            cid,
+            quantity,
+            actual.event_id,
+            report.ts_last,
+            ts_now,
+            true,
+            Some(vid),
+            Some(account_id),
+            None,
+            Some(trigger_price),
+            None,
+            false,
+        );
+        assert_eq!(*actual, expected);
+    }
+
+    let after = apply_events(&order, &events);
+    assert_eq!(after.status(), OrderStatus::Accepted);
+    assert_eq!(after.quantity(), quantity);
+    assert_eq!(after.price(), None);
+    assert_eq!(after.trigger_price(), Some(trigger_price));
+    assert_eq!(after.filled_qty(), Quantity::from(0));
+    assert!(
+        generate_reconciliation_order_events(&after, &report, Some(&instrument), ts_now).is_empty()
+    );
+}
+
+#[rstest]
+fn test_pre_fill_amendment_preserves_already_triggered_status(instrument: InstrumentAny) {
+    let cid = ClientOrderId::from("O-TRIGGERED-AMEND");
+    let vid = VenueOrderId::from("V-TRIGGERED-AMEND");
+    let account = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::StopLimit)
+        .instrument_id(instrument.id())
+        .client_order_id(cid)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(3))
+        .price(Price::from("1.00000"))
+        .trigger_price(Price::from("1.01000"))
+        .build();
+    submit_accept(&mut order, account, vid);
+    let mut report = create_test_order_report(
+        cid,
+        vid,
+        instrument.id(),
+        OrderType::StopLimit,
+        OrderStatus::Triggered,
+        Quantity::from(3),
+        Quantity::from(0),
+    );
+    order
+        .apply(create_reconciliation_triggered(
+            &order,
+            &report,
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+    let pending = OrderPendingUpdateSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(order.instrument_id())
+        .client_order_id(cid)
+        .account_id(account)
+        .venue_order_id(vid)
+        .build();
+    order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+    report.quantity = Quantity::from(5);
+    report.price = Some(Price::from("1.02000"));
+    report.trigger_price = Some(Price::from("1.03000"));
+    report.filled_qty = Quantity::from(1);
+    let events = generate_reconciliation_order_pre_fill_events(&order, &report, UnixNanos::from(7));
+
+    let [OrderEventAny::Updated(updated)] = events.as_slice() else {
+        panic!("expected amendment without duplicate trigger, was {events:?}");
+    };
+
+    let expected = OrderUpdated::new(
+        order.trader_id(),
+        order.strategy_id(),
+        instrument.id(),
+        cid,
+        Quantity::from(5),
+        updated.event_id,
+        report.ts_last,
+        UnixNanos::from(7),
+        true,
+        Some(vid),
+        Some(account),
+        Some(Price::from("1.02000")),
+        Some(Price::from("1.03000")),
+        None,
+        false,
+    );
+    assert_eq!(*updated, expected);
+    let after = apply_events(&order, &events);
+    assert_eq!(after.status(), OrderStatus::Triggered);
+    assert_eq!(after.quantity(), Quantity::from(5));
+    assert_eq!(after.filled_qty(), Quantity::from(0));
+    assert!(
+        generate_reconciliation_order_pre_fill_events(&after, &report, UnixNanos::from(8))
+            .is_empty()
+    );
+}
+
+#[rstest]
+fn test_market_report_reconciles_matched_quantity_with_report_price(instrument: InstrumentAny) {
+    let cid = ClientOrderId::from("O-MARKET-MATCHED");
+    let vid = VenueOrderId::from("V-MARKET-MATCHED");
+    let account = AccountId::from("SIM-001");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(cid)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(50))
+        .build();
+    submit_accept(&mut order, account, vid);
+    let mut report = create_test_order_report(
+        cid,
+        vid,
+        instrument.id(),
+        OrderType::Market,
+        OrderStatus::Filled,
+        Quantity::from(10),
+        Quantity::from(10),
+    );
+    report.order_side = Some(OrderSide::Sell);
+    report.price = Some(Price::from("1.25000"));
+    report.avg_px = Some(dec!(1.25000));
+    let events = generate_reconciliation_order_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(7),
+    );
+
+    let [OrderEventAny::Updated(updated), OrderEventAny::Filled(fill)] = events.as_slice() else {
+        panic!("expected matched-quantity update before market fill, was {events:?}");
+    };
+
+    let expected = OrderUpdated::new(
+        order.trader_id(),
+        order.strategy_id(),
+        instrument.id(),
+        cid,
+        Quantity::from(10),
+        updated.event_id,
+        report.ts_last,
+        UnixNanos::from(7),
+        true,
+        Some(vid),
+        Some(account),
+        None,
+        None,
+        None,
+        false,
+    );
+    assert_eq!(*updated, expected);
+    assert_eq!(fill.order_side, OrderSide::Sell);
+    assert_eq!(fill.liquidity_side, LiquiditySide::Taker);
+    assert_eq!(fill.last_qty, Quantity::from(10));
+    assert_eq!(fill.last_px, Price::from("1.25000"));
+    let after = apply_events(&order, &events);
+    assert_eq!(after.status(), OrderStatus::Filled);
+    assert_eq!(after.quantity(), Quantity::from(10));
+    assert_eq!(after.filled_qty(), Quantity::from(10));
+    assert_eq!(after.leaves_qty(), Quantity::from(0));
+    assert_eq!(after.price(), None);
 }

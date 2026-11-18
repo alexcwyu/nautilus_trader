@@ -15,6 +15,7 @@
 
 //! Legacy Parquet catalog rewrite into the current Parquet schema and layout.
 
+use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use nautilus_core::UnixNanos;
 use nautilus_model::instruments::NautilusInstrumentType;
@@ -22,17 +23,21 @@ use nautilus_serialization::arrow::record_batch_without_identifier_column;
 use object_store::{PutMode, PutOptions, path::Path as ObjectPath};
 
 use super::{
-    catalog::ParquetDataCatalog, io::write_batches_to_object_store_create,
-    paths::timestamps_to_filename,
+    catalog::ParquetDataCatalog,
+    io::write_batches_to_object_store_create,
+    paths::{parse_filename_timestamps, timestamps_to_filename},
 };
 use crate::{
     backend::migration::{
         CatalogMigrationPlan, CatalogMigrationReport, IdentifierSource, ParquetCatalogSource,
-        build_catalog_migration_plan, ensure_distinct_migration_locations,
+        PlannedMigrationFile, build_catalog_migration_plan, ensure_distinct_migration_locations,
         ensure_planned_file_unchanged, prepare_migration_parts, read_planned_migration_file,
     },
     catalog::types::instrument_path_prefix,
-    common::{metadata::record_batch_ts_init_range, storage::normalize_storage_location},
+    common::{
+        metadata::record_batch_ts_init_range, paths::escape_local_file_uri,
+        storage::normalize_storage_location,
+    },
 };
 
 /// Settings for converting a legacy Parquet catalog into a separate native catalog.
@@ -52,8 +57,8 @@ pub struct ParquetMigrationConfig {
 ///
 /// # Errors
 ///
-/// Returns an error for overlapping locations, invalid schemas, a nonempty destination,
-/// or an object-store read or write failure.
+/// Returns an error if locations overlap, schemas are invalid, the destination is nonempty, or an
+/// object-store read or write fails.
 pub fn migrate_parquet_catalog(
     config: ParquetMigrationConfig,
 ) -> anyhow::Result<CatalogMigrationReport> {
@@ -73,9 +78,8 @@ pub fn migrate_parquet_catalog(
         return Ok(CatalogMigrationReport::from_plan(&plan, true));
     }
 
-    let url = url::Url::parse(&target_uri)?;
-    if url.scheme() == "file" {
-        let path = url
+    if target_uri.starts_with("file://") {
+        let path = url::Url::parse(&escape_local_file_uri(&target_uri))?
             .to_file_path()
             .map_err(|()| anyhow::anyhow!("Invalid destination file URI"))?;
         std::fs::create_dir_all(path)?;
@@ -172,62 +176,8 @@ impl ParquetDataCatalog {
             }
 
             let batches = read_planned_migration_file(source, file)?;
-            let mut migrated_rows = 0;
-            let mut path_identifier_rows = 0;
-
-            for part in prepare_migration_parts(file, batches)? {
-                if part.row_count == 0 {
-                    continue;
-                }
-
-                let directory =
-                    if let Some(custom_type_name) = file.target_type_name.strip_prefix("custom/") {
-                        self.make_path_custom_data(custom_type_name, part.identifier.as_deref())?
-                    } else {
-                        let prefix =
-                            if let Some(class) = file.target_table.strip_prefix("instruments/") {
-                                instrument_path_prefix(&class.parse::<NautilusInstrumentType>()?)
-                            } else {
-                                &file.target_type_name
-                            };
-
-                        self.make_path(prefix, part.identifier.as_deref())?
-                    };
-
-                let (start_ts, end_ts) = record_batch_ts_init_range(&part.batches)?;
-                let filename =
-                    timestamps_to_filename(UnixNanos::from(start_ts), UnixNanos::from(end_ts));
-                let object_path = self.to_object_path(&format!("{directory}/{filename}"))?;
-                let batches = part
-                    .batches
-                    .into_iter()
-                    .map(record_batch_without_identifier_column)
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                self.execute_async(|| async {
-                    write_batches_to_object_store_create(
-                        &batches,
-                        self.object_store.clone(),
-                        &object_path,
-                        Some(self.compression),
-                        Some(self.max_row_group_size),
-                        None,
-                    )
-                    .await
-                })
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Parquet migration target object already exists or cannot be created: \
-                         {object_path}: {e}"
-                    )
-                })?;
-
-                migrated_rows += part.row_count;
-                if part.identifier_source == IdentifierSource::Path {
-                    path_identifier_rows += part.row_count;
-                }
-            }
-
+            let (migrated_rows, path_identifier_rows) =
+                self.write_migration_batches(file, batches)?;
             if migrated_rows == 0 {
                 report.record_skipped_file(file);
             } else {
@@ -236,6 +186,79 @@ impl ParquetDataCatalog {
         }
 
         Ok(report)
+    }
+
+    fn write_migration_batches(
+        &self,
+        file: &PlannedMigrationFile,
+        batches: Vec<RecordBatch>,
+    ) -> anyhow::Result<(usize, usize)> {
+        let mut migrated_rows = 0;
+        let mut path_identifier_rows = 0;
+
+        let parts = prepare_migration_parts(file, batches)?;
+        let coverage = parse_filename_timestamps(&file.relative_path);
+
+        for part in parts {
+            if part.row_count == 0 {
+                continue;
+            }
+
+            let directory = if let Some(custom_type_name) =
+                file.target_type_name.strip_prefix("custom/")
+            {
+                self.make_path_custom_data(custom_type_name, part.identifier.as_deref())?
+            } else {
+                let prefix = if let Some(class) = file.target_table.strip_prefix("instruments/") {
+                    instrument_path_prefix(&class.parse::<NautilusInstrumentType>()?)
+                } else {
+                    &file.target_type_name
+                };
+
+                self.make_path(prefix, part.identifier.as_deref())?
+            };
+
+            let (row_start, row_end) = record_batch_ts_init_range(&part.batches)?;
+            let (start_ts, end_ts) = coverage.unwrap_or((row_start, row_end));
+            anyhow::ensure!(
+                start_ts <= row_start && row_end <= end_ts,
+                "Parquet migration source coverage does not contain its rows: {}",
+                file.relative_path
+            );
+            let filename =
+                timestamps_to_filename(UnixNanos::from(start_ts), UnixNanos::from(end_ts));
+            let object_path = self.to_object_path(&format!("{directory}/{filename}"))?;
+            let batches = part
+                .batches
+                .into_iter()
+                .map(record_batch_without_identifier_column)
+                .collect::<Result<Vec<_>, _>>()?;
+
+            self.execute_async(|| async {
+                write_batches_to_object_store_create(
+                    &batches,
+                    self.object_store.clone(),
+                    &object_path,
+                    Some(self.compression),
+                    Some(self.max_row_group_size),
+                    None,
+                )
+                .await
+            })
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Parquet migration target object already exists or cannot be created: \
+                     {object_path}: {e}"
+                )
+            })?;
+
+            migrated_rows += part.row_count;
+            if part.identifier_source == IdentifierSource::Path {
+                path_identifier_rows += part.row_count;
+            }
+        }
+
+        Ok((migrated_rows, path_identifier_rows))
     }
 
     fn ensure_migration_target_empty(&self) -> anyhow::Result<()> {

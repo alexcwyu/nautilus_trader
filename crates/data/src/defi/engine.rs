@@ -31,7 +31,7 @@ use nautilus_common::{
 use nautilus_core::UUID4;
 use nautilus_model::{
     defi::{
-        Blockchain, DefiData, PoolProfiler,
+        Blockchain, DefiData, Pool, PoolProfiler,
         data::{DexPoolData, block::BlockPosition},
         pool_analysis::PoolSnapshot,
     },
@@ -232,7 +232,10 @@ impl DataEngine {
         }
 
         if let Some(client) = self.get_client(req.client_id(), req.venue()) {
-            client.execute_defi_request(req)
+            let client_id = client.client_id();
+            client
+                .execute_defi_request(req)
+                .map_err(|e| e.context(format!("Data client {client_id} request failed")))
         } else {
             anyhow::bail!(
                 "Cannot handle request: no client found for {:?} {:?}",
@@ -251,26 +254,7 @@ impl DataEngine {
                 let topic = defi::switchboard::get_defi_blocks_topic(block.chain());
                 msgbus::publish_defi_block(topic, &block);
             }
-            DefiData::Pool(pool) => {
-                if let Err(e) = self.cache().borrow_mut().add_pool(pool.clone()) {
-                    log::error!("Failed to add Pool to cache: {e}");
-                }
-
-                match CurrencyPair::try_from(&pool) {
-                    Ok(instrument) => {
-                        self.handle_instrument(&InstrumentAny::CurrencyPair(instrument));
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to create instrument for Pool {}: {e}",
-                            pool.instrument_id
-                        );
-                    }
-                }
-
-                let topic = defi::switchboard::get_defi_pool_topic(pool.instrument_id);
-                msgbus::publish_defi_pool(topic, &pool);
-            }
+            DefiData::Pool(pool) => self.handle_pool(&pool),
             DefiData::PoolSnapshot(snapshot) => {
                 // Replayed snapshots carry no request identity, so any pending bootstrap accepts them
                 if !self
@@ -288,49 +272,27 @@ impl DataEngine {
             }
             DefiData::PoolSwap(swap) => {
                 let instrument_id = swap.instrument_id;
-                // Subscribers receive events immediately; keep a copy for profiler hydration
-                // while the snapshot is pending.
-                if self.pool_snapshot_pending.contains_key(&instrument_id) {
-                    log::debug!("Buffering swap event for {instrument_id} (waiting for snapshot)");
-                    self.pool_event_buffers
-                        .entry(instrument_id)
-                        .or_default()
-                        .push(DefiData::PoolSwap(swap.clone()));
-                }
+                self.buffer_pool_event(instrument_id, "swap event", || {
+                    DefiData::PoolSwap(swap.clone())
+                });
 
                 let topic = defi::switchboard::get_defi_pool_swaps_topic(instrument_id);
                 msgbus::publish_defi_swap(topic, &swap);
             }
             DefiData::PoolLiquidityUpdate(update) => {
                 let instrument_id = update.instrument_id;
-                // Subscribers receive events immediately; keep a copy for profiler hydration
-                // while the snapshot is pending.
-                if self.pool_snapshot_pending.contains_key(&instrument_id) {
-                    log::debug!(
-                        "Buffering liquidity update event for {instrument_id} (waiting for snapshot)"
-                    );
-                    self.pool_event_buffers
-                        .entry(instrument_id)
-                        .or_default()
-                        .push(DefiData::PoolLiquidityUpdate(update.clone()));
-                }
+                self.buffer_pool_event(instrument_id, "liquidity update event", || {
+                    DefiData::PoolLiquidityUpdate(update.clone())
+                });
 
                 let topic = defi::switchboard::get_defi_liquidity_topic(instrument_id);
                 msgbus::publish_defi_liquidity(topic, &update);
             }
             DefiData::PoolFeeCollect(collect) => {
                 let instrument_id = collect.instrument_id;
-                // Subscribers receive events immediately; keep a copy for profiler hydration
-                // while the snapshot is pending.
-                if self.pool_snapshot_pending.contains_key(&instrument_id) {
-                    log::debug!(
-                        "Buffering fee collect event for {instrument_id} (waiting for snapshot)"
-                    );
-                    self.pool_event_buffers
-                        .entry(instrument_id)
-                        .or_default()
-                        .push(DefiData::PoolFeeCollect(collect.clone()));
-                }
+                self.buffer_pool_event(instrument_id, "fee collect event", || {
+                    DefiData::PoolFeeCollect(collect.clone())
+                });
 
                 let topic = defi::switchboard::get_defi_collect_topic(instrument_id);
                 msgbus::publish_defi_collect(topic, &collect);
@@ -377,20 +339,57 @@ impl DataEngine {
             }
             DefiData::PoolFlash(flash) => {
                 let instrument_id = flash.instrument_id;
-                // Subscribers receive events immediately; keep a copy for profiler hydration
-                // while the snapshot is pending.
-                if self.pool_snapshot_pending.contains_key(&instrument_id) {
-                    log::debug!("Buffering flash event for {instrument_id} (waiting for snapshot)");
-                    self.pool_event_buffers
-                        .entry(instrument_id)
-                        .or_default()
-                        .push(DefiData::PoolFlash(flash.clone()));
-                }
+                self.buffer_pool_event(instrument_id, "flash event", || {
+                    DefiData::PoolFlash(flash.clone())
+                });
 
                 let topic = defi::switchboard::get_defi_flash_topic(instrument_id);
                 msgbus::publish_defi_flash(topic, &flash);
             }
         }
+    }
+
+    fn buffer_pool_event(
+        &mut self,
+        instrument_id: InstrumentId,
+        event_name: &str,
+        event: impl FnOnce() -> DefiData,
+    ) {
+        // Subscribers receive events immediately; only hydration needs the buffered copy
+        if self.pool_snapshot_pending.contains_key(&instrument_id) {
+            log::debug!("Buffering {event_name} for {instrument_id} (waiting for snapshot)");
+            self.pool_event_buffers
+                .entry(instrument_id)
+                .or_default()
+                .push(event());
+        }
+    }
+
+    fn handle_pool(&mut self, pool: &Pool) {
+        let instrument = match CurrencyPair::try_from(pool) {
+            Ok(instrument) => InstrumentAny::CurrencyPair(instrument),
+            Err(e) => {
+                log::error!(
+                    "Failed to create instrument for Pool {}: {e}",
+                    pool.instrument_id
+                );
+                return;
+            }
+        };
+
+        if !self.cache_instrument(&instrument) {
+            return;
+        }
+
+        if let Err(e) = self.cache().borrow_mut().add_pool(pool.clone()) {
+            log::error!("Failed to add Pool to cache: {e}");
+            return;
+        }
+
+        self.publish_instrument(&instrument);
+
+        let topic = defi::switchboard::get_defi_pool_topic(pool.instrument_id);
+        msgbus::publish_defi_pool(topic, pool);
     }
 
     pub(crate) fn handle_pool_snapshot_response(&mut self, response: &PoolSnapshotResponse) {
@@ -488,9 +487,9 @@ impl DataEngine {
 
         // Create updater and subscribe to topics
         self.pool_snapshot_pending.remove(&instrument_id);
-        let updater = Rc::new(PoolUpdater::new(&instrument_id, self.cache().clone()));
+        let updater = Rc::new(PoolUpdater::new(&instrument_id, Rc::clone(self.cache())));
 
-        self.subscribe_pool_updater_topics(instrument_id, updater.clone());
+        self.subscribe_pool_updater_topics(instrument_id, Rc::clone(&updater));
         self.pool_updaters.insert(instrument_id, updater);
 
         log::info!("Pool profiler setup completed for {instrument_id}, now processing live events");
@@ -507,17 +506,17 @@ impl DataEngine {
 
         // Subscribe swap handler
         let swap_topic = defi::switchboard::get_defi_pool_swaps_topic(instrument_id);
-        let swap_handler = TypedHandler(Rc::new(PoolSwapHandler::new(updater.clone())));
+        let swap_handler = TypedHandler(Rc::new(PoolSwapHandler::new(Rc::clone(&updater))));
         msgbus::subscribe_defi_swaps(swap_topic.into(), swap_handler, priority);
 
         // Subscribe liquidity handler
         let liq_topic = defi::switchboard::get_defi_liquidity_topic(instrument_id);
-        let liq_handler = TypedHandler(Rc::new(PoolLiquidityHandler::new(updater.clone())));
+        let liq_handler = TypedHandler(Rc::new(PoolLiquidityHandler::new(Rc::clone(&updater))));
         msgbus::subscribe_defi_liquidity(liq_topic.into(), liq_handler, priority);
 
         // Subscribe collect handler
         let collect_topic = defi::switchboard::get_defi_collect_topic(instrument_id);
-        let collect_handler = TypedHandler(Rc::new(PoolCollectHandler::new(updater.clone())));
+        let collect_handler = TypedHandler(Rc::new(PoolCollectHandler::new(Rc::clone(&updater))));
         msgbus::subscribe_defi_collects(collect_topic.into(), collect_handler, priority);
 
         // Subscribe flash handler
@@ -583,7 +582,7 @@ impl DataEngine {
             } else if let Some(pool) = cache.pool(instrument_id) {
                 // Pool exists but no profiler, create profiler from pool
                 let pool = Arc::new(pool.clone());
-                let mut pool_profiler = PoolProfiler::new(pool.clone());
+                let mut pool_profiler = PoolProfiler::new(Arc::clone(&pool));
 
                 if let Some(initial_sqrt_price_x96) = pool.initial_sqrt_price_x96 {
                     if let Err(e) = pool_profiler.initialize(initial_sqrt_price_x96) {
@@ -608,37 +607,44 @@ impl DataEngine {
                 // Neither profiler nor pool exists, request snapshot
                 drop(cache);
 
-                let request_id = UUID4::new();
-                let ts_init = self.clock().borrow().timestamp_ns();
-
-                let request = RequestPoolSnapshot::new(
-                    *instrument_id,
-                    client_id.copied(),
-                    request_id,
-                    ts_init,
-                    None,
-                );
-
-                if let Err(e) = self.execute_defi_request(DefiRequestCommand::PoolSnapshot(request))
-                {
-                    log::warn!("Failed to request pool snapshot for {instrument_id}: {e}");
-                } else {
-                    log::debug!("Requested pool snapshot for {instrument_id}");
-                    self.pool_snapshot_pending
-                        .insert(*instrument_id, request_id);
-                    self.pool_event_buffers.entry(*instrument_id).or_default();
-                }
+                self.request_pool_snapshot(instrument_id, client_id);
                 return;
             }
         }
 
         // Profiler exists, create updater and subscribe to topics
-        let updater = Rc::new(PoolUpdater::new(instrument_id, self.cache().clone()));
+        let updater = Rc::new(PoolUpdater::new(instrument_id, Rc::clone(self.cache())));
 
-        self.subscribe_pool_updater_topics(*instrument_id, updater.clone());
+        self.subscribe_pool_updater_topics(*instrument_id, Rc::clone(&updater));
         self.pool_updaters.insert(*instrument_id, updater);
 
         log::debug!("Created PoolUpdater for instrument ID {instrument_id}");
+    }
+
+    fn request_pool_snapshot(
+        &mut self,
+        instrument_id: &InstrumentId,
+        client_id: Option<&ClientId>,
+    ) {
+        let request_id = UUID4::new();
+        let ts_init = self.clock().borrow().timestamp_ns();
+
+        let request = RequestPoolSnapshot::new(
+            *instrument_id,
+            client_id.copied(),
+            request_id,
+            ts_init,
+            None,
+        );
+
+        if let Err(e) = self.execute_defi_request(DefiRequestCommand::PoolSnapshot(request)) {
+            log::warn!("Failed to request pool snapshot for {instrument_id}: {e}");
+        } else {
+            log::debug!("Requested pool snapshot for {instrument_id}");
+            self.pool_snapshot_pending
+                .insert(*instrument_id, request_id);
+            self.pool_event_buffers.entry(*instrument_id).or_default();
+        }
     }
 
     fn release_pool_updater(&mut self, instrument_id: &InstrumentId) {
@@ -666,15 +672,15 @@ impl DataEngine {
 
     fn unsubscribe_pool_updater_topics(instrument_id: InstrumentId, updater: Rc<PoolUpdater>) {
         let swap_topic = defi::switchboard::get_defi_pool_swaps_topic(instrument_id);
-        let swap_handler = TypedHandler(Rc::new(PoolSwapHandler::new(updater.clone())));
+        let swap_handler = TypedHandler(Rc::new(PoolSwapHandler::new(Rc::clone(&updater))));
         msgbus::unsubscribe_defi_swaps(swap_topic.into(), &swap_handler);
 
         let liq_topic = defi::switchboard::get_defi_liquidity_topic(instrument_id);
-        let liq_handler = TypedHandler(Rc::new(PoolLiquidityHandler::new(updater.clone())));
+        let liq_handler = TypedHandler(Rc::new(PoolLiquidityHandler::new(Rc::clone(&updater))));
         msgbus::unsubscribe_defi_liquidity(liq_topic.into(), &liq_handler);
 
         let collect_topic = defi::switchboard::get_defi_collect_topic(instrument_id);
-        let collect_handler = TypedHandler(Rc::new(PoolCollectHandler::new(updater.clone())));
+        let collect_handler = TypedHandler(Rc::new(PoolCollectHandler::new(Rc::clone(&updater))));
         msgbus::unsubscribe_defi_collects(collect_topic.into(), &collect_handler);
 
         let flash_topic = defi::switchboard::get_defi_flash_topic(instrument_id);
@@ -685,9 +691,10 @@ impl DataEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{cell::RefCell, sync::Arc};
 
     use alloy_primitives::{Address, I256, U160, U256};
+    use nautilus_common::{cache::Cache, clock::VirtualClock};
     use nautilus_core::UnixNanos;
     use nautilus_model::{
         defi::{
@@ -868,6 +875,69 @@ mod tests {
     }
 
     #[rstest]
+    #[case::snapshot_pending(true)]
+    #[case::no_snapshot_pending(false)]
+    fn test_pool_subscriber_events_buffer_only_for_pending_snapshot(
+        test_instrument_id: InstrumentId,
+        test_chain: Arc<Chain>,
+        test_dex: Arc<Dex>,
+        #[case] pending: bool,
+    ) {
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut engine = DataEngine::new(clock, cache, None);
+        if pending {
+            engine
+                .pool_snapshot_pending
+                .insert(test_instrument_id, UUID4::new());
+        }
+
+        let events = vec![
+            DefiData::PoolSwap(create_test_swap(
+                test_instrument_id,
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
+                104,
+                3,
+                2,
+            )),
+            DefiData::PoolLiquidityUpdate(create_test_liquidity_update(
+                test_instrument_id,
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
+                102,
+                1,
+                4,
+            )),
+            DefiData::PoolFeeCollect(create_test_fee_collect(
+                test_instrument_id,
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
+                103,
+                2,
+                1,
+            )),
+            DefiData::PoolFlash(create_test_flash(
+                test_instrument_id,
+                test_chain,
+                test_dex,
+                101,
+                4,
+                3,
+            )),
+        ];
+
+        for event in &events {
+            engine.process_defi_data(event.clone());
+        }
+
+        assert_eq!(
+            engine.pool_event_buffers.remove(&test_instrument_id),
+            pending.then_some(events),
+        );
+    }
+
+    #[rstest]
     fn test_get_event_block_position_swap(
         test_instrument_id: InstrumentId,
         test_chain: Arc<Chain>,
@@ -973,16 +1043,16 @@ mod tests {
         let events = vec![
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 0,
                 0,
             )),
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 0,
                 1,
@@ -1012,16 +1082,16 @@ mod tests {
         let events = vec![
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 2,
                 5,
             )),
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 1,
                 3,
@@ -1051,16 +1121,16 @@ mod tests {
         let events = vec![
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 102,
                 0,
                 0,
             )),
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 5,
                 2,
@@ -1090,32 +1160,32 @@ mod tests {
         let events = vec![
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 2,
                 0,
             )),
             DefiData::PoolLiquidityUpdate(create_test_liquidity_update(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 0,
                 0,
             )),
             DefiData::PoolFeeCollect(create_test_fee_collect(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 1,
                 0,
             )),
             DefiData::PoolFlash(create_test_flash(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 3,
                 0,
@@ -1148,16 +1218,16 @@ mod tests {
         let events = vec![
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 5,
                 10,
             )),
             DefiData::PoolSwap(create_test_swap(
                 test_instrument_id,
-                test_chain.clone(),
-                test_dex.clone(),
+                Arc::clone(&test_chain),
+                Arc::clone(&test_dex),
                 100,
                 5,
                 5,

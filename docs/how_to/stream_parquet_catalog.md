@@ -67,6 +67,22 @@ RotationConfig.scheduled_dates(
 `scheduled_dates` takes an interval duration in nanoseconds and a time of day in nanoseconds since
 midnight, in its IANA `timezone`, which defaults to `UTC`. Sizes and intervals must be positive.
 
+Rotation follows the rows' `ts_init` rather than the wall clock. A file's first row sets its boundary:
+one interval after its `ts_init`, or the next scheduled time after it. The first row at or after the
+boundary opens the next file. Size rotation is deferred: a file that reaches its size limit stays open
+until a row with a later `ts_init` arrives, and that row opens the next file. A row whose `ts_init` is
+not later than the open file's latest row stays in that file whatever rotation is due, and rows
+written in one batch share one decision, so rotation never splits rows with the same `ts_init`.
+This holds only while each staged type's `ts_init` does not decrease, across all of its identifiers.
+Rotation compares a row with the open file alone, so a late row at or before a sealed file's last
+`ts_init` lands in a later file, which can then overlap the sealed file's interval and fail promotion.
+
+Interval-based promotion and explicit seals, such as the Rust `FeatherWriter::seal`, do not follow
+`ts_init`: they seal every open file when they run, so a row written afterward with the same
+`ts_init` as a sealed file's last row starts the next file. Unless the later rows are exact bar
+replays, promotion rejects the overlapping catalog interval and retains that source. Leave
+`promotion_interval_ms` unset when rows sharing a `ts_init` must stay in one file.
+
 ## Understand query visibility
 
 The shared writer core owns filtering, Feather file appends, rotation, and promotion scheduling.
@@ -105,7 +121,8 @@ when that interval is due. Closing waits for pending work and, by default, promo
 Keep `delete_feather_after_promotion=False` to retain the Feather source after successful promotion.
 Enable it only when source cleanup is desired. Cleanup follows a successful commit; it is separate
 from making catalog data queryable. Promotion identities prevent a repeated completed source from
-being imported again.
+being imported again. The active deletion policy also applies when a restarted writer finds an
+identical source whose promotion is already recorded.
 
 Use explicit close and handle its error. Dropping a writer only provides best-effort cleanup and is
 not evidence of successful promotion. If a promotion fails, preserve its staged files and investigate
@@ -115,7 +132,7 @@ run's `environment`, such as `Environment.LIVE`, to convert a run outside the de
 folder.
 
 A writer holds an exclusive lock on each `.feather.partial` file until it seals the file, so a
-crashed process leaves its open files unlocked. Recovery seals each unlocked partial file: it keeps
+crashed process leaves its open files unlocked. Recovery seals each unlocked regular partial file: it keeps
 the complete record batches, drops any bytes after them with a warning, and renames the file to
 `.feather`. It removes a partial file that has no complete record batch and leaves an empty one in
 place. A read error other than a write cut short leaves the file for a later recovery pass.
@@ -139,9 +156,26 @@ Feather file produces two such groups when its records differ in schema, for exa
 book depth staged alongside a populated one for the same instrument. The catalog filename also
 carries a hash of the promotion identity.
 
-The catalog requires disjoint closed `ts_init` intervals per identifier directory. Before writing one
-Feather file, promotion unifies groups whose precision metadata differs only by a zero precision and
-whose zero-precision group has no decimal values, and writes one file for the combined interval.
+Within each Feather file, CLEAR-only batches with no side, zero or undefined price, zero size, and
+order ID zero adopt the next nonempty order batch's precision for the same instrument before grouping.
+Trailing CLEAR batches use the last preceding nonempty order batch's precision. If the file contains
+only CLEAR rows for an instrument, their zero precision stays unchanged. Raw price and size values
+stay unchanged; zero fields decode with the chosen precision, while an undefined price remains
+undefined at precision zero.
+
+Databento MBO CLEAR rows with an undefined price follow this rule, including CLEAR-only snapshots.
+
+The catalog requires disjoint closed `ts_init` intervals per identifier directory. For bars, promotion
+removes rows that exactly match all persisted rows at the same `ts_init`, including schema, precision
+metadata, OHLCV, and `ts_event`. With `use_ts_event_for_ts_init=True`, `ts_init` is replaced with
+`ts_event` before this comparison. The same OHLCV at a different `ts_init` is not a replay; promotion
+still requires disjoint intervals. A differing bar at the same `ts_init` fails the interval check,
+and its Feather source is retained.
+
+Before writing one Feather file, promotion unifies groups whose precision metadata differs only by a zero precision and
+whose zero-precision group has no decimal values. Promotion writes one file for the combined interval
+and preserves source order among rows with equal `ts_init`, including nonadjacent batches with the
+same schema.
 Groups that still overlap, or that cannot be unified without changing decimal values, fail before
 any catalog file from that Feather source is written. The staged Feather source is retained, and no
 promotion identity is recorded for that source. Automatic promotion and

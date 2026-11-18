@@ -58,12 +58,12 @@
 //! Hyperliquid uses **mark price** for all trigger evaluations (TP/SL orders).
 
 use anyhow::Context;
-use nautilus_core::UnixNanos;
 pub use nautilus_core::serialization::{
     deserialize_decimal_from_str, deserialize_optional_decimal_from_str,
     deserialize_vec_decimal_from_str, serialize_decimal_as_str, serialize_optional_decimal_as_str,
     serialize_vec_decimal_as_str,
 };
+use nautilus_core::{UnixNanos, datetime::NANOSECONDS_IN_MILLISECOND};
 use nautilus_model::{
     data::{bar::BarType, quote::QuoteTick},
     enums::{
@@ -285,8 +285,10 @@ pub fn normalize_order(
 /// Converts millisecond timestamp to [`UnixNanos`].
 #[inline]
 pub fn millis_to_nanos(millis: u64) -> anyhow::Result<UnixNanos> {
-    let value = nautilus_core::datetime::millis_to_nanos(millis as f64)?;
-    Ok(UnixNanos::from(value))
+    millis
+        .checked_mul(NANOSECONDS_IN_MILLISECOND)
+        .map(UnixNanos::from)
+        .with_context(|| format!("milliseconds {millis} is out of range for `u64` nanoseconds"))
 }
 
 /// Parses an outcome (HIP-4) spot coin or token symbol into an asset ID.
@@ -1223,6 +1225,11 @@ pub(crate) fn determine_order_list_grouping(orders: &[OrderAny]) -> HyperliquidE
     } else {
         HyperliquidExchangeGrouping::Na
     }
+}
+
+pub(crate) fn is_false_or_none(value: &Option<bool>) -> bool {
+    // Hyperliquid rejects cancel actions hashed with an explicit false fast flag
+    *value != Some(true)
 }
 
 #[cfg(test)]
@@ -2762,6 +2769,58 @@ mod tests {
     }
 
     #[rstest]
+    #[case("limit")]
+    #[case("trigger")]
+    fn test_order_conversion_matches_normalized_decimal_fixture(
+        #[case] case_name: &str,
+        #[values(false, true)] normalize_prices: bool,
+    ) {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test_data/order_decimal_signing.json"))
+                .unwrap();
+        let case = fixture["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == case_name)
+            .unwrap();
+        let input = &case["input"]["orders"][0];
+        let order = if case_name == "limit" {
+            limit_order(input["p"].as_str().unwrap())
+        } else {
+            stop_market_order(
+                OrderSide::Buy,
+                input["t"]["trigger"]["triggerPx"].as_str().unwrap(),
+            )
+        };
+
+        let converted = order_to_hyperliquid_request_with_asset_and_cloid(
+            &order,
+            0,
+            0,
+            normalize_prices,
+            50,
+            None,
+        )
+        .unwrap();
+        let direct: HyperliquidExchangePlaceOrderRequest =
+            serde_json::from_value(input.clone()).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&converted).unwrap(),
+            case["action"]["orders"][0]
+        );
+        assert_eq!(
+            serde_json::to_value(&direct).unwrap(),
+            serde_json::to_value(&converted).unwrap()
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&direct).unwrap(),
+            rmp_serde::to_vec_named(&converted).unwrap()
+        );
+    }
+
+    #[rstest]
     fn test_order_to_request_raw_price_rejects_excess_decimals() {
         let err = order_to_hyperliquid_request_with_asset(&limit_order("0.62201"), 0, 4, false, 50)
             .unwrap_err();
@@ -2818,5 +2877,21 @@ mod tests {
             dec!(0.123456)
         };
         assert_eq!(request.price, expected);
+    }
+
+    #[rstest]
+    #[case(1_762_819_200_001, 1_762_819_200_001_000_000)]
+    #[case(18_446_744_073_709, 18_446_744_073_709_000_000)]
+    fn test_millis_to_nanos_is_exact(#[case] millis: u64, #[case] expected: u64) {
+        assert_eq!(millis_to_nanos(millis).unwrap(), UnixNanos::from(expected));
+    }
+
+    #[rstest]
+    fn test_millis_to_nanos_overflow_errors() {
+        let err = millis_to_nanos(18_446_744_073_710).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "milliseconds 18446744073710 is out of range for `u64` nanoseconds"
+        );
     }
 }

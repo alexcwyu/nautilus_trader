@@ -66,7 +66,7 @@ pub enum CatalogCompression {
     Zstd,
 }
 
-/// Configuration for a catalog available to request-time historical data loading.
+/// Configuration for catalog connection and storage settings.
 #[cfg_attr(
     feature = "python",
     expect(
@@ -119,8 +119,7 @@ impl<S: data_catalog_config_builder::IsComplete> DataCatalogConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`DataCatalogConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`DataCatalogConfig::validate`]).
     pub fn build(self) -> ConfigResult<DataCatalogConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -154,7 +153,7 @@ impl DataCatalogConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if `batch_size` or `max_row_group_size` is zero.
+    /// Returns an error if `batch_size` or `max_row_group_size` is zero.
     pub fn validate(&self) -> ConfigResult<()> {
         validate_catalog_counts(self.batch_size, self.max_row_group_size)
     }
@@ -347,7 +346,7 @@ impl RotationConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if a size or interval is zero or the timezone is unknown.
+    /// Returns an error if a size or interval is zero or the timezone is unknown.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -532,8 +531,7 @@ impl<S: streaming_config_builder::IsComplete> StreamingConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`StreamingConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`StreamingConfig::validate`]).
     pub fn build(self) -> ConfigResult<StreamingConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -573,8 +571,8 @@ impl StreamingConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -742,8 +740,7 @@ mod tests {
 
     #[rstest]
     fn data_catalog_config_preserves_backend_params() {
-        let mut params = Params::new();
-        params.insert("snapshot_id".to_string(), json!(1024));
+        let params = Params::new([("snapshot_id".to_string(), json!(1024))].into());
         let config = DataCatalogConfig::new(
             "/data/catalog".to_string(),
             Some("file".to_string()),
@@ -918,8 +915,7 @@ read_only = true
 
     #[rstest]
     fn data_catalog_config_connect_config_carries_protocol_options_settings_and_params() {
-        let mut params = Params::new();
-        params.insert("snapshot_id".to_string(), json!(1024));
+        let params = Params::new([("snapshot_id".to_string(), json!(1024))].into());
         let config = DataCatalogConfig::builder()
             .path("bucket/catalog".to_string())
             .fs_protocol("s3".to_string())
@@ -1020,8 +1016,7 @@ read_only = true
 
     #[rstest]
     fn streaming_config_builder_preserves_promotion_options_and_params() {
-        let mut params = Params::new();
-        params.insert("batch_size".to_string(), json!(512));
+        let params = Params::new([("batch_size".to_string(), json!(512))].into());
         let config = StreamingConfig::builder()
             .writer_path("/data/stream".to_string())
             .catalog(local_catalog())

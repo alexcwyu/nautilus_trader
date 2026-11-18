@@ -30,7 +30,7 @@ use super::{to_pykey_err, to_pyvalue_err};
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if the key is missing or value extraction fails.
+/// Returns an error if the key is missing or value extraction fails.
 pub fn get_required_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<String> {
     dict.get_item(key)?
         .ok_or_else(|| to_pykey_err(format!("Missing required key: {key}")))?
@@ -45,7 +45,7 @@ pub fn get_required_string(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Stri
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if the key is missing or value extraction fails.
+/// Returns an error if the key is missing or value extraction fails.
 pub fn get_required<T>(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<T>
 where
     T: for<'a, 'py> FromPyObject<'a, 'py>,
@@ -66,7 +66,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if value extraction fails (but not if the key is missing or value is None).
+/// Returns an error if value extraction fails (but not if the key is missing or value is None).
 #[inline]
 pub fn get_optional<T>(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<T>>
 where
@@ -93,7 +93,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if the key is missing, value extraction fails, or parsing fails.
+/// Returns an error if the key is missing, value extraction fails, or parsing fails.
 pub fn get_required_parsed<T, F>(dict: &Bound<'_, PyDict>, key: &str, parser: F) -> PyResult<T>
 where
     F: FnOnce(String) -> Result<T, String>,
@@ -111,7 +111,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if value extraction or parsing fails (but not if the key is missing or value is None).
+/// Returns an error if value extraction or parsing fails (but not if the key is missing or value is
+/// None).
 pub fn get_optional_parsed<T, F>(
     dict: &Bound<'_, PyDict>,
     key: &str,
@@ -134,7 +135,7 @@ where
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if the key is missing or value extraction fails.
+/// Returns an error if the key is missing or value extraction fails.
 pub fn get_required_list<'py>(
     dict: &Bound<'py, PyDict>,
     key: &str,
@@ -216,6 +217,7 @@ mod tests {
                 value.parse::<u64>().map_err(|e| e.to_string())
             })
             .unwrap();
+
             let levels = get_required_list(&dict, "levels")
                 .unwrap()
                 .extract::<Vec<u64>>()
@@ -248,16 +250,19 @@ mod tests {
         Python::attach(|py| {
             let dict = PyDict::new(py);
             dict.set_item("value", "42").unwrap();
+
             let parsed = get_optional_parsed(&dict, "value", |value| {
                 value.parse::<u64>().map_err(|e| e.to_string())
             })
             .unwrap();
+
             let missing = get_optional_parsed(&dict, "missing", |value| {
                 value.parse::<u64>().map_err(|e| e.to_string())
             })
             .unwrap();
 
             dict.set_item("value", py.None()).unwrap();
+
             let none = get_optional_parsed(&dict, "value", |value| {
                 value.parse::<u64>().map_err(|e| e.to_string())
             })

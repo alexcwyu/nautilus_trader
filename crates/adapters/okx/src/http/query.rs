@@ -32,8 +32,8 @@ use serde::{self, Deserialize, Serialize};
 
 use crate::{
     common::enums::{
-        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXInstrumentType, OKXOrderStatus, OKXOrderType,
-        OKXPositionMode, OKXPositionSide, OKXTradeMode,
+        OKXAlgoOrderStatus, OKXAlgoOrderType, OKXContractType, OKXInstrumentType, OKXMarginMode,
+        OKXOrderStatus, OKXOrderType, OKXPositionMode, OKXPositionSide, OKXTradeMode,
     },
     http::error::BuildError,
 };
@@ -522,7 +522,7 @@ pub struct GetFundingRateHistoryParams {
     /// Pagination: records older than this timestamp (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<String>,
-    /// Number of results per request (default 100, max 100).
+    /// Number of results per request (default 400, max 400).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
 }
@@ -734,6 +734,52 @@ pub struct GetOrderParams {
     pub pos_side: Option<OKXPositionSide>,
 }
 
+/// Parameters for GET /api/v5/account/bills and GET /api/v5/account/bills-archive.
+///
+/// All filters are optional, allowing account-wide and currency-wide queries.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Builder)]
+#[builder(default)]
+#[builder(setter(into, strip_option))]
+#[serde(rename_all = "camelCase")]
+pub struct GetAccountBillsParams {
+    /// Instrument type: SPOT, MARGIN, SWAP, FUTURES, OPTION, EVENTS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_type: Option<OKXInstrumentType>,
+    /// Instrument ID, e.g. "BTC-USDT".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    /// Bill currency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ccy: Option<String>,
+    /// Margin mode: cross or isolated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mgn_mode: Option<OKXMarginMode>,
+    /// Contract type: linear or inverse, applicable to FUTURES/SWAP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ct_type: Option<OKXContractType>,
+    /// Bill type code, as defined by OKX.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub bill_type: Option<String>,
+    /// Bill subtype code, as defined by OKX.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_type: Option<String>,
+    /// Returns records older than this bill ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// Returns records newer than this bill ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    /// Begin timestamp in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub begin: Option<String>,
+    /// End timestamp in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    /// Number of results per request (default 100, maximum 100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 /// Parameters for the GET /api/v5/account/trade-fee endpoint.
 #[derive(Clone, Debug, Deserialize, Serialize, Builder)]
 #[builder(setter(into, strip_option))]
@@ -779,24 +825,6 @@ mod tests {
         assert_eq!(
             qs, "instId=BTC-USDT-SWAP&bar=1m",
             "unexpected optional parameters were serialized: {qs}",
-        );
-    }
-
-    #[rstest]
-    fn test_no_literal_none_strings_leak_into_query_string() {
-        let mut builder = GetCandlesticksParamsBuilder::default();
-        builder.inst_id("BTC-USDT-SWAP");
-        builder.bar("1m");
-
-        let params = builder.build().unwrap();
-        let qs = serde_urlencoded::to_string(&params).unwrap();
-        assert!(
-            !qs.contains("None"),
-            "found literal \"None\" in query string: {qs}",
-        );
-        assert!(
-            !qs.contains("after=") && !qs.contains("before=") && !qs.contains("limit="),
-            "empty optional parameters must be omitted entirely: {qs}",
         );
     }
 

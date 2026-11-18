@@ -34,7 +34,8 @@ pub const PARQUET_CATALOG_FACTORY_NAME: &str = "Parquet";
 /// Minimal connection-config supplied to [`CatalogFactory`].
 #[derive(Debug, Clone)]
 pub struct CatalogConnectConfig {
-    /// Resolved URI for the catalog backend (e.g. `file:///tmp/cat`, `s3://bucket/cat`).
+    /// URI for the catalog backend (e.g. `file:///tmp/cat`, `s3://bucket/cat`), or a relative local
+    /// path for the backend to resolve (e.g. `./catalog`).
     pub uri: String,
     /// Optional storage-backend options (credentials, region, ...) passed to `object_store`.
     pub storage_options: Option<AHashMap<String, String>>,
@@ -66,6 +67,7 @@ impl CatalogConnectConfig {
     /// Builds a [`CatalogConnectConfig`] from `path` + optional `fs_protocol`.
     ///
     /// A `file` protocol with a Windows drive path becomes `file:///C:/...`.
+    /// A `file` protocol leaves a relative path unchanged, for the backend to resolve.
     /// A path that already contains `://` is left unchanged.
     #[must_use]
     pub fn from_path_and_protocol(
@@ -149,8 +151,8 @@ impl CatalogParamKind {
 ///
 /// # Errors
 ///
-/// Returns an error naming the catalog and the key if a key is not accepted or its value has the
-/// wrong kind.
+/// Returns an error if a key is not accepted or its value has the wrong kind. The error names the
+/// catalog and the key.
 pub fn validate_catalog_params(
     catalog: &str,
     params: Option<&Params>,
@@ -226,9 +228,6 @@ mod tests {
         let cfg = CatalogConnectConfig::from_path_and_protocol("/tmp/cat", Some("file"), None);
         assert_eq!(cfg.uri, "file:///tmp/cat");
 
-        let cfg = CatalogConnectConfig::from_path_and_protocol("data/cat", Some("file"), None);
-        assert_eq!(cfg.uri, "file://data/cat");
-
         let cfg = CatalogConnectConfig::from_path_and_protocol(
             r"\\server\share\catalog",
             Some("file"),
@@ -262,13 +261,12 @@ mod tests {
     ];
 
     fn params(entries: &[(&str, Value)]) -> Params {
-        let mut params = Params::new();
-
-        for (key, value) in entries {
-            params.insert((*key).to_string(), value.clone());
-        }
-
-        params
+        Params::new(
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), value.clone()))
+                .collect(),
+        )
     }
 
     #[rstest]

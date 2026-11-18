@@ -32,6 +32,16 @@ CREATE TABLE IF NOT EXISTS "currency" (
     currency_type CURRENCY_TYPE
 );
 
+CREATE TABLE IF NOT EXISTS "defi_currency" (
+    currency_id TEXT PRIMARY KEY REFERENCES currency(id),
+    chain_id BIGINT NOT NULL CHECK (chain_id BETWEEN 0 AND 4294967295),
+    address TEXT NOT NULL CHECK (address ~ '^0x[0-9a-f]{40}$'),
+    symbol TEXT NOT NULL CHECK (btrim(symbol) <> '' AND symbol !~ '[[:space:]:@]'),
+    chain_name TEXT NOT NULL,
+    UNIQUE (chain_id, address),
+    CHECK (currency_id = symbol || '@' || upper(chain_name))
+);
+
 CREATE TABLE IF NOT EXISTS "instrument" (
     id TEXT PRIMARY KEY NOT NULL,
     kind TEXT,
@@ -71,6 +81,11 @@ CREATE TABLE IF NOT EXISTS "instrument" (
 );
 
 ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS info JSON;
+ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS tick_scheme TEXT;
+ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS underlying_instrument_id TEXT;
+ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS exercise_style TEXT;
+ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS settlement_type TEXT;
+ALTER TABLE "instrument" ADD COLUMN IF NOT EXISTS defi_currency_codes TEXT[];
 -- Maker/taker fee rates are account-owned; drop the retired instrument columns from
 -- databases created before that change. Dropping is metadata-only and idempotent.
 ALTER TABLE "instrument" DROP COLUMN IF EXISTS maker_fee;
@@ -293,14 +308,14 @@ CREATE TABLE IF NOT EXISTS "position"(
     closing_order_id TEXT,  -- REFERENCES TBD
     entry TEXT NOT NULL,
     side TEXT NOT NULL,
-    signed_qty DOUBLE PRECISION NOT NULL,
+    signed_qty NUMERIC NOT NULL,
     quantity TEXT NOT NULL,
     peak_qty TEXT NOT NULL,
     quote_currency TEXT NOT NULL,
     base_currency TEXT,
     settlement_currency TEXT NOT NULL,
-    avg_px_open DOUBLE PRECISION NOT NULL,
-    avg_px_close DOUBLE PRECISION,
+    avg_px_open NUMERIC NOT NULL,
+    avg_px_close NUMERIC,
     realized_return DOUBLE PRECISION,
     realized_pnl TEXT,
     unrealized_pnl TEXT,
@@ -325,6 +340,7 @@ CREATE TABLE IF NOT EXISTS "account_event"(
     base_currency TEXT REFERENCES currency(id),
     balances JSONB,
     margins JSONB,
+    info JSON,
     is_reported BOOLEAN DEFAULT FALSE,
     ts_event TEXT NOT NULL,
     ts_init TEXT NOT NULL,
@@ -335,6 +351,8 @@ CREATE TABLE IF NOT EXISTS "account_event"(
 -- trader, so the cache stamps the writing node's trader on each event. Earlier events stay without
 -- a trader until assigned with `nautilus database assign-account`.
 ALTER TABLE "account_event" ADD COLUMN IF NOT EXISTS trader_id TEXT REFERENCES trader(id) ON DELETE CASCADE;
+-- Preserve venue-specific account metadata alongside the typed balances and margins.
+ALTER TABLE "account_event" ADD COLUMN IF NOT EXISTS info JSON;
 
 -- Qualify the order and position snapshot keys and the order position index key with the trader.
 -- Client order and position IDs are only unique per trader: NETTING position IDs are
@@ -467,6 +485,16 @@ CREATE TABLE IF NOT EXISTS "bar" (
     ts_init TEXT NOT NULL,
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS "greeks" (
+    instrument_id TEXT PRIMARY KEY NOT NULL,
+    value JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS "yield_curve" (
+    curve_name TEXT PRIMARY KEY NOT NULL,
+    value JSONB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS "signal" (

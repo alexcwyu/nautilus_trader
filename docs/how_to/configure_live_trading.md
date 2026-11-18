@@ -190,11 +190,9 @@ changes, or closes. Set `snapshot_positions_interval_secs` independently to add 
 of every open position. Redis and Postgres cache backings persist both paths. Without backing, the
 snapshots remain available on the in-process message bus but are not persisted.
 
-`with_load_state` and `with_save_state` control actor and strategy state persistence, which requires
-a Redis backing. The Postgres adapter backs cache state only: with registered actors or strategies,
-`with_load_state(True)` fails when the trader starts, while `with_save_state(True)` fails when the
-node stops or is disposed. On startup the kernel passes non-empty persisted state to `on_load`; when
-stopping or disposing the node it persists whatever `on_save` returns.
+`with_load_state` and `with_save_state` control actor and strategy state persistence with a Redis or
+Postgres backing. On startup the kernel passes non-empty persisted state to `on_load`; when stopping
+or disposing the node it persists whatever `on_save` returns.
 
 :::warning
 State persistence is not continuous checkpointing. The kernel saves state at most once per run, so a
@@ -347,11 +345,12 @@ across trading nodes.
 :::note[Order tagging behavior]
 Reconciliation tags orders by origin:
 
-- **`VENUE` tag**: external orders discovered at the venue (placed outside this system).
+- **`VENUE` tag**: unclaimed external orders discovered at the venue.
 - **`RECONCILIATION` tag**: synthetic orders generated to align position discrepancies.
 
-When `filter_unclaimed_external_orders` is enabled, only `VENUE`-tagged orders are filtered.
-`RECONCILIATION`-tagged orders are never filtered, so position alignment always succeeds.
+When `filter_unclaimed_external_orders` is enabled, the engine drops unclaimed venue orders and can
+still generate synthetic reconciliation orders. With startup reconciliation enabled, an unresolved
+in-scope position report blocks startup.
 :::
 
 ### Continuous reconciliation
@@ -367,10 +366,10 @@ and caveats, see [Runtime checks](../concepts/execution/reconciliation.md#runtim
 | `inflight_check_threshold_ms`        | 5,000&nbsp;ms  | Time before an in-flight order triggers a venue status check. Lower if colocated.                                                                                                              |
 | `inflight_check_retries`             | 5&nbsp;retries | Retry attempts to verify an in-flight order with the venue.                                                                                                                                    |
 | `open_check_interval_secs`           | None           | How often (seconds) to check open orders at the venue. None or 0.0 disables. Recommended: 5-10s.                                                                                               |
-| `open_check_open_only`               | True           | When true, query only open orders; when false, fetch full history (resource-intensive).                                                                                                        |
+| `open_check_open_only`               | True           | When true, bulk queries request open orders; targeted queries can recover terminal reports. When false, bulk queries include full history (resource-intensive).                                |
 | `open_check_lookback_mins`           | 60&nbsp;min    | Lookback window (minutes) for order status polling. Only orders modified within this window.                                                                                                   |
 | `open_check_threshold_ms`            | 5,000&nbsp;ms  | Minimum time since last cached event before acting on venue discrepancies.                                                                                                                     |
-| `open_check_missing_retries`         | 5&nbsp;retries | Max retries before targeted not-found resolution for eligible orders.                                                                                                                          |
+| `open_check_missing_retries`         | 5&nbsp;checks  | Eligible missing-order checks before a targeted status query.                                                                                                                                  |
 | `max_single_order_queries_per_cycle` | 10             | Cap on single-order queries per cycle. Prevents rate-limit exhaustion.                                                                                                                         |
 | `single_order_query_delay_ms`        | 100&nbsp;ms    | Delay (ms) between single-order queries to avoid rate limits.                                                                                                                                  |
 | `reconciliation_startup_delay_secs`  | 10.0&nbsp;s    | Delay (seconds) *after* startup reconciliation before continuous checks begin.                                                                                                                 |
@@ -406,16 +405,18 @@ and caveats, see [Runtime checks](../concepts/execution/reconciliation.md#runtim
 ### Memory management
 
 Periodically purges closed orders, closed positions, and account events from the
-in-memory cache, keeping memory bounded during long-running or HFT sessions.
+in-memory cache, keeping memory bounded during long-running or HFT sessions. Deleting persisted closed
+orders and positions is optional.
 
-| Setting                                | Default | Description                                                                        |
-| -------------------------------------- | ------- | ---------------------------------------------------------------------------------- |
-| `purge_closed_orders_interval_mins`    | None    | How often (minutes) to purge closed orders from memory. Recommended: 10-15 min.    |
-| `purge_closed_orders_buffer_mins`      | None    | How long (minutes) an order must be closed before purging. Recommended: 60 min.    |
-| `purge_closed_positions_interval_mins` | None    | How often (minutes) to purge closed positions from memory. Recommended: 10-15 min. |
-| `purge_closed_positions_buffer_mins`   | None    | How long (minutes) a position must be closed before purging. Recommended: 60 min.  |
-| `purge_account_events_interval_mins`   | None    | How often (minutes) to purge account events from memory. Recommended: 10-15 min.   |
-| `purge_account_events_lookback_mins`   | None    | How old (minutes) an account event must be before purging. Recommended: 60 min.    |
+| Setting                                | Default | Description                                                                                         |
+| -------------------------------------- | ------- | --------------------------------------------------------------------------------------------------- |
+| `purge_closed_orders_interval_mins`    | None    | How often (minutes) to purge closed orders from memory. Recommended: 10-15 min.                     |
+| `purge_closed_orders_buffer_mins`      | None    | How long (minutes) an order must be closed before purging. Recommended: 60 min.                     |
+| `purge_closed_positions_interval_mins` | None    | How often (minutes) to purge closed positions from memory. Recommended: 10-15 min.                  |
+| `purge_closed_positions_buffer_mins`   | None    | How long (minutes) a position must be closed before purging. Recommended: 60 min.                   |
+| `purge_account_events_interval_mins`   | None    | How often (minutes) to purge account events from memory. Recommended: 10-15 min.                    |
+| `purge_account_events_lookback_mins`   | None    | How old (minutes) an account event must be before purging. Recommended: 60 min.                     |
+| `purge_from_database`                  | False   | Also delete persisted closed orders and positions. Redis and Postgres retain account-event history. |
 
 Setting an interval enables the purge loop; leaving it unset disables scheduling and deletion.
 Each loop delegates to the cache APIs described in

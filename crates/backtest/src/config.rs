@@ -25,10 +25,11 @@ use nautilus_common::{
     logging::logger::LoggerConfig,
     msgbus::MessageBusConfig,
 };
-use nautilus_core::{UUID4, UnixNanos, string::secret::SecretString};
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_data::engine::config::DataEngineConfig;
 use nautilus_execution::{
     engine::config::ExecutionEngineConfig,
+    matching_engine::config::OrderPriorityResetPolicy,
     models::{
         fee::{FeeModelAny, FeeModelHandle},
         fill::{FillModelAny, FillModelHandle},
@@ -42,8 +43,6 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, TraderId, Venue},
     types::{Currency, Money},
 };
-#[cfg(feature = "streaming")]
-use nautilus_persistence::config::CatalogBackendType;
 #[cfg(feature = "streaming")]
 use nautilus_persistence::config::DataCatalogConfig;
 use nautilus_portfolio::config::PortfolioConfig;
@@ -283,11 +282,6 @@ pub struct SimulatedVenueConfig {
     /// The leverage overrides for individual instruments.
     #[builder(default)]
     pub leverages: AHashMap<InstrumentId, Decimal>,
-    /// The model used to calculate margin requirements.
-    pub margin_model: Option<MarginModelHandle>,
-    /// The simulation modules run by the exchange.
-    #[builder(default)]
-    pub modules: Vec<SimulationModuleHandle>,
     /// The model used to simulate order fills.
     #[builder(default)]
     pub fill_model: FillModelHandle,
@@ -297,8 +291,13 @@ pub struct SimulatedVenueConfig {
     /// Missing configuration must not silently turn a fee-paying replay into
     /// a zero-fee replay.
     pub fee_model: FeeModelHandle,
+    /// The model used to calculate margin requirements.
+    pub margin_model: Option<MarginModelHandle>,
     /// The optional model used to simulate command latency.
     pub latency_model: Option<LatencyModelHandle>,
+    /// The simulation modules run by the exchange.
+    #[builder(default)]
+    pub modules: Vec<SimulationModuleHandle>,
     /// If the execution client supports routing orders to other venues.
     #[builder(default = false)]
     pub routing: bool,
@@ -365,6 +364,9 @@ pub struct SimulatedVenueConfig {
     /// If open orders are canceled before liquidating positions.
     #[builder(default = true)]
     pub liquidation_cancel_open_orders: bool,
+    /// The queue-priority reset policy for successful modify commands.
+    #[builder(default)]
+    pub order_priority_reset_policy: OrderPriorityResetPolicy,
 }
 
 impl<S: simulated_venue_config_builder::IsComplete> SimulatedVenueConfigBuilder<S> {
@@ -372,8 +374,7 @@ impl<S: simulated_venue_config_builder::IsComplete> SimulatedVenueConfigBuilder<
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`SimulatedVenueConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`SimulatedVenueConfig::validate`]).
     pub fn build(self) -> ConfigResult<SimulatedVenueConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -386,8 +387,8 @@ impl SimulatedVenueConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -520,20 +521,20 @@ pub struct BacktestVenueConfig {
     default_leverage: Option<Decimal>,
     /// The instrument specific leverage configuration (for margin accounts).
     leverages: Option<AHashMap<InstrumentId, Decimal>>,
-    /// The margin model for the venue.
-    margin_model: Option<MarginModelAny>,
-    /// The simulation modules for the venue.
-    #[builder(default)]
-    modules: Vec<SimulationModuleAny>,
     /// The fill model for the venue.
     fill_model: Option<FillModelAny>,
-    /// The latency model for the venue.
-    latency_model: Option<LatencyModelAny>,
     /// The fee model for the venue.
     ///
     /// Required when building engines from this config, including an explicit
     /// zero-fee model; node build fails without one.
     fee_model: Option<FeeModelAny>,
+    /// The margin model for the venue.
+    margin_model: Option<MarginModelAny>,
+    /// The latency model for the venue.
+    latency_model: Option<LatencyModelAny>,
+    /// The simulation modules for the venue.
+    #[builder(default)]
+    modules: Vec<SimulationModuleAny>,
     /// Defines an exchange-calculated price boundary to prevent a market order from being
     /// filled at an extremely aggressive price.
     #[builder(default)]
@@ -548,6 +549,8 @@ pub struct BacktestVenueConfig {
     /// If open orders should be canceled before closing positions during liquidation.
     #[builder(default = true)]
     liquidation_cancel_open_orders: bool,
+    #[builder(default)]
+    order_priority_reset_policy: OrderPriorityResetPolicy,
 }
 
 impl<S: backtest_venue_config_builder::IsComplete> BacktestVenueConfigBuilder<S> {
@@ -555,12 +558,33 @@ impl<S: backtest_venue_config_builder::IsComplete> BacktestVenueConfigBuilder<S>
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`BacktestVenueConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`BacktestVenueConfig::validate`]).
     pub fn build(self) -> ConfigResult<BacktestVenueConfig> {
         let config = self.build_inner();
         config.validate()?;
         Ok(config)
+    }
+
+    #[cfg(feature = "python")]
+    pub(crate) fn build_simulated(
+        self,
+        starting_balances: Vec<Money>,
+        models: BehavioralModels,
+        modules: Vec<SimulationModuleHandle>,
+        use_message_queue: bool,
+    ) -> ConfigResult<SimulatedVenueConfig> {
+        // Runtime balances and models replace builder values; validate only the simulated
+        // config to preserve Python's validation errors and their timing.
+        let mut config = self.build_inner();
+        let leverages = config.leverages.take().unwrap_or_default();
+        build_simulated_venue(
+            &config,
+            starting_balances,
+            leverages,
+            models,
+            modules,
+            use_message_queue,
+        )
     }
 }
 
@@ -569,8 +593,8 @@ impl BacktestVenueConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -723,6 +747,11 @@ impl BacktestVenueConfig {
     }
 
     #[must_use]
+    pub fn order_priority_reset_policy(&self) -> OrderPriorityResetPolicy {
+        self.order_priority_reset_policy
+    }
+
+    #[must_use]
     pub fn queue_position(&self) -> bool {
         self.queue_position
     }
@@ -748,18 +777,18 @@ impl BacktestVenueConfig {
     }
 
     #[must_use]
-    pub fn margin_model(&self) -> Option<&MarginModelAny> {
-        self.margin_model.as_ref()
-    }
-
-    #[must_use]
-    pub fn modules(&self) -> &[SimulationModuleAny] {
-        &self.modules
-    }
-
-    #[must_use]
     pub fn fill_model(&self) -> Option<&FillModelAny> {
         self.fill_model.as_ref()
+    }
+
+    #[must_use]
+    pub fn fee_model(&self) -> Option<&FeeModelAny> {
+        self.fee_model.as_ref()
+    }
+
+    #[must_use]
+    pub fn margin_model(&self) -> Option<&MarginModelAny> {
+        self.margin_model.as_ref()
     }
 
     #[must_use]
@@ -768,8 +797,8 @@ impl BacktestVenueConfig {
     }
 
     #[must_use]
-    pub fn fee_model(&self) -> Option<&FeeModelAny> {
-        self.fee_model.as_ref()
+    pub fn modules(&self) -> &[SimulationModuleAny] {
+        &self.modules
     }
 
     #[must_use]
@@ -791,6 +820,109 @@ impl BacktestVenueConfig {
     pub fn liquidation_cancel_open_orders(&self) -> bool {
         self.liquidation_cancel_open_orders
     }
+
+    #[cfg(feature = "streaming")]
+    pub(crate) fn to_simulated(&self) -> anyhow::Result<SimulatedVenueConfig> {
+        let starting_balances: Vec<Money> = self
+            .starting_balances()
+            .iter()
+            .map(|s| s.parse::<Money>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid starting balance: {e}"))?;
+
+        let leverages = self.leverages().cloned().unwrap_or_default();
+        let fill_model = self.fill_model().cloned().unwrap_or_default().into();
+
+        let fee_model = self
+            .fee_model()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "BacktestVenueConfig for '{}' requires an explicit fee_model, including an explicit zero-fee model",
+                    self.name()
+                )
+            })?
+            .into();
+
+        let margin_model = self.margin_model().cloned().map(Into::into);
+
+        let latency_model = self.latency_model().cloned().map(Into::into);
+
+        let modules = self.modules().iter().cloned().map(Into::into).collect();
+
+        let models = BehavioralModels {
+            fill: fill_model,
+            fee: fee_model,
+            margin: margin_model,
+            latency: latency_model,
+        };
+
+        Ok(build_simulated_venue(
+            self,
+            starting_balances,
+            leverages,
+            models,
+            modules,
+            true,
+        )?)
+    }
+}
+
+#[cfg(feature = "streaming")]
+fn build_simulated_venue(
+    config: &BacktestVenueConfig,
+    starting_balances: Vec<Money>,
+    leverages: AHashMap<InstrumentId, Decimal>,
+    models: BehavioralModels,
+    modules: Vec<SimulationModuleHandle>,
+    use_message_queue: bool,
+) -> ConfigResult<SimulatedVenueConfig> {
+    SimulatedVenueConfig::builder()
+        .venue(Venue::from(config.name().as_str()))
+        .oms_type(config.oms_type())
+        .account_type(config.account_type())
+        .book_type(config.book_type())
+        .starting_balances(starting_balances)
+        .maybe_base_currency(config.base_currency())
+        .maybe_default_leverage(config.default_leverage())
+        .leverages(leverages)
+        .fill_model(models.fill)
+        .fee_model(models.fee)
+        .maybe_margin_model(models.margin)
+        .maybe_latency_model(models.latency)
+        .modules(modules)
+        .routing(config.routing())
+        .reject_stop_orders(config.reject_stop_orders())
+        .support_gtd_orders(config.support_gtd_orders())
+        .support_contingent_orders(config.support_contingent_orders())
+        .use_position_ids(config.use_position_ids())
+        .use_random_ids(config.use_random_ids())
+        .use_reduce_only(config.use_reduce_only())
+        .use_message_queue(use_message_queue)
+        .use_market_order_acks(config.use_market_order_acks())
+        .bar_execution(config.bar_execution())
+        .bar_adaptive_high_low_ordering(config.bar_adaptive_high_low_ordering())
+        .trade_execution(config.trade_execution())
+        .liquidity_consumption(config.liquidity_consumption())
+        .allow_cash_borrowing(config.allow_cash_borrowing())
+        .frozen_account(config.frozen_account())
+        .queue_position(config.queue_position())
+        .order_priority_reset_policy(config.order_priority_reset_policy())
+        .oto_full_trigger(config.oto_trigger_mode() == OtoTriggerMode::Full)
+        .price_protection_points(config.price_protection_points())
+        .liquidation_enabled(config.liquidation_enabled())
+        .liquidation_trigger_ratio(config.liquidation_trigger_ratio())
+        .liquidation_cancel_open_orders(config.liquidation_cancel_open_orders())
+        .build()
+}
+
+#[cfg(feature = "streaming")]
+#[derive(Debug)]
+pub(crate) struct BehavioralModels {
+    pub(crate) fill: FillModelHandle,
+    pub(crate) fee: FeeModelHandle,
+    pub(crate) margin: Option<MarginModelHandle>,
+    pub(crate) latency: Option<LatencyModelHandle>,
 }
 
 /// Represents the data configuration for one specific backtest run.
@@ -807,18 +939,9 @@ impl BacktestVenueConfig {
 pub struct BacktestDataConfig {
     /// The type of data to query from the catalog.
     data_type: NautilusDataType,
-    /// The path to the data catalog.
-    catalog_path: String,
-    /// Catalog backend used for data loading.
-    #[builder(default)]
+    /// The catalog to query for instruments and replay data.
     #[cfg(feature = "streaming")]
-    catalog_backend: CatalogBackendType,
-    /// The `fsspec` filesystem protocol for the catalog.
-    catalog_fs_protocol: Option<String>,
-    /// The filesystem storage options for the catalog (e.g. cloud auth credentials).
-    catalog_fs_storage_options: Option<AHashMap<String, SecretString>>,
-    /// Rust-specific storage options for the catalog backend.
-    catalog_fs_rust_storage_options: Option<AHashMap<String, SecretString>>,
+    catalog: DataCatalogConfig,
     /// The instrument ID for the data configuration (single).
     instrument_id: Option<InstrumentId>,
     /// Multiple instrument IDs for the data configuration.
@@ -850,8 +973,7 @@ impl<S: backtest_data_config_builder::IsComplete> BacktestDataConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`BacktestDataConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`BacktestDataConfig::validate`]).
     pub fn build(self) -> ConfigResult<BacktestDataConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -860,19 +982,12 @@ impl<S: backtest_data_config_builder::IsComplete> BacktestDataConfigBuilder<S> {
 }
 
 impl BacktestDataConfig {
-    /// Returns the configured catalog backend.
-    #[must_use]
-    #[cfg(feature = "streaming")]
-    pub fn catalog_backend(&self) -> CatalogBackendType {
-        self.catalog_backend.clone()
-    }
-
     /// Validates the data configuration, collecting every field violation.
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -898,8 +1013,13 @@ impl BacktestDataConfig {
             ),
         );
 
-        if self.catalog_path.trim().is_empty() {
-            errors.push(ConfigError::empty_field("catalog_path"));
+        #[cfg(feature = "streaming")]
+        {
+            if self.catalog.path().trim().is_empty() {
+                errors.push(ConfigError::empty_field("catalog.path"));
+            }
+
+            errors.collect(self.catalog.validate());
         }
 
         if let (Some(start), Some(end)) = (self.start_time, self.end_time) {
@@ -931,24 +1051,11 @@ impl BacktestDataConfig {
         &self.data_type
     }
 
+    /// Returns the catalog queried for instruments and replay data.
     #[must_use]
-    pub fn catalog_path(&self) -> &str {
-        &self.catalog_path
-    }
-
-    #[must_use]
-    pub fn catalog_fs_protocol(&self) -> Option<&str> {
-        self.catalog_fs_protocol.as_deref()
-    }
-
-    #[must_use]
-    pub fn catalog_fs_storage_options(&self) -> Option<&AHashMap<String, SecretString>> {
-        self.catalog_fs_storage_options.as_ref()
-    }
-
-    #[must_use]
-    pub fn catalog_fs_rust_storage_options(&self) -> Option<&AHashMap<String, SecretString>> {
-        self.catalog_fs_rust_storage_options.as_ref()
+    #[cfg(feature = "streaming")]
+    pub const fn catalog(&self) -> &DataCatalogConfig {
+        &self.catalog
     }
 
     #[must_use]
@@ -1133,8 +1240,7 @@ impl<S: backtest_run_config_builder::IsComplete> BacktestRunConfigBuilder<S> {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] if any field fails validation
-    /// (see [`BacktestRunConfig::validate`]).
+    /// Returns an error if any field fails validation (see [`BacktestRunConfig::validate`]).
     pub fn build(self) -> ConfigResult<BacktestRunConfig> {
         let config = self.build_inner();
         config.validate()?;
@@ -1147,8 +1253,8 @@ impl BacktestRunConfig {
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] (a [`ConfigError::Multiple`] when more than one field is
-    /// invalid) if any field fails validation.
+    /// Returns an error if any field fails validation. Multiple validation failures are collected
+    /// into one error.
     pub fn validate(&self) -> ConfigResult<()> {
         let mut errors = ConfigErrorCollector::new();
 
@@ -1224,8 +1330,19 @@ impl BacktestRunConfig {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_core::string::secret::REDACTED;
+    #[cfg(feature = "streaming")]
+    use nautilus_core::{
+        Params,
+        string::secret::{REDACTED, SecretString},
+    };
     use nautilus_execution::models::fee::MakerTakerFeeModel;
+    #[cfg(feature = "streaming")]
+    use nautilus_persistence::config::{CatalogBackendType, CatalogCompression};
+    #[cfg(feature = "python")]
+    use pyo3::{
+        Python,
+        types::{PyAnyMethods, PyDict, PyDictMethods},
+    };
     use rstest::rstest;
 
     use super::*;
@@ -1238,6 +1355,15 @@ mod tests {
                 .account_type(AccountType::Margin)
                 .book_type(BookType::L1_MBP)
         };
+    }
+
+    macro_rules! data_builder {
+        ($data_type:expr, $catalog_path:expr) => {{
+            let builder = BacktestDataConfig::builder().data_type($data_type);
+            #[cfg(feature = "streaming")]
+            let builder = builder.catalog(DataCatalogConfig::new($catalog_path, None, None));
+            builder
+        }};
     }
 
     #[rstest]
@@ -1253,9 +1379,7 @@ mod tests {
     #[case(NautilusDataType::InstrumentStatus)]
     #[case(NautilusDataType::InstrumentClose)]
     fn test_data_config_accepts_supported_family(#[case] data_type: NautilusDataType) {
-        let config = BacktestDataConfig::builder()
-            .data_type(data_type.clone())
-            .catalog_path("/tmp/catalog".to_string())
+        let config = data_builder!(data_type.clone(), "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .build()
             .unwrap();
@@ -1265,9 +1389,7 @@ mod tests {
 
     #[rstest]
     fn test_data_config_accepts_the_instrument_family() {
-        let config = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::Instrument)
-            .catalog_path("/tmp/catalog".to_string())
+        let config = data_builder!(NautilusDataType::Instrument, "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .build()
             .unwrap();
@@ -1278,9 +1400,7 @@ mod tests {
     #[rstest]
     #[case(NautilusDataType::Custom { type_name: "Signal".to_string() })]
     fn test_data_config_rejects_unsupported_family(#[case] data_type: NautilusDataType) {
-        let error = BacktestDataConfig::builder()
-            .data_type(data_type.clone())
-            .catalog_path("/tmp/catalog".to_string())
+        let error = data_builder!(data_type.clone(), "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .build()
             .unwrap_err();
@@ -1306,9 +1426,157 @@ mod tests {
         };
     }
 
+    #[cfg(feature = "streaming")]
+    #[rstest]
+    fn test_venue_config_forwards_runtime_policy() {
+        let instrument_id = InstrumentId::from("EUR/USD.SIM");
+        let config = minimal_builder!()
+            .starting_balances(vec!["12_345 USD".to_string()])
+            .base_currency(Currency::USD())
+            .default_leverage(Decimal::new(25, 1))
+            .leverages(AHashMap::from_iter([(instrument_id, Decimal::new(35, 1))]))
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()))
+            .routing(true)
+            .reject_stop_orders(false)
+            .support_gtd_orders(false)
+            .support_contingent_orders(false)
+            .use_position_ids(false)
+            .use_random_ids(true)
+            .use_reduce_only(false)
+            .use_market_order_acks(true)
+            .bar_execution(false)
+            .bar_adaptive_high_low_ordering(true)
+            .trade_execution(false)
+            .liquidity_consumption(true)
+            .allow_cash_borrowing(true)
+            .frozen_account(true)
+            .queue_position(true)
+            .oto_trigger_mode(OtoTriggerMode::Full)
+            .price_protection_points(7)
+            .liquidation_enabled(true)
+            .liquidation_trigger_ratio(1.5)
+            .liquidation_cancel_open_orders(false)
+            .order_priority_reset_policy(OrderPriorityResetPolicy::AnyModify)
+            .build()
+            .unwrap();
+
+        let runtime = config.to_simulated().unwrap();
+
+        assert_eq!(runtime.venue, Venue::from("SIM"));
+        assert_eq!(runtime.oms_type, OmsType::Netting);
+        assert_eq!(runtime.account_type, AccountType::Margin);
+        assert_eq!(runtime.book_type, BookType::L1_MBP);
+        assert_eq!(runtime.starting_balances, vec![Money::from("12_345 USD")]);
+        assert_eq!(runtime.base_currency, Some(Currency::USD()));
+        assert_eq!(runtime.default_leverage, Some(Decimal::new(25, 1)));
+        assert_eq!(
+            runtime.leverages,
+            AHashMap::from_iter([(instrument_id, Decimal::new(35, 1))])
+        );
+        assert_eq!(
+            (
+                runtime.routing,
+                runtime.reject_stop_orders,
+                runtime.support_gtd_orders,
+                runtime.support_contingent_orders,
+                runtime.use_position_ids,
+                runtime.use_random_ids,
+                runtime.use_reduce_only,
+                runtime.use_message_queue,
+                runtime.use_market_order_acks
+            ),
+            (true, false, false, false, false, true, false, true, true),
+        );
+        assert_eq!(
+            (
+                runtime.bar_execution,
+                runtime.bar_adaptive_high_low_ordering,
+                runtime.trade_execution,
+                runtime.liquidity_consumption,
+                runtime.allow_cash_borrowing,
+                runtime.frozen_account,
+                runtime.queue_position,
+                runtime.oto_full_trigger,
+                runtime.defer_option_settlement
+            ),
+            (false, true, false, true, true, true, true, true, true),
+        );
+        assert_eq!(runtime.price_protection_points, 7);
+        assert!(runtime.liquidation_enabled);
+        assert_eq!(
+            runtime.liquidation_trigger_ratio.to_bits(),
+            1.5_f64.to_bits()
+        );
+        assert!(!runtime.liquidation_cancel_open_orders);
+        assert_eq!(
+            runtime.order_priority_reset_policy,
+            OrderPriorityResetPolicy::AnyModify
+        );
+    }
+
     #[rstest]
     fn test_minimal_config_is_valid() {
         assert!(minimal_builder!().build().is_ok());
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    fn test_order_priority_reset_policy_python_keyword(
+        #[values(
+            OrderPriorityResetPolicy::PriceChange,
+            OrderPriorityResetPolicy::PriceOrQuantityIncrease,
+            OrderPriorityResetPolicy::AnyModify
+        )]
+        policy: OrderPriorityResetPolicy,
+    ) {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("order_priority_reset_policy", policy)
+                .unwrap();
+            let config = py
+                .get_type::<BacktestVenueConfig>()
+                .call(
+                    ("SIM", "NETTING", "MARGIN", vec!["1_000 USD"]),
+                    Some(&kwargs),
+                )
+                .unwrap();
+            assert_eq!(
+                config
+                    .getattr("order_priority_reset_policy")
+                    .unwrap()
+                    .extract::<OrderPriorityResetPolicy>()
+                    .unwrap(),
+                policy
+            );
+            let config = config.extract::<BacktestVenueConfig>().unwrap();
+            assert_eq!(config.order_priority_reset_policy(), policy);
+        });
+    }
+
+    #[rstest]
+    fn test_order_priority_reset_policy_defaults_and_builder() {
+        let defaults = minimal_builder!().build().unwrap();
+        assert_eq!(
+            defaults.order_priority_reset_policy(),
+            OrderPriorityResetPolicy::PriceChange
+        );
+        assert_eq!(
+            minimal_simulated_builder!()
+                .build()
+                .unwrap()
+                .order_priority_reset_policy,
+            OrderPriorityResetPolicy::PriceChange
+        );
+        let config = minimal_builder!()
+            .order_priority_reset_policy(OrderPriorityResetPolicy::AnyModify)
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.order_priority_reset_policy(),
+            OrderPriorityResetPolicy::AnyModify
+        );
     }
 
     #[rstest]
@@ -1439,33 +1707,28 @@ mod tests {
 
     #[rstest]
     fn test_minimal_data_config_is_valid() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path("/tmp/catalog".to_string())
+        let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .build();
         assert!(result.is_ok());
     }
 
+    #[cfg(feature = "streaming")]
     #[rstest]
     #[case("")]
     #[case("   ")]
     fn test_empty_catalog_path_rejected(#[case] catalog_path: &str) {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path(catalog_path.to_string())
+        let result = data_builder!(NautilusDataType::QuoteTick, catalog_path.to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .build();
         assert!(
-            matches!(result, Err(ConfigError::EmptyField { field }) if field == "catalog_path")
+            matches!(result, Err(ConfigError::EmptyField { field }) if field == "catalog.path")
         );
     }
 
     #[rstest]
     fn test_inverted_time_range_rejected() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path("/tmp/catalog".to_string())
+        let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .start_time(UnixNanos::from(5_000_000_000u64))
             .end_time(UnixNanos::from(1_000_000_000u64))
@@ -1475,9 +1738,7 @@ mod tests {
 
     #[rstest]
     fn test_equal_time_range_accepted() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path("/tmp/catalog".to_string())
+        let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
             .start_time(UnixNanos::from(1_000_000_000u64))
             .end_time(UnixNanos::from(1_000_000_000u64))
@@ -1487,18 +1748,13 @@ mod tests {
 
     #[rstest]
     fn test_missing_identifier_rejected() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path("/tmp/catalog".to_string())
-            .build();
+        let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string()).build();
         assert!(matches!(result, Err(ConfigError::RequiredOneOf { fields }) if fields.len() == 3));
     }
 
     #[rstest]
     fn test_empty_instrument_ids_rejected() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path("/tmp/catalog".to_string())
+        let result = data_builder!(NautilusDataType::QuoteTick, "/tmp/catalog".to_string())
             .instrument_ids(vec![])
             .build();
         assert!(matches!(result, Err(ConfigError::RequiredOneOf { .. })));
@@ -1506,9 +1762,7 @@ mod tests {
 
     #[rstest]
     fn test_bar_types_satisfies_identifier_requirement() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::Bar)
-            .catalog_path("/tmp/catalog".to_string())
+        let result = data_builder!(NautilusDataType::Bar, "/tmp/catalog".to_string())
             .bar_types(vec!["ETH/USDT.BINANCE-1-MINUTE-LAST-EXTERNAL".to_string()])
             .build();
         assert!(result.is_ok());
@@ -1516,44 +1770,119 @@ mod tests {
 
     #[rstest]
     fn test_data_config_multiple_violations_collected() {
-        let result = BacktestDataConfig::builder()
-            .data_type(NautilusDataType::QuoteTick)
-            .catalog_path(String::new())
+        let result = data_builder!(NautilusDataType::QuoteTick, String::new())
             .start_time(UnixNanos::from(5_000_000_000u64))
             .end_time(UnixNanos::from(1_000_000_000u64))
             .build();
         let ConfigError::Multiple { errors } = result.unwrap_err() else {
             panic!("expected ConfigError::Multiple");
         };
-        assert_eq!(errors.len(), 3);
+
+        assert_eq!(errors.len(), 2 + usize::from(cfg!(feature = "streaming")));
     }
 
+    #[cfg(feature = "streaming")]
     #[rstest]
-    fn test_data_config_debug_redacts_storage_option_values() {
+    #[case::local("/data/catalog", "file", "file:///data/catalog")]
+    #[case::object_store("bucket/history", "s3", "s3://bucket/history")]
+    fn test_data_config_preserves_catalog_connection_settings(
+        #[case] path: &str,
+        #[case] protocol: &str,
+        #[case] uri: &str,
+    ) {
+        let options =
+            AHashMap::from([("region".to_string(), SecretString::from("ap-southeast-2"))]);
+
+        let params = Params::new(indexmap::IndexMap::from([(
+            "snapshot_id".to_string(),
+            serde_json::json!(7),
+        )]));
+        let catalog = DataCatalogConfig::builder()
+            .path(path.to_string())
+            .name("history".to_string())
+            .fs_protocol(protocol.to_string())
+            .catalog_backend(CatalogBackendType::External("Research".to_string()))
+            .batch_size(512)
+            .compression(CatalogCompression::Snappy)
+            .max_row_group_size(2048)
+            .params(params.clone())
+            .fs_rust_storage_options(options.clone())
+            .read_only(true)
+            .build()
+            .unwrap();
         let config = BacktestDataConfig::builder()
             .data_type(NautilusDataType::QuoteTick)
-            .catalog_path("/tmp/catalog".to_string())
+            .catalog(catalog.clone())
             .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
-            .catalog_fs_storage_options(AHashMap::from([(
-                "key".to_string(),
-                SecretString::from("fs-key-sentinel"),
+            .build()
+            .unwrap();
+        let connect = config.catalog().connect_config();
+
+        assert_eq!(config.catalog(), &catalog);
+        assert_eq!(config.catalog().fs_rust_storage_options(), Some(&options));
+        assert_eq!(connect.uri, uri);
+        assert_eq!(
+            connect.storage_options,
+            Some(AHashMap::from([(
+                "region".to_string(),
+                "ap-southeast-2".to_string()
             )]))
-            .catalog_fs_rust_storage_options(AHashMap::from([(
+        );
+        assert_eq!(connect.batch_size, Some(512));
+        assert_eq!(connect.compression, Some(CatalogCompression::Snappy));
+        assert_eq!(connect.max_row_group_size, Some(2048));
+        assert_eq!(connect.params, Some(params));
+    }
+
+    #[cfg(feature = "streaming")]
+    #[rstest]
+    #[case::batch_size("batch_size")]
+    #[case::row_group("max_row_group_size")]
+    fn test_data_config_validates_deserialized_catalog(#[case] field: &str) {
+        let catalog: DataCatalogConfig = serde_json::from_value(serde_json::json!({
+            "path": "/data/catalog",
+            (field): 0,
+        }))
+        .unwrap();
+        let error = BacktestDataConfig::builder()
+            .data_type(NautilusDataType::QuoteTick)
+            .catalog(catalog)
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConfigError::range(
+                field,
+                "must be a positive number of rows; omit the field for the backend default",
+            )
+        );
+    }
+
+    #[cfg(feature = "streaming")]
+    #[rstest]
+    fn test_data_config_debug_redacts_storage_option_values() {
+        let catalog = DataCatalogConfig::builder()
+            .path("/tmp/catalog".to_string())
+            .fs_rust_storage_options(AHashMap::from([(
                 "aws_secret_access_key".to_string(),
                 SecretString::from("rust-secret-sentinel"),
             )]))
             .build()
             .unwrap();
+        let config = BacktestDataConfig::builder()
+            .data_type(NautilusDataType::QuoteTick)
+            .catalog(catalog)
+            .instrument_id(InstrumentId::from("ETH/USDT.BINANCE"))
+            .build()
+            .unwrap();
 
         let debug_output = format!("{config:?}");
 
-        assert!(!debug_output.contains("fs-key-sentinel"));
         assert!(!debug_output.contains("rust-secret-sentinel"));
         assert!(debug_output.contains(&format!(
-            "catalog_fs_storage_options: Some({{\"key\": {REDACTED}}})"
-        )));
-        assert!(debug_output.contains(&format!(
-            "catalog_fs_rust_storage_options: Some({{\"aws_secret_access_key\": {REDACTED}}})"
+            "fs_rust_storage_options: Some({{\"aws_secret_access_key\": {REDACTED}}})"
         )));
     }
 
